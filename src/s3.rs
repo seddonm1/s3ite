@@ -29,7 +29,10 @@ use uuid::Uuid;
 #[async_trait::async_trait]
 impl S3 for Sqlite {
     #[tracing::instrument]
-    async fn create_bucket(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
+    async fn create_bucket(
+        &self,
+        req: S3Request<CreateBucketInput>,
+    ) -> S3Result<S3Response<CreateBucketOutput>> {
         let input = req.input;
 
         if self.buckets.read().await.contains_key(&input.bucket) {
@@ -50,11 +53,18 @@ impl S3 for Sqlite {
     }
 
     #[tracing::instrument]
-    async fn copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
+    async fn copy_object(
+        &self,
+        req: S3Request<CopyObjectInput>,
+    ) -> S3Result<S3Response<CopyObjectOutput>> {
         let input = req.input;
         let (bucket, key) = match input.copy_source {
             CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
-            CopySource::Bucket { ref bucket, ref key, .. } => (bucket, key),
+            CopySource::Bucket {
+                ref bucket,
+                ref key,
+                ..
+            } => (bucket, key),
         };
 
         // verify source and target buckets exist
@@ -104,7 +114,10 @@ impl S3 for Sqlite {
     }
 
     #[tracing::instrument]
-    async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
+    async fn delete_bucket(
+        &self,
+        req: S3Request<DeleteBucketInput>,
+    ) -> S3Result<S3Response<DeleteBucketOutput>> {
         let input = req.input;
 
         let mut guard = self.buckets.write().await;
@@ -123,7 +136,10 @@ impl S3 for Sqlite {
     }
 
     #[tracing::instrument]
-    async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
+    async fn delete_object(
+        &self,
+        req: S3Request<DeleteObjectInput>,
+    ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let input = req.input;
 
         let bucket_pool = self.try_get_bucket_pool(&input.bucket).await?;
@@ -163,9 +179,17 @@ impl S3 for Sqlite {
     }
 
     #[tracing::instrument]
-    async fn delete_objects(&self, req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
+    async fn delete_objects(
+        &self,
+        req: S3Request<DeleteObjectsInput>,
+    ) -> S3Result<S3Response<DeleteObjectsOutput>> {
         let input = req.input;
-        let delete_keys = input.delete.objects.into_iter().map(|object| object.key).collect::<Vec<_>>();
+        let delete_keys = input
+            .delete
+            .objects
+            .into_iter()
+            .map(|object| object.key)
+            .collect::<Vec<_>>();
 
         let bucket_pool = self.try_get_bucket_pool(&input.bucket).await?;
 
@@ -196,7 +220,10 @@ impl S3 for Sqlite {
     }
 
     #[tracing::instrument]
-    async fn get_bucket_location(&self, req: S3Request<GetBucketLocationInput>) -> S3Result<S3Response<GetBucketLocationOutput>> {
+    async fn get_bucket_location(
+        &self,
+        req: S3Request<GetBucketLocationInput>,
+    ) -> S3Result<S3Response<GetBucketLocationOutput>> {
         let input = req.input;
 
         if self.buckets.read().await.contains_key(&input.bucket).not() {
@@ -213,7 +240,10 @@ impl S3 for Sqlite {
     }
 
     #[tracing::instrument]
-    async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
+    async fn get_object(
+        &self,
+        req: S3Request<GetObjectInput>,
+    ) -> S3Result<S3Response<GetObjectOutput>> {
         let input = req.input;
 
         let bucket_pool = self.try_get_bucket_pool(&input.bucket).await?;
@@ -265,7 +295,10 @@ impl S3 for Sqlite {
     }
 
     #[tracing::instrument]
-    async fn head_bucket(&self, req: S3Request<HeadBucketInput>) -> S3Result<S3Response<HeadBucketOutput>> {
+    async fn head_bucket(
+        &self,
+        req: S3Request<HeadBucketInput>,
+    ) -> S3Result<S3Response<HeadBucketOutput>> {
         let input = req.input;
 
         if self.buckets.read().await.contains_key(&input.bucket).not() {
@@ -281,7 +314,10 @@ impl S3 for Sqlite {
     }
 
     #[tracing::instrument]
-    async fn head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
+    async fn head_object(
+        &self,
+        req: S3Request<HeadObjectInput>,
+    ) -> S3Result<S3Response<HeadObjectOutput>> {
         let input = req.input;
 
         let bucket_pool = self.try_get_bucket_pool(&input.bucket).await?;
@@ -316,7 +352,10 @@ impl S3 for Sqlite {
     }
 
     #[tracing::instrument]
-    async fn list_buckets(&self, _: S3Request<ListBucketsInput>) -> S3Result<S3Response<ListBucketsOutput>> {
+    async fn list_buckets(
+        &self,
+        _: S3Request<ListBucketsInput>,
+    ) -> S3Result<S3Response<ListBucketsOutput>> {
         let mut buckets: Vec<Bucket> = Vec::new();
 
         for name in self.buckets.read().await.keys() {
@@ -324,7 +363,8 @@ impl S3 for Sqlite {
             let file_meta = fs::metadata(file_path)
                 .await
                 .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
-            let created_or_modified_date = Timestamp::from(try_!(file_meta.created().or(file_meta.modified())));
+            let created_or_modified_date =
+                Timestamp::from(try_!(file_meta.created().or(file_meta.modified())));
 
             let bucket = Bucket {
                 creation_date: Some(created_or_modified_date),
@@ -341,7 +381,10 @@ impl S3 for Sqlite {
     }
 
     #[tracing::instrument]
-    async fn list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
+    async fn list_objects(
+        &self,
+        req: S3Request<ListObjectsInput>,
+    ) -> S3Result<S3Response<ListObjectsOutput>> {
         let v2_resp = self.list_objects_v2(req.map_input(Into::into)).await?;
 
         Ok(v2_resp.map_output(|v2| ListObjectsOutput {
@@ -356,7 +399,10 @@ impl S3 for Sqlite {
     }
 
     #[tracing::instrument]
-    async fn list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
+    async fn list_objects_v2(
+        &self,
+        req: S3Request<ListObjectsV2Input>,
+    ) -> S3Result<S3Response<ListObjectsV2Output>> {
         let ListObjectsV2Input {
             bucket,
             prefix,
@@ -393,7 +439,13 @@ impl S3 for Sqlite {
         let mut keys_values = bucket_pool
             .interact(move |connection| {
                 let transaction = connection.transaction()?;
-                Self::try_list_objects(&transaction, prefix_clone, &start_after_clone, max_keys, &continuation_token_clone)
+                Self::try_list_objects(
+                    &transaction,
+                    prefix_clone,
+                    &start_after_clone,
+                    max_keys,
+                    &continuation_token_clone,
+                )
             })
             .await
             .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
@@ -421,12 +473,15 @@ impl S3 for Sqlite {
                 .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
 
             // clean up old tokens
-            continuation_tokens.retain(|_, value| (OffsetDateTime::now_utc() - value.last_modified).as_seconds_f32() < 300.0);
+            continuation_tokens.retain(|_, value| {
+                (OffsetDateTime::now_utc() - value.last_modified).as_seconds_f32() < 300.0
+            });
 
             let continuation_token = is_truncated.then(|| {
-                let (token, mut offset) = continuation_token.map_or((Uuid::new_v4().to_string(), 0), |continuation_token| {
-                    (continuation_token.token, continuation_token.offset)
-                });
+                let (token, mut offset) = continuation_token
+                    .map_or((Uuid::new_v4().to_string(), 0), |continuation_token| {
+                        (continuation_token.token, continuation_token.offset)
+                    });
                 offset += max_keys_usize;
                 let continuation_token = ContinuationToken {
                     token: token.clone(),
@@ -453,7 +508,8 @@ impl S3 for Sqlite {
             name: Some(bucket),
             prefix,
             start_after,
-            next_continuation_token: continuation_token.map(|continuation_token| continuation_token.token),
+            next_continuation_token: continuation_token
+                .map(|continuation_token| continuation_token.token),
             ..Default::default()
         };
 
@@ -461,7 +517,10 @@ impl S3 for Sqlite {
     }
 
     #[tracing::instrument]
-    async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
+    async fn put_object(
+        &self,
+        req: S3Request<PutObjectInput>,
+    ) -> S3Result<S3Response<PutObjectOutput>> {
         let input = req.input;
 
         if self.buckets.read().await.contains_key(&input.bucket).not() {
@@ -493,7 +552,10 @@ impl S3 for Sqlite {
         if key.ends_with('/') {
             if let Some(len) = content_length {
                 if len > 0 {
-                    return Err(s3_error!(UnexpectedContent, "Unexpected request body when creating a directory object."));
+                    return Err(s3_error!(
+                        UnexpectedContent,
+                        "Unexpected request body when creating a directory object."
+                    ));
                 }
             };
 
@@ -579,7 +641,13 @@ impl S3 for Sqlite {
         bucket_pool
             .interact(move |connection| {
                 let transaction = connection.transaction()?;
-                Self::try_create_multipart_upload(&transaction, upload_id, &bucket_clone, &key_clone, req.credentials)?;
+                Self::try_create_multipart_upload(
+                    &transaction,
+                    upload_id,
+                    &bucket_clone,
+                    &key_clone,
+                    req.credentials,
+                )?;
                 transaction.commit()
             })
             .await
@@ -597,7 +665,10 @@ impl S3 for Sqlite {
     }
 
     #[tracing::instrument]
-    async fn upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
+    async fn upload_part(
+        &self,
+        req: S3Request<UploadPartInput>,
+    ) -> S3Result<S3Response<UploadPartOutput>> {
         let UploadPartInput {
             body,
             bucket,
@@ -633,9 +704,15 @@ impl S3 for Sqlite {
                     .transaction()
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
 
-                if Self::try_verify_upload_id(&transaction, upload_id, &bucket, &key, req.credentials)
-                    .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
-                    .not()
+                if Self::try_verify_upload_id(
+                    &transaction,
+                    upload_id,
+                    &bucket,
+                    &key,
+                    req.credentials,
+                )
+                .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
+                .not()
                 {
                     return Err(s3_error!(AccessDenied));
                 };
@@ -672,9 +749,15 @@ impl S3 for Sqlite {
     }
 
     #[tracing::instrument]
-    async fn list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
+    async fn list_parts(
+        &self,
+        req: S3Request<ListPartsInput>,
+    ) -> S3Result<S3Response<ListPartsOutput>> {
         let ListPartsInput {
-            bucket, key, upload_id, ..
+            bucket,
+            key,
+            upload_id,
+            ..
         } = req.input;
 
         let upload_id = Uuid::parse_str(&upload_id).map_err(|_| s3_error!(InvalidRequest))?;
@@ -688,9 +771,15 @@ impl S3 for Sqlite {
                     .transaction()
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
 
-                if Self::try_verify_upload_id(&transaction, upload_id, &bucket_clone, &key_clone, req.credentials)
-                    .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
-                    .not()
+                if Self::try_verify_upload_id(
+                    &transaction,
+                    upload_id,
+                    &bucket_clone,
+                    &key_clone,
+                    req.credentials,
+                )
+                .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
+                .not()
                 {
                     return Err(s3_error!(AccessDenied));
                 };
@@ -764,9 +853,15 @@ impl S3 for Sqlite {
                     .transaction()
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
 
-                if Self::try_verify_upload_id(&transaction, upload_id, &bucket_clone, &key_clone, req.credentials)
-                    .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
-                    .not()
+                if Self::try_verify_upload_id(
+                    &transaction,
+                    upload_id,
+                    &bucket_clone,
+                    &key_clone,
+                    req.credentials,
+                )
+                .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
+                .not()
                 {
                     return Err(s3_error!(AccessDenied));
                 };
@@ -774,7 +869,11 @@ impl S3 for Sqlite {
                 let parts = Self::try_get_multiparts(&transaction, upload_id)
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
 
-                let value = parts.into_iter().map(|part| part.value).collect::<Vec<_>>().concat();
+                let value = parts
+                    .into_iter()
+                    .map(|part| part.value)
+                    .collect::<Vec<_>>()
+                    .concat();
                 let mut md5_hash = Md5::new();
                 md5_hash.update(&value);
                 let md5 = hex(md5_hash.finalize());
