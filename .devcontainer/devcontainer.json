@@ -1,0 +1,32 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the README at:
+// https://github.com/microsoft/vscode-dev-containers/tree/v0.177.0/containers/rust
+{
+	"name": "Rust",
+	"build": {
+		"dockerfile": "Dockerfile"
+	},
+	"runArgs": [],
+	"containerEnv": {
+		"CARGO_TARGET_DIR": "/tmp/target"
+	},
+	// Set *default* container specific settings.json values on container create.
+	"customizations": {
+		"vscode": {
+			"settings": {
+				"lldb.executable": "/usr/bin/lldb",
+				// VS Code don't watch files under ./target
+				"files.watcherExclude": {
+					"**/target/**": true
+				},
+				"rust-analyzer.checkOnSave.command": "clippy"
+			},
+			// Add the IDs of extensions you want installed when the container is created.
+			"extensions": [
+				"rust-lang.rust-analyzer",
+				"vadimcn.vscode-lldb",
+				"bungcip.better-toml",
+				"serayuzgur.crates"
+			]
+		}
+	}
+}
