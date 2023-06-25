@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::all, clippy::pedantic)]
 
-use s3s_sqlite::Result;
-use s3s_sqlite::Sqlite;
+use s3ite::Result;
+use s3ite::Sqlite;
 
 use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;

@@ -87,6 +87,14 @@ impl Sqlite {
                         let connection = pool.get().await.unwrap();
                         connection
                             .interact(|connection| {
+                                connection.execute_batch(
+                                    "
+                                    PRAGMA foreign_keys=true;
+                                    PRAGMA analysis_limit=1000;
+                                    PRAGMA optimize;
+                                    ",
+                                )?;
+
                                 let transaction = connection.transaction()?;
                                 Self::try_delete_multipart_expired(
                                     &transaction,
@@ -97,7 +105,10 @@ impl Sqlite {
                             .await
                             .map_err(|_| rusqlite::Error::InvalidQuery)??;
 
-                        buckets.insert(path.file_stem().unwrap().to_str().unwrap().to_string(), pool);
+                        buckets.insert(
+                            path.file_stem().unwrap().to_str().unwrap().to_string(),
+                            pool,
+                        );
                     }
                 }
             }
@@ -120,12 +131,18 @@ impl Sqlite {
         self.resolve_abs_path(dir)
     }
 
-    pub(crate) async fn try_create_bucket(&self, bucket: &str, file_path: PathBuf) -> rusqlite::Result<()> {
+    pub(crate) async fn try_create_bucket(
+        &self,
+        bucket: &str,
+        file_path: PathBuf,
+    ) -> rusqlite::Result<()> {
         let cfg = Config::new(file_path);
         let pool = cfg.create_pool(Runtime::Tokio1).unwrap();
         let connection = pool.get().await.unwrap();
         connection
             .interact(|connection| {
+                connection.execute_batch("PRAGMA foreign_keys=true;")?;
+
                 let transaction = connection.transaction()?;
                 Self::try_create_tables(&transaction)?;
                 transaction.commit()
@@ -142,23 +159,22 @@ impl Sqlite {
     pub(crate) fn try_create_tables(transaction: &Transaction) -> rusqlite::Result<usize> {
         transaction.execute(
             "CREATE TABLE IF NOT EXISTS data (
-                    key             TEXT PRIMARY KEY,
-                    value           BLOB,
-                    size            INTEGER NOT NULL,
-                    metadata        TEXT,
-                    last_modified   TEXT NOT NULL,
-                    md5             TEXT
+                    key TEXT PRIMARY KEY,
+                    value BLOB,
+                    size INTEGER NOT NULL,
+                    metadata TEXT,
+                    last_modified TEXT NOT NULL,
+                    md5 TEXT
                 ) STRICT;",
             (),
         )?;
         transaction.execute(
             "CREATE TABLE IF NOT EXISTS multipart_upload (
-                    upload_id               BLOB NOT NULL  PRIMARY KEY,
-                    bucket                  TEXT NOT NULL,
-                    key                     TEXT NOT NULL,
-                    last_modified           TEXT NOT NULL,
-                    last_modified_epoch     TEXT NOT NULL,
-                    access_key              TEXT
+                    upload_id BLOB NOT NULL PRIMARY KEY,
+                    bucket TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    last_modified TEXT NOT NULL,
+                    access_key TEXT
                 ) STRICT;",
             (),
         )?;
@@ -168,16 +184,14 @@ impl Sqlite {
         )?;
         transaction.execute(
             "CREATE TABLE IF NOT EXISTS multipart_upload_part (
-                    upload_id               BLOB NOT NULL,
-                    last_modified           TEXT NOT NULL,
-                    last_modified_epoch     TEXT NOT NULL,
-                    part_number             INTEGER NOT NULL,
-                    value                   BLOB NOT NULL,
-                    size                    INTEGER NOT NULL,
-                    md5                     TEXT,
+                    upload_id BLOB NOT NULL,
+                    last_modified TEXT NOT NULL,
+                    part_number INTEGER NOT NULL,
+                    value BLOB NOT NULL,
+                    size INTEGER NOT NULL,
+                    md5 TEXT,
                     PRIMARY KEY (upload_id, part_number),
-                    FOREIGN KEY (upload_id)
-                        REFERENCES multipart_upload (upload_id)
+                    FOREIGN KEY (upload_id) REFERENCES multipart_upload (upload_id) ON DELETE CASCADE
                 ) STRICT;",
             (),
         )
@@ -258,7 +272,11 @@ impl Sqlite {
                         .map(|metadata| serde_json::from_str(&metadata))
                         .transpose()
                         .map_err(|err| {
-                            rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(err))
+                            rusqlite::Error::FromSqlConversionFailure(
+                                2,
+                                rusqlite::types::Type::Text,
+                                Box::new(err),
+                            )
                         })?,
                     last_modified: row.get(3)?,
                     md5: row.get(4)?,
@@ -270,8 +288,13 @@ impl Sqlite {
     }
 
     /// resolve object path under the virtual root
-    pub(crate) fn try_get_object(transaction: &Transaction, key: &str) -> rusqlite::Result<Option<KeyValue>> {
-        let mut stmt = transaction.prepare_cached("SELECT value, size, metadata, last_modified, md5 FROM data WHERE key = ?;")?;
+    pub(crate) fn try_get_object(
+        transaction: &Transaction,
+        key: &str,
+    ) -> rusqlite::Result<Option<KeyValue>> {
+        let mut stmt = transaction.prepare_cached(
+            "SELECT value, size, metadata, last_modified, md5 FROM data WHERE key = ?;",
+        )?;
 
         stmt.query_row([key], |row| {
             Ok(KeyValue {
@@ -282,7 +305,13 @@ impl Sqlite {
                     .get::<_, Option<String>>(2)?
                     .map(|metadata| serde_json::from_str(&metadata))
                     .transpose()
-                    .map_err(|err| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(err)))?,
+                    .map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })?,
                 last_modified: row.get(3)?,
                 md5: row.get(4)?,
             })
@@ -290,8 +319,12 @@ impl Sqlite {
         .optional()
     }
 
-    pub(crate) fn try_get_metadata(transaction: &Transaction, key: &str) -> rusqlite::Result<Option<KeyMetadata>> {
-        let mut stmt = transaction.prepare_cached("SELECT size, metadata, last_modified FROM data WHERE key = ?;")?;
+    pub(crate) fn try_get_metadata(
+        transaction: &Transaction,
+        key: &str,
+    ) -> rusqlite::Result<Option<KeyMetadata>> {
+        let mut stmt = transaction
+            .prepare_cached("SELECT size, metadata, last_modified FROM data WHERE key = ?;")?;
 
         stmt.query_row([key], |row| {
             Ok(KeyMetadata {
@@ -300,7 +333,13 @@ impl Sqlite {
                     .get::<_, Option<String>>(1)?
                     .map(|metadata| serde_json::from_str(&metadata))
                     .transpose()
-                    .map_err(|err| rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(err)))?,
+                    .map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })?,
                 last_modified: row.get(2)?,
             })
         })
@@ -308,7 +347,10 @@ impl Sqlite {
     }
 
     /// resolve object path under the virtual root
-    pub(crate) fn try_put_object(transaction: &Transaction, kv: KeyValue) -> rusqlite::Result<usize> {
+    pub(crate) fn try_put_object(
+        transaction: &Transaction,
+        kv: KeyValue,
+    ) -> rusqlite::Result<usize> {
         let mut stmt = transaction
                     .prepare_cached("INSERT INTO data (key, value, size, metadata, last_modified, md5) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(key) DO UPDATE SET value=excluded.value, size=excluded.size, metadata=excluded.metadata, last_modified=excluded.last_modified, md5=excluded.md5;")?;
 
@@ -326,16 +368,24 @@ impl Sqlite {
     }
 
     /// resolve object path under the virtual root
-    pub(crate) fn try_delete_object(transaction: &Transaction, key: &str) -> rusqlite::Result<usize> {
+    pub(crate) fn try_delete_object(
+        transaction: &Transaction,
+        key: &str,
+    ) -> rusqlite::Result<usize> {
         let mut stmt = transaction.prepare_cached("DELETE FROM data WHERE key = ?;")?;
 
         stmt.execute([key])
     }
 
-    pub(crate) fn try_delete_objects(transaction: &Transaction, keys: &[String]) -> rusqlite::Result<Vec<String>> {
+    pub(crate) fn try_delete_objects(
+        transaction: &Transaction,
+        keys: &[String],
+    ) -> rusqlite::Result<Vec<String>> {
         let vars = repeat_vars(keys.len());
 
-        let mut stmt = transaction.prepare(&format!("DELETE FROM data WHERE key IN ({vars}) RETURNING key;"))?;
+        let mut stmt = transaction.prepare(&format!(
+            "DELETE FROM data WHERE key IN ({vars}) RETURNING key;"
+        ))?;
 
         let keys = stmt
             .query_map(rusqlite::params_from_iter(keys), |row| row.get(0))?
@@ -344,7 +394,10 @@ impl Sqlite {
         Ok(keys)
     }
 
-    pub(crate) fn try_delete_objects_like(transaction: &Transaction, key: &str) -> rusqlite::Result<usize> {
+    pub(crate) fn try_delete_objects_like(
+        transaction: &Transaction,
+        key: &str,
+    ) -> rusqlite::Result<usize> {
         let mut stmt = transaction.prepare_cached("DELETE FROM data WHERE key LIKE ?;")?;
 
         stmt.execute([format!("{key}%")])
@@ -358,14 +411,13 @@ impl Sqlite {
         credentials: Option<Credentials>,
     ) -> rusqlite::Result<usize> {
         let mut stmt = transaction.prepare_cached(
-            "INSERT INTO multipart_upload (upload_id, last_modified, last_modified_epoch, bucket, key, access_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6);",
+            "INSERT INTO multipart_upload (upload_id, last_modified, bucket, key, access_key) VALUES (?1, ?2, ?3, ?4, ?5);",
         )?;
 
         let now = OffsetDateTime::now_utc();
         stmt.execute((
             upload_id,
             now,
-            now.unix_timestamp(),
             bucket,
             key,
             credentials.map(|credentials| credentials.access_key),
@@ -382,20 +434,24 @@ impl Sqlite {
         let mut stmt = transaction
             .prepare_cached("SELECT access_key FROM multipart_upload WHERE upload_id = $1 AND bucket = $2 AND key = $3;")?;
 
-        let access_key = stmt.query_row((upload_id, bucket, key), |row| row.get::<_, Option<String>>(0))?;
+        let access_key = stmt.query_row((upload_id, bucket, key), |row| {
+            row.get::<_, Option<String>>(0)
+        })?;
 
         Ok(access_key == credentials.map(|credentials| credentials.access_key))
     }
 
-    pub(crate) fn try_put_multipart(transaction: &Transaction, multipart: Multipart) -> rusqlite::Result<usize> {
+    pub(crate) fn try_put_multipart(
+        transaction: &Transaction,
+        multipart: Multipart,
+    ) -> rusqlite::Result<usize> {
         let mut stmt = transaction.prepare_cached(
-            "INSERT INTO multipart_upload_part (upload_id, last_modified, last_modified_epoch, part_number, value, size, md5) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
+            "INSERT INTO multipart_upload_part (upload_id, last_modified, part_number, value, size, md5) VALUES (?1, ?2, ?3, ?4, ?5, ?6);",
         )?;
 
         stmt.execute((
             multipart.upload_id,
             multipart.last_modified,
-            multipart.last_modified.unix_timestamp(),
             multipart.part_number,
             multipart.value,
             multipart.size,
@@ -403,7 +459,10 @@ impl Sqlite {
         ))
     }
 
-    pub(crate) fn try_list_multipart(transaction: &Transaction, upload_id: Uuid) -> rusqlite::Result<Vec<MultipartMetadata>> {
+    pub(crate) fn try_list_multipart(
+        transaction: &Transaction,
+        upload_id: Uuid,
+    ) -> rusqlite::Result<Vec<MultipartMetadata>> {
         let mut stmt = transaction.prepare_cached(
             "SELECT last_modified, part_number, size FROM multipart_upload_part WHERE upload_id = ?1 ORDER BY part_number;",
         )?;
@@ -422,7 +481,10 @@ impl Sqlite {
         Ok(objects)
     }
 
-    pub(crate) fn try_get_multiparts(transaction: &Transaction, upload_id: Uuid) -> rusqlite::Result<Vec<Multipart>> {
+    pub(crate) fn try_get_multiparts(
+        transaction: &Transaction,
+        upload_id: Uuid,
+    ) -> rusqlite::Result<Vec<Multipart>> {
         let mut stmt = transaction.prepare_cached(
                 "SELECT last_modified, part_number, value, size, md5 FROM multipart_upload_part WHERE upload_id = ?1 ORDER BY part_number;",
             )?;
@@ -444,24 +506,25 @@ impl Sqlite {
         Ok(objects)
     }
 
-    pub(crate) fn try_delete_multipart(transaction: &Transaction, upload_id: Uuid) -> rusqlite::Result<()> {
-        let mut stmt = transaction.prepare_cached("DELETE FROM multipart_upload_part WHERE upload_id = ?1;")?;
-        stmt.execute([upload_id])?;
-
-        let mut stmt = transaction.prepare_cached("DELETE FROM multipart_upload WHERE upload_id = ?1;")?;
+    pub(crate) fn try_delete_multipart(
+        transaction: &Transaction,
+        upload_id: Uuid,
+    ) -> rusqlite::Result<()> {
+        let mut stmt =
+            transaction.prepare_cached("DELETE FROM multipart_upload WHERE upload_id = ?1;")?;
         stmt.execute([upload_id])?;
 
         Ok(())
     }
 
-    pub(crate) fn try_delete_multipart_expired(transaction: &Transaction, expire_before: OffsetDateTime) -> rusqlite::Result<()> {
-        let ts = expire_before.unix_timestamp();
-
-        let mut stmt = transaction.prepare_cached("DELETE FROM multipart_upload_part WHERE last_modified_epoch < ?1;")?;
-        stmt.execute([ts])?;
-
-        let mut stmt = transaction.prepare_cached("DELETE FROM multipart_upload WHERE last_modified_epoch < ?1;")?;
-        stmt.execute([ts])?;
+    pub(crate) fn try_delete_multipart_expired(
+        transaction: &Transaction,
+        expire_before: OffsetDateTime,
+    ) -> rusqlite::Result<()> {
+        let mut stmt = transaction.prepare_cached(
+            "DELETE FROM multipart_upload WHERE DATETIME(last_modified) < DATETIME($1);",
+        )?;
+        stmt.execute([expire_before])?;
 
         Ok(())
     }
