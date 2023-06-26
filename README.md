@@ -14,7 +14,7 @@ This concept is backed by benchmarks from SQLite showing that it can be [faster 
 
 Each bucket is saved to a separate `.sqlite3` database named after the bucket name. The [smithy](https://github.com/awslabs/smithy) generated bindings for `s3` are then mapped to the correct SQL calls against a very simple schema that is designed to be human accessible.
 
-### data
+### Data
 
 The main table, `data`, is a simple key/value with metadata store.
 
@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS data (
 ) STRICT, WITHOUT ROWID;
 ```
 
-### multipart
+### Multipart Uploads
 
 For `multipart` uploads two temporary tables are used:
 
