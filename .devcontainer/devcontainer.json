@@ -5,7 +5,10 @@
 	"build": {
 		"dockerfile": "Dockerfile"
 	},
-	"runArgs": [],
+	"runArgs": [
+		"-p",
+		"8014:8014"
+	],
 	"containerEnv": {
 		"CARGO_TARGET_DIR": "/tmp/target"
 	},

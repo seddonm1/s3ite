@@ -1,4 +1,4 @@
-use crate::error::*;
+use crate::error::{Error, Result};
 
 use s3s::StdError;
 

@@ -165,7 +165,7 @@ impl Sqlite {
                     metadata TEXT,
                     last_modified TEXT NOT NULL,
                     md5 TEXT
-                ) STRICT;",
+                ) STRICT, WITHOUT ROWID;",
             (),
         )?;
         transaction.execute(
@@ -175,7 +175,7 @@ impl Sqlite {
                     key TEXT NOT NULL,
                     last_modified TEXT NOT NULL,
                     access_key TEXT
-                ) STRICT;",
+                ) STRICT, WITHOUT ROWID;",
             (),
         )?;
         transaction.execute(

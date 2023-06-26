@@ -385,16 +385,32 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<ListObjectsInput>,
     ) -> S3Result<S3Response<ListObjectsOutput>> {
+        let marker = req.input.marker.clone();
+
         let v2_resp = self.list_objects_v2(req.map_input(Into::into)).await?;
 
-        Ok(v2_resp.map_output(|v2| ListObjectsOutput {
-            contents: v2.contents,
-            delimiter: v2.delimiter,
-            encoding_type: v2.encoding_type,
-            name: v2.name,
-            prefix: v2.prefix,
-            max_keys: v2.max_keys,
-            ..Default::default()
+        Ok(v2_resp.map_output(|v2| {
+            let next_marker = v2
+                .is_truncated
+                .then(|| {
+                    v2.contents.as_ref().and_then(|contents| {
+                        contents.last().and_then(|last| last.key.as_ref().cloned())
+                    })
+                })
+                .flatten();
+
+            ListObjectsOutput {
+                contents: v2.contents,
+                delimiter: v2.delimiter,
+                encoding_type: v2.encoding_type,
+                name: v2.name,
+                prefix: v2.prefix,
+                max_keys: v2.max_keys,
+                is_truncated: v2.is_truncated,
+                marker,
+                next_marker,
+                ..Default::default()
+            }
         }))
     }
 
