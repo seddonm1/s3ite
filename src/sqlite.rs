@@ -89,6 +89,7 @@ impl Sqlite {
                             .interact(|connection| {
                                 connection.execute_batch(
                                     "
+                                    PRAGMA journal_mode=WAL;
                                     PRAGMA foreign_keys=true;
                                     PRAGMA analysis_limit=1000;
                                     PRAGMA optimize;
@@ -141,7 +142,12 @@ impl Sqlite {
         let connection = pool.get().await.unwrap();
         connection
             .interact(|connection| {
-                connection.execute_batch("PRAGMA foreign_keys=true;")?;
+                connection.execute_batch(
+                    "
+                    PRAGMA journal_mode=WAL;
+                    PRAGMA foreign_keys=true;
+                ",
+                )?;
 
                 let transaction = connection.transaction()?;
                 Self::try_create_tables(&transaction)?;
@@ -165,7 +171,7 @@ impl Sqlite {
                     metadata TEXT,
                     last_modified TEXT NOT NULL,
                     md5 TEXT
-                ) STRICT, WITHOUT ROWID;",
+                ) STRICT;",
             (),
         )?;
         transaction.execute(
@@ -175,7 +181,7 @@ impl Sqlite {
                     key TEXT NOT NULL,
                     last_modified TEXT NOT NULL,
                     access_key TEXT
-                ) STRICT, WITHOUT ROWID;",
+                ) STRICT;",
             (),
         )?;
         transaction.execute(

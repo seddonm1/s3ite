@@ -6,7 +6,7 @@ This is an experimental binding using the [s3s](https://crates.io/crates/s3s) cr
 
 ## Why
 
-This crate was built to test the feasiblity of using SQLite as an alternative to formats like [TFRecord](https://www.tensorflow.org/tutorials/load_data/tfrecord) for storing a large number of machine learning training data with an accessible API. Although `tfrecord` and SQLite share a similar few-large-storage-files architecture - making backups and data movement efficient/easy - having both a SQLite interface and [Amazon S3](https://aws.amazon.com/s3/)/`http` API makes access to the contained data easier with tooling that likely already exists on your machine.
+This crate was built to test the feasiblity of using SQLite as an alternative to formats like [TFRecord](https://www.tensorflow.org/tutorials/load_data/tfrecord) for storing a large number of machine learning training data with an accessible API. Although `TFRecord` and SQLite share a similar few-large-storage-files architecture - making backups and data movement efficient/easy - having both a SQLite interface and [Amazon S3](https://aws.amazon.com/s3/)/`http` API makes access to the contained data easier with tooling that likely already exists on your machine.
 
 This concept is backed by benchmarks from SQLite showing that it can be [faster than filesytems](https://www.sqlite.org/fasterthanfs.html) for certain data access patterns.
 
@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS data (
     metadata        TEXT,
     last_modified   TEXT NOT NULL,
     md5             TEXT
-) STRICT, WITHOUT ROWID;
+) STRICT;
 ```
 
 ### Multipart Uploads
@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS multipart_upload (
     key                     TEXT NOT NULL,
     last_modified           TEXT NOT NULL,
     access_key              TEXT
-) STRICT, WITHOUT ROWID;
+) STRICT;
 
 CREATE TABLE IF NOT EXISTS multipart_upload_part (
     upload_id               BLOB NOT NULL,
@@ -71,7 +71,7 @@ cargo install --path .
 ## Run
 
 ```bash
-s3ite . --access-key AKIAIOSFODNN7EXAMPLE --secret-key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+s3ite . --host 0.0.0.0 --port 8014 --access-key AKIAIOSFODNN7EXAMPLE --secret-key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 ```
 
 ## Docker
