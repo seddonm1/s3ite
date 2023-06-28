@@ -54,6 +54,23 @@ CREATE TABLE IF NOT EXISTS multipart_upload_part (
 ) STRICT;
 ```
 
+## Docker
+
+```bash
+docker run --rm \
+-e RUST_LOG=info \
+-v $(pwd)/test:/data \
+-p 8014:8014 \
+s3ite:latest \
+./s3ite /data \
+--host 0.0.0.0 \
+--port 8014 \
+--concurrency_limit 16 \
+--access-key AKIAIOSFODNN7EXAMPLE \
+--secret-key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+```
+
+
 ## Build
 
 This code can be used as a library or a standalone binary. To build the binary:
@@ -74,17 +91,3 @@ cargo install --path .
 s3ite . --host 0.0.0.0 --port 8014 --access-key AKIAIOSFODNN7EXAMPLE --secret-key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 ```
 
-## Docker
-
-```bash
-docker run --rm \
--e RUST_LOG=info \
--v $(pwd)/test:/data \
--p 8014:8014 \
-s3ite:latest \
-./s3ite /data \
---host 0.0.0.0 \
---port 8014 \
---access-key AKIAIOSFODNN7EXAMPLE \
---secret-key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-```

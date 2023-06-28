@@ -1,6 +1,7 @@
 use crate::error::*;
 use crate::utils::repeat_vars;
 
+use clap::ValueEnum;
 use deadpool_sqlite::rusqlite::Transaction;
 use deadpool_sqlite::{Object, Pool};
 use rusqlite::Error::ToSqlConversionFailure;
@@ -26,15 +27,125 @@ use uuid::Uuid;
 #[derive(Debug)]
 pub struct Sqlite {
     pub(crate) root: PathBuf,
+    pub(crate) pragmas: Pragmas,
     pub(crate) buckets: Arc<RwLock<HashMap<String, Pool>>>,
     pub(crate) continuation_tokens: Arc<std::sync::RwLock<HashMap<String, ContinuationToken>>>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ContinuationToken {
-    pub(crate) token: String,
-    pub(crate) last_modified: OffsetDateTime,
-    pub(crate) offset: usize,
+pub struct Pragmas {
+    pub journal_mode: JournalMode,
+    pub synchronous: Synchronous,
+    pub temp_store: TempStore,
+    pub cache_size: u32,
+    pub query_only: bool,
+    pub foreign_keys: bool,
+}
+
+impl Default for Pragmas {
+    fn default() -> Self {
+        Self {
+            journal_mode: JournalMode::Wal,
+            synchronous: Synchronous::Normal,
+            temp_store: TempStore::Memory,
+            cache_size: 67_108_864,
+            query_only: false,
+            foreign_keys: true,
+        }
+    }
+}
+
+impl Pragmas {
+    #[must_use]
+    pub fn to_sql(&self) -> String {
+        format!(
+            "
+            PRAGMA journal_mode={};
+            PRAGMA synchronous={};
+            PRAGMA temp_store={};
+            PRAGMA cache_size=-{};
+            PRAGMA query_only={};
+            PRAGMA foreign_keys={};
+        ",
+            self.journal_mode,
+            self.synchronous,
+            self.temp_store,
+            self.cache_size,
+            self.query_only,
+            self.foreign_keys,
+        )
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+pub enum JournalMode {
+    Delete,
+    Truncate,
+    Persist,
+    Memory,
+    Wal,
+    Off,
+}
+
+impl std::fmt::Display for JournalMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                JournalMode::Delete => "DELETE",
+                JournalMode::Truncate => "TRUNCATE",
+                JournalMode::Persist => "PERSIST",
+                JournalMode::Memory => "MEMORY",
+                JournalMode::Wal => "WAL",
+                JournalMode::Off => "OFF",
+            }
+        )
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+pub enum Synchronous {
+    Off,
+    Normal,
+    Full,
+    Extra,
+}
+
+impl std::fmt::Display for Synchronous {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Synchronous::Off => "OFF",
+                Synchronous::Normal => "NORMAL",
+                Synchronous::Full => "FULL",
+                Synchronous::Extra => "EXTRA",
+            }
+        )
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+pub enum TempStore {
+    Default,
+    File,
+    Memory,
+}
+
+impl std::fmt::Display for TempStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                TempStore::Default => "DEFAULT",
+                TempStore::File => "FILE",
+                TempStore::Memory => "MEMORY",
+            }
+        )
+    }
 }
 
 pub(crate) struct KeyValue {
@@ -67,9 +178,16 @@ pub(crate) struct MultipartMetadata {
     pub(crate) size: i64,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ContinuationToken {
+    pub(crate) token: String,
+    pub(crate) last_modified: OffsetDateTime,
+    pub(crate) offset: usize,
+}
+
 impl Sqlite {
     /// # Panics
-    pub async fn new(root: impl AsRef<Path>) -> Result<Self> {
+    pub async fn new(root: impl AsRef<Path>, pragmas: Pragmas) -> Result<Self> {
         let root = env::current_dir()?.join(root).canonicalize()?;
 
         let mut buckets = HashMap::new();
@@ -77,6 +195,7 @@ impl Sqlite {
         let mut iter = fs::read_dir(root.clone()).await?;
         while let Some(entry) = iter.next_entry().await? {
             let file_type = entry.file_type().await?;
+            let pragmas = pragmas.clone();
 
             if file_type.is_file() {
                 let path = entry.path();
@@ -86,11 +205,11 @@ impl Sqlite {
                         let pool = cfg.create_pool(Runtime::Tokio1)?;
                         let connection = pool.get().await.unwrap();
                         connection
-                            .interact(|connection| {
+                            .interact(move |connection| {
+                                connection.execute_batch(&pragmas.to_sql())?;
+
                                 connection.execute_batch(
                                     "
-                                    PRAGMA journal_mode=WAL;
-                                    PRAGMA foreign_keys=true;
                                     PRAGMA analysis_limit=1000;
                                     PRAGMA optimize;
                                     ",
@@ -117,6 +236,7 @@ impl Sqlite {
 
         Ok(Self {
             root,
+            pragmas,
             buckets: Arc::new(RwLock::new(buckets)),
             continuation_tokens: Arc::new(std::sync::RwLock::new(HashMap::new())),
         })
@@ -140,14 +260,10 @@ impl Sqlite {
         let cfg = Config::new(file_path);
         let pool = cfg.create_pool(Runtime::Tokio1).unwrap();
         let connection = pool.get().await.unwrap();
+        let pragmas = self.pragmas.clone();
         connection
-            .interact(|connection| {
-                connection.execute_batch(
-                    "
-                    PRAGMA journal_mode=WAL;
-                    PRAGMA foreign_keys=true;
-                ",
-                )?;
+            .interact(move |connection| {
+                connection.execute_batch(&pragmas.to_sql())?;
 
                 let transaction = connection.transaction()?;
                 Self::try_create_tables(&transaction)?;
@@ -171,7 +287,7 @@ impl Sqlite {
                     metadata TEXT,
                     last_modified TEXT NOT NULL,
                     md5 TEXT
-                ) STRICT;",
+                );",
             (),
         )?;
         transaction.execute(
@@ -181,7 +297,7 @@ impl Sqlite {
                     key TEXT NOT NULL,
                     last_modified TEXT NOT NULL,
                     access_key TEXT
-                ) STRICT;",
+                );",
             (),
         )?;
         transaction.execute(
@@ -198,7 +314,7 @@ impl Sqlite {
                     md5 TEXT,
                     PRIMARY KEY (upload_id, part_number),
                     FOREIGN KEY (upload_id) REFERENCES multipart_upload (upload_id) ON DELETE CASCADE
-                ) STRICT;",
+                );",
             (),
         )
     }

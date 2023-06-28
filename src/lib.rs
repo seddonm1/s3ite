@@ -17,4 +17,4 @@ mod sqlite;
 mod utils;
 
 pub use self::error::*;
-pub use self::sqlite::Sqlite;
+pub use self::sqlite::*;

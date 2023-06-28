@@ -4,9 +4,8 @@
     clippy::must_use_candidate, //
 )]
 
-use md5::Digest;
-use md5::Md5;
-use s3ite::Sqlite;
+use md5::{Digest, Md5};
+use s3ite::{Pragmas, Sqlite};
 use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;
 
@@ -63,7 +62,7 @@ impl TestContext {
 
         // Setup S3 provider
         fs::create_dir_all(FS_ROOT).unwrap();
-        let fs = Sqlite::new(FS_ROOT).await.unwrap();
+        let fs = Sqlite::new(FS_ROOT, Pragmas::default()).await.unwrap();
 
         // Setup S3 service
         let service = {

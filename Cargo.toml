@@ -1,8 +1,8 @@
 [package]
 name = "s3ite"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "An experimental S3 server based on sqlite"
+description = "An S3 server backed by SQLite"
 license = "MIT"
 readme = "../../README.md"
 repository = "https://github.com/seddonm1/s3ite"

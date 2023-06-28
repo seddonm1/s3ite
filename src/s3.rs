@@ -33,6 +33,10 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<CreateBucketInput>,
     ) -> S3Result<S3Response<CreateBucketOutput>> {
+        if self.pragmas.query_only {
+            return Err(s3_error!(MethodNotAllowed, "database is in read-only mode"));
+        }
+
         let input = req.input;
 
         if self.buckets.read().await.contains_key(&input.bucket) {
@@ -57,6 +61,10 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<CopyObjectInput>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
+        if self.pragmas.query_only {
+            return Err(s3_error!(MethodNotAllowed, "database is in read-only mode"));
+        }
+
         let input = req.input;
         let (bucket, key) = match input.copy_source {
             CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
@@ -118,15 +126,26 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<DeleteBucketInput>,
     ) -> S3Result<S3Response<DeleteBucketOutput>> {
+        if self.pragmas.query_only {
+            return Err(s3_error!(MethodNotAllowed, "database is in read-only mode"));
+        }
+
         let input = req.input;
 
         let mut guard = self.buckets.write().await;
         match guard.get(&input.bucket) {
             Some(connection) => {
                 connection.close();
-                fs::remove_file(self.get_bucket_path(&input.bucket)?)
+                let bucket_path = self.get_bucket_path(&input.bucket)?;
+                fs::remove_file(&bucket_path)
                     .await
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
+                fs::remove_file(format!("{}-wal", bucket_path.to_string_lossy()))
+                    .await
+                    .ok();
+                fs::remove_file(format!("{}-shm", bucket_path.to_string_lossy()))
+                    .await
+                    .ok();
                 guard.remove(&input.bucket);
             }
             None => return Err(s3_error!(NoSuchBucket)),
@@ -183,6 +202,10 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        if self.pragmas.query_only {
+            return Err(s3_error!(MethodNotAllowed, "database is in read-only mode"));
+        }
+
         let input = req.input;
         let delete_keys = input
             .delete
@@ -537,6 +560,10 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
+        if self.pragmas.query_only {
+            return Err(s3_error!(MethodNotAllowed, "database is in read-only mode"));
+        }
+
         let input = req.input;
 
         if self.buckets.read().await.contains_key(&input.bucket).not() {
@@ -647,6 +674,10 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        if self.pragmas.query_only {
+            return Err(s3_error!(MethodNotAllowed, "database is in read-only mode"));
+        }
+
         let CreateMultipartUploadInput { bucket, key, .. } = req.input;
 
         let upload_id = Uuid::new_v4();
@@ -839,6 +870,10 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        if self.pragmas.query_only {
+            return Err(s3_error!(MethodNotAllowed, "database is in read-only mode"));
+        }
+
         let CompleteMultipartUploadInput {
             multipart_upload,
             bucket,
