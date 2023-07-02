@@ -1,7 +1,7 @@
 FROM rust:1.70.0 as build-env
 WORKDIR /app
 COPY . /app
-RUN cargo build --release --bin s3ite --features binary
+RUN cargo build -C target-feature="+avx2" --release --bin s3ite --features binary
 
 FROM gcr.io/distroless/cc
 COPY --from=build-env /app/target/release/s3ite /

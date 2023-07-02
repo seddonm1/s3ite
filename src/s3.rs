@@ -33,22 +33,20 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<CreateBucketInput>,
     ) -> S3Result<S3Response<CreateBucketOutput>> {
-        if self.pragmas.query_only {
-            return Err(s3_error!(MethodNotAllowed, "database is in read-only mode"));
-        }
+        let CreateBucketInput { bucket, .. } = req.input;
 
-        let input = req.input;
+        self.validate_mutable_bucket(&bucket)?;
 
-        if self.buckets.read().await.contains_key(&input.bucket) {
+        if self.buckets.read().await.contains_key(&bucket) {
             return Err(s3_error!(BucketAlreadyExists));
         }
 
-        let file_path = self.get_bucket_path(&input.bucket)?;
+        let file_path = self.get_bucket_path(&bucket)?;
         if file_path.exists() {
             return Err(s3_error!(BucketAlreadyExists));
         }
 
-        self.try_create_bucket(&input.bucket, file_path)
+        self.try_create_bucket(&bucket, file_path)
             .await
             .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
 
@@ -61,29 +59,29 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<CopyObjectInput>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
-        if self.pragmas.query_only {
-            return Err(s3_error!(MethodNotAllowed, "database is in read-only mode"));
-        }
+        let CopyObjectInput {
+            bucket: tgt_bucket,
+            key: tgt_key,
+            copy_source,
+            ..
+        } = req.input;
 
-        let input = req.input;
-        let (bucket, key) = match input.copy_source {
+        self.validate_mutable_bucket(&tgt_bucket)?;
+
+        let (src_bucket, src_key) = match copy_source {
             CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
-            CopySource::Bucket {
-                ref bucket,
-                ref key,
-                ..
-            } => (bucket, key),
+            CopySource::Bucket { bucket, key, .. } => (bucket, key),
         };
 
         // verify source and target buckets exist
-        let bucket_pool = self.try_get_bucket_pool(bucket).await?;
+        let bucket_pool = self.try_get_bucket_pool(&src_bucket).await?;
 
         let mut object = bucket_pool
             .interact(move |connection| {
                 let transaction = connection
                     .transaction()
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
-                Self::try_get_object(&transaction, &input.key)
+                Self::try_get_object(&transaction, &src_key)
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
                     .ok_or_else(|| s3_error!(NoSuchKey))
             })
@@ -95,7 +93,7 @@ impl S3 for Sqlite {
             })?;
 
         // replace key with target key
-        object.key = key.to_string();
+        object.key = tgt_key.to_string();
 
         let copy_object_result = CopyObjectResult {
             e_tag: object.md5.clone(),
@@ -103,7 +101,7 @@ impl S3 for Sqlite {
             ..Default::default()
         };
 
-        let bucket_pool = self.try_get_bucket_pool(&input.bucket).await?;
+        let bucket_pool = self.try_get_bucket_pool(&tgt_bucket).await?;
         bucket_pool
             .interact(move |connection| {
                 let transaction = connection.transaction()?;
@@ -126,17 +124,15 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<DeleteBucketInput>,
     ) -> S3Result<S3Response<DeleteBucketOutput>> {
-        if self.pragmas.query_only {
-            return Err(s3_error!(MethodNotAllowed, "database is in read-only mode"));
-        }
+        let DeleteBucketInput { bucket, .. } = req.input;
 
-        let input = req.input;
+        self.validate_mutable_bucket(&bucket)?;
 
         let mut guard = self.buckets.write().await;
-        match guard.get(&input.bucket) {
+        match guard.get(&bucket) {
             Some(connection) => {
                 connection.close();
-                let bucket_path = self.get_bucket_path(&input.bucket)?;
+                let bucket_path = self.get_bucket_path(&bucket)?;
                 fs::remove_file(&bucket_path)
                     .await
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
@@ -146,7 +142,7 @@ impl S3 for Sqlite {
                 fs::remove_file(format!("{}-shm", bucket_path.to_string_lossy()))
                     .await
                     .ok();
-                guard.remove(&input.bucket);
+                guard.remove(&bucket);
             }
             None => return Err(s3_error!(NoSuchBucket)),
         };
@@ -202,19 +198,17 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
-        if self.pragmas.query_only {
-            return Err(s3_error!(MethodNotAllowed, "database is in read-only mode"));
-        }
+        let DeleteObjectsInput { bucket, delete, .. } = req.input;
 
-        let input = req.input;
-        let delete_keys = input
-            .delete
+        self.validate_mutable_bucket(&bucket)?;
+
+        let delete_keys = delete
             .objects
             .into_iter()
             .map(|object| object.key)
             .collect::<Vec<_>>();
 
-        let bucket_pool = self.try_get_bucket_pool(&input.bucket).await?;
+        let bucket_pool = self.try_get_bucket_pool(&bucket).await?;
 
         let affected_keys = bucket_pool
             .interact(move |connection| {
@@ -560,23 +554,6 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
-        if self.pragmas.query_only {
-            return Err(s3_error!(MethodNotAllowed, "database is in read-only mode"));
-        }
-
-        let input = req.input;
-
-        if self.buckets.read().await.contains_key(&input.bucket).not() {
-            return Err(s3_error!(NoSuchBucket));
-        }
-
-        if let Some(ref storage_class) = input.storage_class {
-            let is_valid = ["STANDARD", "REDUCED_REDUNDANCY"].contains(&storage_class.as_str());
-            if is_valid.not() {
-                return Err(s3_error!(InvalidStorageClass));
-            }
-        }
-
         let PutObjectInput {
             body,
             bucket,
@@ -584,8 +561,22 @@ impl S3 for Sqlite {
             metadata,
             content_length,
             content_md5,
+            storage_class,
             ..
-        } = input;
+        } = req.input;
+
+        self.validate_mutable_bucket(&bucket)?;
+
+        if self.buckets.read().await.contains_key(&bucket).not() {
+            return Err(s3_error!(NoSuchBucket));
+        }
+
+        if let Some(ref storage_class) = storage_class {
+            let is_valid = ["STANDARD", "REDUCED_REDUNDANCY"].contains(&storage_class.as_str());
+            if is_valid.not() {
+                return Err(s3_error!(InvalidStorageClass));
+            }
+        }
 
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 
@@ -674,11 +665,9 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
-        if self.pragmas.query_only {
-            return Err(s3_error!(MethodNotAllowed, "database is in read-only mode"));
-        }
-
         let CreateMultipartUploadInput { bucket, key, .. } = req.input;
+
+        self.validate_mutable_bucket(&bucket)?;
 
         let upload_id = Uuid::new_v4();
 
@@ -870,10 +859,6 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        if self.pragmas.query_only {
-            return Err(s3_error!(MethodNotAllowed, "database is in read-only mode"));
-        }
-
         let CompleteMultipartUploadInput {
             multipart_upload,
             bucket,
@@ -881,6 +866,8 @@ impl S3 for Sqlite {
             upload_id,
             ..
         } = req.input;
+
+        self.validate_mutable_bucket(&bucket)?;
 
         let upload_id = Uuid::parse_str(&upload_id).map_err(|_| s3_error!(InvalidRequest))?;
 

@@ -10,6 +10,38 @@ This crate was built to test the feasiblity of using SQLite as an alternative to
 
 This concept is backed by benchmarks from SQLite showing that it can be [faster than filesytems](https://www.sqlite.org/fasterthanfs.html) for certain data access patterns.
 
+## Configuration
+
+`s3ite` has two methods of configuration: a `yaml` configuration file or command-line-interface. The `yaml` configuration (provided via the `--config` argument) allows options to be specified at the `bucket` level whereas the command-line-interface provides only service-level configurations.
+
+This structure is heirarchical where:
+
+### Bucket Level Configuration
+
+`bucket` level configurations will take precedence over the `sevice` level configuration.
+
+This design allows setting specific `bucket` level permissions like below where the `mybucket` bucket will be `read-only` and all other buckets will be writable.
+
+```yaml
+root: .
+host: 0.0.0.0
+port: 8014
+permissive_cors: true
+concurrency: 16
+read_only: false
+buckets:
+  mybucket:
+    read_only: true
+```
+
+### Command-Line Service Configuration
+
+Command-line-interface arguments will take precedence over any `service` level configuration like below where the default `root` value `.` is overridden with `/data`.
+
+```bash
+s3ite --root /data
+```
+
 ## Architecture
 
 Each bucket is saved to a separate `.sqlite3` database named after the bucket name. The [smithy](https://github.com/awslabs/smithy) generated bindings for `s3` are then mapped to the correct SQL calls against a very simple schema that is designed to be human accessible.

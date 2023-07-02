@@ -33,7 +33,10 @@ where
 
 impl From<Error> for S3Error {
     fn from(e: Error) -> Self {
-        S3Error::with_source(S3ErrorCode::InternalError, e.source)
+        match e.source.downcast::<S3Error>() {
+            Ok(s3error) => *s3error,
+            Err(source) => S3Error::with_source(S3ErrorCode::InternalError, source),
+        }
     }
 }
 

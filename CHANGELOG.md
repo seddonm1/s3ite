@@ -10,12 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Delete leftover `-wal` or `-shm` database artifacts when removing a bucket.
+- `config` YAML format configurations to supply complex configurations.
 - `concurrency_limit` to limit on the concurrent number of requests the underlying service can handle. Default `16`.
-- `sqlite_journal_mode` to control the SQLite `journal_mode` pragma. Default: `WAL`.
-- `sqlite_synchronous` to control the SQLite `synchronous` pragma. Default: `NORMAL`.
-- `sqlite_temp_store` to control the SQLite `temp_store` pragma. Default: `MEMORY`.
-- `sqlite_cache_size` to control the SQLite `cache_size` pragma. Default: `67108864`.
-- `sqlite_query_only` to control the SQLite `query_only` pragma and prevent mutations to the database if set. Default: `false`.
+- `read_only` to control whether this service/bucket is read-only. This is enforced at both the S3 API and SQLite (`query_only` pragma) level. Default: `false`.
+- `journal_mode` to control the SQLite `journal_mode` pragma. Default: `WAL`.
+- `synchronous` to control the SQLite `synchronous` pragma. Default: `NORMAL`.
+- `temp_store` to control the SQLite `temp_store` pragma. Default: `MEMORY`.
+- `cache_size` to control the SQLite `cache_size` pragma. Default: `67108864`.
 
 ### Changed
 

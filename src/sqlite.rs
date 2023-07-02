@@ -1,19 +1,19 @@
 use crate::error::*;
 use crate::utils::repeat_vars;
 
-use clap::ValueEnum;
 use deadpool_sqlite::rusqlite::Transaction;
 use deadpool_sqlite::{Object, Pool};
 use rusqlite::Error::ToSqlConversionFailure;
 use rusqlite::{OptionalExtension, ToSql};
 use s3s::auth::Credentials;
-use s3s::S3ErrorCode::InternalError;
+use s3s::S3ErrorCode::{InternalError, MethodNotAllowed};
 use s3s::{dto, s3_error, S3Error};
 use time::{Duration, OffsetDateTime};
 use tokio::sync::RwLock;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
+use std::ops::Not;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -27,125 +27,9 @@ use uuid::Uuid;
 #[derive(Debug)]
 pub struct Sqlite {
     pub(crate) root: PathBuf,
-    pub(crate) pragmas: Pragmas,
+    pub(crate) config: crate::Config,
     pub(crate) buckets: Arc<RwLock<HashMap<String, Pool>>>,
     pub(crate) continuation_tokens: Arc<std::sync::RwLock<HashMap<String, ContinuationToken>>>,
-}
-
-#[derive(Clone, Debug)]
-pub struct Pragmas {
-    pub journal_mode: JournalMode,
-    pub synchronous: Synchronous,
-    pub temp_store: TempStore,
-    pub cache_size: u32,
-    pub query_only: bool,
-    pub foreign_keys: bool,
-}
-
-impl Default for Pragmas {
-    fn default() -> Self {
-        Self {
-            journal_mode: JournalMode::Wal,
-            synchronous: Synchronous::Normal,
-            temp_store: TempStore::Memory,
-            cache_size: 67_108_864,
-            query_only: false,
-            foreign_keys: true,
-        }
-    }
-}
-
-impl Pragmas {
-    #[must_use]
-    pub fn to_sql(&self) -> String {
-        format!(
-            "
-            PRAGMA journal_mode={};
-            PRAGMA synchronous={};
-            PRAGMA temp_store={};
-            PRAGMA cache_size=-{};
-            PRAGMA query_only={};
-            PRAGMA foreign_keys={};
-        ",
-            self.journal_mode,
-            self.synchronous,
-            self.temp_store,
-            self.cache_size,
-            self.query_only,
-            self.foreign_keys,
-        )
-    }
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-pub enum JournalMode {
-    Delete,
-    Truncate,
-    Persist,
-    Memory,
-    Wal,
-    Off,
-}
-
-impl std::fmt::Display for JournalMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                JournalMode::Delete => "DELETE",
-                JournalMode::Truncate => "TRUNCATE",
-                JournalMode::Persist => "PERSIST",
-                JournalMode::Memory => "MEMORY",
-                JournalMode::Wal => "WAL",
-                JournalMode::Off => "OFF",
-            }
-        )
-    }
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-pub enum Synchronous {
-    Off,
-    Normal,
-    Full,
-    Extra,
-}
-
-impl std::fmt::Display for Synchronous {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                Synchronous::Off => "OFF",
-                Synchronous::Normal => "NORMAL",
-                Synchronous::Full => "FULL",
-                Synchronous::Extra => "EXTRA",
-            }
-        )
-    }
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-pub enum TempStore {
-    Default,
-    File,
-    Memory,
-}
-
-impl std::fmt::Display for TempStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                TempStore::Default => "DEFAULT",
-                TempStore::File => "FILE",
-                TempStore::Memory => "MEMORY",
-            }
-        )
-    }
 }
 
 pub(crate) struct KeyValue {
@@ -187,26 +71,29 @@ pub(crate) struct ContinuationToken {
 
 impl Sqlite {
     /// # Panics
-    pub async fn new(root: impl AsRef<Path>, pragmas: Pragmas) -> Result<Self> {
-        let root = env::current_dir()?.join(root).canonicalize()?;
+    pub async fn new(config: &crate::Config) -> Result<Self> {
+        let root = env::current_dir()?.join(&config.root).canonicalize()?;
 
         let mut buckets = HashMap::new();
 
         let mut iter = fs::read_dir(root.clone()).await?;
         while let Some(entry) = iter.next_entry().await? {
             let file_type = entry.file_type().await?;
-            let pragmas = pragmas.clone();
+            let config = config.clone();
 
             if file_type.is_file() {
                 let path = entry.path();
                 if let Some(extension) = path.extension() {
                     if extension == "sqlite3" {
+                        let bucket = path.file_stem().unwrap().to_str().unwrap().to_string();
+                        let bucket_clone = bucket.clone();
+
                         let cfg = Config::new(path.clone());
                         let pool = cfg.create_pool(Runtime::Tokio1)?;
                         let connection = pool.get().await.unwrap();
                         connection
                             .interact(move |connection| {
-                                connection.execute_batch(&pragmas.to_sql())?;
+                                connection.execute_batch(&config.to_sql(Some(&bucket_clone)))?;
 
                                 connection.execute_batch(
                                     "
@@ -225,18 +112,30 @@ impl Sqlite {
                             .await
                             .map_err(|_| rusqlite::Error::InvalidQuery)??;
 
-                        buckets.insert(
-                            path.file_stem().unwrap().to_str().unwrap().to_string(),
-                            pool,
-                        );
+                        buckets.insert(bucket, pool);
                     }
                 }
             }
         }
 
+        // validate that any specified bucket configurations have existing bucket
+        let difference = config
+            .buckets
+            .keys()
+            .collect::<HashSet<_>>()
+            .difference(&buckets.keys().collect::<HashSet<_>>())
+            .copied()
+            .collect::<Vec<_>>();
+        if difference.is_empty().not() {
+            Err(S3Error::with_message(
+                InternalError,
+                format!("found configurations for buckets: {difference:?} that do not exist"),
+            ))?;
+        }
+
         Ok(Self {
             root,
-            pragmas,
+            config: config.clone(),
             buckets: Arc::new(RwLock::new(buckets)),
             continuation_tokens: Arc::new(std::sync::RwLock::new(HashMap::new())),
         })
@@ -257,13 +156,15 @@ impl Sqlite {
         bucket: &str,
         file_path: PathBuf,
     ) -> rusqlite::Result<()> {
+        let config = self.config.clone();
+
         let cfg = Config::new(file_path);
         let pool = cfg.create_pool(Runtime::Tokio1).unwrap();
         let connection = pool.get().await.unwrap();
-        let pragmas = self.pragmas.clone();
+
         connection
             .interact(move |connection| {
-                connection.execute_batch(&pragmas.to_sql())?;
+                connection.execute_batch(&config.to_sql(None))?;
 
                 let transaction = connection.transaction()?;
                 Self::try_create_tables(&transaction)?;
@@ -648,6 +549,16 @@ impl Sqlite {
         )?;
         stmt.execute([expire_before])?;
 
+        Ok(())
+    }
+
+    pub(crate) fn validate_mutable_bucket(&self, bucket: &str) -> Result<()> {
+        if self.config.read_only(Some(bucket)) {
+            Err(S3Error::with_message(
+                MethodNotAllowed,
+                "database is in read-only mode",
+            ))?;
+        }
         Ok(())
     }
 }

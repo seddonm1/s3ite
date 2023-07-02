@@ -12,9 +12,11 @@
 #[macro_use]
 mod error;
 
+mod config;
 mod s3;
 mod sqlite;
 mod utils;
 
+pub use self::config::*;
 pub use self::error::*;
 pub use self::sqlite::*;
