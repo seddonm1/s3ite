@@ -35,7 +35,7 @@ struct Opt {
     config: Option<PathBuf>,
 
     #[clap(long)]
-    /// The ip address to listen on for this service. Use `0.0.0.0` to listen on all interfaces.
+    /// The IP address to listen on for this service. Use `0.0.0.0` to listen on all interfaces.
     host: Option<IpAddr>,
 
     #[clap(long)]
@@ -111,6 +111,12 @@ async fn main() -> Result {
     if let Some(port) = opt.port {
         config.port = port;
     }
+    if let Some(access_key) = opt.access_key {
+        config.access_key = Some(access_key);
+    }
+    if let Some(secret_key) = opt.secret_key {
+        config.secret_key = Some(secret_key);
+    }
     if let Some(permissive_cors) = opt.permissive_cors {
         config.permissive_cors = permissive_cors;
     }
@@ -148,7 +154,7 @@ async fn main() -> Result {
         let mut s3 = S3ServiceBuilder::new(sqlite);
 
         // Enable authentication
-        if let (Some(access_key), Some(secret_key)) = (opt.access_key, opt.secret_key) {
+        if let (Some(access_key), Some(secret_key)) = (config.access_key, config.secret_key) {
             s3.set_auth(SimpleAuth::from_single(access_key, secret_key));
         }
 

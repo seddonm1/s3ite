@@ -8,20 +8,26 @@ use std::{
 };
 
 #[derive(Clone, Deserialize, Debug)]
-
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// The base path where the `.sqlite3` files will be created.
     /// All `.sqlite3` files at this path will be loaded at startup and exposed via this service.
     #[serde(default = "default_root")]
     pub root: PathBuf,
 
-    /// The ip address to listen on for this service. Use `0.0.0.0` to listen on all interfaces.
+    /// The IP address to listen on for this service. Use `0.0.0.0` to listen on all interfaces.
     #[serde(default = "default_host")]
     pub host: IpAddr,
 
     /// The port to listen on for this service.
     #[serde(default = "default_port")]
     pub port: u16,
+
+    /// The access key ID that is used to authenticate for this service.
+    pub access_key: Option<String>,
+
+    /// The secret access key that is used to authenticate for this service.
+    pub secret_key: Option<String>,
 
     #[serde(default = "default_concurrency_limit")]
     /// Enforces a limit on the concurrent number of requests the underlying service can handle.
@@ -41,9 +47,10 @@ pub struct Config {
     pub read_only: bool,
 
     /// Service level SQLite configurations
-    #[serde(default = "default_pragmas")]
+    #[serde(flatten, default = "default_pragmas")]
     pub sqlite: Pragmas,
 
+    /// Bucket specific configurations
     #[serde(default = "HashMap::new")]
     pub buckets: HashMap<String, Bucket>,
 }
@@ -54,6 +61,8 @@ impl Default for Config {
             root: default_root(),
             host: default_host(),
             port: default_port(),
+            access_key: None,
+            secret_key: None,
             concurrency_limit: default_concurrency_limit(),
             permissive_cors: default_permissive_cors(),
             read_only: default_read_only(),
