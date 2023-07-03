@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Correct verification of `Content-MD5` if provided by client.
+
 ### Added
 
 - Delete leftover `-wal` or `-shm` database artifacts when removing a bucket.
@@ -15,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - SQLite tables are now created without `STRICT` mode enabled. This is to allow greater backward compatibility.
+- Issue SQLite `VACUUM` command on startup.
 
 ## [0.1.0] - 2023-06-27
 
