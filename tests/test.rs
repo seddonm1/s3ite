@@ -140,8 +140,9 @@ async fn delete_bucket(c: &Client, bucket: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn hex(input: impl AsRef<[u8]>) -> String {
-    hex_simd::encode_to_string(input, hex_simd::AsciiCase::Lower)
+pub fn base64(input: impl AsRef<[u8]>) -> String {
+    let base64 = base64_simd::STANDARD;
+    base64.encode_to_string(input)
 }
 
 #[tokio::test]
@@ -195,7 +196,7 @@ async fn test_single_object() -> Result<()> {
     let content_bytes = content.as_bytes();
     let mut md5_hash = Md5::new();
     md5_hash.update(content_bytes);
-    let content_md5 = hex(md5_hash.finalize());
+    let content_md5 = base64(md5_hash.finalize());
 
     create_bucket(&context, &bucket).await?;
 
@@ -240,7 +241,7 @@ async fn test_multipart() -> Result<()> {
     let content_bytes = content.as_bytes();
     let mut md5_hash = Md5::new();
     md5_hash.update(content_bytes);
-    let content_md5 = hex(md5_hash.finalize());
+    let content_md5 = base64(md5_hash.finalize());
 
     let upload_id = {
         let result = context
