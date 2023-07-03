@@ -99,6 +99,7 @@ impl Sqlite {
                                     "
                                     PRAGMA analysis_limit=1000;
                                     PRAGMA optimize;
+                                    VACUUM;
                                     ",
                                 )?;
 

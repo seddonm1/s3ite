@@ -30,6 +30,11 @@ pub fn hex(input: impl AsRef<[u8]>) -> String {
     hex_simd::encode_to_string(input, hex_simd::AsciiCase::Lower)
 }
 
+pub fn base64(input: impl AsRef<[u8]>) -> String {
+    let base64 = base64_simd::STANDARD;
+    base64.encode_to_string(input)
+}
+
 // Helper function to return a comma-separated sequence of `?`.
 // - `repeat_vars(0) => panic!(...)`
 // - `repeat_vars(1) => "?"`

@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS data (
     metadata        TEXT,
     last_modified   TEXT NOT NULL,
     md5             TEXT
-) STRICT;
+);
 ```
 
 ### Multipart Uploads
@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS multipart_upload (
     key                     TEXT NOT NULL,
     last_modified           TEXT NOT NULL,
     access_key              TEXT
-) STRICT;
+);
 
 CREATE TABLE IF NOT EXISTS multipart_upload_part (
     upload_id               BLOB NOT NULL,
@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS multipart_upload_part (
     md5                     TEXT,
     PRIMARY KEY (upload_id, part_number),
     FOREIGN KEY (upload_id) REFERENCES multipart_upload (upload_id) ON DELETE CASCADE
-) STRICT;
+);
 ```
 
 ## Configuration
