@@ -4,9 +4,7 @@
     clippy::must_use_candidate, //
 )]
 
-use md5::Digest;
-use md5::Md5;
-use s3ite::Sqlite;
+use s3ite::{Config, Sqlite};
 use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;
 
@@ -26,6 +24,7 @@ use aws_sdk_s3::types::CreateBucketConfiguration;
 use aws_sdk_s3::Client;
 
 use anyhow::Result;
+use md5::{Digest, Md5};
 use once_cell::sync::Lazy;
 use tokio::sync::Mutex;
 use tokio::sync::MutexGuard;
@@ -55,7 +54,7 @@ pub struct TestContext {
 }
 
 impl TestContext {
-    pub async fn new() -> Self {
+    pub async fn new(config: Option<Config>) -> Self {
         Lazy::force(&TRACING);
 
         // Fake credentials
@@ -63,7 +62,10 @@ impl TestContext {
 
         // Setup S3 provider
         fs::create_dir_all(FS_ROOT).unwrap();
-        let fs = Sqlite::new(FS_ROOT).await.unwrap();
+        let mut config = config.unwrap_or_default();
+        config.root = FS_ROOT.into();
+
+        let fs = Sqlite::new(&config).await.unwrap();
 
         // Setup S3 service
         let service = {
@@ -138,15 +140,16 @@ async fn delete_bucket(c: &Client, bucket: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn hex(input: impl AsRef<[u8]>) -> String {
-    hex_simd::encode_to_string(input, hex_simd::AsciiCase::Lower)
+pub fn base64(input: impl AsRef<[u8]>) -> String {
+    let base64 = base64_simd::STANDARD;
+    base64.encode_to_string(input)
 }
 
 #[tokio::test]
 #[tracing::instrument]
 async fn test_list_buckets() -> Result<()> {
     let _guard = serial().await;
-    let context = TestContext::new().await;
+    let context = TestContext::new(None).await;
 
     let buckets = vec![
         format!("test-list-buckets-{}", Uuid::new_v4()),
@@ -185,7 +188,7 @@ async fn test_list_buckets() -> Result<()> {
 #[tracing::instrument]
 async fn test_single_object() -> Result<()> {
     let _guard = serial().await;
-    let context = TestContext::new().await;
+    let context = TestContext::new(None).await;
 
     let bucket = format!("test-single-object-{}", Uuid::new_v4());
     let key = "sample.txt";
@@ -193,7 +196,7 @@ async fn test_single_object() -> Result<()> {
     let content_bytes = content.as_bytes();
     let mut md5_hash = Md5::new();
     md5_hash.update(content_bytes);
-    let content_md5 = hex(md5_hash.finalize());
+    let content_md5 = base64(md5_hash.finalize());
 
     create_bucket(&context, &bucket).await?;
 
@@ -228,7 +231,7 @@ async fn test_single_object() -> Result<()> {
 #[tracing::instrument]
 async fn test_multipart() -> Result<()> {
     let _guard = serial().await;
-    let context = TestContext::new().await;
+    let context = TestContext::new(None).await;
 
     let bucket = format!("test-multipart-{}", Uuid::new_v4());
     create_bucket(&context, &bucket).await?;
@@ -238,7 +241,7 @@ async fn test_multipart() -> Result<()> {
     let content_bytes = content.as_bytes();
     let mut md5_hash = Md5::new();
     md5_hash.update(content_bytes);
-    let content_md5 = hex(md5_hash.finalize());
+    let content_md5 = base64(md5_hash.finalize());
 
     let upload_id = {
         let result = context
@@ -318,6 +321,30 @@ async fn test_multipart() -> Result<()> {
         delete_object(&context, &bucket, key).await?;
         delete_bucket(&context, &bucket).await?;
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_read_only_object() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(Some(Config {
+        read_only: true,
+        ..Default::default()
+    }))
+    .await;
+
+    let bucket = format!("test-single-object-{}", Uuid::new_v4());
+
+    match create_bucket(&context, &bucket).await {
+        Err(err)
+            if err
+                .root_cause()
+                .to_string()
+                .contains("database is in read-only mode") => {}
+        other => panic!("{:?}", other),
+    };
 
     Ok(())
 }

@@ -6,13 +6,14 @@ use deadpool_sqlite::{Object, Pool};
 use rusqlite::Error::ToSqlConversionFailure;
 use rusqlite::{OptionalExtension, ToSql};
 use s3s::auth::Credentials;
-use s3s::S3ErrorCode::InternalError;
+use s3s::S3ErrorCode::{InternalError, MethodNotAllowed};
 use s3s::{dto, s3_error, S3Error};
 use time::{Duration, OffsetDateTime};
 use tokio::sync::RwLock;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
+use std::ops::Not;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -26,15 +27,9 @@ use uuid::Uuid;
 #[derive(Debug)]
 pub struct Sqlite {
     pub(crate) root: PathBuf,
+    pub(crate) config: crate::Config,
     pub(crate) buckets: Arc<RwLock<HashMap<String, Pool>>>,
     pub(crate) continuation_tokens: Arc<std::sync::RwLock<HashMap<String, ContinuationToken>>>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ContinuationToken {
-    pub(crate) token: String,
-    pub(crate) last_modified: OffsetDateTime,
-    pub(crate) offset: usize,
 }
 
 pub(crate) struct KeyValue {
@@ -67,32 +62,44 @@ pub(crate) struct MultipartMetadata {
     pub(crate) size: i64,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ContinuationToken {
+    pub(crate) token: String,
+    pub(crate) last_modified: OffsetDateTime,
+    pub(crate) offset: usize,
+}
+
 impl Sqlite {
     /// # Panics
-    pub async fn new(root: impl AsRef<Path>) -> Result<Self> {
-        let root = env::current_dir()?.join(root).canonicalize()?;
+    pub async fn new(config: &crate::Config) -> Result<Self> {
+        let root = env::current_dir()?.join(&config.root).canonicalize()?;
 
         let mut buckets = HashMap::new();
 
         let mut iter = fs::read_dir(root.clone()).await?;
         while let Some(entry) = iter.next_entry().await? {
             let file_type = entry.file_type().await?;
+            let config = config.clone();
 
             if file_type.is_file() {
                 let path = entry.path();
                 if let Some(extension) = path.extension() {
                     if extension == "sqlite3" {
+                        let bucket = path.file_stem().unwrap().to_str().unwrap().to_string();
+                        let bucket_clone = bucket.clone();
+
                         let cfg = Config::new(path.clone());
                         let pool = cfg.create_pool(Runtime::Tokio1)?;
                         let connection = pool.get().await.unwrap();
                         connection
-                            .interact(|connection| {
+                            .interact(move |connection| {
+                                connection.execute_batch(&config.to_sql(Some(&bucket_clone)))?;
+
                                 connection.execute_batch(
                                     "
-                                    PRAGMA journal_mode=WAL;
-                                    PRAGMA foreign_keys=true;
                                     PRAGMA analysis_limit=1000;
                                     PRAGMA optimize;
+                                    VACUUM;
                                     ",
                                 )?;
 
@@ -106,17 +113,30 @@ impl Sqlite {
                             .await
                             .map_err(|_| rusqlite::Error::InvalidQuery)??;
 
-                        buckets.insert(
-                            path.file_stem().unwrap().to_str().unwrap().to_string(),
-                            pool,
-                        );
+                        buckets.insert(bucket, pool);
                     }
                 }
             }
         }
 
+        // validate that any specified bucket configurations have existing bucket
+        let difference = config
+            .buckets
+            .keys()
+            .collect::<HashSet<_>>()
+            .difference(&buckets.keys().collect::<HashSet<_>>())
+            .copied()
+            .collect::<Vec<_>>();
+        if difference.is_empty().not() {
+            Err(S3Error::with_message(
+                InternalError,
+                format!("found configurations for buckets: {difference:?} that do not exist"),
+            ))?;
+        }
+
         Ok(Self {
             root,
+            config: config.clone(),
             buckets: Arc::new(RwLock::new(buckets)),
             continuation_tokens: Arc::new(std::sync::RwLock::new(HashMap::new())),
         })
@@ -137,17 +157,15 @@ impl Sqlite {
         bucket: &str,
         file_path: PathBuf,
     ) -> rusqlite::Result<()> {
+        let config = self.config.clone();
+
         let cfg = Config::new(file_path);
         let pool = cfg.create_pool(Runtime::Tokio1).unwrap();
         let connection = pool.get().await.unwrap();
+
         connection
-            .interact(|connection| {
-                connection.execute_batch(
-                    "
-                    PRAGMA journal_mode=WAL;
-                    PRAGMA foreign_keys=true;
-                ",
-                )?;
+            .interact(move |connection| {
+                connection.execute_batch(&config.to_sql(None))?;
 
                 let transaction = connection.transaction()?;
                 Self::try_create_tables(&transaction)?;
@@ -171,7 +189,7 @@ impl Sqlite {
                     metadata TEXT,
                     last_modified TEXT NOT NULL,
                     md5 TEXT
-                ) STRICT;",
+                );",
             (),
         )?;
         transaction.execute(
@@ -181,7 +199,7 @@ impl Sqlite {
                     key TEXT NOT NULL,
                     last_modified TEXT NOT NULL,
                     access_key TEXT
-                ) STRICT;",
+                );",
             (),
         )?;
         transaction.execute(
@@ -198,7 +216,7 @@ impl Sqlite {
                     md5 TEXT,
                     PRIMARY KEY (upload_id, part_number),
                     FOREIGN KEY (upload_id) REFERENCES multipart_upload (upload_id) ON DELETE CASCADE
-                ) STRICT;",
+                );",
             (),
         )
     }
@@ -532,6 +550,16 @@ impl Sqlite {
         )?;
         stmt.execute([expire_before])?;
 
+        Ok(())
+    }
+
+    pub(crate) fn validate_mutable_bucket(&self, bucket: &str) -> Result<()> {
+        if self.config.read_only(Some(bucket)) {
+            Err(S3Error::with_message(
+                MethodNotAllowed,
+                "database is in read-only mode",
+            ))?;
+        }
         Ok(())
     }
 }

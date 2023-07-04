@@ -33,18 +33,20 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<CreateBucketInput>,
     ) -> S3Result<S3Response<CreateBucketOutput>> {
-        let input = req.input;
+        let CreateBucketInput { bucket, .. } = req.input;
 
-        if self.buckets.read().await.contains_key(&input.bucket) {
+        self.validate_mutable_bucket(&bucket)?;
+
+        if self.buckets.read().await.contains_key(&bucket) {
             return Err(s3_error!(BucketAlreadyExists));
         }
 
-        let file_path = self.get_bucket_path(&input.bucket)?;
+        let file_path = self.get_bucket_path(&bucket)?;
         if file_path.exists() {
             return Err(s3_error!(BucketAlreadyExists));
         }
 
-        self.try_create_bucket(&input.bucket, file_path)
+        self.try_create_bucket(&bucket, file_path)
             .await
             .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
 
@@ -57,25 +59,29 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<CopyObjectInput>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
-        let input = req.input;
-        let (bucket, key) = match input.copy_source {
+        let CopyObjectInput {
+            bucket: tgt_bucket,
+            key: tgt_key,
+            copy_source,
+            ..
+        } = req.input;
+
+        self.validate_mutable_bucket(&tgt_bucket)?;
+
+        let (src_bucket, src_key) = match copy_source {
             CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
-            CopySource::Bucket {
-                ref bucket,
-                ref key,
-                ..
-            } => (bucket, key),
+            CopySource::Bucket { bucket, key, .. } => (bucket, key),
         };
 
         // verify source and target buckets exist
-        let bucket_pool = self.try_get_bucket_pool(bucket).await?;
+        let bucket_pool = self.try_get_bucket_pool(&src_bucket).await?;
 
         let mut object = bucket_pool
             .interact(move |connection| {
                 let transaction = connection
                     .transaction()
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
-                Self::try_get_object(&transaction, &input.key)
+                Self::try_get_object(&transaction, &src_key)
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
                     .ok_or_else(|| s3_error!(NoSuchKey))
             })
@@ -87,7 +93,7 @@ impl S3 for Sqlite {
             })?;
 
         // replace key with target key
-        object.key = key.to_string();
+        object.key = tgt_key.to_string();
 
         let copy_object_result = CopyObjectResult {
             e_tag: object.md5.clone(),
@@ -95,7 +101,7 @@ impl S3 for Sqlite {
             ..Default::default()
         };
 
-        let bucket_pool = self.try_get_bucket_pool(&input.bucket).await?;
+        let bucket_pool = self.try_get_bucket_pool(&tgt_bucket).await?;
         bucket_pool
             .interact(move |connection| {
                 let transaction = connection.transaction()?;
@@ -118,16 +124,25 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<DeleteBucketInput>,
     ) -> S3Result<S3Response<DeleteBucketOutput>> {
-        let input = req.input;
+        let DeleteBucketInput { bucket, .. } = req.input;
+
+        self.validate_mutable_bucket(&bucket)?;
 
         let mut guard = self.buckets.write().await;
-        match guard.get(&input.bucket) {
+        match guard.get(&bucket) {
             Some(connection) => {
                 connection.close();
-                fs::remove_file(self.get_bucket_path(&input.bucket)?)
+                let bucket_path = self.get_bucket_path(&bucket)?;
+                fs::remove_file(&bucket_path)
                     .await
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
-                guard.remove(&input.bucket);
+                fs::remove_file(format!("{}-wal", bucket_path.to_string_lossy()))
+                    .await
+                    .ok();
+                fs::remove_file(format!("{}-shm", bucket_path.to_string_lossy()))
+                    .await
+                    .ok();
+                guard.remove(&bucket);
             }
             None => return Err(s3_error!(NoSuchBucket)),
         };
@@ -140,9 +155,9 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
-        let input = req.input;
+        let DeleteObjectInput { bucket, key, .. } = req.input;
 
-        let bucket_pool = self.try_get_bucket_pool(&input.bucket).await?;
+        let bucket_pool = self.try_get_bucket_pool(&bucket).await?;
 
         bucket_pool
             .interact(move |connection| {
@@ -151,15 +166,15 @@ impl S3 for Sqlite {
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
 
                 // if is directory
-                if input.key.ends_with('/') {
-                    let rows_affected = Self::try_delete_objects_like(&transaction, &input.key)
+                if key.ends_with('/') {
+                    let rows_affected = Self::try_delete_objects_like(&transaction, &key)
                         .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
 
                     if rows_affected > 1 {
                         return Err(s3_error!(BucketNotEmpty));
                     }
                 } else {
-                    let rows_affected = Self::try_delete_object(&transaction, &input.key)
+                    let rows_affected = Self::try_delete_object(&transaction, &key)
                         .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
 
                     if rows_affected != 1 {
@@ -183,15 +198,17 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
-        let input = req.input;
-        let delete_keys = input
-            .delete
+        let DeleteObjectsInput { bucket, delete, .. } = req.input;
+
+        self.validate_mutable_bucket(&bucket)?;
+
+        let delete_keys = delete
             .objects
             .into_iter()
             .map(|object| object.key)
             .collect::<Vec<_>>();
 
-        let bucket_pool = self.try_get_bucket_pool(&input.bucket).await?;
+        let bucket_pool = self.try_get_bucket_pool(&bucket).await?;
 
         let affected_keys = bucket_pool
             .interact(move |connection| {
@@ -224,13 +241,13 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<GetBucketLocationInput>,
     ) -> S3Result<S3Response<GetBucketLocationOutput>> {
-        let input = req.input;
+        let GetBucketLocationInput { bucket, .. } = req.input;
 
-        if self.buckets.read().await.contains_key(&input.bucket).not() {
+        if self.buckets.read().await.contains_key(&bucket).not() {
             return Err(s3_error!(NoSuchBucket));
         }
 
-        let file_path = self.get_bucket_path(&input.bucket)?;
+        let file_path = self.get_bucket_path(&bucket)?;
         if file_path.exists().not() {
             return Err(s3_error!(NoSuchBucket));
         }
@@ -244,23 +261,25 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
-        let input = req.input;
+        let GetObjectInput {
+            bucket, key, range, ..
+        } = req.input;
 
-        let bucket_pool = self.try_get_bucket_pool(&input.bucket).await?;
+        let bucket_pool = self.try_get_bucket_pool(&bucket).await?;
 
         let object = bucket_pool
             .interact(move |connection| {
                 let transaction = connection
                     .transaction()
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
-                Self::try_get_object(&transaction, &input.key)
+                Self::try_get_object(&transaction, &key)
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
                     .ok_or_else(|| s3_error!(NoSuchKey))
             })
             .await
             .map_err(|err| S3Error::with_message(InternalError, err.to_string()))??;
 
-        let content_length = match input.range {
+        let content_length = match range {
             None => object.size,
             Some(range) => {
                 let object_range = range.check(object.size)?;
@@ -269,7 +288,7 @@ impl S3 for Sqlite {
         };
         let content_length_i64 = try_!(i64::try_from(content_length));
 
-        let value = match input.range {
+        let value = match range {
             Some(Range::Int { first, .. }) => {
                 let first = try_!(usize::try_from(first));
                 Bytes::copy_from_slice(&object.value.unwrap()[first..])
@@ -299,13 +318,13 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<HeadBucketInput>,
     ) -> S3Result<S3Response<HeadBucketOutput>> {
-        let input = req.input;
+        let HeadBucketInput { bucket, .. } = req.input;
 
-        if self.buckets.read().await.contains_key(&input.bucket).not() {
+        if self.buckets.read().await.contains_key(&bucket).not() {
             return Err(s3_error!(NoSuchBucket));
         }
 
-        let file_path = self.get_bucket_path(&input.bucket)?;
+        let file_path = self.get_bucket_path(&bucket)?;
         if file_path.exists().not() {
             return Err(s3_error!(NoSuchBucket));
         }
@@ -318,16 +337,16 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
-        let input = req.input;
+        let HeadObjectInput { bucket, key, .. } = req.input;
 
-        let bucket_pool = self.try_get_bucket_pool(&input.bucket).await?;
+        let bucket_pool = self.try_get_bucket_pool(&bucket).await?;
 
         let object = bucket_pool
             .interact(move |connection| {
                 let transaction = connection
                     .transaction()
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
-                Self::try_get_metadata(&transaction, &input.key)
+                Self::try_get_metadata(&transaction, &key)
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
                     .ok_or_else(|| s3_error!(NoSuchKey))
             })
@@ -354,8 +373,10 @@ impl S3 for Sqlite {
     #[tracing::instrument]
     async fn list_buckets(
         &self,
-        _: S3Request<ListBucketsInput>,
+        req: S3Request<ListBucketsInput>,
     ) -> S3Result<S3Response<ListBucketsOutput>> {
+        let ListBucketsInput {} = req.input;
+
         let mut buckets: Vec<Bucket> = Vec::new();
 
         for name in self.buckets.read().await.keys() {
@@ -537,19 +558,6 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
-        let input = req.input;
-
-        if self.buckets.read().await.contains_key(&input.bucket).not() {
-            return Err(s3_error!(NoSuchBucket));
-        }
-
-        if let Some(ref storage_class) = input.storage_class {
-            let is_valid = ["STANDARD", "REDUCED_REDUNDANCY"].contains(&storage_class.as_str());
-            if is_valid.not() {
-                return Err(s3_error!(InvalidStorageClass));
-            }
-        }
-
         let PutObjectInput {
             body,
             bucket,
@@ -557,8 +565,22 @@ impl S3 for Sqlite {
             metadata,
             content_length,
             content_md5,
+            storage_class,
             ..
-        } = input;
+        } = req.input;
+
+        self.validate_mutable_bucket(&bucket)?;
+
+        if self.buckets.read().await.contains_key(&bucket).not() {
+            return Err(s3_error!(NoSuchBucket));
+        }
+
+        if let Some(ref storage_class) = storage_class {
+            let is_valid = ["STANDARD", "REDUCED_REDUNDANCY"].contains(&storage_class.as_str());
+            if is_valid.not() {
+                return Err(s3_error!(InvalidStorageClass));
+            }
+        }
 
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 
@@ -603,11 +625,12 @@ impl S3 for Sqlite {
         let stream = body.inspect_ok(|bytes| md5_hash.update(bytes.as_ref()));
         let mut value = Vec::new();
         let size = copy_bytes(stream, &mut value).await?;
-        let md5 = hex(md5_hash.finalize());
+        let md5_bytes = md5_hash.finalize();
+        let md5 = hex(md5_bytes);
 
         // if provided verify content_md5
         if let Some(content_md5) = content_md5 {
-            if content_md5 != md5 {
+            if content_md5 != base64(md5_bytes) {
                 return Err(s3_error!(BadDigest));
             }
         }
@@ -648,6 +671,8 @@ impl S3 for Sqlite {
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
         let CreateMultipartUploadInput { bucket, key, .. } = req.input;
+
+        self.validate_mutable_bucket(&bucket)?;
 
         let upload_id = Uuid::new_v4();
 
@@ -702,12 +727,13 @@ impl S3 for Sqlite {
         let stream = body.inspect_ok(|bytes| md5_hash.update(bytes.as_ref()));
         let mut value = Vec::new();
         copy_bytes(stream, &mut value).await?;
+        let md5_bytes = md5_hash.finalize();
+        let md5 = hex(md5_bytes);
         let size = try_!(i64::try_from(value.len()));
-        let md5 = hex(md5_hash.finalize());
 
         // if provided verify content_md5
         if let Some(content_md5) = content_md5 {
-            if content_md5 != md5 {
+            if content_md5 != base64(md5_bytes) {
                 return Err(s3_error!(BadDigest));
             }
         }
@@ -846,6 +872,8 @@ impl S3 for Sqlite {
             upload_id,
             ..
         } = req.input;
+
+        self.validate_mutable_bucket(&bucket)?;
 
         let upload_id = Uuid::parse_str(&upload_id).map_err(|_| s3_error!(InvalidRequest))?;
 
