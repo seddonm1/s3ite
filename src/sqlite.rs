@@ -354,7 +354,7 @@ impl Sqlite {
         key: &str,
     ) -> rusqlite::Result<Option<KeyMetadata>> {
         let mut stmt = transaction
-            .prepare_cached("SELECT size, metadata, last_modified FROM data WHERE key = ?;")?;
+            .prepare_cached("SELECT size, metadata, last_modified FROM metadata WHERE key = ?;")?;
 
         stmt.query_row([key], |row| {
             Ok(KeyMetadata {
@@ -406,8 +406,10 @@ impl Sqlite {
         transaction: &Transaction,
         key: &str,
     ) -> rusqlite::Result<usize> {
-        let mut stmt = transaction.prepare_cached("DELETE FROM data WHERE key = ?;")?;
+        let mut stmt = transaction.prepare_cached("DELETE FROM metadata WHERE key = ?;")?;
+        stmt.execute([key])?;
 
+        let mut stmt = transaction.prepare_cached("DELETE FROM data WHERE key = ?;")?;
         stmt.execute([key])
     }
 
@@ -416,6 +418,11 @@ impl Sqlite {
         keys: &[String],
     ) -> rusqlite::Result<Vec<String>> {
         let vars = repeat_vars(keys.len());
+
+        let mut stmt =
+            transaction.prepare(&format!("DELETE FROM metadata WHERE key IN ({vars});"))?;
+
+        stmt.execute(rusqlite::params_from_iter(keys))?;
 
         let mut stmt = transaction.prepare(&format!(
             "DELETE FROM data WHERE key IN ({vars}) RETURNING key;"
@@ -432,6 +439,10 @@ impl Sqlite {
         transaction: &Transaction,
         key: &str,
     ) -> rusqlite::Result<usize> {
+        let mut stmt = transaction.prepare_cached("DELETE FROM metadata WHERE key LIKE ?;")?;
+
+        stmt.execute([format!("{key}%")])?;
+
         let mut stmt = transaction.prepare_cached("DELETE FROM data WHERE key LIKE ?;")?;
 
         stmt.execute([format!("{key}%")])
