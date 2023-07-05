@@ -182,13 +182,19 @@ impl Sqlite {
     /// resolve object path under the virtual root
     pub(crate) fn try_create_tables(transaction: &Transaction) -> rusqlite::Result<usize> {
         transaction.execute(
-            "CREATE TABLE IF NOT EXISTS data (
+            "CREATE TABLE IF NOT EXISTS metadata (
                     key TEXT PRIMARY KEY,
-                    value BLOB,
                     size INTEGER NOT NULL,
                     metadata TEXT,
                     last_modified TEXT NOT NULL,
                     md5 TEXT
+                );",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE IF NOT EXISTS data (
+                    key TEXT PRIMARY KEY,
+                    value BLOB
                 );",
             (),
         )?;
@@ -250,35 +256,35 @@ impl Sqlite {
 
         let (query, params): (&str, Vec<&dyn ToSql>) = match (&prefix, start_after, continuation_token) {
             (None, None, None) => (
-                "SELECT key, size, metadata, last_modified, md5 FROM data ORDER BY key LIMIT $1;",
+                "SELECT key, size, metadata, last_modified, md5 FROM metadata ORDER BY key LIMIT $1;",
                 vec![&max_keys],
             ),
             (None, None, Some(continuation_token)) => (
-                "SELECT key, size, metadata, last_modified, md5 FROM data ORDER BY key LIMIT $1, OFFSET ?2;",
+                "SELECT key, size, metadata, last_modified, md5 FROM metadata ORDER BY key LIMIT $1, OFFSET ?2;",
                 vec![&max_keys, &continuation_token.offset],
             ),
             (None, Some(start_after), None) => (
-                "SELECT key, size, metadata, last_modified, md5 FROM data WHERE key > ?1 ORDER BY key LIMIT $2;",
+                "SELECT key, size, metadata, last_modified, md5 FROM metadata WHERE key > ?1 ORDER BY key LIMIT $2;",
                 vec![start_after, &max_keys],
             ),
             (None, Some(start_after), Some(continuation_token)) => (
-                "SELECT key, size, metadata, last_modified, md5 FROM data WHERE key > ?1 ORDER BY key LIMIT $2 OFFSET ?3;",
+                "SELECT key, size, metadata, last_modified, md5 FROM metadata WHERE key > ?1 ORDER BY key LIMIT $2 OFFSET ?3;",
                 vec![start_after, &max_keys, &continuation_token.offset],
             ),
             (Some(prefix), None, None) => (
-                "SELECT key, size, metadata, last_modified, md5 FROM data WHERE key LIKE ?1 ORDER BY key LIMIT $2;",
+                "SELECT key, size, metadata, last_modified, md5 FROM metadata WHERE key LIKE ?1 ORDER BY key LIMIT $2;",
                 vec![prefix, &max_keys],
             ),
             (Some(prefix), None, Some(continuation_token)) => (
-                "SELECT key, size, metadata, last_modified, md5 FROM data WHERE key LIKE ?1 ORDER BY key LIMIT ?2 OFFSET ?3;",
+                "SELECT key, size, metadata, last_modified, md5 FROM metadata WHERE key LIKE ?1 ORDER BY key LIMIT ?2 OFFSET ?3;",
                 vec![prefix,&max_keys, &continuation_token.offset],
             ),
             (Some(prefix), Some(start_after), None) => (
-                "SELECT key, size, metadata, last_modified, md5 FROM data WHERE key LIKE ?1 AND key > ?2 ORDER BY key LIMIT ?3;",
+                "SELECT key, size, metadata, last_modified, md5 FROM metadata WHERE key LIKE ?1 AND key > ?2 ORDER BY key LIMIT ?3;",
                 vec![prefix, start_after, &max_keys],
             ),
             (Some(prefix), Some(start_after), Some(continuation_token)) => (
-                "SELECT key, size, metadata, last_modified, md5 FROM data WHERE key LIKE ?1 AND key > ?2 ORDER BY key LIMIT ?3 OFFSET ?4;",
+                "SELECT key, size, metadata, last_modified, md5 FROM metadata WHERE key LIKE ?1 AND key > ?2 ORDER BY key LIMIT ?3 OFFSET ?4;",
                 vec![prefix, start_after, &max_keys, &continuation_token.offset],
             ),
         };
@@ -317,27 +323,27 @@ impl Sqlite {
         key: &str,
     ) -> rusqlite::Result<Option<KeyValue>> {
         let mut stmt = transaction.prepare_cached(
-            "SELECT value, size, metadata, last_modified, md5 FROM data WHERE key = ?;",
+            "SELECT metadata.key, data.value, metadata.size, metadata.metadata, metadata.last_modified, metadata.md5 FROM metadata INNER JOIN data ON metadata.key = data.key WHERE metadata.key = ?;",
         )?;
 
         stmt.query_row([key], |row| {
             Ok(KeyValue {
-                key: key.to_string(),
-                value: Some(row.get::<_, Vec<u8>>(0)?),
-                size: row.get(1)?,
+                key: row.get(0)?,
+                value: Some(row.get::<_, Vec<u8>>(1)?),
+                size: row.get(2)?,
                 metadata: row
-                    .get::<_, Option<String>>(2)?
+                    .get::<_, Option<String>>(3)?
                     .map(|metadata| serde_json::from_str(&metadata))
                     .transpose()
                     .map_err(|err| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            2,
+                            3,
                             rusqlite::types::Type::Text,
                             Box::new(err),
                         )
                     })?,
-                last_modified: row.get(3)?,
-                md5: row.get(4)?,
+                last_modified: row.get(4)?,
+                md5: row.get(5)?,
             })
         })
         .optional()
@@ -376,11 +382,10 @@ impl Sqlite {
         kv: KeyValue,
     ) -> rusqlite::Result<usize> {
         let mut stmt = transaction
-                    .prepare_cached("INSERT INTO data (key, value, size, metadata, last_modified, md5) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(key) DO UPDATE SET value=excluded.value, size=excluded.size, metadata=excluded.metadata, last_modified=excluded.last_modified, md5=excluded.md5;")?;
+                    .prepare_cached("INSERT INTO metadata (key, size, metadata, last_modified, md5) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(key) DO UPDATE SET size=excluded.size, metadata=excluded.metadata, last_modified=excluded.last_modified, md5=excluded.md5;")?;
 
         stmt.execute((
-            kv.key,
-            kv.value,
+            &kv.key,
             kv.size,
             kv.metadata
                 .map(|metadata| serde_json::to_string(&metadata))
@@ -388,7 +393,12 @@ impl Sqlite {
                 .map_err(|err| ToSqlConversionFailure(Box::new(err)))?,
             kv.last_modified,
             kv.md5,
-        ))
+        ))?;
+
+        let mut stmt = transaction
+                    .prepare_cached("INSERT INTO data (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value;")?;
+
+        stmt.execute((kv.key, kv.value))
     }
 
     /// resolve object path under the virtual root
