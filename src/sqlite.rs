@@ -41,6 +41,12 @@ pub(crate) struct KeyValue {
     pub(crate) md5: Option<String>,
 }
 
+pub(crate) struct KeySize {
+    pub(crate) key: String,
+    pub(crate) size: u64,
+    pub(crate) last_modified: OffsetDateTime,
+}
+
 pub(crate) struct KeyMetadata {
     pub(crate) size: u64,
     pub(crate) metadata: Option<dto::Metadata>,
@@ -99,7 +105,6 @@ impl Sqlite {
                                     "
                                     PRAGMA analysis_limit=1000;
                                     PRAGMA optimize;
-                                    VACUUM;
                                     ",
                                 )?;
 
@@ -182,19 +187,20 @@ impl Sqlite {
     /// resolve object path under the virtual root
     pub(crate) fn try_create_tables(transaction: &Transaction) -> rusqlite::Result<usize> {
         transaction.execute(
+            "CREATE TABLE IF NOT EXISTS data (
+                    key TEXT PRIMARY KEY,
+                    value BLOB
+                );",
+            (),
+        )?;
+        transaction.execute(
             "CREATE TABLE IF NOT EXISTS metadata (
                     key TEXT PRIMARY KEY,
                     size INTEGER NOT NULL,
                     metadata TEXT,
                     last_modified TEXT NOT NULL,
-                    md5 TEXT
-                );",
-            (),
-        )?;
-        transaction.execute(
-            "CREATE TABLE IF NOT EXISTS data (
-                    key TEXT PRIMARY KEY,
-                    value BLOB
+                    md5 TEXT,
+                    FOREIGN KEY (key) REFERENCES data (key) ON DELETE CASCADE
                 );",
             (),
         )?;
@@ -204,12 +210,9 @@ impl Sqlite {
                     bucket TEXT NOT NULL,
                     key TEXT NOT NULL,
                     last_modified TEXT NOT NULL,
-                    access_key TEXT
+                    access_key TEXT,
+                    UNIQUE(upload_id, bucket, key)
                 );",
-            (),
-        )?;
-        transaction.execute(
-            "CREATE UNIQUE INDEX multipart_upload_unique_upload_id_bucket_key ON multipart_upload(upload_id, bucket, key);",
             (),
         )?;
         transaction.execute(
@@ -246,9 +249,15 @@ impl Sqlite {
         start_after: &Option<String>,
         max_keys: i32,
         continuation_token: &Option<ContinuationToken>,
-    ) -> rusqlite::Result<Vec<KeyValue>> {
+    ) -> rusqlite::Result<Vec<KeySize>> {
         // prefix with the sqlite wildcard
-        let prefix = prefix.map(|prefix| format!("{prefix}%"));
+        let prefix = prefix.and_then(|prefix| {
+            if prefix.is_empty() {
+                None
+            } else {
+                Some(format!("{prefix}%"))
+            }
+        });
 
         // add one additional key to the query to determine if more keys are available
         // results are then truncated to max_keys before sending to client
@@ -256,23 +265,23 @@ impl Sqlite {
 
         let (query, params): (&str, Vec<&dyn ToSql>) = match (&prefix, start_after, continuation_token) {
             (None, None, None) => (
-                "SELECT key, size, metadata, last_modified, md5 FROM metadata ORDER BY key LIMIT $1;",
+                "SELECT key, size, metadata, last_modified, md5 FROM metadata ORDER BY key LIMIT ?1;",
                 vec![&max_keys],
             ),
             (None, None, Some(continuation_token)) => (
-                "SELECT key, size, metadata, last_modified, md5 FROM metadata ORDER BY key LIMIT $1, OFFSET ?2;",
+                "SELECT key, size, metadata, last_modified, md5 FROM metadata ORDER BY key LIMIT ?1 OFFSET ?2;",
                 vec![&max_keys, &continuation_token.offset],
             ),
             (None, Some(start_after), None) => (
-                "SELECT key, size, metadata, last_modified, md5 FROM metadata WHERE key > ?1 ORDER BY key LIMIT $2;",
+                "SELECT key, size, metadata, last_modified, md5 FROM metadata WHERE key > ?1 ORDER BY key LIMIT ?2;",
                 vec![start_after, &max_keys],
             ),
             (None, Some(start_after), Some(continuation_token)) => (
-                "SELECT key, size, metadata, last_modified, md5 FROM metadata WHERE key > ?1 ORDER BY key LIMIT $2 OFFSET ?3;",
+                "SELECT key, size, metadata, last_modified, md5 FROM metadata WHERE key > ?1 ORDER BY key LIMIT ?2 OFFSET ?3;",
                 vec![start_after, &max_keys, &continuation_token.offset],
             ),
             (Some(prefix), None, None) => (
-                "SELECT key, size, metadata, last_modified, md5 FROM metadata WHERE key LIKE ?1 ORDER BY key LIMIT $2;",
+                "SELECT key, size, metadata, last_modified, md5 FROM metadata WHERE key LIKE ?1 ORDER BY key LIMIT ?2;",
                 vec![prefix, &max_keys],
             ),
             (Some(prefix), None, Some(continuation_token)) => (
@@ -293,23 +302,10 @@ impl Sqlite {
 
         let objects = stmt
             .query_map(params.as_slice(), |row| {
-                Ok(KeyValue {
+                Ok(KeySize {
                     key: row.get(0)?,
-                    value: None,
                     size: row.get(1)?,
-                    metadata: row
-                        .get::<_, Option<String>>(2)?
-                        .map(|metadata| serde_json::from_str(&metadata))
-                        .transpose()
-                        .map_err(|err| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                2,
-                                rusqlite::types::Type::Text,
-                                Box::new(err),
-                            )
-                        })?,
-                    last_modified: row.get(3)?,
-                    md5: row.get(4)?,
+                    last_modified: row.get(2)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -382,10 +378,15 @@ impl Sqlite {
         kv: KeyValue,
     ) -> rusqlite::Result<usize> {
         let mut stmt = transaction
-                    .prepare_cached("INSERT INTO metadata (key, size, metadata, last_modified, md5) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(key) DO UPDATE SET size=excluded.size, metadata=excluded.metadata, last_modified=excluded.last_modified, md5=excluded.md5;")?;
+                    .prepare_cached("INSERT INTO data (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value;")?;
+
+        stmt.execute((&kv.key, kv.value))?;
+
+        let mut stmt = transaction
+        .prepare_cached("INSERT INTO metadata (key, size, metadata, last_modified, md5) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(key) DO UPDATE SET size=excluded.size, metadata=excluded.metadata, last_modified=excluded.last_modified, md5=excluded.md5;")?;
 
         stmt.execute((
-            &kv.key,
+            kv.key,
             kv.size,
             kv.metadata
                 .map(|metadata| serde_json::to_string(&metadata))
@@ -393,12 +394,7 @@ impl Sqlite {
                 .map_err(|err| ToSqlConversionFailure(Box::new(err)))?,
             kv.last_modified,
             kv.md5,
-        ))?;
-
-        let mut stmt = transaction
-                    .prepare_cached("INSERT INTO data (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value;")?;
-
-        stmt.execute((kv.key, kv.value))
+        ))
     }
 
     /// resolve object path under the virtual root
@@ -406,10 +402,7 @@ impl Sqlite {
         transaction: &Transaction,
         key: &str,
     ) -> rusqlite::Result<usize> {
-        let mut stmt = transaction.prepare_cached("DELETE FROM metadata WHERE key = ?;")?;
-        stmt.execute([key])?;
-
-        let mut stmt = transaction.prepare_cached("DELETE FROM data WHERE key = ?;")?;
+        let mut stmt = transaction.prepare_cached("DELETE FROM data WHERE key = ?1;")?;
         stmt.execute([key])
     }
 
@@ -418,11 +411,6 @@ impl Sqlite {
         keys: &[String],
     ) -> rusqlite::Result<Vec<String>> {
         let vars = repeat_vars(keys.len());
-
-        let mut stmt =
-            transaction.prepare(&format!("DELETE FROM metadata WHERE key IN ({vars});"))?;
-
-        stmt.execute(rusqlite::params_from_iter(keys))?;
 
         let mut stmt = transaction.prepare(&format!(
             "DELETE FROM data WHERE key IN ({vars}) RETURNING key;"
@@ -439,11 +427,7 @@ impl Sqlite {
         transaction: &Transaction,
         key: &str,
     ) -> rusqlite::Result<usize> {
-        let mut stmt = transaction.prepare_cached("DELETE FROM metadata WHERE key LIKE ?;")?;
-
-        stmt.execute([format!("{key}%")])?;
-
-        let mut stmt = transaction.prepare_cached("DELETE FROM data WHERE key LIKE ?;")?;
+        let mut stmt = transaction.prepare_cached("DELETE FROM data WHERE key LIKE ?1;")?;
 
         stmt.execute([format!("{key}%")])
     }
@@ -477,7 +461,7 @@ impl Sqlite {
         credentials: Option<Credentials>,
     ) -> rusqlite::Result<bool> {
         let mut stmt = transaction
-            .prepare_cached("SELECT access_key FROM multipart_upload WHERE upload_id = $1 AND bucket = $2 AND key = $3;")?;
+            .prepare_cached("SELECT access_key FROM multipart_upload WHERE upload_id = ?1 AND bucket = ?2 AND key = ?3;")?;
 
         let access_key = stmt.query_row((upload_id, bucket, key), |row| {
             row.get::<_, Option<String>>(0)
@@ -567,7 +551,7 @@ impl Sqlite {
         expire_before: OffsetDateTime,
     ) -> rusqlite::Result<()> {
         let mut stmt = transaction.prepare_cached(
-            "DELETE FROM multipart_upload WHERE DATETIME(last_modified) < DATETIME($1);",
+            "DELETE FROM multipart_upload WHERE DATETIME(last_modified) < DATETIME(?1);",
         )?;
         stmt.execute([expire_before])?;
 

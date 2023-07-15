@@ -156,7 +156,6 @@ impl S3 for Sqlite {
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let DeleteObjectInput { bucket, key, .. } = req.input;
-
         let bucket_pool = self.try_get_bucket_pool(&bucket).await?;
 
         bucket_pool
