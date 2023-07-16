@@ -138,6 +138,7 @@ impl Config {
             PRAGMA cache_size=-{};
             PRAGMA query_only={};
             PRAGMA foreign_keys=true;
+            PRAGMA auto_vacuum=INCREMENTAL;
         ",
             self.journal_mode(bucket),
             self.synchronous(bucket),

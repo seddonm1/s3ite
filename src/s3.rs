@@ -1,5 +1,3 @@
-use std::ops::Not;
-
 use crate::error::*;
 use crate::sqlite::ContinuationToken;
 use crate::sqlite::KeyValue;
@@ -9,6 +7,8 @@ use crate::utils::*;
 
 use bytes::Bytes;
 use futures::stream;
+use futures::TryStreamExt;
+use md5::{Digest, Md5};
 use s3s::dto::*;
 use s3s::s3_error;
 use s3s::S3Error;
@@ -17,12 +17,9 @@ use s3s::S3ErrorCode::InternalError;
 use s3s::S3Result;
 use s3s::S3;
 use s3s::{S3Request, S3Response};
+use std::ops::Not;
 use time::OffsetDateTime;
-
 use tokio::fs;
-
-use futures::TryStreamExt;
-use md5::{Digest, Md5};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -156,7 +153,6 @@ impl S3 for Sqlite {
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let DeleteObjectInput { bucket, key, .. } = req.input;
-
         let bucket_pool = self.try_get_bucket_pool(&bucket).await?;
 
         bucket_pool
@@ -451,102 +447,95 @@ impl S3 for Sqlite {
             ..
         } = req.input;
 
-        let max_keys = max_keys.unwrap_or(1000);
+        let max_keys = max_keys.unwrap_or(1000).clamp(0, 1000);
         let max_keys_usize = try_!(usize::try_from(max_keys));
-
-        let cotinuation_token_clone = continuation_token.clone();
-        let continuation_token = continuation_token
-            .map(|continuation_token| {
-                let continuation_tokens = self
-                    .continuation_tokens
-                    .read()
-                    .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
-                match continuation_tokens.get(&continuation_token) {
-                    Some(continuation_token) => Ok(continuation_token.clone()),
-                    None => Err(s3_error!(InvalidToken)),
-                }
-            })
-            .transpose()?;
-
-        let prefix_clone = prefix.clone();
-        let start_after_clone = start_after.clone();
         let continuation_token_clone = continuation_token.clone();
 
-        let bucket_pool = self.try_get_bucket_pool(&bucket).await?;
-        let mut keys_values = bucket_pool
-            .interact(move |connection| {
-                let transaction = connection.transaction()?;
-                Self::try_list_objects(
-                    &transaction,
-                    prefix_clone,
-                    &start_after_clone,
-                    max_keys,
-                    &continuation_token_clone,
-                )
-            })
-            .await
-            .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
-            .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
+        let (key_sizes, next_continuation_token) = match continuation_token {
+            // initial request requires taking a snapshot of the state of the database
+            None => {
+                let prefix_clone = prefix.clone();
+                let start_after_clone = start_after.clone();
+                let bucket_pool = self.try_get_bucket_pool(&bucket).await?;
+                let mut key_sizes = bucket_pool
+                    .interact(move |connection| {
+                        let transaction = connection.transaction()?;
+                        Self::try_list_objects(&transaction, &prefix_clone, &start_after_clone)
+                    })
+                    .await
+                    .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
+                    .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
 
-        let is_truncated = keys_values.len() > max_keys_usize;
-        keys_values.truncate(max_keys_usize);
+                if key_sizes.len() <= max_keys_usize {
+                    (key_sizes, None)
+                } else {
+                    let remainder = key_sizes.split_off(max_keys_usize);
 
-        let objects = keys_values
+                    let mut continuation_tokens = self.continuation_tokens.lock().unwrap();
+                    let next_continuation_token = Uuid::new_v4().to_string();
+                    continuation_tokens.insert(
+                        next_continuation_token.clone(),
+                        ContinuationToken {
+                            token: next_continuation_token.clone(),
+                            last_modified: OffsetDateTime::now_utc(),
+                            key_sizes: remainder,
+                        },
+                    );
+
+                    (key_sizes, Some(next_continuation_token))
+                }
+            }
+            // subsequent request
+            Some(continuation_token) => {
+                let mut continuation_tokens = self.continuation_tokens.lock().unwrap();
+                let mut continuation_token = match continuation_tokens.remove(&continuation_token) {
+                    Some(continuation_token) => Ok(continuation_token),
+                    None => Err(s3_error!(InvalidToken)),
+                }?;
+
+                if continuation_token.key_sizes.len() <= max_keys_usize {
+                    (continuation_token.key_sizes, None)
+                } else {
+                    let remainder = continuation_token.key_sizes.split_off(max_keys_usize);
+                    let key_sizes = std::mem::replace(&mut continuation_token.key_sizes, remainder);
+
+                    let continuation_token_clone = continuation_token.token.clone();
+                    continuation_token.last_modified = OffsetDateTime::now_utc();
+                    continuation_tokens
+                        .insert(continuation_token_clone.clone(), continuation_token);
+
+                    (key_sizes, Some(continuation_token_clone))
+                }
+            }
+        };
+
+        let objects = key_sizes
             .into_iter()
-            .map(|object| {
+            .map(|key_size| {
                 Ok(Object {
-                    key: Some(object.key),
-                    last_modified: Some(object.last_modified.into()),
-                    size: i64::try_from(object.size)?,
+                    key: Some(key_size.key),
+                    last_modified: Some(key_size.last_modified.into()),
+                    size: i64::try_from(key_size.size)?,
+                    e_tag: Some(key_size.md5),
                     ..Default::default()
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-
-        let continuation_token = {
-            let mut continuation_tokens = self
-                .continuation_tokens
-                .write()
-                .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
-
-            // clean up old tokens
-            continuation_tokens.retain(|_, value| {
-                (OffsetDateTime::now_utc() - value.last_modified).as_seconds_f32() < 300.0
-            });
-
-            let continuation_token = is_truncated.then(|| {
-                let (token, mut offset) = continuation_token
-                    .map_or((Uuid::new_v4().to_string(), 0), |continuation_token| {
-                        (continuation_token.token, continuation_token.offset)
-                    });
-                offset += max_keys_usize;
-                let continuation_token = ContinuationToken {
-                    token: token.clone(),
-                    last_modified: OffsetDateTime::now_utc(),
-                    offset,
-                };
-                continuation_tokens.insert(token, continuation_token.clone());
-                continuation_token
-            });
-
-            Result::<_, S3Error>::Ok(continuation_token)
-        }?;
 
         let key_count = try_!(i32::try_from(objects.len()));
 
         let output = ListObjectsV2Output {
             key_count,
             max_keys,
-            continuation_token: cotinuation_token_clone,
-            is_truncated,
+            continuation_token: continuation_token_clone,
+            is_truncated: next_continuation_token.is_some(),
             contents: Some(objects),
             delimiter,
             encoding_type,
             name: Some(bucket),
             prefix,
             start_after,
-            next_continuation_token: continuation_token
-                .map(|continuation_token| continuation_token.token),
+            next_continuation_token,
             ..Default::default()
         };
 

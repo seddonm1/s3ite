@@ -18,17 +18,22 @@ Each `bucket` is saved to a separate `.sqlite3` database named after the `bucket
 
 ### Data
 
-The main table, `data`, is a simple key/value with metadata store.
+The main table, `data`, is a simple key/value table with a separate `metadata` store. `metadata` is split from `data` as it was found to be more performant for large `list_objects` calls presumably due to it being able to be cached by the SQLite engine. This idea was inspired by [BadgerDB](https://github.com/outcaste-io/badger) who implemented ideas from the WISCKEY paper and saw big wins with separating values from keys.
 
 ```sql
 CREATE TABLE IF NOT EXISTS data (
-    key             TEXT PRIMARY KEY,
-    value           BLOB,
-    size            INTEGER NOT NULL,
-    metadata        TEXT,
-    last_modified   TEXT NOT NULL,
-    md5             TEXT
+    key TEXT PRIMARY KEY,
+    value BLOB
 );
+
+CREATE TABLE IF NOT EXISTS metadata (
+    key TEXT PRIMARY KEY,
+    size INTEGER NOT NULL,
+    metadata TEXT,
+    last_modified TEXT NOT NULL,
+    md5 TEXT,
+    FOREIGN KEY (key) REFERENCES data (key) ON DELETE CASCADE
+) WITHOUT ROWID;
 ```
 
 ### Multipart Uploads
@@ -41,7 +46,8 @@ CREATE TABLE IF NOT EXISTS multipart_upload (
     bucket                  TEXT NOT NULL,
     key                     TEXT NOT NULL,
     last_modified           TEXT NOT NULL,
-    access_key              TEXT
+    access_key              TEXT,
+    UNIQUE(upload_id, bucket, key)
 );
 
 CREATE TABLE IF NOT EXISTS multipart_upload_part (
@@ -126,7 +132,7 @@ s3ite:latest \
 --root /data \
 --host 0.0.0.0 \
 --port 8014 \
---concurrency_limit 16 \
+--concurrency-limit 16 \
 --access-key AKIAIOSFODNN7EXAMPLE \
 --secret-key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 ```
