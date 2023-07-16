@@ -2,26 +2,24 @@ use crate::error::*;
 use crate::utils::repeat_vars;
 
 use deadpool_sqlite::rusqlite::Transaction;
+use deadpool_sqlite::{Config, Runtime};
 use deadpool_sqlite::{Object, Pool};
+use path_absolutize::Absolutize;
 use rusqlite::Error::ToSqlConversionFailure;
 use rusqlite::{OptionalExtension, ToSql};
 use s3s::auth::Credentials;
 use s3s::S3ErrorCode::{InternalError, MethodNotAllowed};
 use s3s::{dto, s3_error, S3Error};
-use time::{Duration, OffsetDateTime};
-use tokio::sync::RwLock;
-
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ops::Not;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
-
+use std::sync::{Arc, Mutex};
+use time::{Duration, OffsetDateTime};
 use tokio::fs;
-
-use deadpool_sqlite::{Config, Runtime};
-use path_absolutize::Absolutize;
+use tokio::sync::RwLock;
+use tracing::warn;
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -29,9 +27,10 @@ pub struct Sqlite {
     pub(crate) root: PathBuf,
     pub(crate) config: crate::Config,
     pub(crate) buckets: Arc<RwLock<HashMap<String, Pool>>>,
-    pub(crate) continuation_tokens: Arc<std::sync::RwLock<HashMap<String, ContinuationToken>>>,
+    pub(crate) continuation_tokens: Arc<Mutex<HashMap<String, ContinuationToken>>>,
 }
 
+#[derive(Debug)]
 pub(crate) struct KeyValue {
     pub(crate) key: String,
     pub(crate) value: Option<Vec<u8>>,
@@ -41,18 +40,22 @@ pub(crate) struct KeyValue {
     pub(crate) md5: Option<String>,
 }
 
+#[derive(Debug)]
 pub(crate) struct KeySize {
     pub(crate) key: String,
     pub(crate) size: u64,
     pub(crate) last_modified: OffsetDateTime,
+    pub(crate) md5: String,
 }
 
+#[derive(Debug)]
 pub(crate) struct KeyMetadata {
     pub(crate) size: u64,
     pub(crate) metadata: Option<dto::Metadata>,
     pub(crate) last_modified: OffsetDateTime,
 }
 
+#[derive(Debug)]
 pub(crate) struct Multipart {
     pub(crate) upload_id: Uuid,
     pub(crate) part_number: i32,
@@ -62,17 +65,18 @@ pub(crate) struct Multipart {
     pub(crate) md5: Option<String>,
 }
 
+#[derive(Debug)]
 pub(crate) struct MultipartMetadata {
     pub(crate) part_number: i32,
     pub(crate) last_modified: OffsetDateTime,
     pub(crate) size: i64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct ContinuationToken {
     pub(crate) token: String,
     pub(crate) last_modified: OffsetDateTime,
-    pub(crate) offset: usize,
+    pub(crate) key_sizes: Vec<KeySize>,
 }
 
 impl Sqlite {
@@ -139,11 +143,51 @@ impl Sqlite {
             ))?;
         }
 
+        let buckets = Arc::new(RwLock::new(buckets));
+        let continuation_tokens = Arc::new(Mutex::new(HashMap::<String, ContinuationToken>::new()));
+
+        // start a garbage collection process for:
+        // - run the vacuum process
+        // - cleaning up expired continuation_tokens
+        let buckets_clone = buckets.clone();
+        let continuation_tokens_clone = continuation_tokens.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(10000)).await;
+
+                // database maintenance
+                let buckets = buckets_clone.write().await;
+                for (_, pool) in buckets.iter() {
+                    let connection = pool.get().await.unwrap();
+                    connection
+                        .interact(move |connection| {
+                            connection
+                                .execute_batch(
+                                    "
+                                    PRAGMA wal_checkpoint(TRUNCATE);
+                                    PRAGMA incremental_vacuum(100);
+                                    ",
+                                )
+                                .map_err(|err| warn!("{}", err.to_string()))
+                                .ok();
+                        })
+                        .await
+                        .ok();
+                }
+
+                // remove any redundant state (i.e. cancelled `list_objects` request snapshots)
+                let mut continuation_tokens = continuation_tokens_clone.lock().unwrap();
+                continuation_tokens.retain(|_, value| {
+                    (OffsetDateTime::now_utc() - value.last_modified).as_seconds_f32() < 120.0
+                });
+            }
+        });
+
         Ok(Self {
             root,
             config: config.clone(),
-            buckets: Arc::new(RwLock::new(buckets)),
-            continuation_tokens: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            buckets,
+            continuation_tokens,
         })
     }
 
@@ -201,7 +245,7 @@ impl Sqlite {
                     last_modified TEXT NOT NULL,
                     md5 TEXT,
                     FOREIGN KEY (key) REFERENCES data (key) ON DELETE CASCADE
-                );",
+                ) WITHOUT ROWID;",
             (),
         )?;
         transaction.execute(
@@ -245,13 +289,11 @@ impl Sqlite {
     /// resolve object path under the virtual root
     pub(crate) fn try_list_objects(
         transaction: &Transaction,
-        prefix: Option<String>,
+        prefix: &Option<String>,
         start_after: &Option<String>,
-        max_keys: i32,
-        continuation_token: &Option<ContinuationToken>,
     ) -> rusqlite::Result<Vec<KeySize>> {
         // prefix with the sqlite wildcard
-        let prefix = prefix.and_then(|prefix| {
+        let prefix = prefix.as_ref().and_then(|prefix| {
             if prefix.is_empty() {
                 None
             } else {
@@ -259,42 +301,22 @@ impl Sqlite {
             }
         });
 
-        // add one additional key to the query to determine if more keys are available
-        // results are then truncated to max_keys before sending to client
-        let max_keys = max_keys + 1;
-
-        let (query, params): (&str, Vec<&dyn ToSql>) = match (&prefix, start_after, continuation_token) {
-            (None, None, None) => (
-                "SELECT key, size, metadata, last_modified, md5 FROM metadata ORDER BY key LIMIT ?1;",
-                vec![&max_keys],
+        let (query, params): (&str, Vec<&dyn ToSql>) = match (&prefix, start_after) {
+            (Some(prefix), Some(start_after)) => (
+                "SELECT key, size, last_modified, md5 FROM metadata WHERE key LIKE ?1 AND key > ?2 ORDER BY key;",
+                vec![prefix, start_after],
             ),
-            (None, None, Some(continuation_token)) => (
-                "SELECT key, size, metadata, last_modified, md5 FROM metadata ORDER BY key LIMIT ?1 OFFSET ?2;",
-                vec![&max_keys, &continuation_token.offset],
+            (Some(prefix), None) => (
+                "SELECT key, size, last_modified, md5 FROM metadata WHERE key LIKE ?1 ORDER BY key;",
+                vec![prefix],
             ),
-            (None, Some(start_after), None) => (
-                "SELECT key, size, metadata, last_modified, md5 FROM metadata WHERE key > ?1 ORDER BY key LIMIT ?2;",
-                vec![start_after, &max_keys],
+            (None, Some(start_after)) => (
+                "SELECT key, size, last_modified, md5 FROM metadata WHERE key > ?1 ORDER BY key;",
+                vec![start_after],
             ),
-            (None, Some(start_after), Some(continuation_token)) => (
-                "SELECT key, size, metadata, last_modified, md5 FROM metadata WHERE key > ?1 ORDER BY key LIMIT ?2 OFFSET ?3;",
-                vec![start_after, &max_keys, &continuation_token.offset],
-            ),
-            (Some(prefix), None, None) => (
-                "SELECT key, size, metadata, last_modified, md5 FROM metadata WHERE key LIKE ?1 ORDER BY key LIMIT ?2;",
-                vec![prefix, &max_keys],
-            ),
-            (Some(prefix), None, Some(continuation_token)) => (
-                "SELECT key, size, metadata, last_modified, md5 FROM metadata WHERE key LIKE ?1 ORDER BY key LIMIT ?2 OFFSET ?3;",
-                vec![prefix,&max_keys, &continuation_token.offset],
-            ),
-            (Some(prefix), Some(start_after), None) => (
-                "SELECT key, size, metadata, last_modified, md5 FROM metadata WHERE key LIKE ?1 AND key > ?2 ORDER BY key LIMIT ?3;",
-                vec![prefix, start_after, &max_keys],
-            ),
-            (Some(prefix), Some(start_after), Some(continuation_token)) => (
-                "SELECT key, size, metadata, last_modified, md5 FROM metadata WHERE key LIKE ?1 AND key > ?2 ORDER BY key LIMIT ?3 OFFSET ?4;",
-                vec![prefix, start_after, &max_keys, &continuation_token.offset],
+            (None, None) => (
+                "SELECT key, size, last_modified, md5 FROM metadata ORDER BY key;",
+                vec![],
             ),
         };
 
@@ -306,6 +328,7 @@ impl Sqlite {
                     key: row.get(0)?,
                     size: row.get(1)?,
                     last_modified: row.get(2)?,
+                    md5: row.get(3)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -319,7 +342,17 @@ impl Sqlite {
         key: &str,
     ) -> rusqlite::Result<Option<KeyValue>> {
         let mut stmt = transaction.prepare_cached(
-            "SELECT metadata.key, data.value, metadata.size, metadata.metadata, metadata.last_modified, metadata.md5 FROM metadata INNER JOIN data ON metadata.key = data.key WHERE metadata.key = ?;",
+            "
+            SELECT
+                metadata.key,
+                data.value,
+                metadata.size,
+                metadata.metadata,
+                metadata.last_modified,
+                metadata.md5
+            FROM metadata
+            INNER JOIN data ON metadata.key = data.key
+            WHERE metadata.key = ?;",
         )?;
 
         stmt.query_row([key], |row| {
@@ -349,8 +382,15 @@ impl Sqlite {
         transaction: &Transaction,
         key: &str,
     ) -> rusqlite::Result<Option<KeyMetadata>> {
-        let mut stmt = transaction
-            .prepare_cached("SELECT size, metadata, last_modified FROM metadata WHERE key = ?;")?;
+        let mut stmt = transaction.prepare_cached(
+            "
+            SELECT
+                size,
+                metadata,
+                last_modified
+            FROM metadata
+            WHERE key = ?;",
+        )?;
 
         stmt.query_row([key], |row| {
             Ok(KeyMetadata {
@@ -377,13 +417,23 @@ impl Sqlite {
         transaction: &Transaction,
         kv: KeyValue,
     ) -> rusqlite::Result<usize> {
-        let mut stmt = transaction
-                    .prepare_cached("INSERT INTO data (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value;")?;
+        let mut stmt = transaction.prepare_cached(
+            "
+            INSERT INTO data (key, value)
+            VALUES (?1, ?2)
+            ON CONFLICT(key) DO UPDATE
+            SET value=excluded.value;",
+        )?;
 
         stmt.execute((&kv.key, kv.value))?;
 
-        let mut stmt = transaction
-        .prepare_cached("INSERT INTO metadata (key, size, metadata, last_modified, md5) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(key) DO UPDATE SET size=excluded.size, metadata=excluded.metadata, last_modified=excluded.last_modified, md5=excluded.md5;")?;
+        let mut stmt = transaction.prepare_cached(
+            "
+            INSERT INTO metadata (key, size, metadata, last_modified, md5)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(key) DO UPDATE
+            SET size=excluded.size, metadata=excluded.metadata, last_modified=excluded.last_modified, md5=excluded.md5;",
+        )?;
 
         stmt.execute((
             kv.key,
@@ -402,7 +452,11 @@ impl Sqlite {
         transaction: &Transaction,
         key: &str,
     ) -> rusqlite::Result<usize> {
-        let mut stmt = transaction.prepare_cached("DELETE FROM data WHERE key = ?1;")?;
+        let mut stmt = transaction.prepare_cached(
+            "
+            DELETE FROM data
+            WHERE key = ?1;",
+        )?;
         stmt.execute([key])
     }
 
@@ -413,7 +467,10 @@ impl Sqlite {
         let vars = repeat_vars(keys.len());
 
         let mut stmt = transaction.prepare(&format!(
-            "DELETE FROM data WHERE key IN ({vars}) RETURNING key;"
+            "
+            DELETE FROM data
+            WHERE key IN ({vars})
+            RETURNING key;"
         ))?;
 
         let keys = stmt
@@ -427,7 +484,11 @@ impl Sqlite {
         transaction: &Transaction,
         key: &str,
     ) -> rusqlite::Result<usize> {
-        let mut stmt = transaction.prepare_cached("DELETE FROM data WHERE key LIKE ?1;")?;
+        let mut stmt = transaction.prepare_cached(
+            "
+            DELETE FROM data
+            WHERE key LIKE ?1;",
+        )?;
 
         stmt.execute([format!("{key}%")])
     }
@@ -440,7 +501,9 @@ impl Sqlite {
         credentials: Option<Credentials>,
     ) -> rusqlite::Result<usize> {
         let mut stmt = transaction.prepare_cached(
-            "INSERT INTO multipart_upload (upload_id, last_modified, bucket, key, access_key) VALUES (?1, ?2, ?3, ?4, ?5);",
+            "
+            INSERT INTO multipart_upload (upload_id, last_modified, bucket, key, access_key)
+            VALUES (?1, ?2, ?3, ?4, ?5);",
         )?;
 
         let now = OffsetDateTime::now_utc();
@@ -460,8 +523,12 @@ impl Sqlite {
         key: &str,
         credentials: Option<Credentials>,
     ) -> rusqlite::Result<bool> {
-        let mut stmt = transaction
-            .prepare_cached("SELECT access_key FROM multipart_upload WHERE upload_id = ?1 AND bucket = ?2 AND key = ?3;")?;
+        let mut stmt = transaction.prepare_cached(
+            "
+            SELECT access_key
+            FROM multipart_upload
+            WHERE upload_id = ?1 AND bucket = ?2 AND key = ?3;",
+        )?;
 
         let access_key = stmt.query_row((upload_id, bucket, key), |row| {
             row.get::<_, Option<String>>(0)
@@ -475,7 +542,9 @@ impl Sqlite {
         multipart: Multipart,
     ) -> rusqlite::Result<usize> {
         let mut stmt = transaction.prepare_cached(
-            "INSERT INTO multipart_upload_part (upload_id, last_modified, part_number, value, size, md5) VALUES (?1, ?2, ?3, ?4, ?5, ?6);",
+            "
+            INSERT INTO multipart_upload_part (upload_id, last_modified, part_number, value, size, md5)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6);",
         )?;
 
         stmt.execute((
@@ -493,7 +562,14 @@ impl Sqlite {
         upload_id: Uuid,
     ) -> rusqlite::Result<Vec<MultipartMetadata>> {
         let mut stmt = transaction.prepare_cached(
-            "SELECT last_modified, part_number, size FROM multipart_upload_part WHERE upload_id = ?1 ORDER BY part_number;",
+            "
+            SELECT
+                last_modified,
+                part_number,
+                size
+            FROM multipart_upload_part
+            WHERE upload_id = ?1
+            ORDER BY part_number;",
         )?;
 
         #[allow(clippy::let_and_return)]
@@ -515,8 +591,17 @@ impl Sqlite {
         upload_id: Uuid,
     ) -> rusqlite::Result<Vec<Multipart>> {
         let mut stmt = transaction.prepare_cached(
-                "SELECT last_modified, part_number, value, size, md5 FROM multipart_upload_part WHERE upload_id = ?1 ORDER BY part_number;",
-            )?;
+            "
+            SELECT
+                last_modified,
+                part_number,
+                value,
+                size,
+                md5
+            FROM multipart_upload_part
+            WHERE upload_id = ?1
+            ORDER BY part_number;",
+        )?;
 
         #[allow(clippy::let_and_return)]
         let objects = stmt
@@ -539,8 +624,11 @@ impl Sqlite {
         transaction: &Transaction,
         upload_id: Uuid,
     ) -> rusqlite::Result<()> {
-        let mut stmt =
-            transaction.prepare_cached("DELETE FROM multipart_upload WHERE upload_id = ?1;")?;
+        let mut stmt = transaction.prepare_cached(
+            "
+            DELETE FROM multipart_upload
+            WHERE upload_id = ?1;",
+        )?;
         stmt.execute([upload_id])?;
 
         Ok(())
@@ -551,7 +639,9 @@ impl Sqlite {
         expire_before: OffsetDateTime,
     ) -> rusqlite::Result<()> {
         let mut stmt = transaction.prepare_cached(
-            "DELETE FROM multipart_upload WHERE DATETIME(last_modified) < DATETIME(?1);",
+            "
+            DELETE FROM multipart_upload
+            WHERE DATETIME(last_modified) < DATETIME(?1);",
         )?;
         stmt.execute([expire_before])?;
 
