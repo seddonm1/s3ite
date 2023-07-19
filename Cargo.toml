@@ -18,7 +18,7 @@ async-trait = "0.1.71"
 base64-simd = "0.8.0"
 bytes = "1.4.0"
 chrono = { version = "0.4.26", default-features = false, features = ["std", "clock"] }
-clap = { version = "4.3.14", optional = true, features = ["derive"] }
+clap = { version = "4.3.17", optional = true, features = ["derive"] }
 deadpool-sqlite = { version = "0.5.0", default-features = false, features = ["rt_tokio_1"] }
 rusqlite = { version = "0.28.0", features = ["time", "uuid", "bundled"] }
 futures = "0.3.28"
@@ -32,13 +32,13 @@ path-absolutize = "3.1.0"
 s3s = "0.6.1"
 serde = { version = "1.0.171", features =["derive"] }
 serde_json = "1.0.103"
-serde_yaml = "0.9.23"
+serde_yaml = "0.9.24"
 thiserror = "1.0.43"
 time = "0.3.23"
 tokio = { version = "1.29.1", features = ["fs", "io-util"] }
 tokio-util = { version = "0.7.8", features = ["io"] }
 tower = { version = "0.4.13", features = ["full"] }
-tower-http = { version = "0.4.1", features = ["cors"] }
+tower-http = { version = "0.4.2", features = ["cors"] }
 tracing = "0.1.37"
 tracing-error = "0.2.0"
 tracing-subscriber = { version = "0.3.17", optional = true, features = ["env-filter", "time"] }
