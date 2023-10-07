@@ -571,7 +571,9 @@ impl S3 for Sqlite {
             }
         }
 
-        let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
+        let Some(body) = body else {
+            return Err(s3_error!(IncompleteBody));
+        };
 
         let bucket_pool = self.try_get_bucket_pool(&bucket).await?;
 
@@ -866,7 +868,9 @@ impl S3 for Sqlite {
 
         let upload_id = Uuid::parse_str(&upload_id).map_err(|_| s3_error!(InvalidRequest))?;
 
-        let Some(multipart_upload) = multipart_upload else { return Err(s3_error!(InvalidPart)) };
+        let Some(multipart_upload) = multipart_upload else {
+            return Err(s3_error!(InvalidPart));
+        };
 
         let mut cnt: i32 = 0;
         for part in multipart_upload.parts.into_iter().flatten() {

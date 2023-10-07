@@ -157,7 +157,7 @@ impl Sqlite {
 
                 // database maintenance
                 let buckets = buckets_clone.write().await;
-                for (_, pool) in buckets.iter() {
+                for pool in buckets.values() {
                     let connection = pool.get().await.unwrap();
                     connection
                         .interact(move |connection| {
