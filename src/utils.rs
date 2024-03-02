@@ -1,12 +1,12 @@
-use crate::error::{Error, Result};
-
+use bytes::Bytes;
+use futures::{Stream, StreamExt};
 use s3s::StdError;
-
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 
-use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use crate::S3ite;
+
+pub type Result<T = (), E = crate::error::S3ite> = std::result::Result<T, E>;
 
 pub async fn copy_bytes<S, W>(mut stream: S, writer: &mut W) -> Result<u64>
 where
@@ -15,10 +15,7 @@ where
 {
     let mut nwritten: u64 = 0;
     while let Some(result) = stream.next().await {
-        let bytes = match result {
-            Ok(x) => x,
-            Err(e) => return Err(Error::new(e)),
-        };
+        let bytes = result.map_err(|_| S3ite::Copy)?;
         writer.write_all(&bytes).await?;
         nwritten += bytes.len() as u64;
     }

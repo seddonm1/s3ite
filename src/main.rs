@@ -1,24 +1,24 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::all, clippy::pedantic)]
 
-use s3ite::{Config, Error, JournalMode, Result, Sqlite};
+use hyper_util::service::TowerToHyperService;
+use s3ite::{Config, JournalMode, Result, S3ite, Sqlite};
 use s3ite::{Synchronous, TempStore};
 
 use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;
 use tower::limit::ConcurrencyLimitLayer;
-use tower::make::Shared;
-use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 
 use std::fs;
 use std::net::IpAddr;
 use std::net::SocketAddr;
-use std::net::TcpListener;
 use std::path::PathBuf;
+use tokio::net::TcpListener;
 
 use clap::Parser;
-use hyper::server::Server;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -69,24 +69,29 @@ struct Opt {
     read_only: Option<bool>,
 
     #[clap(long)]
-    /// Controls the SQLite `journal_mode` flag pragma.
+    /// Controls the `SQLite` `journal_mode` flag pragma.
     journal_mode: Option<JournalMode>,
 
     #[clap(long)]
-    /// Controls the SQLite `synchronous` pragma.
+    /// Controls the `SQLite` `synchronous` pragma.
     synchronous: Option<Synchronous>,
 
     #[clap(long)]
-    /// Controls the SQLite `temp_store` pragma.
+    /// Controls the `SQLite` `temp_store` pragma.
     temp_store: Option<TempStore>,
 
     #[clap(long)]
-    /// Controls the SQLite `cache_size` pragma in kilobytes.
+    /// Controls the `SQLite` `cache_size` pragma in kilobytes.
     cache_size: Option<u32>,
+
+    #[clap(long)]
+    /// Controls the number of reader connections to `SQLite`
+    readers: Option<usize>,
 }
 
 #[tokio::main]
-async fn main() -> Result {
+#[allow(clippy::too_many_lines)]
+async fn main() -> Result<()> {
     let env_filter = EnvFilter::from_default_env();
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
@@ -96,7 +101,7 @@ async fn main() -> Result {
         .config
         .map(|config| {
             let config = fs::read(config)?;
-            Ok::<_, Error>(serde_yaml::from_slice::<Config>(&config)?)
+            Ok::<_, S3ite>(serde_yaml::from_slice::<Config>(&config)?)
         })
         .transpose()?
         .unwrap_or_default();
@@ -142,15 +147,11 @@ async fn main() -> Result {
         config.sqlite.cache_size = cache_size;
     }
 
-    // Parse addr
-    let addr = SocketAddr::new(config.host, config.port);
-    let listener = TcpListener::bind(addr)?;
-
     // Setup S3 provider
     let sqlite = Sqlite::new(&config).await?;
 
     // Setup S3 service
-    let s3_service = {
+    let svc = {
         let mut s3 = S3ServiceBuilder::new(sqlite);
 
         // Enable authentication
@@ -166,33 +167,74 @@ async fn main() -> Result {
         s3.build().into_shared()
     };
 
-    // Run server
-    // Add CorsLayer if defined
-    if config.permissive_cors {
-        let service = Shared::new(
-            ServiceBuilder::new()
-                .layer(CorsLayer::very_permissive())
-                .layer(ConcurrencyLimitLayer::new(config.concurrency_limit.into()))
-                .service(s3_service),
-        );
-        let server = Server::from_tcp(listener)?.serve(service);
-        info!("server is running at http://{addr}");
-        server.with_graceful_shutdown(shutdown_signal()).await?;
-    } else {
-        let service = Shared::new(
-            ServiceBuilder::new()
-                .layer(ConcurrencyLimitLayer::new(config.concurrency_limit.into()))
-                .service(s3_service),
-        );
-        let server = Server::from_tcp(listener)?.serve(service);
-        info!("server is running at http://{addr}");
-        server.with_graceful_shutdown(shutdown_signal()).await?;
-    };
+    // Parse addr
+    let addr = SocketAddr::new(config.host, config.port);
+    let listener = TcpListener::bind(addr).await?;
+    let local_addr = listener.local_addr()?;
+    let http_server = auto::Builder::new(TokioExecutor::new());
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
+
+    info!("server is running at http://{local_addr}");
+
+    loop {
+        let (stream, _) = tokio::select! {
+            res = listener.accept() => {
+                match res {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        tracing::error!("error accepting connection: {err}");
+                        continue;
+                    }
+                }
+            }
+            _ = ctrl_c.as_mut() => {
+                break;
+            }
+        };
+
+        let io = TokioIo::new(stream);
+
+        // Add CorsLayer if defined
+        if config.permissive_cors {
+            let conn = http_server.serve_connection(
+                io,
+                TowerToHyperService::new(
+                    tower::ServiceBuilder::new()
+                        .layer(CorsLayer::very_permissive())
+                        .layer(ConcurrencyLimitLayer::new(config.concurrency_limit.into()))
+                        .service(svc.clone()),
+                ),
+            );
+            let conn = graceful.watch(conn.into_owned());
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+        } else {
+            let conn = http_server.serve_connection(
+                io,
+                TowerToHyperService::new(
+                    tower::ServiceBuilder::new()
+                        .layer(ConcurrencyLimitLayer::new(config.concurrency_limit.into()))
+                        .service(svc.clone()),
+                ),
+            );
+            let conn = graceful.watch(conn.into_owned());
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+        };
+    }
+
+    tokio::select! {
+        () = graceful.shutdown() => {
+             tracing::debug!("Gracefully shutdown!");
+        },
+        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+             tracing::debug!("Waited 10 seconds for graceful shutdown, aborting...");
+        }
+    }
 
     info!("server is stopped");
     Ok(())
-}
-
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
 }

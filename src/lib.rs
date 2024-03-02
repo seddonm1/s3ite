@@ -13,6 +13,7 @@
 mod error;
 
 mod config;
+mod database;
 mod s3;
 mod sqlite;
 mod utils;

@@ -39,7 +39,7 @@ static TRACING: Lazy<()> = Lazy::new(|| {
     use tracing_subscriber::EnvFilter;
 
     if env::var("RUST_LOG").is_err() {
-        env::set_var("RUST_LOG", "it_aws=debug,s3s_sqlite=debug,s3s=debug");
+        env::set_var("RUST_LOG", "it_aws=error,s3s_sqlite=debug,s3s=error");
     }
 
     tracing_subscriber::fmt()
@@ -78,13 +78,13 @@ impl TestContext {
             b.build()
         };
 
-        // Convert to aws http connector
-        let conn = s3s_aws::Connector::from(service.into_shared());
+        // Convert to aws http client
+        let client = s3s_aws::Client::from(service.into_shared());
 
         // Setup aws sdk config
         let config = SdkConfig::builder()
             .credentials_provider(SharedCredentialsProvider::new(cred))
-            .http_connector(conn)
+            .http_client(client)
             .region(Region::new(REGION))
             .endpoint_url(format!("http://{DOMAIN_NAME}"))
             .build();
@@ -105,6 +105,7 @@ impl Deref for TestContext {
 
 impl Drop for TestContext {
     fn drop(&mut self) {
+        println!("drop testcontext");
         fs::remove_dir_all(FS_ROOT).unwrap();
     }
 }
@@ -171,7 +172,7 @@ async fn test_list_buckets() -> Result<()> {
     }
     let list_buckets = result?;
 
-    list_buckets.buckets().unwrap().iter().all(|list_bucket| {
+    list_buckets.buckets().iter().all(|list_bucket| {
         buckets
             .iter()
             .any(|bucket| Some(bucket.as_str()) == list_bucket.name())
@@ -198,32 +199,31 @@ async fn test_single_object() -> Result<()> {
     md5_hash.update(content_bytes);
     let content_md5 = base64(md5_hash.finalize());
 
+    // create_bucket
     create_bucket(&context, &bucket).await?;
 
-    {
-        context
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(content_bytes))
-            .content_md5(content_md5)
-            .send()
-            .await?;
-    }
+    // put_object
+    context
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from_static(content_bytes))
+        .content_md5(content_md5)
+        .send()
+        .await?;
 
-    {
-        let get_object_output = context.get_object().bucket(&bucket).key(key).send().await?;
-        let content_length: usize = get_object_output.content_length().try_into().unwrap();
-        let body = get_object_output.body.collect().await?.into_bytes();
+    // get_object
+    let get_object_output = context.get_object().bucket(&bucket).key(key).send().await?;
+    let content_length = get_object_output.content_length().unwrap();
+    let body = get_object_output.body.collect().await?.into_bytes();
 
-        assert_eq!(content_length, content.len());
-        assert_eq!(body.as_ref(), content.as_bytes());
-    }
+    assert_eq!(content_length as usize, content.len());
+    assert_eq!(body.as_ref(), content.as_bytes());
 
-    {
-        delete_object(&context, &bucket, key).await?;
-    }
+    // delete_object
+    delete_object(&context, &bucket, key).await?;
 
+    // println!("ok");
     Ok(())
 }
 
@@ -307,10 +307,10 @@ async fn test_multipart() -> Result<()> {
             Ok(get_object_output) => {
                 debug!(?get_object_output);
 
-                let content_length: usize = get_object_output.content_length().try_into().unwrap();
+                let content_length = get_object_output.content_length().unwrap();
                 let body = get_object_output.body.collect().await?.into_bytes();
 
-                assert_eq!(content_length, content.len());
+                assert_eq!(content_length as usize, content.len());
                 assert_eq!(body.as_ref(), content.as_bytes());
             }
             Err(ref err) => error!(?err),
