@@ -46,7 +46,7 @@ pub struct Config {
     #[serde(default = "default_read_only")]
     pub read_only: bool,
 
-    /// Service level SQLite configurations
+    /// Service level `SQLite` configurations
     #[serde(flatten, default = "default_pragmas")]
     pub sqlite: Pragmas,
 
@@ -151,19 +151,19 @@ impl Config {
 
 #[derive(Clone, Deserialize, Debug)]
 pub struct Pragmas {
-    /// Controls the SQLite `journal_mode` flag pragma.
+    /// Controls the `SQLite` `journal_mode` flag pragma.
     #[serde(default = "default_journal_mode")]
     pub journal_mode: JournalMode,
 
-    /// Controls the SQLite `synchronous` pragma.
+    /// Controls the `SQLite` `synchronous` pragma.
     #[serde(default = "default_synchronous")]
     pub synchronous: Synchronous,
 
-    /// Controls the SQLite `temp_store` pragma.
+    /// Controls the `SQLite` `temp_store` pragma.
     #[serde(default = "default_temp_store")]
     pub temp_store: TempStore,
 
-    /// Controls the SQLite `cache_size` pragma in kilobytes.
+    /// Controls the `SQLite` `cache_size` pragma in kilobytes.
     #[serde(default = "default_cache_size")]
     pub cache_size: u32,
 }
@@ -184,22 +184,22 @@ pub struct Bucket {
     /// If this bucket should be read-only
     pub read_only: Option<bool>,
 
-    /// Bucket level SQLite configurations
+    /// Bucket level `SQLite` configurations
     pub sqlite: Option<BucketPragmas>,
 }
 
 #[derive(Clone, Deserialize, Debug)]
 pub struct BucketPragmas {
-    /// Controls the SQLite `journal_mode` flag pragma.
+    /// Controls the `SQLite` `journal_mode` flag pragma.
     pub journal_mode: Option<JournalMode>,
 
-    /// Controls the SQLite `synchronous` pragma.
+    /// Controls the `SQLite` `synchronous` pragma.
     pub synchronous: Option<Synchronous>,
 
-    /// Controls the SQLite `temp_store` pragma.
+    /// Controls the `SQLite` `temp_store` pragma.
     pub temp_store: Option<TempStore>,
 
-    /// Controls the SQLite `cache_size` pragma in kilobytes.
+    /// Controls the `SQLite` `cache_size` pragma in kilobytes.
     pub cache_size: Option<u32>,
 }
 

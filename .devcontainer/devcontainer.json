@@ -27,8 +27,8 @@
 			"extensions": [
 				"rust-lang.rust-analyzer",
 				"vadimcn.vscode-lldb",
-				"bungcip.better-toml",
-				"serayuzgur.crates"
+				"bungcip.even-better-toml",
+				"fill-labs.dependi"
 			]
 		}
 	}

@@ -3,7 +3,7 @@ use crate::sqlite::ContinuationToken;
 use crate::sqlite::KeyValue;
 use crate::sqlite::Multipart;
 use crate::sqlite::Sqlite;
-use crate::utils::*;
+use crate::utils::{base64, copy_bytes, hex};
 
 use bytes::Bytes;
 use futures::stream;
@@ -12,7 +12,6 @@ use md5::{Digest, Md5};
 use s3s::dto::*;
 use s3s::s3_error;
 use s3s::S3Error;
-use s3s::S3ErrorCode;
 use s3s::S3ErrorCode::InternalError;
 use s3s::S3Result;
 use s3s::S3;
@@ -47,6 +46,8 @@ impl S3 for Sqlite {
             .await
             .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
 
+        println!("created bucket");
+
         let output = CreateBucketOutput::default(); // TODO: handle other fields
         Ok(S3Response::new(output))
     }
@@ -71,23 +72,15 @@ impl S3 for Sqlite {
         };
 
         // verify source and target buckets exist
-        let bucket_pool = self.try_get_bucket_pool(&src_bucket).await?;
+        let connection = self.try_get_connection(&src_bucket).await?;
 
-        let mut object = bucket_pool
-            .interact(move |connection| {
-                let transaction = connection
-                    .transaction()
-                    .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
-                Self::try_get_object(&transaction, &src_key)
-                    .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
-                    .ok_or_else(|| s3_error!(NoSuchKey))
+        let mut object = connection
+            .read(move |connection| {
+                let transaction = connection.transaction()?;
+                Ok(Self::try_get_object(&transaction, &src_key)?
+                    .ok_or_else(|| s3_error!(NoSuchKey))?)
             })
-            .await
-            .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
-            .map_err(|err| match err.code() {
-                S3ErrorCode::NoSuchKey => err,
-                _ => s3_error!(InternalError),
-            })?;
+            .await?;
 
         // replace key with target key
         object.key = tgt_key.to_string();
@@ -98,16 +91,14 @@ impl S3 for Sqlite {
             ..Default::default()
         };
 
-        let bucket_pool = self.try_get_bucket_pool(&tgt_bucket).await?;
-        bucket_pool
-            .interact(move |connection| {
+        let connection = self.try_get_connection(&tgt_bucket).await?;
+        connection
+            .write(move |connection| {
                 let transaction = connection.transaction()?;
                 Self::try_put_object(&transaction, object)?;
-                transaction.commit()
+                Ok(transaction.commit()?)
             })
-            .await
-            .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
-            .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
+            .await?;
 
         let output = CopyObjectOutput {
             copy_object_result: Some(copy_object_result),
@@ -128,7 +119,7 @@ impl S3 for Sqlite {
         let mut guard = self.buckets.write().await;
         match guard.get(&bucket) {
             Some(connection) => {
-                connection.close();
+                connection.to_owned().close();
                 let bucket_path = self.get_bucket_path(&bucket)?;
                 fs::remove_file(&bucket_path)
                     .await
@@ -153,13 +144,11 @@ impl S3 for Sqlite {
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let DeleteObjectInput { bucket, key, .. } = req.input;
-        let bucket_pool = self.try_get_bucket_pool(&bucket).await?;
+        let connection = self.try_get_connection(&bucket).await?;
 
-        bucket_pool
-            .interact(move |connection| {
-                let transaction = connection
-                    .transaction()
-                    .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
+        connection
+            .write(move |connection| {
+                let transaction = connection.transaction()?;
 
                 // if is directory
                 if key.ends_with('/') {
@@ -167,23 +156,20 @@ impl S3 for Sqlite {
                         .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
 
                     if rows_affected > 1 {
-                        return Err(s3_error!(BucketNotEmpty));
+                        return Err(s3_error!(BucketNotEmpty).into());
                     }
                 } else {
                     let rows_affected = Self::try_delete_object(&transaction, &key)
                         .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
 
                     if rows_affected != 1 {
-                        return Err(s3_error!(NoSuchKey));
+                        return Err(s3_error!(NoSuchKey).into());
                     }
                 }
 
-                transaction
-                    .commit()
-                    .map_err(|err| S3Error::with_message(InternalError, err.to_string()))
+                Ok(transaction.commit()?)
             })
-            .await
-            .map_err(|err| S3Error::with_message(InternalError, err.to_string()))??;
+            .await?;
 
         let output = DeleteObjectOutput::default(); // TODO: handle other fields
         Ok(S3Response::new(output))
@@ -204,18 +190,16 @@ impl S3 for Sqlite {
             .map(|object| object.key)
             .collect::<Vec<_>>();
 
-        let bucket_pool = self.try_get_bucket_pool(&bucket).await?;
+        let connection = self.try_get_connection(&bucket).await?;
 
-        let affected_keys = bucket_pool
-            .interact(move |connection| {
+        let affected_keys = connection
+            .write(move |connection| {
                 let transaction = connection.transaction()?;
                 let affected_keys = Self::try_delete_objects(&transaction, &delete_keys)?;
                 transaction.commit()?;
-                rusqlite::Result::<_, rusqlite::Error>::Ok(affected_keys)
+                Ok(affected_keys)
             })
-            .await
-            .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
-            .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
+            .await?;
 
         let output = DeleteObjectsOutput {
             deleted: Some(
@@ -261,19 +245,16 @@ impl S3 for Sqlite {
             bucket, key, range, ..
         } = req.input;
 
-        let bucket_pool = self.try_get_bucket_pool(&bucket).await?;
+        let connection = self.try_get_connection(&bucket).await?;
 
-        let object = bucket_pool
-            .interact(move |connection| {
-                let transaction = connection
-                    .transaction()
-                    .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
-                Self::try_get_object(&transaction, &key)
-                    .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
-                    .ok_or_else(|| s3_error!(NoSuchKey))
-            })
-            .await
-            .map_err(|err| S3Error::with_message(InternalError, err.to_string()))??;
+        let object =
+            connection
+                .read(move |connection| {
+                    let transaction = connection.transaction()?;
+                    Ok(Self::try_get_object(&transaction, &key)?
+                        .ok_or_else(|| s3_error!(NoSuchKey))?)
+                })
+                .await?;
 
         let content_length = match range {
             None => object.size,
@@ -300,7 +281,7 @@ impl S3 for Sqlite {
 
         let output = GetObjectOutput {
             body: Some(StreamingBlob::wrap::<_, S3Error>(body)),
-            content_length: content_length_i64,
+            content_length: Some(content_length_i64),
             last_modified: Some(object.last_modified.into()),
             metadata: object.metadata,
             e_tag: object.md5,
@@ -325,7 +306,12 @@ impl S3 for Sqlite {
             return Err(s3_error!(NoSuchBucket));
         }
 
-        Ok(S3Response::new(HeadBucketOutput {}))
+        Ok(S3Response::new(HeadBucketOutput {
+            access_point_alias: None,
+            bucket_location_name: None,
+            bucket_location_type: None,
+            bucket_region: None,
+        }))
     }
 
     #[tracing::instrument]
@@ -335,29 +321,21 @@ impl S3 for Sqlite {
     ) -> S3Result<S3Response<HeadObjectOutput>> {
         let HeadObjectInput { bucket, key, .. } = req.input;
 
-        let bucket_pool = self.try_get_bucket_pool(&bucket).await?;
+        let connection = self.try_get_connection(&bucket).await?;
 
-        let object = bucket_pool
-            .interact(move |connection| {
-                let transaction = connection
-                    .transaction()
-                    .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
-                Self::try_get_metadata(&transaction, &key)
-                    .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
-                    .ok_or_else(|| s3_error!(NoSuchKey))
+        let object = connection
+            .read(move |connection| {
+                let transaction = connection.transaction()?;
+                Ok(Self::try_get_metadata(&transaction, &key)?
+                    .ok_or_else(|| s3_error!(NoSuchKey))?)
             })
-            .await
-            .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
-            .map_err(|err| match err.code() {
-                S3ErrorCode::NoSuchKey => err,
-                _ => s3_error!(InternalError),
-            })?;
+            .await?;
 
         // TODO: detect content type
         let content_type = mime::APPLICATION_OCTET_STREAM;
 
         let output = HeadObjectOutput {
-            content_length: try_!(i64::try_from(object.size)),
+            content_length: Some(try_!(i64::try_from(object.size))),
             content_type: Some(content_type),
             last_modified: Some(object.last_modified.into()),
             metadata: object.metadata,
@@ -409,10 +387,11 @@ impl S3 for Sqlite {
         Ok(v2_resp.map_output(|v2| {
             let next_marker = v2
                 .is_truncated
+                .unwrap_or(false)
                 .then(|| {
-                    v2.contents.as_ref().and_then(|contents| {
-                        contents.last().and_then(|last| last.key.as_ref().cloned())
-                    })
+                    v2.contents
+                        .as_ref()
+                        .and_then(|contents| contents.last().and_then(|last| last.key.clone()))
                 })
                 .flatten();
 
@@ -456,15 +435,18 @@ impl S3 for Sqlite {
             None => {
                 let prefix_clone = prefix.clone();
                 let start_after_clone = start_after.clone();
-                let bucket_pool = self.try_get_bucket_pool(&bucket).await?;
-                let mut key_sizes = bucket_pool
-                    .interact(move |connection| {
+
+                let connection = self.try_get_connection(&bucket).await?;
+                let mut key_sizes = connection
+                    .read(move |connection| {
                         let transaction = connection.transaction()?;
-                        Self::try_list_objects(&transaction, &prefix_clone, &start_after_clone)
+                        Ok(Self::try_list_objects(
+                            &transaction,
+                            &prefix_clone,
+                            &start_after_clone,
+                        )?)
                     })
-                    .await
-                    .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
-                    .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
+                    .await?;
 
                 if key_sizes.len() <= max_keys_usize {
                     (key_sizes, None)
@@ -515,7 +497,7 @@ impl S3 for Sqlite {
                 Ok(Object {
                     key: Some(key_size.key),
                     last_modified: Some(key_size.last_modified.into()),
-                    size: i64::try_from(key_size.size)?,
+                    size: Some(i64::try_from(key_size.size)?),
                     e_tag: Some(key_size.md5),
                     ..Default::default()
                 })
@@ -525,10 +507,10 @@ impl S3 for Sqlite {
         let key_count = try_!(i32::try_from(objects.len()));
 
         let output = ListObjectsV2Output {
-            key_count,
-            max_keys,
+            key_count: Some(key_count),
+            max_keys: Some(max_keys),
             continuation_token: continuation_token_clone,
-            is_truncated: next_continuation_token.is_some(),
+            is_truncated: Some(next_continuation_token.is_some()),
             contents: Some(objects),
             delimiter,
             encoding_type,
@@ -575,7 +557,7 @@ impl S3 for Sqlite {
             return Err(s3_error!(IncompleteBody));
         };
 
-        let bucket_pool = self.try_get_bucket_pool(&bucket).await?;
+        let connection = self.try_get_connection(&bucket).await?;
 
         // if is directory
         if key.ends_with('/') {
@@ -588,8 +570,8 @@ impl S3 for Sqlite {
                 }
             };
 
-            bucket_pool
-                .interact(move |connection| {
+            connection
+                .write(move |connection| {
                     let transaction = connection.transaction()?;
                     Self::try_put_object(
                         &transaction,
@@ -602,11 +584,9 @@ impl S3 for Sqlite {
                             md5: None,
                         },
                     )?;
-                    transaction.commit()
+                    Ok(transaction.commit()?)
                 })
-                .await
-                .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
-                .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
+                .await?;
 
             let output = PutObjectOutput::default();
             return Ok(S3Response::new(output));
@@ -629,8 +609,8 @@ impl S3 for Sqlite {
         debug!(path = %key, ?size, %md5, "write file");
 
         let md5_clone = md5.clone();
-        bucket_pool
-            .interact(move |connection| {
+        connection
+            .write(move |connection| {
                 let transaction = connection.transaction()?;
                 Self::try_put_object(
                     &transaction,
@@ -643,11 +623,9 @@ impl S3 for Sqlite {
                         md5: Some(md5_clone),
                     },
                 )?;
-                transaction.commit()
+                Ok(transaction.commit()?)
             })
-            .await
-            .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
-            .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
+            .await?;
 
         let output = PutObjectOutput {
             e_tag: Some(md5),
@@ -669,9 +647,9 @@ impl S3 for Sqlite {
 
         let bucket_clone = bucket.clone();
         let key_clone = key.clone();
-        let bucket_pool = self.try_get_bucket_pool(&bucket).await?;
-        bucket_pool
-            .interact(move |connection| {
+        let connection = self.try_get_connection(&bucket).await?;
+        connection
+            .write(move |connection| {
                 let transaction = connection.transaction()?;
                 Self::try_create_multipart_upload(
                     &transaction,
@@ -680,11 +658,9 @@ impl S3 for Sqlite {
                     &key_clone,
                     req.credentials,
                 )?;
-                transaction.commit()
+                Ok(transaction.commit()?)
             })
-            .await
-            .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
-            .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
+            .await?;
 
         let output = CreateMultipartUploadOutput {
             bucket: Some(bucket),
@@ -730,12 +706,10 @@ impl S3 for Sqlite {
         }
 
         let md5_clone = md5.clone();
-        let bucket_pool = self.try_get_bucket_pool(&bucket).await?;
-        bucket_pool
-            .interact(move |connection| {
-                let transaction = connection
-                    .transaction()
-                    .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
+        let connection = self.try_get_connection(&bucket).await?;
+        connection
+            .write(move |connection| {
+                let transaction = connection.transaction()?;
 
                 if Self::try_verify_upload_id(
                     &transaction,
@@ -743,11 +717,10 @@ impl S3 for Sqlite {
                     &bucket,
                     &key,
                     req.credentials,
-                )
-                .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
+                )?
                 .not()
                 {
-                    return Err(s3_error!(AccessDenied));
+                    return Err(s3_error!(AccessDenied).into());
                 };
 
                 Self::try_put_multipart(
@@ -760,19 +733,11 @@ impl S3 for Sqlite {
                         size,
                         md5: Some(md5_clone),
                     },
-                )
-                .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
+                )?;
 
-                transaction
-                    .commit()
-                    .map_err(|err| S3Error::with_message(InternalError, err.to_string()))
+                Ok(transaction.commit()?)
             })
-            .await
-            .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
-            .map_err(|err| match err.code() {
-                S3ErrorCode::AccessDenied => err,
-                _ => s3_error!(InternalError),
-            })?;
+            .await?;
 
         let output = UploadPartOutput {
             e_tag: Some(md5),
@@ -797,9 +762,9 @@ impl S3 for Sqlite {
 
         let bucket_clone = bucket.clone();
         let key_clone = key.clone();
-        let bucket_pool = self.try_get_bucket_pool(&bucket).await?;
-        let parts = bucket_pool
-            .interact(move |connection| {
+        let connection = self.try_get_connection(&bucket).await?;
+        let parts = connection
+            .read(move |connection| {
                 let transaction = connection
                     .transaction()
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
@@ -814,7 +779,7 @@ impl S3 for Sqlite {
                 .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
                 .not()
                 {
-                    return Err(s3_error!(AccessDenied));
+                    return Err(s3_error!(AccessDenied).into());
                 };
 
                 let parts = Self::try_list_multipart(&transaction, upload_id)
@@ -824,19 +789,14 @@ impl S3 for Sqlite {
 
                 Ok(parts)
             })
-            .await
-            .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
-            .map_err(|err| match err.code() {
-                S3ErrorCode::AccessDenied => err,
-                _ => s3_error!(InternalError),
-            })?;
+            .await?;
 
         let parts = parts
             .into_iter()
             .map(|part| Part {
                 last_modified: Some(part.last_modified.into()),
-                part_number: part.part_number,
-                size: part.size,
+                part_number: Some(part.part_number),
+                size: Some(part.size),
                 ..Default::default()
             })
             .collect::<Vec<_>>();
@@ -876,16 +836,16 @@ impl S3 for Sqlite {
         for part in multipart_upload.parts.into_iter().flatten() {
             let part_number = part.part_number;
             cnt += 1;
-            if part_number != cnt {
+            if part_number != Some(cnt) {
                 return Err(s3_error!(InvalidRequest, "invalid part order"));
             }
         }
 
         let bucket_clone = bucket.clone();
         let key_clone = key.clone();
-        let bucket_pool = self.try_get_bucket_pool(&bucket).await?;
-        let md5 = bucket_pool
-            .interact(move |connection| {
+        let connection = self.try_get_connection(&bucket).await?;
+        let md5 = connection
+            .write(move |connection| {
                 let transaction = connection
                     .transaction()
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
@@ -900,7 +860,7 @@ impl S3 for Sqlite {
                 .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
                 .not()
                 {
-                    return Err(s3_error!(AccessDenied));
+                    return Err(s3_error!(AccessDenied).into());
                 };
 
                 let parts = Self::try_get_multiparts(&transaction, upload_id)
@@ -938,12 +898,7 @@ impl S3 for Sqlite {
 
                 Ok(md5)
             })
-            .await
-            .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
-            .map_err(|err| match err.code() {
-                S3ErrorCode::AccessDenied => err,
-                _ => s3_error!(InternalError),
-            })?;
+            .await?;
 
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket),

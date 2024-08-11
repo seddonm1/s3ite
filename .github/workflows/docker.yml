@@ -1,14 +1,20 @@
 name: Build and publish a Docker image to ghcr.io
 on:
   release:
-    types: [ published ]
+    types: [published]
 
 jobs:
   docker_publish:
     runs-on: ubuntu-latest
     steps:
-      - name: 'Checkout GitHub Action'
-        uses: actions/checkout@main
+      - name: "Checkout GitHub Action"
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Docker meta
         id: meta
@@ -21,17 +27,18 @@ jobs:
 
       - name: Login to image repository
         if: github.ref_type == 'tag'
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.PACKAGES_GITHUB_TOKEN }}
 
       - name: Build and push
-        uses: docker/build-push-action@v3
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
+          platforms: linux/amd64,linux/arm64
           push: ${{ github.ref_type == 'tag' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
