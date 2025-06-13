@@ -1,24 +1,23 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::all, clippy::pedantic)]
 
-use hyper_util::service::TowerToHyperService;
-use s3ite::{Config, JournalMode, Result, S3ite, Sqlite};
-use s3ite::{Synchronous, TempStore};
-
-use s3s::auth::SimpleAuth;
-use s3s::service::S3ServiceBuilder;
-use tower::limit::ConcurrencyLimitLayer;
-use tower_http::cors::CorsLayer;
-
-use std::fs;
-use std::net::IpAddr;
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use tokio::net::TcpListener;
+use std::{
+    fs,
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+};
 
 use clap::Parser;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto;
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto,
+    service::TowerToHyperService,
+};
+use s3ite::{Config, JournalMode, Result, S3ite, Sqlite, Synchronous, TempStore};
+use s3s::{auth::SimpleAuth, host::MultiDomain, service::S3ServiceBuilder};
+use tokio::net::TcpListener;
+use tower::limit::ConcurrencyLimitLayer;
+use tower_http::cors::CorsLayer;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -161,7 +160,7 @@ async fn main() -> Result<()> {
 
         // Enable parsing virtual-hosted-style requests
         if let Some(domain_name) = &config.domain_name {
-            s3.set_base_domain(domain_name);
+            s3.set_host(MultiDomain::new(&[domain_name]).unwrap());
         }
 
         s3.build().into_shared()
@@ -223,7 +222,7 @@ async fn main() -> Result<()> {
             tokio::spawn(async move {
                 let _ = conn.await;
             });
-        };
+        }
     }
 
     tokio::select! {

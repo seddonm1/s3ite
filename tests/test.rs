@@ -4,30 +4,25 @@
     clippy::must_use_candidate, //
 )]
 
-use s3ite::{Config, Sqlite};
-use s3s::auth::SimpleAuth;
-use s3s::service::S3ServiceBuilder;
-
-use std::env;
-use std::fs;
-use std::ops::Deref;
-
-use aws_config::SdkConfig;
-use aws_credential_types::provider::SharedCredentialsProvider;
-use aws_sdk_s3::config::Credentials;
-use aws_sdk_s3::config::Region;
-use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::BucketLocationConstraint;
-use aws_sdk_s3::types::CompletedMultipartUpload;
-use aws_sdk_s3::types::CompletedPart;
-use aws_sdk_s3::types::CreateBucketConfiguration;
-use aws_sdk_s3::Client;
+use std::{env, fs, ops::Deref};
 
 use anyhow::Result;
+use aws_config::SdkConfig;
+use aws_credential_types::provider::SharedCredentialsProvider;
+use aws_sdk_s3::{
+    config::{Credentials, Region},
+    primitives::ByteStream,
+    types::{
+        BucketLocationConstraint, CompletedMultipartUpload, CompletedPart,
+        CreateBucketConfiguration,
+    },
+    Client,
+};
 use md5::{Digest, Md5};
 use once_cell::sync::Lazy;
-use tokio::sync::Mutex;
-use tokio::sync::MutexGuard;
+use s3ite::{Config, Sqlite};
+use s3s::{auth::SimpleAuth, host::MultiDomain, service::S3ServiceBuilder};
+use tokio::sync::{Mutex, MutexGuard};
 use tracing::{debug, error};
 use uuid::Uuid;
 
@@ -74,7 +69,7 @@ impl TestContext {
                 cred.access_key_id(),
                 cred.secret_access_key(),
             ));
-            b.set_base_domain(DOMAIN_NAME);
+            b.set_host(MultiDomain::new(&[DOMAIN_NAME]).unwrap());
             b.build()
         };
 
@@ -343,7 +338,7 @@ async fn test_read_only_object() -> Result<()> {
                 .root_cause()
                 .to_string()
                 .contains("database is in read-only mode") => {}
-        other => panic!("{:?}", other),
+        other => panic!("{other:?}"),
     };
 
     Ok(())

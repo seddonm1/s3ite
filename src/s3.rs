@@ -1,26 +1,21 @@
-use crate::error::*;
-use crate::sqlite::ContinuationToken;
-use crate::sqlite::KeyValue;
-use crate::sqlite::Multipart;
-use crate::sqlite::Sqlite;
-use crate::utils::{base64, copy_bytes, hex};
+use std::ops::Not;
 
 use bytes::Bytes;
-use futures::stream;
-use futures::TryStreamExt;
+use futures::{stream, TryStreamExt};
 use md5::{Digest, Md5};
-use s3s::dto::*;
-use s3s::s3_error;
-use s3s::S3Error;
-use s3s::S3ErrorCode::InternalError;
-use s3s::S3Result;
-use s3s::S3;
-use s3s::{S3Request, S3Response};
-use std::ops::Not;
+use s3s::{
+    dto::*, s3_error, S3Error, S3ErrorCode::InternalError, S3Request, S3Response, S3Result, S3,
+};
 use time::OffsetDateTime;
 use tokio::fs;
 use tracing::debug;
 use uuid::Uuid;
+
+use crate::{
+    error::*,
+    sqlite::{ContinuationToken, KeyValue, Multipart, Sqlite},
+    utils::{base64, copy_bytes, hex},
+};
 
 #[async_trait::async_trait]
 impl S3 for Sqlite {
@@ -133,7 +128,7 @@ impl S3 for Sqlite {
                 guard.remove(&bucket);
             }
             None => return Err(s3_error!(NoSuchBucket)),
-        };
+        }
 
         Ok(S3Response::new(DeleteBucketOutput {}))
     }
@@ -349,7 +344,12 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<ListBucketsInput>,
     ) -> S3Result<S3Response<ListBucketsOutput>> {
-        let ListBucketsInput {} = req.input;
+        let ListBucketsInput {
+            bucket_region: _,
+            continuation_token: _,
+            max_buckets: _,
+            prefix: _,
+        } = req.input;
 
         let mut buckets: Vec<Bucket> = Vec::new();
 
@@ -362,6 +362,7 @@ impl S3 for Sqlite {
                 Timestamp::from(try_!(file_meta.created().or(file_meta.modified())));
 
             let bucket = Bucket {
+                bucket_region: None,
                 creation_date: Some(created_or_modified_date),
                 name: Some(name.clone()),
             };
@@ -369,8 +370,10 @@ impl S3 for Sqlite {
         }
 
         let output = ListBucketsOutput {
+            continuation_token: None,
             buckets: Some(buckets),
             owner: None,
+            prefix: None,
         };
         Ok(S3Response::new(output))
     }
@@ -442,8 +445,8 @@ impl S3 for Sqlite {
                         let transaction = connection.transaction()?;
                         Ok(Self::try_list_objects(
                             &transaction,
-                            &prefix_clone,
-                            &start_after_clone,
+                            prefix_clone.as_ref(),
+                            start_after_clone.as_ref(),
                         )?)
                     })
                     .await?;
@@ -568,7 +571,7 @@ impl S3 for Sqlite {
                         "Unexpected request body when creating a directory object."
                     ));
                 }
-            };
+            }
 
             connection
                 .write(move |connection| {
@@ -721,7 +724,7 @@ impl S3 for Sqlite {
                 .not()
                 {
                     return Err(s3_error!(AccessDenied).into());
-                };
+                }
 
                 Self::try_put_multipart(
                     &transaction,
@@ -780,7 +783,7 @@ impl S3 for Sqlite {
                 .not()
                 {
                     return Err(s3_error!(AccessDenied).into());
-                };
+                }
 
                 let parts = Self::try_list_multipart(&transaction, upload_id)
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
@@ -861,7 +864,7 @@ impl S3 for Sqlite {
                 .not()
                 {
                     return Err(s3_error!(AccessDenied).into());
-                };
+                }
 
                 let parts = Self::try_get_multiparts(&transaction, upload_id)
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;

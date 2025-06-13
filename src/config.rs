@@ -1,11 +1,12 @@
-use clap::ValueEnum;
-use serde::Deserialize;
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
     str::FromStr,
 };
+
+use clap::ValueEnum;
+use serde::Deserialize;
 
 #[derive(Clone, Deserialize, Debug)]
 #[serde(deny_unknown_fields)]

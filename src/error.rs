@@ -1,7 +1,9 @@
-use crate::database::Message;
-use s3s::S3Error;
 use std::panic::Location;
+
+use s3s::S3Error;
 use tracing::error;
+
+use crate::database::Message;
 
 pub type Result<T> = std::result::Result<T, S3ite>;
 

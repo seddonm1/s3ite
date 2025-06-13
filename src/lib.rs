@@ -18,6 +18,4 @@ mod s3;
 mod sqlite;
 mod utils;
 
-pub use self::config::*;
-pub use self::error::*;
-pub use self::sqlite::*;
+pub use self::{config::*, error::*, sqlite::*};
