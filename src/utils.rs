@@ -1,8 +1,7 @@
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use s3s::StdError;
-use tokio::io::AsyncWrite;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::S3ite;
 

@@ -16,19 +16,20 @@
     missing_debug_implementations
 )]
 
-use crate::error::Result;
-use crate::Config;
-use crossbeam_channel::Sender;
-use rusqlite::{OpenFlags, TransactionBehavior};
-use std::path::Path;
-use std::sync::Arc;
-use std::thread::JoinHandle;
 use std::{
     fmt::{self, Debug},
+    path::Path,
+    sync::Arc,
     thread,
+    thread::JoinHandle,
 };
+
+use crossbeam_channel::Sender;
+use rusqlite::{OpenFlags, TransactionBehavior};
 use tokio::sync::oneshot;
 use tracing::{debug, error};
+
+use crate::{error::Result, Config};
 
 static MESSAGE_BOUND: usize = 100;
 

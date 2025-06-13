@@ -1,23 +1,24 @@
-use crate::database::Connection;
-use crate::error::Result;
-use crate::utils::repeat_vars;
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    ops::Not,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::{Arc, Mutex},
+};
 
 use path_absolutize::Absolutize;
-use rusqlite::Error::ToSqlConversionFailure;
-use rusqlite::{OptionalExtension, ToSql, Transaction};
-use s3s::auth::Credentials;
-use s3s::S3ErrorCode::{InternalError, MethodNotAllowed};
-use s3s::{dto, s3_error, S3Error};
-use std::collections::{HashMap, HashSet};
-use std::env;
-use std::ops::Not;
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use rusqlite::{Error::ToSqlConversionFailure, OptionalExtension, ToSql, Transaction};
+use s3s::{
+    auth::Credentials,
+    dto, s3_error, S3Error,
+    S3ErrorCode::{InternalError, MethodNotAllowed},
+};
 use time::{Duration, OffsetDateTime};
-use tokio::fs;
-use tokio::sync::RwLock;
+use tokio::{fs, sync::RwLock};
 use uuid::Uuid;
+
+use crate::{database::Connection, error::Result, utils::repeat_vars};
 
 #[derive(Debug)]
 pub struct Sqlite {
@@ -274,8 +275,8 @@ impl Sqlite {
     /// resolve object path under the virtual root
     pub(crate) fn try_list_objects(
         transaction: &Transaction,
-        prefix: &Option<String>,
-        start_after: &Option<String>,
+        prefix: Option<&String>,
+        start_after: Option<&String>,
     ) -> rusqlite::Result<Vec<KeySize>> {
         // prefix with the sqlite wildcard
         let prefix = prefix.as_ref().and_then(|prefix| {
