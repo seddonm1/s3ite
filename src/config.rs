@@ -237,7 +237,7 @@ fn default_root() -> PathBuf {
 }
 
 fn default_host() -> IpAddr {
-    IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))
+    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
 }
 
 fn default_port() -> u16 {

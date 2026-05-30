@@ -3,7 +3,7 @@
     clippy::await_holding_lock,
     clippy::cargo_common_metadata,
     clippy::dbg_macro,
-    clippy::empty_enum,
+    clippy::empty_enums,
     clippy::enum_glob_use,
     clippy::inefficient_to_string,
     clippy::mem_forget,

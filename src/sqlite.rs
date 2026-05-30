@@ -20,6 +20,21 @@ use uuid::Uuid;
 
 use crate::{database::Connection, error::Result, utils::repeat_vars};
 
+fn row_u64(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<u64> {
+    let value = row.get::<_, i64>(idx)?;
+    u64::try_from(value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            idx,
+            rusqlite::types::Type::Integer,
+            Box::new(err),
+        )
+    })
+}
+
+fn sql_i64(value: u64) -> rusqlite::Result<i64> {
+    i64::try_from(value).map_err(|err| ToSqlConversionFailure(Box::new(err)))
+}
+
 #[derive(Debug)]
 pub struct Sqlite {
     pub(crate) root: PathBuf,
@@ -149,7 +164,7 @@ impl Sqlite {
         let continuation_tokens_clone = continuation_tokens.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_millis(10000)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 
                 // database maintenance
                 let buckets = buckets_clone.write().await;
@@ -312,7 +327,7 @@ impl Sqlite {
             .query_map(params.as_slice(), |row| {
                 Ok(KeySize {
                     key: row.get(0)?,
-                    size: row.get(1)?,
+                    size: row_u64(row, 1)?,
                     last_modified: row.get(2)?,
                     md5: row.get(3)?,
                 })
@@ -345,7 +360,7 @@ impl Sqlite {
             Ok(KeyValue {
                 key: row.get(0)?,
                 value: Some(row.get::<_, Vec<u8>>(1)?),
-                size: row.get(2)?,
+                size: row_u64(row, 2)?,
                 metadata: row
                     .get::<_, Option<String>>(3)?
                     .map(|metadata| serde_json::from_str(&metadata))
@@ -380,7 +395,7 @@ impl Sqlite {
 
         stmt.query_row([key], |row| {
             Ok(KeyMetadata {
-                size: row.get(0)?,
+                size: row_u64(row, 0)?,
                 metadata: row
                     .get::<_, Option<String>>(1)?
                     .map(|metadata| serde_json::from_str(&metadata))
@@ -421,9 +436,10 @@ impl Sqlite {
             SET size=excluded.size, metadata=excluded.metadata, last_modified=excluded.last_modified, md5=excluded.md5;",
         )?;
 
+        let size = sql_i64(kv.size)?;
         stmt.execute((
             kv.key,
-            kv.size,
+            size,
             kv.metadata
                 .map(|metadata| serde_json::to_string(&metadata))
                 .transpose()

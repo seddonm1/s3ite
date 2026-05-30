@@ -78,10 +78,10 @@ impl S3 for Sqlite {
             .await?;
 
         // replace key with target key
-        object.key = tgt_key.to_string();
+        object.key = tgt_key.clone();
 
         let copy_object_result = CopyObjectResult {
-            e_tag: object.md5.clone(),
+            e_tag: object.md5.clone().map(ETag::Strong),
             last_modified: Some(object.last_modified.into()),
             ..Default::default()
         };
@@ -279,7 +279,7 @@ impl S3 for Sqlite {
             content_length: Some(content_length_i64),
             last_modified: Some(object.last_modified.into()),
             metadata: object.metadata,
-            e_tag: object.md5,
+            e_tag: object.md5.map(ETag::Strong),
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -331,7 +331,7 @@ impl S3 for Sqlite {
 
         let output = HeadObjectOutput {
             content_length: Some(try_!(i64::try_from(object.size))),
-            content_type: Some(content_type),
+            content_type: Some(content_type.to_string()),
             last_modified: Some(object.last_modified.into()),
             metadata: object.metadata,
             ..Default::default()
@@ -501,7 +501,7 @@ impl S3 for Sqlite {
                     key: Some(key_size.key),
                     last_modified: Some(key_size.last_modified.into()),
                     size: Some(i64::try_from(key_size.size)?),
-                    e_tag: Some(key_size.md5),
+                    e_tag: Some(ETag::Strong(key_size.md5)),
                     ..Default::default()
                 })
             })
@@ -631,7 +631,7 @@ impl S3 for Sqlite {
             .await?;
 
         let output = PutObjectOutput {
-            e_tag: Some(md5),
+            e_tag: Some(ETag::Strong(md5)),
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -743,7 +743,7 @@ impl S3 for Sqlite {
             .await?;
 
         let output = UploadPartOutput {
-            e_tag: Some(md5),
+            e_tag: Some(ETag::Strong(md5)),
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -906,7 +906,7 @@ impl S3 for Sqlite {
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket),
             key: Some(key),
-            e_tag: Some(md5),
+            e_tag: Some(ETag::Strong(md5)),
             ..Default::default()
         };
         Ok(S3Response::new(output))

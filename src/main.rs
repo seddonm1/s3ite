@@ -163,7 +163,7 @@ async fn main() -> Result<()> {
             s3.set_host(MultiDomain::new(&[domain_name]).unwrap());
         }
 
-        s3.build().into_shared()
+        s3.build()
     };
 
     // Parse addr
