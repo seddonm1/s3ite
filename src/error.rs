@@ -1,7 +1,7 @@
 #[cfg(feature = "binary")]
 use std::panic::Location;
 
-use s3s::S3Error;
+use s3s::{S3Error, S3ErrorCode};
 #[cfg(feature = "binary")]
 use tracing::error;
 
@@ -19,6 +19,10 @@ pub enum S3ite {
     DatabaseQueueFull,
     #[error("database queue is closed")]
     DatabaseQueueClosed,
+    #[error("bucket does not exist")]
+    BucketNotFound,
+    #[error("database is in read-only mode")]
+    BucketReadOnly,
     #[error("configuration error: {0}")]
     Configuration(String),
     #[error("database worker thread panicked")]
@@ -39,6 +43,14 @@ impl From<S3ite> for S3Error {
     fn from(e: S3ite) -> Self {
         match e {
             S3ite::S3(s3error) => s3error,
+            S3ite::BucketNotFound => S3Error::new(S3ErrorCode::NoSuchBucket),
+            S3ite::BucketReadOnly => S3Error::with_message(
+                S3ErrorCode::MethodNotAllowed,
+                "database is in read-only mode",
+            ),
+            S3ite::Configuration(message) => {
+                S3Error::with_message(S3ErrorCode::InternalError, message)
+            }
             _ => S3Error::internal_error(e),
         }
     }

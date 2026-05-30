@@ -457,22 +457,7 @@ impl S3 for Sqlite {
     ) -> S3Result<S3Response<CreateBucketOutput>> {
         let CreateBucketInput { bucket, .. } = req.input;
 
-        self.validate_mutable_bucket(&bucket)?;
-
-        if self.buckets.read().await.contains_key(&bucket) {
-            return Ok(S3Response::new(CreateBucketOutput::default()));
-        }
-
-        let file_path = self.get_bucket_path(&bucket)?;
-        if file_path.exists() {
-            return Ok(S3Response::new(CreateBucketOutput::default()));
-        }
-
-        self.try_create_bucket(&bucket, file_path)
-            .await
-            .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
-
-        debug!(bucket = %bucket, "created bucket");
+        self.try_create_bucket(&bucket).await?;
 
         let output = CreateBucketOutput::default(); // TODO: handle other fields
         Ok(S3Response::new(output))
@@ -583,7 +568,7 @@ impl S3 for Sqlite {
             .write()
             .await
             .remove(&bucket)
-            .ok_or_else(|| s3_error!(NoSuchBucket))?;
+            .ok_or(S3ite::BucketNotFound)?;
 
         connection.close().await?;
 

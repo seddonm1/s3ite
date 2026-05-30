@@ -8,16 +8,16 @@ use std::{
 
 use path_absolutize::Absolutize;
 use rusqlite::{Error::ToSqlConversionFailure, OptionalExtension, Transaction};
-use s3s::{
-    S3Error,
-    S3ErrorCode::{InternalError, MethodNotAllowed},
-    dto, s3_error,
-};
+use s3s::dto;
 use time::{Duration, OffsetDateTime};
 use tokio::{fs, sync::RwLock};
+use tracing::debug;
 use uuid::Uuid;
 
-use crate::{database::BucketConnection, error::Result};
+use crate::{
+    database::BucketConnection,
+    error::{Result, S3ite},
+};
 
 fn row_u64(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<u64> {
     let value = row.get::<_, i64>(idx)?;
@@ -188,10 +188,9 @@ impl Sqlite {
             .copied()
             .collect::<Vec<_>>();
         if difference.is_empty().not() {
-            Err(S3Error::with_message(
-                InternalError,
-                format!("found configurations for buckets: {difference:?} that do not exist"),
-            ))?;
+            return Err(S3ite::Configuration(format!(
+                "found configurations for buckets: {difference:?} that do not exist"
+            )));
         }
 
         let buckets = Arc::new(RwLock::new(buckets));
@@ -252,12 +251,19 @@ impl Sqlite {
             .read()
             .await
             .get(bucket)
-            .ok_or_else(|| s3_error!(NoSuchBucket))?
+            .ok_or(S3ite::BucketNotFound)?
             .to_owned())
     }
 
-    /// Creates a bucket database and registers its connection.
-    pub(crate) async fn try_create_bucket(&self, bucket: &str, file_path: PathBuf) -> Result<()> {
+    /// Creates or opens a bucket database and registers its connection.
+    pub(crate) async fn try_create_bucket(&self, bucket: &str) -> Result<()> {
+        self.validate_mutable_bucket(bucket)?;
+
+        if self.buckets.read().await.contains_key(bucket) {
+            return Ok(());
+        }
+
+        let file_path = self.get_bucket_path(bucket)?;
         let config = self.config.clone();
 
         let connection = BucketConnection::open(file_path, &config, bucket).await?;
@@ -272,10 +278,11 @@ impl Sqlite {
             })
             .await?;
 
-        self.buckets
-            .write()
-            .await
-            .insert(bucket.to_string(), Arc::new(connection));
+        let mut buckets = self.buckets.write().await;
+        if buckets.contains_key(bucket).not() {
+            buckets.insert(bucket.to_string(), Arc::new(connection));
+            debug!(bucket = %bucket, "created bucket");
+        }
 
         Ok(())
     }
@@ -839,10 +846,7 @@ impl Sqlite {
     /// Rejects mutations for read-only bucket configuration.
     pub(crate) fn validate_mutable_bucket(&self, bucket: &str) -> Result<()> {
         if self.config.read_only(Some(bucket)) {
-            Err(S3Error::with_message(
-                MethodNotAllowed,
-                "database is in read-only mode",
-            ))?;
+            return Err(S3ite::BucketReadOnly);
         }
         Ok(())
     }
