@@ -15,8 +15,6 @@ pub enum S3ite {
     Rusqlite(rusqlite::Error),
     #[error("Io {}", .0)]
     Io(std::io::Error),
-    #[error("Crossbeam")]
-    Crossbeam,
     #[error("database queue is full")]
     DatabaseQueueFull,
     #[error("database queue is closed")]

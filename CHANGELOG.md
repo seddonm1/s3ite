@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Change the default SQLite cache size from `67_108_864` KiB to `65_536` KiB.
 - Rework SQLite connection management so read threads are configured independently, database queues fail fast when full or closed, and shutdown joins worker threads instead of busy-waiting.
 - Replace process-global listing continuation snapshots with keyset pagination over ordered keys.
+- Reduce the direct dependency surface by removing unused dependencies, feature-gating binary-only crates, and replacing `crossbeam-channel` worker queues with `std::sync::mpsc::sync_channel`.
 - Ignore local reference clones and local `s3-tests` runtime artifacts.
 
 ### Fixed

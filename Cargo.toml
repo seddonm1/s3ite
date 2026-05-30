@@ -30,7 +30,6 @@ binary = [
 async-trait = "0.1.89"
 bytes = "1.11.1"
 clap = { version = "4.6.1", optional = true, features = ["derive"] }
-crossbeam-channel = "0.5.15"
 futures = "0.3.32"
 hyper = { version = "1.10.1", optional = true, default-features = false, features = [
     "http1",

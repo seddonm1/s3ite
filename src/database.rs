@@ -4,12 +4,12 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
     },
     thread,
     thread::JoinHandle,
 };
 
-use crossbeam_channel::{Receiver, Sender, TrySendError};
 use rusqlite::{OpenFlags, TransactionBehavior};
 use tokio::sync::oneshot;
 use tracing::{debug, error};
@@ -24,6 +24,9 @@ const QUEUE_BOUND: usize = 100;
 
 /// Unit of work executed by a worker-owned database connection.
 type CallFn = Box<dyn FnOnce(&mut rusqlite::Connection) + Send + 'static>;
+
+/// Shared receiving end for a worker queue.
+type SharedReceiver = Arc<Mutex<Receiver<WorkerCommand>>>;
 
 /// Command sent to a database worker thread.
 enum WorkerCommand {
@@ -58,8 +61,8 @@ impl Debug for BucketConnection {
 
 /// Shared worker state behind cloned connection handles.
 struct BucketConnectionInner {
-    writer_sender: Sender<WorkerCommand>,
-    reader_sender: Sender<WorkerCommand>,
+    writer_sender: SyncSender<WorkerCommand>,
+    reader_sender: SyncSender<WorkerCommand>,
     writer_handle: Mutex<Option<JoinHandle<()>>>,
     reader_handles: Mutex<Vec<JoinHandle<()>>>,
     closed: AtomicBool,
@@ -184,14 +187,13 @@ impl BucketConnectionInner {
         F: FnOnce() -> rusqlite::Result<rusqlite::Connection> + Send + 'static,
         G: Fn() -> rusqlite::Result<rusqlite::Connection> + Send + Sync + 'static,
     {
-        let (writer_sender, writer_receiver) =
-            crossbeam_channel::bounded::<WorkerCommand>(QUEUE_BOUND);
+        let (writer_sender, writer_receiver) = sync_channel::<WorkerCommand>(QUEUE_BOUND);
         let (writer_handle, writer_started) =
-            WorkerRole::Writer.spawn(writer_receiver, open_writer);
+            WorkerRole::Writer.spawn(Arc::new(Mutex::new(writer_receiver)), open_writer);
         Self::wait_for_worker(writer_started).await?;
 
-        let (reader_sender, reader_receiver) =
-            crossbeam_channel::bounded::<WorkerCommand>(QUEUE_BOUND);
+        let (reader_sender, reader_receiver) = sync_channel::<WorkerCommand>(QUEUE_BOUND);
+        let reader_receiver = Arc::new(Mutex::new(reader_receiver));
         let mut reader_handles = Vec::with_capacity(readers);
         for _ in 0..readers {
             let reader_receiver = reader_receiver.clone();
@@ -212,7 +214,7 @@ impl BucketConnectionInner {
     }
 
     /// Runs work on the selected worker queue and returns the closure result.
-    async fn call<F, R>(&self, queue: &Sender<WorkerCommand>, function: F) -> Result<R>
+    async fn call<F, R>(&self, queue: &SyncSender<WorkerCommand>, function: F) -> Result<R>
     where
         F: FnOnce(&mut rusqlite::Connection) -> Result<R> + 'static + Send,
         R: Send + 'static,
@@ -326,7 +328,7 @@ impl WorkerRole {
     /// Spawns a worker thread and returns a startup notification receiver.
     fn spawn<F>(
         self,
-        receiver: Receiver<WorkerCommand>,
+        receiver: SharedReceiver,
         open_connection: F,
     ) -> (JoinHandle<()>, oneshot::Receiver<rusqlite::Result<()>>)
     where
@@ -358,8 +360,19 @@ impl WorkerRole {
     }
 
     /// Runs the worker command loop until the queue closes or shutdown is requested.
-    fn run(self, mut connection: rusqlite::Connection, receiver: &Receiver<WorkerCommand>) {
-        while let Ok(message) = receiver.recv() {
+    fn run(self, mut connection: rusqlite::Connection, receiver: &SharedReceiver) {
+        loop {
+            let message = {
+                let Ok(receiver) = receiver.lock() else {
+                    return;
+                };
+                receiver.recv()
+            };
+
+            let Ok(message) = message else {
+                return;
+            };
+
             match message {
                 WorkerCommand::Execute(function) => function(&mut connection),
                 WorkerCommand::Close => {
