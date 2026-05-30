@@ -1,5 +1,10 @@
 #![forbid(unsafe_code)]
-#![deny(clippy::all, clippy::pedantic)]
+#![deny(
+    clippy::all,
+    clippy::expect_used,
+    clippy::pedantic,
+    clippy::unwrap_used
+)]
 
 use std::net::SocketAddr;
 
@@ -8,7 +13,7 @@ use hyper_util::{
     server::conn::auto,
     service::TowerToHyperService,
 };
-use s3ite::{Config, Result, Sqlite};
+use s3ite::{Config, Result, S3ite, Sqlite};
 use s3s::{auth::SimpleAuth, host::MultiDomain, service::S3ServiceBuilder};
 use tokio::net::TcpListener;
 use tower::limit::ConcurrencyLimitLayer;
@@ -38,7 +43,10 @@ async fn main() -> Result<()> {
 
         // Enable parsing virtual-hosted-style requests
         if let Some(domain_name) = &config.domain_name {
-            s3.set_host(MultiDomain::new(&[domain_name]).unwrap());
+            let domains = [domain_name.as_str()];
+            let domains =
+                MultiDomain::new(&domains).map_err(|err| S3ite::Configuration(err.to_string()))?;
+            s3.set_host(domains);
         }
 
         s3.build()
@@ -85,7 +93,7 @@ async fn main() -> Result<()> {
             );
             let conn = graceful.watch(conn.into_owned());
             tokio::spawn(async move {
-                let _ = conn.await;
+                _ = conn.await;
             });
         } else {
             let conn = http_server.serve_connection(
@@ -98,7 +106,7 @@ async fn main() -> Result<()> {
             );
             let conn = graceful.watch(conn.into_owned());
             tokio::spawn(async move {
-                let _ = conn.await;
+                _ = conn.await;
             });
         }
     }

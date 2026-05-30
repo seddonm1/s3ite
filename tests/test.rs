@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 #![deny(
     clippy::all, //
+    clippy::expect_used, //
     clippy::must_use_candidate, //
+    clippy::unwrap_used, //
 )]
 
 use std::{collections::HashMap, fs, ops::Deref, path::PathBuf};
@@ -50,22 +52,26 @@ pub struct TestContext {
 }
 
 impl TestContext {
-    pub async fn new(config: Option<Config>) -> Self {
+    pub async fn new(config: Option<Config>) -> Result<Self> {
         Self::new_with_root(config, PathBuf::from(FS_ROOT), true).await
     }
 
-    pub async fn new_with_root(config: Option<Config>, root: PathBuf, cleanup: bool) -> Self {
+    pub async fn new_with_root(
+        config: Option<Config>,
+        root: PathBuf,
+        cleanup: bool,
+    ) -> Result<Self> {
         Lazy::force(&TRACING);
 
         // Fake credentials
         let cred = Credentials::for_tests();
 
         // Setup S3 provider
-        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&root)?;
         let mut config = config.unwrap_or_default();
         config.root = root.clone();
 
-        let fs = Sqlite::new(&config).await.unwrap();
+        let fs = Sqlite::new(&config).await?;
 
         // Setup S3 service
         let service = {
@@ -74,7 +80,7 @@ impl TestContext {
                 cred.access_key_id(),
                 cred.secret_access_key(),
             ));
-            b.set_host(MultiDomain::new(&[DOMAIN_NAME]).unwrap());
+            b.set_host(MultiDomain::new(&[DOMAIN_NAME])?);
             b.build()
         };
 
@@ -89,11 +95,11 @@ impl TestContext {
             .endpoint_url(format!("http://{DOMAIN_NAME}"))
             .build();
 
-        Self {
+        Ok(Self {
             client: Client::new(&config),
             root,
             cleanup,
-        }
+        })
     }
 }
 
@@ -108,7 +114,7 @@ impl Deref for TestContext {
 impl Drop for TestContext {
     fn drop(&mut self) {
         if self.cleanup {
-            fs::remove_dir_all(&self.root).unwrap();
+            fs::remove_dir_all(&self.root).ok();
         }
     }
 }
@@ -191,7 +197,10 @@ async fn upload_part_body(
         .await?;
 
     Ok(CompletedPart::builder()
-        .e_tag(part.e_tag.unwrap())
+        .e_tag(
+            part.e_tag
+                .ok_or_else(|| anyhow::anyhow!("upload part response missing ETag"))?,
+        )
         .part_number(part_number)
         .build())
 }
@@ -215,7 +224,7 @@ fn assert_error_contains(error: impl std::fmt::Debug, text: &str) {
 #[tracing::instrument]
 async fn test_list_buckets() -> Result<()> {
     let _guard = serial().await;
-    let context = TestContext::new(None).await;
+    let context = TestContext::new(None).await?;
 
     let buckets = vec![
         format!("test-list-buckets-{}", Uuid::new_v4()),
@@ -254,7 +263,7 @@ async fn test_list_buckets() -> Result<()> {
 #[tracing::instrument]
 async fn test_single_object() -> Result<()> {
     let _guard = serial().await;
-    let context = TestContext::new(None).await;
+    let context = TestContext::new(None).await?;
 
     let bucket = format!("test-single-object-{}", Uuid::new_v4());
     let key = "sample.txt";
@@ -285,7 +294,9 @@ async fn test_single_object() -> Result<()> {
 
     // get_object
     let get_object_output = context.get_object().bucket(&bucket).key(key).send().await?;
-    let content_length = get_object_output.content_length().unwrap();
+    let content_length = get_object_output
+        .content_length()
+        .ok_or_else(|| anyhow::anyhow!("get object response missing content length"))?;
     let body = get_object_output.body.collect().await?.into_bytes();
 
     assert_eq!(content_length as usize, content.len());
@@ -316,7 +327,7 @@ async fn test_single_object() -> Result<()> {
 #[tracing::instrument]
 async fn test_get_object_ranges() -> Result<()> {
     let _guard = serial().await;
-    let context = TestContext::new(None).await;
+    let context = TestContext::new(None).await?;
 
     let bucket = format!("test-ranges-{}", Uuid::new_v4());
     let key = "sample.txt";
@@ -372,14 +383,16 @@ async fn test_get_object_ranges() -> Result<()> {
     assert_eq!(suffix.content_range(), Some("bytes 4-5/6"));
     assert_eq!(suffix.body.collect().await?.into_bytes().as_ref(), b"ef");
 
-    let err = context
+    let Err(err) = context
         .get_object()
         .bucket(&bucket)
         .key(key)
         .range("bytes=99-100")
         .send()
         .await
-        .unwrap_err();
+    else {
+        anyhow::bail!("unsatisfiable range should fail");
+    };
     assert_error_contains(err, "InvalidRange");
 
     let empty_key = "empty.txt";
@@ -410,7 +423,7 @@ async fn test_get_object_ranges() -> Result<()> {
 #[tracing::instrument]
 async fn test_list_objects_prefix_delimiter_and_pagination() -> Result<()> {
     let _guard = serial().await;
-    let context = TestContext::new(None).await;
+    let context = TestContext::new(None).await?;
 
     let bucket = format!("test-list-objects-{}", Uuid::new_v4());
     create_bucket(&context, &bucket).await?;
@@ -522,7 +535,11 @@ async fn test_list_objects_prefix_delimiter_and_pagination() -> Result<()> {
         .list_objects_v2()
         .bucket(&bucket)
         .prefix("page/")
-        .continuation_token(first_page.next_continuation_token().unwrap())
+        .continuation_token(
+            first_page
+                .next_continuation_token()
+                .ok_or_else(|| anyhow::anyhow!("first page missing continuation token"))?,
+        )
         .send()
         .await?;
     let second_page_keys = second_page
@@ -568,7 +585,7 @@ async fn test_list_objects_prefix_delimiter_and_pagination() -> Result<()> {
 #[tracing::instrument]
 async fn test_list_objects_ceph_edge_semantics() -> Result<()> {
     let _guard = serial().await;
-    let context = TestContext::new(None).await;
+    let context = TestContext::new(None).await?;
 
     let bucket = format!("test-list-ceph-edges-{}", Uuid::new_v4());
     create_bucket(&context, &bucket).await?;
@@ -644,7 +661,11 @@ async fn test_list_objects_ceph_edge_semantics() -> Result<()> {
         .list_objects()
         .bucket(&bucket)
         .delimiter("/")
-        .marker(v1_first.next_marker().unwrap())
+        .marker(
+            v1_first
+                .next_marker()
+                .ok_or_else(|| anyhow::anyhow!("first v1 page missing next marker"))?,
+        )
         .max_keys(1)
         .send()
         .await?;
@@ -653,7 +674,11 @@ async fn test_list_objects_ceph_edge_semantics() -> Result<()> {
         .list_objects()
         .bucket(&bucket)
         .delimiter("/")
-        .marker(v1_second.next_marker().unwrap())
+        .marker(
+            v1_second
+                .next_marker()
+                .ok_or_else(|| anyhow::anyhow!("second v1 page missing next marker"))?,
+        )
         .max_keys(1)
         .send()
         .await?;
@@ -677,7 +702,11 @@ async fn test_list_objects_ceph_edge_semantics() -> Result<()> {
         .list_objects_v2()
         .bucket(&bucket)
         .delimiter("/")
-        .continuation_token(v2_first.next_continuation_token().unwrap())
+        .continuation_token(
+            v2_first
+                .next_continuation_token()
+                .ok_or_else(|| anyhow::anyhow!("first v2 page missing continuation token"))?,
+        )
         .max_keys(1)
         .send()
         .await?;
@@ -685,7 +714,11 @@ async fn test_list_objects_ceph_edge_semantics() -> Result<()> {
         .list_objects_v2()
         .bucket(&bucket)
         .delimiter("/")
-        .continuation_token(v2_second.next_continuation_token().unwrap())
+        .continuation_token(
+            v2_second
+                .next_continuation_token()
+                .ok_or_else(|| anyhow::anyhow!("second v2 page missing continuation token"))?,
+        )
         .max_keys(1)
         .send()
         .await?;
@@ -744,7 +777,7 @@ async fn test_list_objects_ceph_edge_semantics() -> Result<()> {
 #[tracing::instrument]
 async fn test_list_object_versions_for_unversioned_bucket() -> Result<()> {
     let _guard = serial().await;
-    let context = TestContext::new(None).await;
+    let context = TestContext::new(None).await?;
 
     let bucket = format!("test-list-object-versions-{}", Uuid::new_v4());
     create_bucket(&context, &bucket).await?;
@@ -783,14 +816,21 @@ async fn test_list_object_versions_for_unversioned_bucket() -> Result<()> {
             .all(|version| version.version_id() == Some("null"))
     );
 
-    let second_page = context
-        .list_object_versions()
-        .bucket(&bucket)
-        .prefix("version/")
-        .key_marker(first_page.next_key_marker().unwrap())
-        .version_id_marker(first_page.next_version_id_marker().unwrap())
-        .send()
-        .await?;
+    let second_page =
+        context
+            .list_object_versions()
+            .bucket(&bucket)
+            .prefix("version/")
+            .key_marker(
+                first_page
+                    .next_key_marker()
+                    .ok_or_else(|| anyhow::anyhow!("first version page missing next key marker"))?,
+            )
+            .version_id_marker(first_page.next_version_id_marker().ok_or_else(|| {
+                anyhow::anyhow!("first version page missing next version ID marker")
+            })?)
+            .send()
+            .await?;
     let second_page_keys = second_page
         .versions()
         .iter()
@@ -831,7 +871,7 @@ async fn test_list_object_versions_for_unversioned_bucket() -> Result<()> {
 #[tracing::instrument]
 async fn test_delete_and_trailing_slash_conformance() -> Result<()> {
     let _guard = serial().await;
-    let context = TestContext::new(None).await;
+    let context = TestContext::new(None).await?;
 
     let bucket = format!("test-delete-conformance-{}", Uuid::new_v4());
     create_bucket(&context, &bucket).await?;
@@ -848,12 +888,9 @@ async fn test_delete_and_trailing_slash_conformance() -> Result<()> {
         b"folder/"
     );
 
-    let err = context
-        .delete_bucket()
-        .bucket(&bucket)
-        .send()
-        .await
-        .unwrap_err();
+    let Err(err) = context.delete_bucket().bucket(&bucket).send().await else {
+        anyhow::bail!("deleting a non-empty bucket should fail");
+    };
     assert_error_contains(err, "BucketNotEmpty");
 
     let delete = Delete::builder()
@@ -889,13 +926,15 @@ async fn test_delete_and_trailing_slash_conformance() -> Result<()> {
         .map(|index| object_identifier(&format!("key-{index}")))
         .collect::<Result<Vec<_>>>()?;
     let too_many = Delete::builder().set_objects(Some(too_many)).build()?;
-    let err = context
+    let Err(err) = context
         .delete_objects()
         .bucket(&bucket)
         .delete(too_many)
         .send()
         .await
-        .unwrap_err();
+    else {
+        anyhow::bail!("deleting too many objects should fail");
+    };
     assert_error_contains(err, "MalformedXML");
 
     delete_bucket(&context, &bucket).await?;
@@ -907,7 +946,7 @@ async fn test_delete_and_trailing_slash_conformance() -> Result<()> {
 #[tracing::instrument]
 async fn test_multipart() -> Result<()> {
     let _guard = serial().await;
-    let context = TestContext::new(None).await;
+    let context = TestContext::new(None).await?;
 
     let bucket = format!("test-multipart-{}", Uuid::new_v4());
     create_bucket(&context, &bucket).await?;
@@ -930,7 +969,9 @@ async fn test_multipart() -> Result<()> {
             Ok(ans) => debug!(?ans),
             Err(err) => error!(?err),
         }
-        result?.upload_id.unwrap()
+        result?
+            .upload_id
+            .ok_or_else(|| anyhow::anyhow!("create multipart response missing upload ID"))?
     };
     let upload_id = upload_id.as_str();
 
@@ -967,7 +1008,7 @@ async fn test_multipart() -> Result<()> {
             .set_parts(Some(upload_parts))
             .build();
 
-        let _ = context
+        context
             .complete_multipart_upload()
             .bucket(&bucket)
             .key(key)
@@ -983,7 +1024,9 @@ async fn test_multipart() -> Result<()> {
             Ok(get_object_output) => {
                 debug!(?get_object_output);
 
-                let content_length = get_object_output.content_length().unwrap();
+                let content_length = get_object_output
+                    .content_length()
+                    .ok_or_else(|| anyhow::anyhow!("get object response missing content length"))?;
                 let body = get_object_output.body.collect().await?.into_bytes();
 
                 assert_eq!(content_length as usize, content.len());
@@ -1005,7 +1048,7 @@ async fn test_multipart() -> Result<()> {
 #[tracing::instrument]
 async fn test_multipart_completion_validation_and_etag() -> Result<()> {
     let _guard = serial().await;
-    let context = TestContext::new(None).await;
+    let context = TestContext::new(None).await?;
 
     let bucket = format!("test-multipart-validation-{}", Uuid::new_v4());
     create_bucket(&context, &bucket).await?;
@@ -1018,7 +1061,7 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
         .send()
         .await?
         .upload_id
-        .unwrap();
+        .ok_or_else(|| anyhow::anyhow!("create multipart response missing upload ID"))?;
     let small_part1 =
         upload_part(&context, &bucket, small_key, &small_upload_id, 1, b"one").await?;
     let small_part2 =
@@ -1026,7 +1069,7 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
     let small_upload = CompletedMultipartUpload::builder()
         .set_parts(Some(vec![small_part1, small_part2]))
         .build();
-    let err = context
+    let Err(err) = context
         .complete_multipart_upload()
         .bucket(&bucket)
         .key(small_key)
@@ -1034,7 +1077,9 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
         .multipart_upload(small_upload)
         .send()
         .await
-        .unwrap_err();
+    else {
+        anyhow::bail!("small multipart completion should fail");
+    };
     assert_error_contains(err, "EntityTooSmall");
 
     let key = "valid.txt";
@@ -1045,7 +1090,7 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
         .send()
         .await?
         .upload_id
-        .unwrap();
+        .ok_or_else(|| anyhow::anyhow!("create multipart response missing upload ID"))?;
     let first_part = vec![b'a'; 5 * 1024 * 1024];
     let mut expected = first_part.clone();
     expected.extend_from_slice(b"world");
@@ -1070,7 +1115,10 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
         .multipart_upload(upload)
         .send()
         .await?;
-    assert!(complete.e_tag().unwrap().trim_matches('"').ends_with("-2"));
+    let complete_etag = complete
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("complete multipart response missing ETag"))?;
+    assert!(complete_etag.trim_matches('"').ends_with("-2"));
 
     let object = context.get_object().bucket(&bucket).key(key).send().await?;
     assert_eq!(
@@ -1086,7 +1134,7 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
         .send()
         .await?
         .upload_id
-        .unwrap();
+        .ok_or_else(|| anyhow::anyhow!("create multipart response missing upload ID"))?;
     let missing_part1 = upload_part(
         &context,
         &bucket,
@@ -1108,7 +1156,7 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
     let missing_upload = CompletedMultipartUpload::builder()
         .set_parts(Some(vec![missing_part1]))
         .build();
-    let err = context
+    let Err(err) = context
         .complete_multipart_upload()
         .bucket(&bucket)
         .key(missing_key)
@@ -1116,7 +1164,9 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
         .multipart_upload(missing_upload)
         .send()
         .await
-        .unwrap_err();
+    else {
+        anyhow::bail!("completion with missing part should fail");
+    };
     assert_error_contains(err, "InvalidPart");
 
     let wrong_key = "wrong-etag.txt";
@@ -1127,7 +1177,7 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
         .send()
         .await?
         .upload_id
-        .unwrap();
+        .ok_or_else(|| anyhow::anyhow!("create multipart response missing upload ID"))?;
     let _wrong_part =
         upload_part(&context, &bucket, wrong_key, &wrong_upload_id, 1, b"one").await?;
     let wrong_upload = CompletedMultipartUpload::builder()
@@ -1138,7 +1188,7 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
                 .build(),
         ]))
         .build();
-    let err = context
+    let Err(err) = context
         .complete_multipart_upload()
         .bucket(&bucket)
         .key(wrong_key)
@@ -1146,7 +1196,9 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
         .multipart_upload(wrong_upload)
         .send()
         .await
-        .unwrap_err();
+    else {
+        anyhow::bail!("completion with wrong ETag should fail");
+    };
     assert_error_contains(err, "InvalidPart");
 
     let order_key = "out-of-order.txt";
@@ -1157,7 +1209,7 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
         .send()
         .await?
         .upload_id
-        .unwrap();
+        .ok_or_else(|| anyhow::anyhow!("create multipart response missing upload ID"))?;
     let order_part1 =
         upload_part(&context, &bucket, order_key, &order_upload_id, 1, b"one").await?;
     let order_part2 =
@@ -1165,7 +1217,7 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
     let order_upload = CompletedMultipartUpload::builder()
         .set_parts(Some(vec![order_part2, order_part1]))
         .build();
-    let err = context
+    let Err(err) = context
         .complete_multipart_upload()
         .bucket(&bucket)
         .key(order_key)
@@ -1173,7 +1225,9 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
         .multipart_upload(order_upload)
         .send()
         .await
-        .unwrap_err();
+    else {
+        anyhow::bail!("out-of-order multipart completion should fail");
+    };
     assert_error_contains(err, "InvalidPartOrder");
 
     delete_object(&context, &bucket, key).await?;
@@ -1186,7 +1240,7 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
 #[tracing::instrument]
 async fn test_abort_multipart_upload() -> Result<()> {
     let _guard = serial().await;
-    let context = TestContext::new(None).await;
+    let context = TestContext::new(None).await?;
 
     let bucket = format!("test-multipart-abort-{}", Uuid::new_v4());
     let key = "aborted.txt";
@@ -1199,7 +1253,7 @@ async fn test_abort_multipart_upload() -> Result<()> {
         .send()
         .await?
         .upload_id
-        .unwrap();
+        .ok_or_else(|| anyhow::anyhow!("create multipart response missing upload ID"))?;
     upload_part(&context, &bucket, key, &upload_id, 1, b"unused").await?;
 
     context
@@ -1217,14 +1271,16 @@ async fn test_abort_multipart_upload() -> Result<()> {
         .await?;
     assert!(objects.contents().is_empty());
 
-    let err = context
+    let Err(err) = context
         .abort_multipart_upload()
         .bucket(&bucket)
         .key(key)
         .upload_id("56788")
         .send()
         .await
-        .unwrap_err();
+    else {
+        anyhow::bail!("aborting an invalid upload should fail");
+    };
     assert_error_contains(err, "NoSuchUpload");
 
     delete_bucket(&context, &bucket).await?;
@@ -1240,7 +1296,7 @@ async fn test_read_only_object() -> Result<()> {
         read_only: true,
         ..Default::default()
     }))
-    .await;
+    .await?;
 
     let bucket = format!("test-single-object-{}", Uuid::new_v4());
 
@@ -1263,13 +1319,15 @@ async fn test_zero_readers_fails_startup() -> Result<()> {
     let root = PathBuf::from(format!("{FS_ROOT}-zero-readers-{}", Uuid::new_v4()));
     fs::create_dir_all(&root)?;
 
-    let err = Sqlite::new(&Config {
+    let Err(err) = Sqlite::new(&Config {
         root: root.clone(),
         readers: 0,
         ..Default::default()
     })
     .await
-    .unwrap_err();
+    else {
+        anyhow::bail!("zero readers should fail startup");
+    };
     assert_error_contains(err, "readers must be greater than zero");
 
     fs::remove_dir_all(root)?;
@@ -1287,7 +1345,7 @@ async fn test_bucket_read_only_blocks_delete_and_upload_part() -> Result<()> {
     let content = b"read-only data";
 
     let upload_id = {
-        let context = TestContext::new_with_root(None, root.clone(), false).await;
+        let context = TestContext::new_with_root(None, root.clone(), false).await?;
         create_bucket(&context, &bucket).await?;
         context
             .put_object()
@@ -1303,7 +1361,7 @@ async fn test_bucket_read_only_blocks_delete_and_upload_part() -> Result<()> {
             .send()
             .await?
             .upload_id
-            .unwrap()
+            .ok_or_else(|| anyhow::anyhow!("create multipart response missing upload ID"))?
     };
 
     let mut buckets = HashMap::new();
@@ -1322,18 +1380,20 @@ async fn test_bucket_read_only_blocks_delete_and_upload_part() -> Result<()> {
         root,
         true,
     )
-    .await;
+    .await?;
 
-    let err = context
+    let Err(err) = context
         .delete_object()
         .bucket(&bucket)
         .key(key)
         .send()
         .await
-        .unwrap_err();
+    else {
+        anyhow::bail!("deleting from a read-only bucket should fail");
+    };
     assert_error_contains(err, "database is in read-only mode");
 
-    let err = context
+    let Err(err) = context
         .upload_part()
         .bucket(&bucket)
         .key("multipart.txt")
@@ -1342,7 +1402,9 @@ async fn test_bucket_read_only_blocks_delete_and_upload_part() -> Result<()> {
         .body(ByteStream::from_static(b"blocked"))
         .send()
         .await
-        .unwrap_err();
+    else {
+        anyhow::bail!("uploading a part to a read-only bucket should fail");
+    };
     assert_error_contains(err, "database is in read-only mode");
 
     let object = context.get_object().bucket(&bucket).key(key).send().await?;

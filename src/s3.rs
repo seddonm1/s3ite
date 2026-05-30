@@ -4,8 +4,26 @@ use bytes::Bytes;
 use futures::{TryStreamExt, stream};
 use md5::{Digest, Md5};
 use s3s::{
-    S3, S3Error, S3ErrorCode::InternalError, S3Request, S3Response, S3Result, auth::Credentials,
-    dto::*, s3_error,
+    S3, S3Error,
+    S3ErrorCode::InternalError,
+    S3Request, S3Response, S3Result,
+    auth::Credentials,
+    dto::{
+        AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, CommonPrefix,
+        CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput,
+        CopyObjectOutput, CopyObjectResult, CopySource, CreateBucketInput, CreateBucketOutput,
+        CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketInput,
+        DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput,
+        DeleteObjectsOutput, DeletedObject, ETag, EncodingType, GetBucketLocationInput,
+        GetBucketLocationOutput, GetObjectAclInput, GetObjectAclOutput, GetObjectInput,
+        GetObjectOutput, Grant, Grantee, HeadBucketInput, HeadBucketOutput, HeadObjectInput,
+        HeadObjectOutput, ListBucketsInput, ListBucketsOutput, ListObjectVersionsInput,
+        ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
+        ListObjectsV2Output, ListPartsInput, ListPartsOutput, MetadataDirective, Object,
+        ObjectVersion, ObjectVersionStorageClass, Owner, Part, Permission, PutObjectInput,
+        PutObjectOutput, StreamingBlob, Timestamp, Type, UploadPartInput, UploadPartOutput,
+    },
+    s3_error,
 };
 use time::OffsetDateTime;
 use tokio::fs;
@@ -13,7 +31,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    error::*,
+    error::S3ite,
     sqlite::{KeySize, KeyValue, Multipart, MultipartUploadState, Sqlite},
     utils::{base64, copy_bytes, hex},
 };

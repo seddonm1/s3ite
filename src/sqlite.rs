@@ -3,7 +3,6 @@ use std::{
     env,
     ops::Not,
     path::{Path, PathBuf},
-    str::FromStr,
     sync::Arc,
 };
 
@@ -108,6 +107,11 @@ pub(crate) struct CompletedMultipartUploadState {
 
 impl Sqlite {
     /// Opens configured bucket databases and starts background maintenance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the root path, configured bucket databases, or bucket
+    /// configuration cannot be loaded.
     pub async fn new(config: &crate::Config) -> Result<Self> {
         if config.readers == 0 {
             Err(crate::S3ite::Configuration(
@@ -230,7 +234,7 @@ impl Sqlite {
 
     /// Resolves the database file path for a bucket.
     pub(crate) fn get_bucket_path(&self, bucket: &str) -> Result<PathBuf> {
-        let dir = PathBuf::from_str(&format!("{}.sqlite3", &bucket)).unwrap();
+        let dir = PathBuf::from(format!("{bucket}.sqlite3"));
         self.resolve_abs_path(dir)
     }
 

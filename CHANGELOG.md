@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Upgrade dependencies, including `s3s` to `0.13`, `rusqlite` to `0.40`, Tokio/Hyper/Tower updates, and the AWS test stack pinned to compatible versions.
+- Replace deprecated `serde_yaml` with the maintained `yaml_serde` fork for YAML configuration parsing.
 - Upgrade the crate to Rust edition 2024.
 - Change the default SQLite cache size from `67_108_864` KiB to `65_536` KiB.
 - Rework SQLite connection management so read threads are configured independently, database queues fail fast when full or closed, and shutdown joins worker threads instead of busy-waiting.

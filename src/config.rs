@@ -3,7 +3,6 @@ use std::{
     fs,
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
-    str::FromStr,
 };
 
 use clap::{Parser, ValueEnum};
@@ -151,6 +150,10 @@ impl Default for Config {
 
 impl Config {
     /// Loads configuration from command-line arguments and an optional YAML file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configured YAML file cannot be read or parsed.
     pub fn from_args() -> Result<Self> {
         Self::from_config_args(ConfigArgs::parse())
     }
@@ -374,7 +377,7 @@ pub enum TempStore {
 }
 
 fn default_root() -> PathBuf {
-    PathBuf::from_str(".").unwrap()
+    PathBuf::from(".")
 }
 
 fn default_host() -> IpAddr {
@@ -456,15 +459,18 @@ mod tests {
     }
 
     #[test]
-    fn readers_default_and_deserialize_override() {
+    fn readers_default_and_deserialize_override()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         assert_eq!(Config::default().readers, 4);
 
-        let config: Config = yaml_serde::from_str("readers: 7\n").unwrap();
+        let config: Config = yaml_serde::from_str("readers: 7\n")?;
         assert_eq!(config.readers, 7);
+
+        Ok(())
     }
 
     #[test]
-    fn cli_args_override_yaml_config() {
+    fn cli_args_override_yaml_config() -> std::result::Result<(), Box<dyn std::error::Error>> {
         use clap::Parser as _;
 
         let path = std::env::temp_dir().join(format!("s3ite-{}.yaml", uuid::Uuid::new_v4()));
@@ -475,25 +481,26 @@ mod tests {
             readers: 2
             cache_size: 512
             ",
-        )
-        .unwrap();
+        )?;
+
+        let path_arg = path.to_string_lossy().into_owned();
 
         let args = ConfigArgs::try_parse_from([
             "s3ite",
             "--config",
-            path.to_str().unwrap(),
+            &path_arg,
             "--port",
             "9001",
             "--cache-size",
             "1024",
-        ])
-        .unwrap();
-        let config = Config::from_config_args(args).unwrap();
+        ])?;
+        let config = Config::from_config_args(args)?;
 
         assert_eq!(config.port, 9001);
         assert_eq!(config.readers, 2);
         assert_eq!(config.sqlite.cache_size, 1024);
 
         std::fs::remove_file(path).ok();
+        Ok(())
     }
 }

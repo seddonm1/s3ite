@@ -226,7 +226,7 @@ impl BucketConnectionInner {
         queue
             .try_send(WorkerCommand::Execute(Box::new(move |conn| {
                 let value = function(conn);
-                let _ = sender.send(value);
+                _ = sender.send(value);
             })))
             .map_err(Self::queue_send_error)?;
 
@@ -265,7 +265,11 @@ impl BucketConnectionInner {
             .is_ok();
 
         if should_signal {
-            let reader_count = self.reader_handles.lock().unwrap().len();
+            let reader_count = self
+                .reader_handles
+                .lock()
+                .map_err(|_| S3ite::ThreadJoin)?
+                .len();
             for _ in 0..reader_count {
                 self.reader_sender.send(WorkerCommand::Close).ok();
             }
@@ -276,7 +280,7 @@ impl BucketConnectionInner {
         let mut join_failed = false;
 
         {
-            let mut reader_handles = self.reader_handles.lock().unwrap();
+            let mut reader_handles = self.reader_handles.lock().map_err(|_| S3ite::ThreadJoin)?;
             for reader_handle in reader_handles.drain(..) {
                 if reader_handle.join().is_err() {
                     join_failed = true;
@@ -285,7 +289,7 @@ impl BucketConnectionInner {
         }
 
         {
-            let mut writer_handle = self.writer_handle.lock().unwrap();
+            let mut writer_handle = self.writer_handle.lock().map_err(|_| S3ite::ThreadJoin)?;
             if let Some(writer_handle) = writer_handle.take()
                 && writer_handle.join().is_err()
             {
@@ -338,7 +342,7 @@ impl WorkerRole {
             let conn = match open_connection() {
                 Ok(connection) => connection,
                 Err(error) => {
-                    let _ = result_sender.send(Err(error));
+                    _ = result_sender.send(Err(error));
                     return;
                 }
             };
@@ -391,7 +395,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn close_is_idempotent_and_rejects_later_operations() {
+    async fn close_is_idempotent_and_rejects_later_operations() -> Result<()> {
         let path = std::env::temp_dir().join(format!("s3ite-{}.sqlite3", uuid::Uuid::new_v4()));
         std::fs::remove_file(&path).ok();
 
@@ -399,18 +403,19 @@ mod tests {
             readers: 1,
             ..Default::default()
         };
-        let connection = BucketConnection::open(&path, &config, "bucket")
-            .await
-            .unwrap();
+        let connection = BucketConnection::open(&path, &config, "bucket").await?;
 
-        connection.close().await.unwrap();
-        connection.close().await.unwrap();
+        connection.close().await?;
+        connection.close().await?;
 
-        let err = connection.read(|_| Ok(())).await.unwrap_err();
+        let Err(err) = connection.read(|_| Ok(())).await else {
+            panic!("read after close should fail");
+        };
         assert!(matches!(err, S3ite::DatabaseQueueClosed));
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(format!("{}-wal", path.to_string_lossy())).ok();
         std::fs::remove_file(format!("{}-shm", path.to_string_lossy())).ok();
+        Ok(())
     }
 }
