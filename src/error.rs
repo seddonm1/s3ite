@@ -17,6 +17,14 @@ pub enum S3ite {
     Io(std::io::Error),
     #[error("Crossbeam")]
     Crossbeam,
+    #[error("database queue is full")]
+    DatabaseQueueFull,
+    #[error("database queue is closed")]
+    DatabaseQueueClosed,
+    #[error("configuration error: {0}")]
+    Configuration(String),
+    #[error("database worker thread panicked")]
+    ThreadJoin,
     #[error("Tokio")]
     Tokio,
     #[error("TryFromInt")]
@@ -59,6 +67,15 @@ impl From<rusqlite::Error> for S3ite {
 impl From<crossbeam_channel::SendError<Message>> for S3ite {
     fn from(_value: crossbeam_channel::SendError<Message>) -> Self {
         Self::Crossbeam
+    }
+}
+
+impl From<crossbeam_channel::TrySendError<Message>> for S3ite {
+    fn from(value: crossbeam_channel::TrySendError<Message>) -> Self {
+        match value {
+            crossbeam_channel::TrySendError::Full(_) => Self::DatabaseQueueFull,
+            crossbeam_channel::TrySendError::Disconnected(_) => Self::DatabaseQueueClosed,
+        }
     }
 }
 

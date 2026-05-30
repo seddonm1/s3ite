@@ -35,6 +35,10 @@ pub struct Config {
     /// This can be tuned depending on infrastructure as SSD/HDD will deal with resource contention very differently.
     pub concurrency_limit: u16,
 
+    /// Controls the number of reader connections to `SQLite`.
+    #[serde(default = "default_readers")]
+    pub readers: usize,
+
     /// Allow permissive Cross-Origin Resource Sharing (CORS) requests.
     /// This can be enabled to allow users to access this service from a web service running on a different host.
     #[serde(default = "default_permissive_cors")]
@@ -65,6 +69,7 @@ impl Default for Config {
             access_key: None,
             secret_key: None,
             concurrency_limit: default_concurrency_limit(),
+            readers: default_readers(),
             permissive_cors: default_permissive_cors(),
             read_only: default_read_only(),
             domain_name: None,
@@ -175,7 +180,7 @@ impl Default for Pragmas {
             journal_mode: JournalMode::WAL,
             synchronous: Synchronous::NORMAL,
             temp_store: TempStore::MEMORY,
-            cache_size: 67_108_864,
+            cache_size: default_cache_size(),
         }
     }
 }
@@ -248,6 +253,10 @@ fn default_concurrency_limit() -> u16 {
     16
 }
 
+fn default_readers() -> usize {
+    4
+}
+
 fn default_permissive_cors() -> bool {
     true
 }
@@ -273,5 +282,46 @@ fn default_temp_store() -> TempStore {
 }
 
 fn default_cache_size() -> u32 {
-    67_108_864
+    65_536
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_sqlite_cache_size_is_kib() {
+        let config = Config::default();
+        assert_eq!(config.sqlite.cache_size, 65_536);
+        assert!(config.to_sql(None).contains("PRAGMA cache_size=-65536;"));
+    }
+
+    #[test]
+    fn bucket_cache_size_overrides_service_default() {
+        let mut config = Config::default();
+        config.buckets.insert(
+            "bucket".to_string(),
+            Bucket {
+                read_only: None,
+                sqlite: Some(BucketPragmas {
+                    journal_mode: None,
+                    synchronous: None,
+                    temp_store: None,
+                    cache_size: Some(512),
+                }),
+            },
+        );
+
+        assert!(config
+            .to_sql(Some("bucket"))
+            .contains("PRAGMA cache_size=-512;"));
+    }
+
+    #[test]
+    fn readers_default_and_deserialize_override() {
+        assert_eq!(Config::default().readers, 4);
+
+        let config: Config = serde_yaml::from_str("readers: 7\n").unwrap();
+        assert_eq!(config.readers, 7);
+    }
 }

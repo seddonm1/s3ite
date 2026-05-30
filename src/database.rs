@@ -19,7 +19,10 @@
 use std::{
     fmt::{self, Debug},
     path::Path,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
     thread::JoinHandle,
 };
@@ -29,7 +32,10 @@ use rusqlite::{OpenFlags, TransactionBehavior};
 use tokio::sync::oneshot;
 use tracing::{debug, error};
 
-use crate::{error::Result, Config};
+use crate::{
+    error::{Result, S3ite},
+    Config,
+};
 
 static MESSAGE_BOUND: usize = 100;
 
@@ -54,15 +60,22 @@ impl Debug for Message {
 /// A handle to call functions in background thread.
 #[derive(Clone)]
 pub struct Connection {
+    inner: Arc<ConnectionInner>,
+}
+
+struct ConnectionInner {
     writer_sender: Sender<Message>,
     reader_sender: Sender<Message>,
-    writer_handle: Arc<JoinHandle<()>>,
-    reader_handles: Arc<Vec<JoinHandle<()>>>,
+    writer_handle: Mutex<Option<JoinHandle<()>>>,
+    reader_handles: Mutex<Vec<JoinHandle<()>>>,
+    closed: AtomicBool,
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        self.close();
+        if Arc::strong_count(&self.inner) == 1 {
+            self.inner.close_blocking().ok();
+        }
     }
 }
 
@@ -87,9 +100,14 @@ impl Connection {
 
         let config = config.to_owned();
         let bucket = bucket.to_string();
-        let readers = config.concurrency_limit as usize;
+        let readers = config.readers;
+        if readers == 0 {
+            return Err(S3ite::Configuration(
+                "readers must be greater than zero".to_string(),
+            ));
+        }
 
-        Ok(connect(
+        connect(
             move || {
                 let mut writer = rusqlite::Connection::open(path)?;
                 writer.set_transaction_behavior(TransactionBehavior::Immediate);
@@ -108,7 +126,7 @@ impl Connection {
             }),
             readers,
         )
-        .await?)
+        .await
     }
 
     /// Call a function in background thread and get the result
@@ -124,11 +142,20 @@ impl Connection {
     {
         let (sender, receiver) = oneshot::channel::<Result<R>>();
 
-        self.writer_sender
-            .send(Message::Execute(Box::new(move |conn| {
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(S3ite::DatabaseQueueClosed);
+        }
+
+        self.inner
+            .writer_sender
+            .try_send(Message::Execute(Box::new(move |conn| {
                 let value = function(conn);
                 let _ = sender.send(value);
             })))?;
+
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(S3ite::DatabaseQueueClosed);
+        }
 
         receiver.await?
     }
@@ -146,11 +173,20 @@ impl Connection {
     {
         let (sender, receiver) = oneshot::channel::<Result<R>>();
 
-        self.reader_sender
-            .send(Message::Execute(Box::new(move |conn| {
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(S3ite::DatabaseQueueClosed);
+        }
+
+        self.inner
+            .reader_sender
+            .try_send(Message::Execute(Box::new(move |conn| {
                 let value = function(conn);
                 let _ = sender.send(value);
             })))?;
+
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(S3ite::DatabaseQueueClosed);
+        }
 
         receiver.await?
     }
@@ -170,21 +206,55 @@ impl Connection {
     /// # Failure
     ///
     /// Will return `Err` if the underlying `SQLite` close call fails.
-    #[allow(dead_code)]
-    pub(crate) fn close(&self) {
-        // close readers
-        for _ in 0..self.reader_handles.len() {
-            self.reader_sender.send(Message::Close).ok();
-        }
-        while self
-            .reader_handles
-            .iter()
-            .any(|reader_handle| !reader_handle.is_finished())
-        {}
+    pub(crate) async fn close(&self) -> Result<()> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || inner.close_blocking())
+            .await
+            .map_err(|_| S3ite::ThreadJoin)?
+    }
+}
 
-        // close writer
-        self.writer_sender.send(Message::Close).ok();
-        while !self.writer_handle.is_finished() {}
+impl ConnectionInner {
+    fn close_blocking(&self) -> Result<()> {
+        let should_signal = self
+            .closed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+
+        if should_signal {
+            let reader_count = self.reader_handles.lock().unwrap().len();
+            for _ in 0..reader_count {
+                self.reader_sender.send(Message::Close).ok();
+            }
+
+            self.writer_sender.send(Message::Close).ok();
+        }
+
+        let mut join_failed = false;
+
+        {
+            let mut reader_handles = self.reader_handles.lock().unwrap();
+            for reader_handle in reader_handles.drain(..) {
+                if reader_handle.join().is_err() {
+                    join_failed = true;
+                }
+            }
+        }
+
+        {
+            let mut writer_handle = self.writer_handle.lock().unwrap();
+            if let Some(writer_handle) = writer_handle.take() {
+                if writer_handle.join().is_err() {
+                    join_failed = true;
+                }
+            }
+        }
+
+        if join_failed {
+            return Err(S3ite::ThreadJoin);
+        }
+
+        Ok(())
     }
 }
 
@@ -194,11 +264,7 @@ impl Debug for Connection {
     }
 }
 
-async fn connect<F, G>(
-    open_writer: F,
-    open_reader: Arc<G>,
-    readers: usize,
-) -> rusqlite::Result<Connection>
+async fn connect<F, G>(open_writer: F, open_reader: Arc<G>, readers: usize) -> Result<Connection>
 where
     F: FnOnce() -> rusqlite::Result<rusqlite::Connection> + Send + 'static,
     G: Fn() -> rusqlite::Result<rusqlite::Connection> + Send + Sync + 'static,
@@ -300,9 +366,39 @@ where
     }
 
     Ok(Connection {
-        writer_sender,
-        reader_sender,
-        writer_handle: Arc::new(writer_handle),
-        reader_handles: Arc::new(reader_handles),
+        inner: Arc::new(ConnectionInner {
+            writer_sender,
+            reader_sender,
+            writer_handle: Mutex::new(Some(writer_handle)),
+            reader_handles: Mutex::new(reader_handles),
+            closed: AtomicBool::new(false),
+        }),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn close_is_idempotent_and_rejects_later_operations() {
+        let path = std::env::temp_dir().join(format!("s3ite-{}.sqlite3", uuid::Uuid::new_v4()));
+        std::fs::remove_file(&path).ok();
+
+        let config = Config {
+            readers: 1,
+            ..Default::default()
+        };
+        let connection = Connection::open(&path, &config, "bucket").await.unwrap();
+
+        connection.close().await.unwrap();
+        connection.close().await.unwrap();
+
+        let err = connection.read(|_| Ok(())).await.unwrap_err();
+        assert!(matches!(err, S3ite::DatabaseQueueClosed));
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(format!("{}-wal", path.to_string_lossy())).ok();
+        std::fs::remove_file(format!("{}-shm", path.to_string_lossy())).ok();
+    }
 }

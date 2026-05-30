@@ -4,11 +4,11 @@ use std::{
     ops::Not,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use path_absolutize::Absolutize;
-use rusqlite::{Error::ToSqlConversionFailure, OptionalExtension, ToSql, Transaction};
+use rusqlite::{Error::ToSqlConversionFailure, OptionalExtension, Transaction};
 use s3s::{
     auth::Credentials,
     dto, s3_error, S3Error,
@@ -40,7 +40,6 @@ pub struct Sqlite {
     pub(crate) root: PathBuf,
     pub(crate) config: crate::Config,
     pub(crate) buckets: Arc<RwLock<HashMap<String, Arc<Connection>>>>,
-    pub(crate) continuation_tokens: Arc<Mutex<HashMap<String, ContinuationToken>>>,
 }
 
 #[derive(Debug)]
@@ -58,7 +57,7 @@ pub(crate) struct KeySize {
     pub(crate) key: String,
     pub(crate) size: u64,
     pub(crate) last_modified: OffsetDateTime,
-    pub(crate) md5: String,
+    pub(crate) md5: Option<String>,
 }
 
 #[derive(Debug)]
@@ -85,16 +84,15 @@ pub(crate) struct MultipartMetadata {
     pub(crate) size: i64,
 }
 
-#[derive(Debug)]
-pub(crate) struct ContinuationToken {
-    pub(crate) token: String,
-    pub(crate) last_modified: OffsetDateTime,
-    pub(crate) key_sizes: Vec<KeySize>,
-}
-
 impl Sqlite {
     /// # Panics
     pub async fn new(config: &crate::Config) -> Result<Self> {
+        if config.readers == 0 {
+            Err(crate::S3ite::Configuration(
+                "readers must be greater than zero".to_string(),
+            ))?;
+        }
+
         let root = env::current_dir()?.join(&config.root).canonicalize()?;
 
         let mut buckets = HashMap::new();
@@ -109,29 +107,33 @@ impl Sqlite {
                 if let Some(extension) = path.extension() {
                     if extension == "sqlite3" {
                         let bucket = path.file_stem().unwrap().to_str().unwrap().to_string();
-                        let bucket_clone = bucket.clone();
                         let connection = Connection::open(path, &config, &bucket).await?;
-                        connection
-                            .write(move |connection| {
-                                connection.execute_batch(&config.to_sql(Some(&bucket_clone)))?;
+                        if config.read_only(Some(&bucket)).not() {
+                            let bucket_clone = bucket.clone();
+                            connection
+                                .write(move |connection| {
+                                    connection
+                                        .execute_batch(&config.to_sql(Some(&bucket_clone)))?;
 
-                                connection.execute_batch(
-                                    "
-                                    PRAGMA analysis_limit=1000;
-                                    PRAGMA optimize;
-                                    ",
-                                )?;
+                                    connection.execute_batch(
+                                        "
+                                        PRAGMA analysis_limit=1000;
+                                        PRAGMA optimize;
+                                        ",
+                                    )?;
 
-                                let transaction = connection.transaction()?;
-                                Self::try_delete_multipart_expired(
-                                    &transaction,
-                                    OffsetDateTime::now_utc().saturating_sub(Duration::hours(1)),
-                                )?;
+                                    let transaction = connection.transaction()?;
+                                    Self::try_delete_multipart_expired(
+                                        &transaction,
+                                        OffsetDateTime::now_utc()
+                                            .saturating_sub(Duration::hours(1)),
+                                    )?;
 
-                                Ok(transaction.commit()?)
-                            })
-                            .await
-                            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                                    Ok(transaction.commit()?)
+                                })
+                                .await
+                                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                        }
 
                         buckets.insert(bucket, Arc::new(connection));
                     }
@@ -155,20 +157,23 @@ impl Sqlite {
         }
 
         let buckets = Arc::new(RwLock::new(buckets));
-        let continuation_tokens = Arc::new(Mutex::new(HashMap::<String, ContinuationToken>::new()));
 
-        // start a garbage collection process for:
-        // - run the vacuum process
-        // - cleaning up expired continuation_tokens
+        // start a garbage collection process for database maintenance
         let buckets_clone = buckets.clone();
-        let continuation_tokens_clone = continuation_tokens.clone();
+        let config_clone = config.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 
-                // database maintenance
-                let buckets = buckets_clone.write().await;
-                for connection in buckets.values() {
+                let connections = buckets_clone
+                    .read()
+                    .await
+                    .iter()
+                    .filter(|(bucket, _)| config_clone.read_only(Some(bucket)).not())
+                    .map(|(_, connection)| connection.clone())
+                    .collect::<Vec<_>>();
+
+                for connection in connections {
                     connection
                         .write(move |connection| {
                             Ok(connection.execute_batch(
@@ -181,12 +186,6 @@ impl Sqlite {
                         .await
                         .ok();
                 }
-
-                // remove any redundant state (i.e. cancelled `list_objects` request snapshots)
-                let mut continuation_tokens = continuation_tokens_clone.lock().unwrap();
-                continuation_tokens.retain(|_, value| {
-                    (OffsetDateTime::now_utc() - value.last_modified).as_seconds_f32() < 120.0
-                });
             }
         });
 
@@ -194,7 +193,6 @@ impl Sqlite {
             root,
             config: config.clone(),
             buckets,
-            continuation_tokens,
         })
     }
 
@@ -290,49 +288,59 @@ impl Sqlite {
     /// resolve object path under the virtual root
     pub(crate) fn try_list_objects(
         transaction: &Transaction,
-        prefix: Option<&String>,
-        start_after: Option<&String>,
+        prefix: Option<&str>,
+        after_key: Option<&str>,
+        limit: usize,
     ) -> rusqlite::Result<Vec<KeySize>> {
-        // prefix with the sqlite wildcard
-        let prefix = prefix.as_ref().and_then(|prefix| {
-            if prefix.is_empty() {
-                None
-            } else {
-                Some(format!("{prefix}%"))
-            }
-        });
-
-        let (query, params): (&str, Vec<&dyn ToSql>) = match (&prefix, start_after) {
-            (Some(prefix), Some(start_after)) => (
-                "SELECT key, size, last_modified, md5 FROM metadata WHERE key LIKE ?1 AND key > ?2 ORDER BY key;",
-                vec![prefix, start_after],
-            ),
-            (Some(prefix), None) => (
-                "SELECT key, size, last_modified, md5 FROM metadata WHERE key LIKE ?1 ORDER BY key;",
-                vec![prefix],
-            ),
-            (None, Some(start_after)) => (
-                "SELECT key, size, last_modified, md5 FROM metadata WHERE key > ?1 ORDER BY key;",
-                vec![start_after],
-            ),
-            (None, None) => (
-                "SELECT key, size, last_modified, md5 FROM metadata ORDER BY key;",
-                vec![],
-            ),
+        let limit = i64::try_from(limit).map_err(|err| ToSqlConversionFailure(Box::new(err)))?;
+        let prefix = prefix.and_then(|prefix| prefix.is_empty().not().then_some(prefix));
+        let map_key_size = |row: &rusqlite::Row<'_>| {
+            Ok(KeySize {
+                key: row.get(0)?,
+                size: row_u64(row, 1)?,
+                last_modified: row.get(2)?,
+                md5: row.get(3)?,
+            })
         };
 
-        let mut stmt = transaction.prepare_cached(query)?;
-
-        let objects = stmt
-            .query_map(params.as_slice(), |row| {
-                Ok(KeySize {
-                    key: row.get(0)?,
-                    size: row_u64(row, 1)?,
-                    last_modified: row.get(2)?,
-                    md5: row.get(3)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let objects = match (prefix, after_key) {
+            (Some(prefix), Some(after_key)) => {
+                let mut stmt = transaction.prepare_cached(
+                    "SELECT key, size, last_modified, md5 FROM metadata WHERE key >= ?1 AND key > ?2 ORDER BY key LIMIT ?3;",
+                )?;
+                let objects = stmt
+                    .query_map((prefix, after_key, limit), map_key_size)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                objects
+            }
+            (Some(prefix), None) => {
+                let mut stmt = transaction.prepare_cached(
+                    "SELECT key, size, last_modified, md5 FROM metadata WHERE key >= ?1 ORDER BY key LIMIT ?2;",
+                )?;
+                let objects = stmt
+                    .query_map((prefix, limit), map_key_size)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                objects
+            }
+            (None, Some(after_key)) => {
+                let mut stmt = transaction.prepare_cached(
+                    "SELECT key, size, last_modified, md5 FROM metadata WHERE key > ?1 ORDER BY key LIMIT ?2;",
+                )?;
+                let objects = stmt
+                    .query_map((after_key, limit), map_key_size)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                objects
+            }
+            (None, None) => {
+                let mut stmt = transaction.prepare_cached(
+                    "SELECT key, size, last_modified, md5 FROM metadata ORDER BY key LIMIT ?1;",
+                )?;
+                let objects = stmt
+                    .query_map([limit], map_key_size)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                objects
+            }
+        };
 
         Ok(objects)
     }
@@ -359,7 +367,7 @@ impl Sqlite {
         stmt.query_row([key], |row| {
             Ok(KeyValue {
                 key: row.get(0)?,
-                value: Some(row.get::<_, Vec<u8>>(1)?),
+                value: row.get(1)?,
                 size: row_u64(row, 2)?,
                 metadata: row
                     .get::<_, Option<String>>(3)?

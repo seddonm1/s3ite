@@ -130,6 +130,9 @@ async fn main() -> Result<()> {
     if let Some(concurrency_limit) = opt.concurrency_limit {
         config.concurrency_limit = concurrency_limit;
     }
+    if let Some(readers) = opt.readers {
+        config.readers = readers;
+    }
     if let Some(read_only) = opt.read_only {
         config.read_only = read_only;
     }

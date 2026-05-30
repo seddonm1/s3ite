@@ -1,4 +1,4 @@
-use std::ops::Not;
+use std::{collections::HashSet, ops::Not};
 
 use bytes::Bytes;
 use futures::{stream, TryStreamExt};
@@ -13,9 +13,74 @@ use uuid::Uuid;
 
 use crate::{
     error::*,
-    sqlite::{ContinuationToken, KeyValue, Multipart, Sqlite},
+    sqlite::{KeySize, KeyValue, Multipart, Sqlite},
     utils::{base64, copy_bytes, hex},
 };
+
+const LIST_BATCH_SIZE: usize = 1024;
+const CONTINUATION_TOKEN_PREFIX: &str = "s3ite:v1:";
+
+fn common_prefix_for_key(key: &str, prefix: &str, delimiter: Option<&str>) -> Option<String> {
+    let delimiter = delimiter.filter(|delimiter| delimiter.is_empty().not())?;
+    let rest = key.strip_prefix(prefix)?;
+    let delimiter_index = rest.find(delimiter)?;
+    Some(format!(
+        "{}{}",
+        prefix,
+        &rest[..delimiter_index + delimiter.len()]
+    ))
+}
+
+fn encode_continuation_token(key: &str) -> String {
+    format!("{CONTINUATION_TOKEN_PREFIX}{}", hex(key.as_bytes()))
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    fn nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = value.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+
+    let mut decoded = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        decoded.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
+    }
+    Some(decoded)
+}
+
+fn decode_continuation_token(token: &str) -> S3Result<String> {
+    let encoded = token
+        .strip_prefix(CONTINUATION_TOKEN_PREFIX)
+        .ok_or_else(|| s3_error!(InvalidToken))?;
+    let decoded = decode_hex(encoded).ok_or_else(|| s3_error!(InvalidToken))?;
+    String::from_utf8(decoded).map_err(|_| s3_error!(InvalidToken))
+}
+
+fn decode_md5_hex(value: &str) -> S3Result<[u8; 16]> {
+    let decoded = decode_hex(value).ok_or_else(|| s3_error!(InvalidPart))?;
+    decoded
+        .try_into()
+        .map_err(|_| s3_error!(InvalidPart, "invalid part etag"))
+}
+
+fn object_from_key_size(key_size: KeySize) -> S3Result<Object> {
+    Ok(Object {
+        key: Some(key_size.key),
+        last_modified: Some(key_size.last_modified.into()),
+        size: Some(i64::try_from(key_size.size).map_err(S3Error::internal_error)?),
+        e_tag: key_size.md5.map(ETag::Strong),
+        ..Default::default()
+    })
+}
 
 #[async_trait::async_trait]
 impl S3 for Sqlite {
@@ -41,7 +106,7 @@ impl S3 for Sqlite {
             .await
             .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
 
-        println!("created bucket");
+        debug!(bucket = %bucket, "created bucket");
 
         let output = CreateBucketOutput::default(); // TODO: handle other fields
         Ok(S3Response::new(output))
@@ -111,24 +176,25 @@ impl S3 for Sqlite {
 
         self.validate_mutable_bucket(&bucket)?;
 
-        let mut guard = self.buckets.write().await;
-        match guard.get(&bucket) {
-            Some(connection) => {
-                connection.to_owned().close();
-                let bucket_path = self.get_bucket_path(&bucket)?;
-                fs::remove_file(&bucket_path)
-                    .await
-                    .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
-                fs::remove_file(format!("{}-wal", bucket_path.to_string_lossy()))
-                    .await
-                    .ok();
-                fs::remove_file(format!("{}-shm", bucket_path.to_string_lossy()))
-                    .await
-                    .ok();
-                guard.remove(&bucket);
-            }
-            None => return Err(s3_error!(NoSuchBucket)),
-        }
+        let connection = self
+            .buckets
+            .write()
+            .await
+            .remove(&bucket)
+            .ok_or_else(|| s3_error!(NoSuchBucket))?;
+
+        connection.close().await?;
+
+        let bucket_path = self.get_bucket_path(&bucket)?;
+        fs::remove_file(&bucket_path)
+            .await
+            .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
+        fs::remove_file(format!("{}-wal", bucket_path.to_string_lossy()))
+            .await
+            .ok();
+        fs::remove_file(format!("{}-shm", bucket_path.to_string_lossy()))
+            .await
+            .ok();
 
         Ok(S3Response::new(DeleteBucketOutput {}))
     }
@@ -139,6 +205,9 @@ impl S3 for Sqlite {
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let DeleteObjectInput { bucket, key, .. } = req.input;
+
+        self.validate_mutable_bucket(&bucket)?;
+
         let connection = self.try_get_connection(&bucket).await?;
 
         connection
@@ -251,31 +320,52 @@ impl S3 for Sqlite {
                 })
                 .await?;
 
-        let content_length = match range {
-            None => object.size,
+        let object_range = match range.as_ref() {
+            None => 0..object.size,
             Some(range) => {
                 let object_range = range.check(object.size)?;
-                object_range.end - object_range.start
+                if object_range.is_empty() {
+                    return Err(s3_error!(InvalidRange));
+                }
+                object_range
             }
         };
+        let content_length = object_range.end - object_range.start;
         let content_length_i64 = try_!(i64::try_from(content_length));
 
-        let value = match range {
-            Some(Range::Int { first, .. }) => {
-                let first = try_!(usize::try_from(first));
-                Bytes::copy_from_slice(&object.value.unwrap()[first..])
+        let value = match object.value {
+            Some(value) => value,
+            None if object.size == 0 => Vec::new(),
+            None => {
+                return Err(S3Error::with_message(
+                    InternalError,
+                    "object metadata has nonzero size but no value",
+                ));
             }
-            Some(Range::Suffix { length }) => {
-                let first = try_!(usize::try_from(object.size - length));
-                Bytes::copy_from_slice(&object.value.unwrap()[first..])
-            }
-            None => Bytes::copy_from_slice(&object.value.unwrap()),
         };
 
+        let start = try_!(usize::try_from(object_range.start));
+        let end = try_!(usize::try_from(object_range.end));
+        let Some(value) = value.get(start..end) else {
+            return Err(S3Error::with_message(
+                InternalError,
+                "object metadata size exceeds stored value length",
+            ));
+        };
+        let value = Bytes::copy_from_slice(value);
         let body = stream::once(async { Ok(value) });
 
         let output = GetObjectOutput {
             body: Some(StreamingBlob::wrap::<_, S3Error>(body)),
+            accept_ranges: Some("bytes".to_string()),
+            content_range: range.is_some().then(|| {
+                format!(
+                    "bytes {}-{}/{}",
+                    object_range.start,
+                    object_range.end - 1,
+                    object.size
+                )
+            }),
             content_length: Some(content_length_i64),
             last_modified: Some(object.last_modified.into()),
             metadata: object.metadata,
@@ -330,6 +420,7 @@ impl S3 for Sqlite {
         let content_type = mime::APPLICATION_OCTET_STREAM;
 
         let output = HeadObjectOutput {
+            accept_ranges: Some("bytes".to_string()),
             content_length: Some(try_!(i64::try_from(object.size))),
             content_type: Some(content_type.to_string()),
             last_modified: Some(object.last_modified.into()),
@@ -388,18 +479,24 @@ impl S3 for Sqlite {
         let v2_resp = self.list_objects_v2(req.map_input(Into::into)).await?;
 
         Ok(v2_resp.map_output(|v2| {
-            let next_marker = v2
-                .is_truncated
-                .unwrap_or(false)
-                .then(|| {
-                    v2.contents
-                        .as_ref()
-                        .and_then(|contents| contents.last().and_then(|last| last.key.clone()))
-                })
-                .flatten();
+            let next_marker = if v2.is_truncated.unwrap_or(false) {
+                v2.contents
+                    .as_ref()
+                    .and_then(|contents| contents.last().and_then(|last| last.key.clone()))
+                    .into_iter()
+                    .chain(v2.common_prefixes.as_ref().and_then(|common_prefixes| {
+                        common_prefixes
+                            .last()
+                            .and_then(|common_prefix| common_prefix.prefix.clone())
+                    }))
+                    .max()
+            } else {
+                None
+            };
 
             ListObjectsOutput {
                 contents: v2.contents,
+                common_prefixes: v2.common_prefixes,
                 delimiter: v2.delimiter,
                 encoding_type: v2.encoding_type,
                 name: v2.name,
@@ -432,82 +529,93 @@ impl S3 for Sqlite {
         let max_keys = max_keys.unwrap_or(1000).clamp(0, 1000);
         let max_keys_usize = try_!(usize::try_from(max_keys));
         let continuation_token_clone = continuation_token.clone();
+        let prefix_filter = prefix.clone().unwrap_or_default();
+        let delimiter_filter = delimiter.clone();
+        let mut after_key = match continuation_token.as_deref() {
+            Some(continuation_token) => Some(decode_continuation_token(continuation_token)?),
+            None => start_after.clone(),
+        };
 
-        let (key_sizes, next_continuation_token) = match continuation_token {
-            // initial request requires taking a snapshot of the state of the database
-            None => {
-                let prefix_clone = prefix.clone();
-                let start_after_clone = start_after.clone();
+        let connection = self.try_get_connection(&bucket).await?;
+        let mut objects = Vec::new();
+        let mut common_prefixes = Vec::new();
+        let mut seen_common_prefixes = HashSet::new();
+        let mut key_count = 0usize;
+        let mut is_truncated = false;
 
-                let connection = self.try_get_connection(&bucket).await?;
-                let mut key_sizes = connection
+        if max_keys_usize > 0 {
+            'pages: loop {
+                let prefix = prefix_filter.clone();
+                let after_key_query = after_key.clone();
+                let key_sizes = connection
                     .read(move |connection| {
                         let transaction = connection.transaction()?;
                         Ok(Self::try_list_objects(
                             &transaction,
-                            prefix_clone.as_ref(),
-                            start_after_clone.as_ref(),
+                            Some(&prefix),
+                            after_key_query.as_deref(),
+                            LIST_BATCH_SIZE,
                         )?)
                     })
                     .await?;
 
-                if key_sizes.len() <= max_keys_usize {
-                    (key_sizes, None)
-                } else {
-                    let remainder = key_sizes.split_off(max_keys_usize);
+                if key_sizes.is_empty() {
+                    break;
+                }
 
-                    let mut continuation_tokens = self.continuation_tokens.lock().unwrap();
-                    let next_continuation_token = Uuid::new_v4().to_string();
-                    continuation_tokens.insert(
-                        next_continuation_token.clone(),
-                        ContinuationToken {
-                            token: next_continuation_token.clone(),
-                            last_modified: OffsetDateTime::now_utc(),
-                            key_sizes: remainder,
-                        },
-                    );
+                let key_sizes_len = key_sizes.len();
+                for key_size in key_sizes {
+                    if prefix_filter.is_empty().not()
+                        && key_size.key.starts_with(&prefix_filter).not()
+                    {
+                        break 'pages;
+                    }
 
-                    (key_sizes, Some(next_continuation_token))
+                    if let Some(common_prefix) = common_prefix_for_key(
+                        &key_size.key,
+                        &prefix_filter,
+                        delimiter_filter.as_deref(),
+                    ) {
+                        if seen_common_prefixes.contains(&common_prefix) {
+                            after_key = Some(key_size.key);
+                            continue;
+                        }
+
+                        if key_count == max_keys_usize {
+                            is_truncated = true;
+                            break 'pages;
+                        }
+
+                        seen_common_prefixes.insert(common_prefix.clone());
+                        common_prefixes.push(CommonPrefix {
+                            prefix: Some(common_prefix),
+                        });
+                        key_count += 1;
+                        after_key = Some(key_size.key);
+                        continue;
+                    }
+
+                    if key_count == max_keys_usize {
+                        is_truncated = true;
+                        break 'pages;
+                    }
+
+                    after_key = Some(key_size.key.clone());
+                    objects.push(object_from_key_size(key_size)?);
+                    key_count += 1;
+                }
+
+                if key_sizes_len < LIST_BATCH_SIZE {
+                    break;
                 }
             }
-            // subsequent request
-            Some(continuation_token) => {
-                let mut continuation_tokens = self.continuation_tokens.lock().unwrap();
-                let mut continuation_token = match continuation_tokens.remove(&continuation_token) {
-                    Some(continuation_token) => Ok(continuation_token),
-                    None => Err(s3_error!(InvalidToken)),
-                }?;
+        }
 
-                if continuation_token.key_sizes.len() <= max_keys_usize {
-                    (continuation_token.key_sizes, None)
-                } else {
-                    let remainder = continuation_token.key_sizes.split_off(max_keys_usize);
-                    let key_sizes = std::mem::replace(&mut continuation_token.key_sizes, remainder);
+        let next_continuation_token = is_truncated
+            .then(|| after_key.as_deref().map(encode_continuation_token))
+            .flatten();
 
-                    let continuation_token_clone = continuation_token.token.clone();
-                    continuation_token.last_modified = OffsetDateTime::now_utc();
-                    continuation_tokens
-                        .insert(continuation_token_clone.clone(), continuation_token);
-
-                    (key_sizes, Some(continuation_token_clone))
-                }
-            }
-        };
-
-        let objects = key_sizes
-            .into_iter()
-            .map(|key_size| {
-                Ok(Object {
-                    key: Some(key_size.key),
-                    last_modified: Some(key_size.last_modified.into()),
-                    size: Some(i64::try_from(key_size.size)?),
-                    e_tag: Some(ETag::Strong(key_size.md5)),
-                    ..Default::default()
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let key_count = try_!(i32::try_from(objects.len()));
+        let key_count = try_!(i32::try_from(key_count));
 
         let output = ListObjectsV2Output {
             key_count: Some(key_count),
@@ -515,6 +623,7 @@ impl S3 for Sqlite {
             continuation_token: continuation_token_clone,
             is_truncated: Some(next_continuation_token.is_some()),
             contents: Some(objects),
+            common_prefixes: delimiter.as_ref().map(|_| common_prefixes),
             delimiter,
             encoding_type,
             name: Some(bucket),
@@ -690,6 +799,8 @@ impl S3 for Sqlite {
             ..
         } = req.input;
 
+        self.validate_mutable_bucket(&bucket)?;
+
         let body = body.ok_or_else(|| s3_error!(IncompleteBody))?;
         let upload_id = Uuid::parse_str(&upload_id).map_err(|_| s3_error!(InvalidRequest))?;
 
@@ -835,14 +946,29 @@ impl S3 for Sqlite {
             return Err(s3_error!(InvalidPart));
         };
 
-        let mut cnt: i32 = 0;
-        for part in multipart_upload.parts.into_iter().flatten() {
-            let part_number = part.part_number;
-            cnt += 1;
-            if part_number != Some(cnt) {
-                return Err(s3_error!(InvalidRequest, "invalid part order"));
-            }
+        let requested_parts = multipart_upload.parts.unwrap_or_default();
+        if requested_parts.is_empty() {
+            return Err(s3_error!(InvalidPart, "You must specify at least one part"));
         }
+
+        let mut previous_part_number = 0;
+        let requested_parts = requested_parts
+            .into_iter()
+            .map(|part| {
+                let part_number = part.part_number.ok_or_else(|| s3_error!(InvalidPart))?;
+                if part_number <= previous_part_number {
+                    return Err(s3_error!(InvalidPartOrder));
+                }
+                previous_part_number = part_number;
+
+                let e_tag = part
+                    .e_tag
+                    .and_then(ETag::into_strong)
+                    .ok_or_else(|| s3_error!(InvalidPart))?;
+
+                Ok((part_number, e_tag))
+            })
+            .collect::<S3Result<Vec<_>>>()?;
 
         let bucket_clone = bucket.clone();
         let key_clone = key.clone();
@@ -869,14 +995,43 @@ impl S3 for Sqlite {
                 let parts = Self::try_get_multiparts(&transaction, upload_id)
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
 
-                let value = parts
-                    .into_iter()
-                    .map(|part| part.value)
-                    .collect::<Vec<_>>()
-                    .concat();
+                if parts.len() != requested_parts.len() {
+                    return Err(s3_error!(InvalidPart).into());
+                }
+
+                let total_size = parts.iter().try_fold(0usize, |total, part| {
+                    let part_size = usize::try_from(part.size)?;
+                    total.checked_add(part_size).ok_or_else(|| {
+                        S3ite::S3(S3Error::with_message(
+                            InternalError,
+                            "multipart object is too large",
+                        ))
+                    })
+                })?;
+
+                let mut value = Vec::with_capacity(total_size);
+                let mut part_md5s = Vec::with_capacity(parts.len() * 16);
+                for ((requested_part_number, requested_etag), part) in
+                    requested_parts.iter().zip(parts)
+                {
+                    if part.part_number != *requested_part_number {
+                        return Err(s3_error!(InvalidPart).into());
+                    }
+
+                    let Some(stored_md5) = part.md5.as_deref() else {
+                        return Err(s3_error!(InvalidPart).into());
+                    };
+                    if requested_etag != stored_md5 {
+                        return Err(s3_error!(InvalidPart).into());
+                    }
+
+                    part_md5s.extend_from_slice(&decode_md5_hex(stored_md5)?);
+                    value.extend_from_slice(&part.value);
+                }
+
                 let mut md5_hash = Md5::new();
-                md5_hash.update(&value);
-                let md5 = hex(md5_hash.finalize());
+                md5_hash.update(&part_md5s);
+                let md5 = format!("{}-{}", hex(md5_hash.finalize()), requested_parts.len());
                 let size = try_!(u64::try_from(value.len()));
 
                 Self::try_put_object(
