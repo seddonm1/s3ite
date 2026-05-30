@@ -23,6 +23,7 @@ const CONTINUATION_TOKEN_PREFIX: &str = "s3ite:v1:";
 const OWNER_DISPLAY_NAME: &str = "s3ite";
 const OWNER_ID: &str = "s3ite";
 
+/// Returns the common prefix produced by applying an S3 delimiter to a key.
 fn common_prefix_for_key(key: &str, prefix: &str, delimiter: Option<&str>) -> Option<String> {
     let delimiter = delimiter.filter(|delimiter| delimiter.is_empty().not())?;
     let rest = key.strip_prefix(prefix)?;
@@ -34,10 +35,12 @@ fn common_prefix_for_key(key: &str, prefix: &str, delimiter: Option<&str>) -> Op
     ))
 }
 
+/// Encodes a listing continuation token from the last scanned key.
 fn encode_continuation_token(key: &str) -> String {
     format!("{CONTINUATION_TOKEN_PREFIX}{}", hex(key.as_bytes()))
 }
 
+/// Decodes a hexadecimal string into bytes.
 fn decode_hex(value: &str) -> Option<Vec<u8>> {
     fn nibble(byte: u8) -> Option<u8> {
         match byte {
@@ -60,6 +63,7 @@ fn decode_hex(value: &str) -> Option<Vec<u8>> {
     Some(decoded)
 }
 
+/// Decodes and validates a listing continuation token.
 fn decode_continuation_token(token: &str) -> S3Result<String> {
     let encoded = token
         .strip_prefix(CONTINUATION_TOKEN_PREFIX)
@@ -68,6 +72,7 @@ fn decode_continuation_token(token: &str) -> S3Result<String> {
     String::from_utf8(decoded).map_err(|_| s3_error!(InvalidToken))
 }
 
+/// Decodes a part ETag into its binary MD5 digest.
 fn decode_md5_hex(value: &str) -> S3Result<[u8; 16]> {
     let decoded = decode_hex(value).ok_or_else(|| s3_error!(InvalidPart))?;
     decoded
@@ -75,6 +80,7 @@ fn decode_md5_hex(value: &str) -> S3Result<[u8; 16]> {
         .map_err(|_| s3_error!(InvalidPart, "invalid part etag"))
 }
 
+/// Returns the canonical owner used by s3ite ACL and listing responses.
 fn owner() -> Owner {
     Owner {
         display_name: Some(OWNER_DISPLAY_NAME.to_string()),
@@ -82,6 +88,7 @@ fn owner() -> Owner {
     }
 }
 
+/// URL-encodes a list response value when requested by the client.
 fn encode_list_value(value: String, encode: bool) -> String {
     if encode.not() {
         return value;
@@ -101,6 +108,7 @@ fn encode_list_value(value: String, encode: bool) -> String {
     encoded
 }
 
+/// Decodes S3 list input values that clients encode for XML-safe control bytes.
 fn decode_list_input_value(value: String) -> String {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(value.len());
@@ -124,10 +132,12 @@ fn decode_list_input_value(value: String) -> String {
     String::from_utf8(decoded).unwrap_or(value)
 }
 
+/// Returns whether list output should use S3 URL encoding.
 fn is_url_encoding(encoding_type: Option<&EncodingType>) -> bool {
     encoding_type.is_some_and(|encoding_type| encoding_type.as_str() == EncodingType::URL)
 }
 
+/// Returns whether a query string contains a specific key-value pair.
 fn has_query_value(query: Option<&str>, name: &str, value: &str) -> bool {
     query.is_some_and(|query| {
         query.split('&').any(|pair| {
@@ -137,6 +147,7 @@ fn has_query_value(query: Option<&str>, name: &str, value: &str) -> bool {
     })
 }
 
+/// Normalizes a delimiter for list output.
 fn output_delimiter(delimiter: Option<String>, encode: bool) -> Option<String> {
     delimiter.and_then(|delimiter| {
         delimiter
@@ -146,6 +157,7 @@ fn output_delimiter(delimiter: Option<String>, encode: bool) -> Option<String> {
     })
 }
 
+/// Validates that multipart state belongs to the request credentials.
 fn validate_multipart_access(
     stored_access_key: Option<&String>,
     credentials: Option<&Credentials>,
@@ -157,6 +169,7 @@ fn validate_multipart_access(
     }
 }
 
+/// Converts stored object metadata into an S3 list object.
 fn object_from_key_size(
     key_size: KeySize,
     encode_keys: bool,
@@ -172,6 +185,7 @@ fn object_from_key_size(
     })
 }
 
+/// Converts stored object metadata into an S3 object-version entry.
 fn object_version_from_key_size(
     key_size: KeySize,
     encode_keys: bool,
@@ -201,6 +215,7 @@ struct KeyListing {
 }
 
 impl Sqlite {
+    /// Lists keys and common prefixes using S3 prefix, delimiter, and marker semantics.
     async fn list_keys(
         &self,
         bucket: &str,
@@ -306,6 +321,7 @@ impl Sqlite {
 
 #[async_trait::async_trait]
 impl S3 for Sqlite {
+    /// Creates a bucket database if it does not already exist.
     #[tracing::instrument]
     async fn create_bucket(
         &self,
@@ -334,6 +350,7 @@ impl S3 for Sqlite {
         Ok(S3Response::new(output))
     }
 
+    /// Copies an object between buckets while applying S3 metadata-directive rules.
     #[tracing::instrument]
     async fn copy_object(
         &self,
@@ -412,6 +429,7 @@ impl S3 for Sqlite {
         Ok(S3Response::new(output))
     }
 
+    /// Deletes an empty bucket database and its SQLite sidecar files.
     #[tracing::instrument]
     async fn delete_bucket(
         &self,
@@ -455,6 +473,7 @@ impl S3 for Sqlite {
         Ok(S3Response::new(DeleteBucketOutput {}))
     }
 
+    /// Deletes an object by key.
     #[tracing::instrument]
     async fn delete_object(
         &self,
@@ -479,6 +498,7 @@ impl S3 for Sqlite {
         Ok(S3Response::new(output))
     }
 
+    /// Deletes a batch of objects and returns S3 multi-delete results.
     #[tracing::instrument]
     async fn delete_objects(
         &self,
@@ -528,6 +548,7 @@ impl S3 for Sqlite {
         Ok(S3Response::new(output))
     }
 
+    /// Returns the default bucket location for an existing bucket.
     #[tracing::instrument]
     async fn get_bucket_location(
         &self,
@@ -548,6 +569,7 @@ impl S3 for Sqlite {
         Ok(S3Response::new(output))
     }
 
+    /// Returns an object body and metadata, applying byte-range requests when present.
     #[tracing::instrument]
     async fn get_object(
         &self,
@@ -626,6 +648,7 @@ impl S3 for Sqlite {
         Ok(S3Response::new(output))
     }
 
+    /// Checks whether a bucket exists.
     #[tracing::instrument]
     async fn head_bucket(
         &self,
@@ -650,6 +673,7 @@ impl S3 for Sqlite {
         }))
     }
 
+    /// Returns object metadata without reading the object body.
     #[tracing::instrument]
     async fn head_object(
         &self,
@@ -686,6 +710,7 @@ impl S3 for Sqlite {
         Ok(S3Response::new(output))
     }
 
+    /// Returns the fixed owner ACL for an existing object.
     #[tracing::instrument]
     async fn get_object_acl(
         &self,
@@ -721,6 +746,7 @@ impl S3 for Sqlite {
         Ok(S3Response::new(output))
     }
 
+    /// Lists all open bucket databases.
     #[tracing::instrument]
     async fn list_buckets(
         &self,
@@ -760,6 +786,7 @@ impl S3 for Sqlite {
         Ok(S3Response::new(output))
     }
 
+    /// Lists objects using the original ListObjects marker protocol.
     #[tracing::instrument]
     async fn list_objects(
         &self,
@@ -849,6 +876,7 @@ impl S3 for Sqlite {
         Ok(S3Response::new(output))
     }
 
+    /// Lists unversioned objects using the ListObjectVersions response shape.
     #[tracing::instrument]
     async fn list_object_versions(
         &self,
@@ -938,6 +966,7 @@ impl S3 for Sqlite {
         Ok(S3Response::new(output))
     }
 
+    /// Lists objects using the ListObjectsV2 continuation-token protocol.
     #[tracing::instrument]
     async fn list_objects_v2(
         &self,
@@ -1042,6 +1071,7 @@ impl S3 for Sqlite {
         Ok(S3Response::new(output))
     }
 
+    /// Stores an object body and metadata.
     #[tracing::instrument]
     async fn put_object(
         &self,
@@ -1125,6 +1155,7 @@ impl S3 for Sqlite {
         Ok(S3Response::new(output))
     }
 
+    /// Creates multipart upload state for a future object.
     #[tracing::instrument]
     async fn create_multipart_upload(
         &self,
@@ -1177,6 +1208,7 @@ impl S3 for Sqlite {
         Ok(S3Response::new(output))
     }
 
+    /// Stores or replaces a multipart upload part.
     #[tracing::instrument]
     async fn upload_part(
         &self,
@@ -1249,6 +1281,7 @@ impl S3 for Sqlite {
         Ok(S3Response::new(output))
     }
 
+    /// Lists parts uploaded for an active multipart upload.
     #[tracing::instrument]
     async fn list_parts(
         &self,
@@ -1314,6 +1347,7 @@ impl S3 for Sqlite {
         Ok(S3Response::new(output))
     }
 
+    /// Aborts an active multipart upload and deletes its parts.
     #[tracing::instrument]
     async fn abort_multipart_upload(
         &self,
@@ -1355,6 +1389,7 @@ impl S3 for Sqlite {
         Ok(S3Response::new(AbortMultipartUploadOutput::default()))
     }
 
+    /// Completes a multipart upload and records the result for idempotent retries.
     #[tracing::instrument]
     async fn complete_multipart_upload(
         &self,
