@@ -1,7 +1,7 @@
 [package]
 name = "s3ite"
 version = "0.7.0"
-edition = "2021"
+edition = "2024"
 description = "An S3 server backed by SQLite"
 license = "MIT"
 readme = "../../README.md"

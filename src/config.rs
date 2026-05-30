@@ -312,9 +312,11 @@ mod tests {
             },
         );
 
-        assert!(config
-            .to_sql(Some("bucket"))
-            .contains("PRAGMA cache_size=-512;"));
+        assert!(
+            config
+                .to_sql(Some("bucket"))
+                .contains("PRAGMA cache_size=-512;")
+        );
     }
 
     #[test]

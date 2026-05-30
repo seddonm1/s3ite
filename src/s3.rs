@@ -1,10 +1,11 @@
-use std::{collections::HashSet, ops::Not};
+use std::{collections::HashSet, fmt::Write as _, ops::Not};
 
 use bytes::Bytes;
-use futures::{stream, TryStreamExt};
+use futures::{TryStreamExt, stream};
 use md5::{Digest, Md5};
 use s3s::{
-    dto::*, s3_error, S3Error, S3ErrorCode::InternalError, S3Request, S3Response, S3Result, S3,
+    S3, S3Error, S3ErrorCode::InternalError, S3Request, S3Response, S3Result, auth::Credentials,
+    dto::*, s3_error,
 };
 use time::OffsetDateTime;
 use tokio::fs;
@@ -13,12 +14,14 @@ use uuid::Uuid;
 
 use crate::{
     error::*,
-    sqlite::{KeySize, KeyValue, Multipart, Sqlite},
+    sqlite::{KeySize, KeyValue, Multipart, MultipartUploadState, Sqlite},
     utils::{base64, copy_bytes, hex},
 };
 
 const LIST_BATCH_SIZE: usize = 1024;
 const CONTINUATION_TOKEN_PREFIX: &str = "s3ite:v1:";
+const OWNER_DISPLAY_NAME: &str = "s3ite";
+const OWNER_ID: &str = "s3ite";
 
 fn common_prefix_for_key(key: &str, prefix: &str, delimiter: Option<&str>) -> Option<String> {
     let delimiter = delimiter.filter(|delimiter| delimiter.is_empty().not())?;
@@ -72,22 +75,114 @@ fn decode_md5_hex(value: &str) -> S3Result<[u8; 16]> {
         .map_err(|_| s3_error!(InvalidPart, "invalid part etag"))
 }
 
-fn object_from_key_size(key_size: KeySize) -> S3Result<Object> {
+fn owner() -> Owner {
+    Owner {
+        display_name: Some(OWNER_DISPLAY_NAME.to_string()),
+        id: Some(OWNER_ID.to_string()),
+    }
+}
+
+fn encode_list_value(value: String, encode: bool) -> String {
+    if encode.not() {
+        return value;
+    }
+
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                encoded.push(char::from(byte));
+            }
+            _ => {
+                let _ = write!(&mut encoded, "%{byte:02X}");
+            }
+        }
+    }
+    encoded
+}
+
+fn decode_list_input_value(value: String) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(value.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let Some(hex) = decode_hex(&value[index + 1..index + 3])
+            && matches!(hex.as_slice(), [b'\n' | b'\r' | b'\t'])
+        {
+            decoded.push(hex[0]);
+            index += 3;
+            continue;
+        }
+
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+
+    String::from_utf8(decoded).unwrap_or(value)
+}
+
+fn is_url_encoding(encoding_type: Option<&EncodingType>) -> bool {
+    encoding_type.is_some_and(|encoding_type| encoding_type.as_str() == EncodingType::URL)
+}
+
+fn has_query_value(query: Option<&str>, name: &str, value: &str) -> bool {
+    query.is_some_and(|query| {
+        query.split('&').any(|pair| {
+            pair.split_once('=')
+                .is_some_and(|(key, found)| key == name && found == value)
+        })
+    })
+}
+
+fn output_delimiter(delimiter: Option<String>, encode: bool) -> Option<String> {
+    delimiter.and_then(|delimiter| {
+        delimiter
+            .is_empty()
+            .not()
+            .then(|| encode_list_value(delimiter, encode))
+    })
+}
+
+fn validate_multipart_access(
+    stored_access_key: Option<&String>,
+    credentials: Option<&Credentials>,
+) -> S3Result<()> {
+    if stored_access_key == credentials.map(|credentials| &credentials.access_key) {
+        Ok(())
+    } else {
+        Err(s3_error!(AccessDenied))
+    }
+}
+
+fn object_from_key_size(
+    key_size: KeySize,
+    encode_keys: bool,
+    owner: Option<&Owner>,
+) -> S3Result<Object> {
     Ok(Object {
-        key: Some(key_size.key),
+        key: Some(encode_list_value(key_size.key, encode_keys)),
         last_modified: Some(key_size.last_modified.into()),
         size: Some(i64::try_from(key_size.size).map_err(S3Error::internal_error)?),
         e_tag: key_size.md5.map(ETag::Strong),
+        owner: owner.cloned(),
         ..Default::default()
     })
 }
 
-fn object_version_from_key_size(key_size: KeySize) -> S3Result<ObjectVersion> {
+fn object_version_from_key_size(
+    key_size: KeySize,
+    encode_keys: bool,
+    owner: Option<&Owner>,
+) -> S3Result<ObjectVersion> {
     Ok(ObjectVersion {
         e_tag: key_size.md5.map(ETag::Strong),
         is_latest: Some(true),
-        key: Some(key_size.key),
+        key: Some(encode_list_value(key_size.key, encode_keys)),
         last_modified: Some(key_size.last_modified.into()),
+        owner: owner.cloned(),
         size: Some(i64::try_from(key_size.size).map_err(S3Error::internal_error)?),
         storage_class: Some(ObjectVersionStorageClass::from_static(
             ObjectVersionStorageClass::STANDARD,
@@ -101,7 +196,7 @@ struct KeyListing {
     keys: Vec<KeySize>,
     common_prefixes: Vec<CommonPrefix>,
     key_count: usize,
-    next_after_key: Option<String>,
+    next_marker: Option<String>,
     is_truncated: bool,
 }
 
@@ -119,6 +214,8 @@ impl Sqlite {
         let mut common_prefixes = Vec::new();
         let mut seen_common_prefixes = HashSet::new();
         let mut key_count = 0usize;
+        let marker_filter = after_key.clone();
+        let mut next_marker = None;
         let mut is_truncated = false;
 
         if max_keys > 0 {
@@ -152,6 +249,14 @@ impl Sqlite {
                     if let Some(common_prefix) =
                         common_prefix_for_key(&key_size.key, prefix_filter, delimiter_filter)
                     {
+                        if marker_filter
+                            .as_ref()
+                            .is_some_and(|marker| common_prefix.as_str() <= marker.as_str())
+                        {
+                            after_key = Some(key_size.key);
+                            continue;
+                        }
+
                         if seen_common_prefixes.contains(&common_prefix) {
                             after_key = Some(key_size.key);
                             continue;
@@ -163,6 +268,7 @@ impl Sqlite {
                         }
 
                         seen_common_prefixes.insert(common_prefix.clone());
+                        next_marker = Some(common_prefix.clone());
                         common_prefixes.push(CommonPrefix {
                             prefix: Some(common_prefix),
                         });
@@ -177,6 +283,7 @@ impl Sqlite {
                     }
 
                     after_key = Some(key_size.key.clone());
+                    next_marker = Some(key_size.key.clone());
                     keys.push(key_size);
                     key_count += 1;
                 }
@@ -191,7 +298,7 @@ impl Sqlite {
             keys,
             common_prefixes,
             key_count,
-            next_after_key: after_key,
+            next_marker,
             is_truncated,
         })
     }
@@ -209,12 +316,12 @@ impl S3 for Sqlite {
         self.validate_mutable_bucket(&bucket)?;
 
         if self.buckets.read().await.contains_key(&bucket) {
-            return Err(s3_error!(BucketAlreadyExists));
+            return Ok(S3Response::new(CreateBucketOutput::default()));
         }
 
         let file_path = self.get_bucket_path(&bucket)?;
         if file_path.exists() {
-            return Err(s3_error!(BucketAlreadyExists));
+            return Ok(S3Response::new(CreateBucketOutput::default()));
         }
 
         self.try_create_bucket(&bucket, file_path)
@@ -235,7 +342,12 @@ impl S3 for Sqlite {
         let CopyObjectInput {
             bucket: tgt_bucket,
             key: tgt_key,
+            cache_control,
+            content_type,
             copy_source,
+            expires,
+            metadata,
+            metadata_directive,
             ..
         } = req.input;
 
@@ -245,6 +357,18 @@ impl S3 for Sqlite {
             CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
             CopySource::Bucket { bucket, key, .. } => (bucket, key),
         };
+        let replace_metadata = metadata_directive
+            .as_ref()
+            .is_some_and(|directive| directive.as_str() == MetadataDirective::REPLACE);
+        if src_bucket.as_ref() == tgt_bucket.as_str()
+            && src_key.as_ref() == tgt_key.as_str()
+            && replace_metadata.not()
+        {
+            return Err(s3_error!(
+                InvalidRequest,
+                "copy source must be different from target unless replacing metadata"
+            ));
+        }
 
         // verify source and target buckets exist
         let connection = self.try_get_connection(&src_bucket).await?;
@@ -259,6 +383,12 @@ impl S3 for Sqlite {
 
         // replace key with target key
         object.key = tgt_key.clone();
+        if replace_metadata {
+            object.metadata = metadata;
+            object.content_type = content_type;
+            object.cache_control = cache_control;
+            object.expires = expires.map(Into::into);
+        }
 
         let copy_object_result = CopyObjectResult {
             e_tag: object.md5.clone().map(ETag::Strong),
@@ -290,6 +420,17 @@ impl S3 for Sqlite {
         let DeleteBucketInput { bucket, .. } = req.input;
 
         self.validate_mutable_bucket(&bucket)?;
+
+        let connection = self.try_get_connection(&bucket).await?;
+        let has_objects = connection
+            .read(|connection| {
+                let transaction = connection.transaction()?;
+                Ok(Self::try_has_objects(&transaction)?)
+            })
+            .await?;
+        if has_objects {
+            return Err(s3_error!(BucketNotEmpty));
+        }
 
         let connection = self
             .buckets
@@ -328,24 +469,8 @@ impl S3 for Sqlite {
         connection
             .write(move |connection| {
                 let transaction = connection.transaction()?;
-
-                // if is directory
-                if key.ends_with('/') {
-                    let rows_affected = Self::try_delete_objects_like(&transaction, &key)
-                        .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
-
-                    if rows_affected > 1 {
-                        return Err(s3_error!(BucketNotEmpty).into());
-                    }
-                } else {
-                    let rows_affected = Self::try_delete_object(&transaction, &key)
-                        .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
-
-                    if rows_affected != 1 {
-                        return Err(s3_error!(NoSuchKey).into());
-                    }
-                }
-
+                Self::try_delete_object(&transaction, &key)
+                    .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
                 Ok(transaction.commit()?)
             })
             .await?;
@@ -363,33 +488,41 @@ impl S3 for Sqlite {
 
         self.validate_mutable_bucket(&bucket)?;
 
+        let quiet = delete.quiet.unwrap_or(false);
         let delete_keys = delete
             .objects
             .into_iter()
             .map(|object| object.key)
             .collect::<Vec<_>>();
+        if delete_keys.len() > 1000 {
+            return Err(s3_error!(
+                MalformedXML,
+                "DeleteObjects supports at most 1000 keys"
+            ));
+        }
 
         let connection = self.try_get_connection(&bucket).await?;
 
-        let affected_keys = connection
+        let deleted_keys = delete_keys.clone();
+        connection
             .write(move |connection| {
                 let transaction = connection.transaction()?;
-                let affected_keys = Self::try_delete_objects(&transaction, &delete_keys)?;
+                Self::try_delete_objects(&transaction, &delete_keys)?;
                 transaction.commit()?;
-                Ok(affected_keys)
+                Ok(())
             })
             .await?;
 
         let output = DeleteObjectsOutput {
-            deleted: Some(
-                affected_keys
+            deleted: quiet.not().then(|| {
+                deleted_keys
                     .into_iter()
                     .map(|key| DeletedObject {
                         key: Some(key),
                         ..Default::default()
                     })
-                    .collect::<Vec<_>>(),
-            ),
+                    .collect::<Vec<_>>()
+            }),
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -473,6 +606,7 @@ impl S3 for Sqlite {
         let output = GetObjectOutput {
             body: Some(StreamingBlob::wrap::<_, S3Error>(body)),
             accept_ranges: Some("bytes".to_string()),
+            cache_control: object.cache_control,
             content_range: range.is_some().then(|| {
                 format!(
                     "bytes {}-{}/{}",
@@ -482,6 +616,8 @@ impl S3 for Sqlite {
                 )
             }),
             content_length: Some(content_length_i64),
+            content_type: object.content_type,
+            expires: object.expires.map(Into::into),
             last_modified: Some(object.last_modified.into()),
             metadata: object.metadata,
             e_tag: object.md5.map(ETag::Strong),
@@ -532,16 +668,56 @@ impl S3 for Sqlite {
             .await?;
 
         // TODO: detect content type
-        let content_type = mime::APPLICATION_OCTET_STREAM;
+        let content_type = object
+            .content_type
+            .unwrap_or_else(|| mime::APPLICATION_OCTET_STREAM.to_string());
 
         let output = HeadObjectOutput {
             accept_ranges: Some("bytes".to_string()),
+            cache_control: object.cache_control,
             content_length: Some(try_!(i64::try_from(object.size))),
-            content_type: Some(content_type.to_string()),
+            content_type: Some(content_type),
+            e_tag: object.md5.map(ETag::Strong),
+            expires: object.expires.map(Into::into),
             last_modified: Some(object.last_modified.into()),
             metadata: object.metadata,
             ..Default::default()
         };
+        Ok(S3Response::new(output))
+    }
+
+    #[tracing::instrument]
+    async fn get_object_acl(
+        &self,
+        req: S3Request<GetObjectAclInput>,
+    ) -> S3Result<S3Response<GetObjectAclOutput>> {
+        let GetObjectAclInput { bucket, key, .. } = req.input;
+
+        let connection = self.try_get_connection(&bucket).await?;
+        connection
+            .read(move |connection| {
+                let transaction = connection.transaction()?;
+                Self::try_get_metadata(&transaction, &key)?.ok_or_else(|| s3_error!(NoSuchKey))?;
+                Ok(())
+            })
+            .await?;
+
+        let owner = owner();
+        let output = GetObjectAclOutput {
+            grants: Some(vec![Grant {
+                grantee: Some(Grantee {
+                    display_name: owner.display_name.clone(),
+                    email_address: None,
+                    id: owner.id.clone(),
+                    type_: Type::from_static(Type::CANONICAL_USER),
+                    uri: None,
+                }),
+                permission: Some(Permission::from_static(Permission::FULL_CONTROL)),
+            }]),
+            owner: Some(owner),
+            ..Default::default()
+        };
+
         Ok(S3Response::new(output))
     }
 
@@ -589,40 +765,88 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<ListObjectsInput>,
     ) -> S3Result<S3Response<ListObjectsOutput>> {
-        let marker = req.input.marker.clone();
+        let allow_unordered = has_query_value(req.uri.query(), "allow-unordered", "true");
+        let ListObjectsInput {
+            bucket,
+            mut prefix,
+            max_keys,
+            mut marker,
+            mut delimiter,
+            encoding_type,
+            ..
+        } = req.input;
 
-        let v2_resp = self.list_objects_v2(req.map_input(Into::into)).await?;
+        prefix = prefix.map(decode_list_input_value);
+        marker = marker.map(decode_list_input_value);
+        delimiter = delimiter.map(decode_list_input_value);
 
-        Ok(v2_resp.map_output(|v2| {
-            let next_marker = if v2.is_truncated.unwrap_or(false) {
-                v2.contents
-                    .as_ref()
-                    .and_then(|contents| contents.last().and_then(|last| last.key.clone()))
+        let max_keys = max_keys.unwrap_or(1000).clamp(0, 1000);
+        let max_keys_usize = try_!(usize::try_from(max_keys));
+        let marker_output = Some(marker.clone().unwrap_or_default());
+        let prefix_filter = prefix.clone().unwrap_or_default();
+        let encode_keys = is_url_encoding(encoding_type.as_ref());
+        let delimiter_filter = delimiter
+            .as_deref()
+            .filter(|delimiter| delimiter.is_empty().not())
+            .map(str::to_string);
+        if allow_unordered && delimiter_filter.is_some() {
+            return Err(s3_error!(
+                InvalidArgument,
+                "allow-unordered cannot be used with delimiter"
+            ));
+        }
+        let delimiter = output_delimiter(delimiter, encode_keys);
+        let owner = owner();
+
+        let listing = self
+            .list_keys(
+                &bucket,
+                &prefix_filter,
+                delimiter_filter.as_deref(),
+                marker.clone(),
+                max_keys_usize,
+            )
+            .await?;
+        let objects = listing
+            .keys
+            .into_iter()
+            .map(|key_size| object_from_key_size(key_size, encode_keys, Some(&owner)))
+            .collect::<S3Result<Vec<_>>>()?;
+        let next_marker = listing
+            .is_truncated
+            .then(|| {
+                listing
+                    .next_marker
+                    .clone()
+                    .map(|marker| encode_list_value(marker, encode_keys))
+            })
+            .flatten();
+
+        let output = ListObjectsOutput {
+            contents: Some(objects),
+            common_prefixes: delimiter.as_ref().map(|_| {
+                listing
+                    .common_prefixes
                     .into_iter()
-                    .chain(v2.common_prefixes.as_ref().and_then(|common_prefixes| {
-                        common_prefixes
-                            .last()
-                            .and_then(|common_prefix| common_prefix.prefix.clone())
-                    }))
-                    .max()
-            } else {
-                None
-            };
+                    .map(|common_prefix| CommonPrefix {
+                        prefix: common_prefix
+                            .prefix
+                            .map(|prefix| encode_list_value(prefix, encode_keys)),
+                    })
+                    .collect::<Vec<_>>()
+            }),
+            delimiter,
+            encoding_type,
+            name: Some(bucket),
+            prefix: prefix.map(|prefix| encode_list_value(prefix, encode_keys)),
+            max_keys: Some(max_keys),
+            is_truncated: Some(next_marker.is_some()),
+            marker: marker_output,
+            next_marker,
+            ..Default::default()
+        };
 
-            ListObjectsOutput {
-                contents: v2.contents,
-                common_prefixes: v2.common_prefixes,
-                delimiter: v2.delimiter,
-                encoding_type: v2.encoding_type,
-                name: v2.name,
-                prefix: v2.prefix,
-                max_keys: v2.max_keys,
-                is_truncated: v2.is_truncated,
-                marker,
-                next_marker,
-                ..Default::default()
-            }
-        }))
+        Ok(S3Response::new(output))
     }
 
     #[tracing::instrument]
@@ -632,21 +856,31 @@ impl S3 for Sqlite {
     ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
         let ListObjectVersionsInput {
             bucket,
-            prefix,
+            mut prefix,
             max_keys,
-            key_marker,
+            mut key_marker,
             version_id_marker,
-            delimiter,
+            mut delimiter,
             encoding_type,
             ..
         } = req.input;
+
+        prefix = prefix.map(decode_list_input_value);
+        key_marker = key_marker.map(decode_list_input_value);
+        delimiter = delimiter.map(decode_list_input_value);
 
         let max_keys = max_keys.unwrap_or(1000).clamp(0, 1000);
         let max_keys_usize = try_!(usize::try_from(max_keys));
         let key_marker_clone = key_marker.clone();
         let version_id_marker_clone = version_id_marker.clone();
         let prefix_filter = prefix.clone().unwrap_or_default();
-        let delimiter_filter = delimiter.clone();
+        let encode_keys = is_url_encoding(encoding_type.as_ref());
+        let delimiter_filter = delimiter
+            .as_deref()
+            .filter(|delimiter| delimiter.is_empty().not())
+            .map(str::to_string);
+        let delimiter = output_delimiter(delimiter, encode_keys);
+        let owner = owner();
 
         let listing = self
             .list_keys(
@@ -660,17 +894,32 @@ impl S3 for Sqlite {
         let versions = listing
             .keys
             .into_iter()
-            .map(object_version_from_key_size)
+            .map(|key_size| object_version_from_key_size(key_size, encode_keys, Some(&owner)))
             .collect::<S3Result<Vec<_>>>()?;
 
         let next_key_marker = listing
             .is_truncated
-            .then(|| listing.next_after_key.clone())
+            .then(|| {
+                listing
+                    .next_marker
+                    .clone()
+                    .map(|marker| encode_list_value(marker, encode_keys))
+            })
             .flatten();
         let next_version_id_marker = next_key_marker.as_ref().map(|_| "null".to_string());
 
         let output = ListObjectVersionsOutput {
-            common_prefixes: delimiter.as_ref().map(|_| listing.common_prefixes),
+            common_prefixes: delimiter.as_ref().map(|_| {
+                listing
+                    .common_prefixes
+                    .into_iter()
+                    .map(|common_prefix| CommonPrefix {
+                        prefix: common_prefix
+                            .prefix
+                            .map(|prefix| encode_list_value(prefix, encode_keys)),
+                    })
+                    .collect::<Vec<_>>()
+            }),
             delete_markers: Some(Vec::new()),
             delimiter,
             encoding_type,
@@ -680,7 +929,7 @@ impl S3 for Sqlite {
             name: Some(bucket),
             next_key_marker,
             next_version_id_marker,
-            prefix,
+            prefix: prefix.map(|prefix| encode_list_value(prefix, encode_keys)),
             version_id_marker: version_id_marker_clone,
             versions: Some(versions),
             ..Default::default()
@@ -694,23 +943,45 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
+        let allow_unordered = has_query_value(req.uri.query(), "allow-unordered", "true");
         let ListObjectsV2Input {
             bucket,
-            prefix,
+            mut prefix,
             max_keys,
-            start_after,
-            delimiter,
+            mut start_after,
+            mut delimiter,
             encoding_type,
             continuation_token,
+            fetch_owner,
             ..
         } = req.input;
+
+        prefix = prefix.map(decode_list_input_value);
+        start_after = start_after.map(decode_list_input_value);
+        delimiter = delimiter.map(decode_list_input_value);
 
         let max_keys = max_keys.unwrap_or(1000).clamp(0, 1000);
         let max_keys_usize = try_!(usize::try_from(max_keys));
         let continuation_token_clone = continuation_token.clone();
         let prefix_filter = prefix.clone().unwrap_or_default();
-        let delimiter_filter = delimiter.clone();
-        let after_key = match continuation_token.as_deref() {
+        let encode_keys = is_url_encoding(encoding_type.as_ref());
+        let delimiter_filter = delimiter
+            .as_deref()
+            .filter(|delimiter| delimiter.is_empty().not())
+            .map(str::to_string);
+        if allow_unordered && delimiter_filter.is_some() {
+            return Err(s3_error!(
+                InvalidArgument,
+                "allow-unordered cannot be used with delimiter"
+            ));
+        }
+        let delimiter = output_delimiter(delimiter, encode_keys);
+        let owner = owner();
+        let owner = fetch_owner.unwrap_or(false).then_some(owner);
+        let after_key = match continuation_token
+            .as_deref()
+            .filter(|continuation_token| continuation_token.is_empty().not())
+        {
             Some(continuation_token) => Some(decode_continuation_token(continuation_token)?),
             None => start_after.clone(),
         };
@@ -727,14 +998,14 @@ impl S3 for Sqlite {
         let objects = listing
             .keys
             .into_iter()
-            .map(object_from_key_size)
+            .map(|key_size| object_from_key_size(key_size, encode_keys, owner.as_ref()))
             .collect::<S3Result<Vec<_>>>()?;
 
         let next_continuation_token = listing
             .is_truncated
             .then(|| {
                 listing
-                    .next_after_key
+                    .next_marker
                     .as_deref()
                     .map(encode_continuation_token)
             })
@@ -748,12 +1019,22 @@ impl S3 for Sqlite {
             continuation_token: continuation_token_clone,
             is_truncated: Some(next_continuation_token.is_some()),
             contents: Some(objects),
-            common_prefixes: delimiter.as_ref().map(|_| listing.common_prefixes),
+            common_prefixes: delimiter.as_ref().map(|_| {
+                listing
+                    .common_prefixes
+                    .into_iter()
+                    .map(|common_prefix| CommonPrefix {
+                        prefix: common_prefix
+                            .prefix
+                            .map(|prefix| encode_list_value(prefix, encode_keys)),
+                    })
+                    .collect::<Vec<_>>()
+            }),
             delimiter,
             encoding_type,
             name: Some(bucket),
-            prefix,
-            start_after,
+            prefix: prefix.map(|prefix| encode_list_value(prefix, encode_keys)),
+            start_after: start_after.map(|start_after| encode_list_value(start_after, encode_keys)),
             next_continuation_token,
             ..Default::default()
         };
@@ -771,8 +1052,11 @@ impl S3 for Sqlite {
             bucket,
             key,
             metadata,
-            content_length,
+            cache_control,
+            content_length: _,
             content_md5,
+            content_type,
+            expires,
             storage_class,
             ..
         } = req.input;
@@ -796,39 +1080,6 @@ impl S3 for Sqlite {
 
         let connection = self.try_get_connection(&bucket).await?;
 
-        // if is directory
-        if key.ends_with('/') {
-            if let Some(len) = content_length {
-                if len > 0 {
-                    return Err(s3_error!(
-                        UnexpectedContent,
-                        "Unexpected request body when creating a directory object."
-                    ));
-                }
-            }
-
-            connection
-                .write(move |connection| {
-                    let transaction = connection.transaction()?;
-                    Self::try_put_object(
-                        &transaction,
-                        KeyValue {
-                            key,
-                            value: None,
-                            size: 0,
-                            metadata,
-                            last_modified: OffsetDateTime::now_utc(),
-                            md5: None,
-                        },
-                    )?;
-                    Ok(transaction.commit()?)
-                })
-                .await?;
-
-            let output = PutObjectOutput::default();
-            return Ok(S3Response::new(output));
-        }
-
         let mut md5_hash = Md5::new();
         let stream = body.inspect_ok(|bytes| md5_hash.update(bytes.as_ref()));
         let mut value = Vec::new();
@@ -837,10 +1088,10 @@ impl S3 for Sqlite {
         let md5 = hex(md5_bytes);
 
         // if provided verify content_md5
-        if let Some(content_md5) = content_md5 {
-            if content_md5 != base64(md5_bytes) {
-                return Err(s3_error!(BadDigest));
-            }
+        if let Some(content_md5) = content_md5
+            && content_md5 != base64(md5_bytes)
+        {
+            return Err(s3_error!(BadDigest));
         }
 
         debug!(path = %key, ?size, %md5, "write file");
@@ -856,6 +1107,9 @@ impl S3 for Sqlite {
                         value: Some(value),
                         size,
                         metadata,
+                        content_type,
+                        cache_control,
+                        expires: expires.map(Into::into),
                         last_modified: OffsetDateTime::now_utc(),
                         md5: Some(md5_clone),
                     },
@@ -876,7 +1130,15 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
-        let CreateMultipartUploadInput { bucket, key, .. } = req.input;
+        let CreateMultipartUploadInput {
+            bucket,
+            key,
+            cache_control,
+            content_type,
+            expires,
+            metadata,
+            ..
+        } = req.input;
 
         self.validate_mutable_bucket(&bucket)?;
 
@@ -893,7 +1155,13 @@ impl S3 for Sqlite {
                     upload_id,
                     &bucket_clone,
                     &key_clone,
-                    req.credentials,
+                    MultipartUploadState {
+                        access_key: req.credentials.map(|credentials| credentials.access_key),
+                        metadata,
+                        content_type,
+                        cache_control,
+                        expires: expires.map(Into::into),
+                    },
                 )?;
                 Ok(transaction.commit()?)
             })
@@ -938,10 +1206,10 @@ impl S3 for Sqlite {
         let size = try_!(i64::try_from(value.len()));
 
         // if provided verify content_md5
-        if let Some(content_md5) = content_md5 {
-            if content_md5 != base64(md5_bytes) {
-                return Err(s3_error!(BadDigest));
-            }
+        if let Some(content_md5) = content_md5
+            && content_md5 != base64(md5_bytes)
+        {
+            return Err(s3_error!(BadDigest));
         }
 
         let md5_clone = md5.clone();
@@ -950,17 +1218,13 @@ impl S3 for Sqlite {
             .write(move |connection| {
                 let transaction = connection.transaction()?;
 
-                if Self::try_verify_upload_id(
-                    &transaction,
-                    upload_id,
-                    &bucket,
-                    &key,
-                    req.credentials,
-                )?
-                .not()
-                {
-                    return Err(s3_error!(AccessDenied).into());
-                }
+                let upload_state =
+                    Self::try_get_multipart_upload_state(&transaction, upload_id, &bucket, &key)?
+                        .ok_or_else(|| s3_error!(NoSuchUpload))?;
+                validate_multipart_access(
+                    upload_state.access_key.as_ref(),
+                    req.credentials.as_ref(),
+                )?;
 
                 Self::try_put_multipart(
                     &transaction,
@@ -1008,18 +1272,18 @@ impl S3 for Sqlite {
                     .transaction()
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
 
-                if Self::try_verify_upload_id(
+                let upload_state = Self::try_get_multipart_upload_state(
                     &transaction,
                     upload_id,
                     &bucket_clone,
                     &key_clone,
-                    req.credentials,
                 )
                 .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
-                .not()
-                {
-                    return Err(s3_error!(AccessDenied).into());
-                }
+                .ok_or_else(|| s3_error!(NoSuchUpload))?;
+                validate_multipart_access(
+                    upload_state.access_key.as_ref(),
+                    req.credentials.as_ref(),
+                )?;
 
                 let parts = Self::try_list_multipart(&transaction, upload_id)
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
@@ -1048,6 +1312,47 @@ impl S3 for Sqlite {
             ..Default::default()
         };
         Ok(S3Response::new(output))
+    }
+
+    #[tracing::instrument]
+    async fn abort_multipart_upload(
+        &self,
+        req: S3Request<AbortMultipartUploadInput>,
+    ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        let AbortMultipartUploadInput {
+            bucket,
+            key,
+            upload_id,
+            ..
+        } = req.input;
+
+        self.validate_mutable_bucket(&bucket)?;
+
+        let upload_id = Uuid::parse_str(&upload_id).map_err(|_| s3_error!(NoSuchUpload))?;
+
+        let connection = self.try_get_connection(&bucket).await?;
+        connection
+            .write(move |connection| {
+                let transaction = connection.transaction()?;
+                let upload_state =
+                    Self::try_get_multipart_upload_state(&transaction, upload_id, &bucket, &key)?
+                        .ok_or_else(|| s3_error!(NoSuchUpload))?;
+                validate_multipart_access(
+                    upload_state.access_key.as_ref(),
+                    req.credentials.as_ref(),
+                )?;
+
+                let deleted = Self::try_delete_multipart(&transaction, upload_id)?;
+                if deleted == 0 {
+                    return Err(s3_error!(NoSuchUpload).into());
+                }
+
+                transaction.commit()?;
+                Ok(())
+            })
+            .await?;
+
+        Ok(S3Response::new(AbortMultipartUploadOutput::default()))
     }
 
     #[tracing::instrument]
@@ -1104,18 +1409,32 @@ impl S3 for Sqlite {
                     .transaction()
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
 
-                if Self::try_verify_upload_id(
+                let Some(upload_state) = Self::try_get_multipart_upload_state(
                     &transaction,
                     upload_id,
                     &bucket_clone,
                     &key_clone,
-                    req.credentials,
                 )
                 .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
-                .not()
-                {
-                    return Err(s3_error!(AccessDenied).into());
-                }
+                else {
+                    let completed = Self::try_get_completed_multipart_upload(
+                        &transaction,
+                        upload_id,
+                        &bucket_clone,
+                        &key_clone,
+                    )
+                    .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?
+                    .ok_or_else(|| s3_error!(NoSuchUpload))?;
+                    validate_multipart_access(
+                        completed.access_key.as_ref(),
+                        req.credentials.as_ref(),
+                    )?;
+                    return Ok(completed.md5);
+                };
+                validate_multipart_access(
+                    upload_state.access_key.as_ref(),
+                    req.credentials.as_ref(),
+                )?;
 
                 let parts = Self::try_get_multiparts(&transaction, upload_id)
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
@@ -1136,11 +1455,16 @@ impl S3 for Sqlite {
 
                 let mut value = Vec::with_capacity(total_size);
                 let mut part_md5s = Vec::with_capacity(parts.len() * 16);
-                for ((requested_part_number, requested_etag), part) in
-                    requested_parts.iter().zip(parts)
+                let final_part_number = requested_parts.len();
+                for (index, ((requested_part_number, requested_etag), part)) in
+                    requested_parts.iter().zip(parts).enumerate()
                 {
                     if part.part_number != *requested_part_number {
                         return Err(s3_error!(InvalidPart).into());
+                    }
+
+                    if index + 1 != final_part_number && part.size < 5 * 1024 * 1024 {
+                        return Err(s3_error!(EntityTooSmall).into());
                     }
 
                     let Some(stored_md5) = part.md5.as_deref() else {
@@ -1162,10 +1486,13 @@ impl S3 for Sqlite {
                 Self::try_put_object(
                     &transaction,
                     KeyValue {
-                        key: key_clone,
+                        key: key_clone.clone(),
                         value: Some(value),
                         size,
-                        metadata: None,
+                        metadata: upload_state.metadata,
+                        content_type: upload_state.content_type,
+                        cache_control: upload_state.cache_control,
+                        expires: upload_state.expires,
                         last_modified: OffsetDateTime::now_utc(),
                         md5: Some(md5.clone()),
                     },
@@ -1174,6 +1501,15 @@ impl S3 for Sqlite {
 
                 Self::try_delete_multipart(&transaction, upload_id)
                     .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
+                Self::try_put_completed_multipart_upload(
+                    &transaction,
+                    upload_id,
+                    &bucket_clone,
+                    &key_clone,
+                    req.credentials.map(|credentials| credentials.access_key),
+                    &md5,
+                )
+                .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
 
                 transaction
                     .commit()

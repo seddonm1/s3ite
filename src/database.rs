@@ -20,8 +20,8 @@ use std::{
     fmt::{self, Debug},
     path::Path,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     thread,
     thread::JoinHandle,
@@ -33,8 +33,8 @@ use tokio::sync::oneshot;
 use tracing::{debug, error};
 
 use crate::{
-    error::{Result, S3ite},
     Config,
+    error::{Result, S3ite},
 };
 
 static MESSAGE_BOUND: usize = 100;
@@ -243,10 +243,10 @@ impl ConnectionInner {
 
         {
             let mut writer_handle = self.writer_handle.lock().unwrap();
-            if let Some(writer_handle) = writer_handle.take() {
-                if writer_handle.join().is_err() {
-                    join_failed = true;
-                }
+            if let Some(writer_handle) = writer_handle.take()
+                && writer_handle.join().is_err()
+            {
+                join_failed = true;
             }
         }
 

@@ -4,19 +4,19 @@
     clippy::must_use_candidate, //
 )]
 
-use std::{collections::HashMap, env, fs, ops::Deref, path::PathBuf};
+use std::{collections::HashMap, fs, ops::Deref, path::PathBuf};
 
 use anyhow::Result;
 use aws_config::SdkConfig;
 use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_sdk_s3::{
+    Client,
     config::{Credentials, Region},
     primitives::ByteStream,
     types::{
         BucketLocationConstraint, CompletedMultipartUpload, CompletedPart,
-        CreateBucketConfiguration,
+        CreateBucketConfiguration, Delete, EncodingType, ObjectIdentifier,
     },
-    Client,
 };
 use md5::{Digest, Md5};
 use once_cell::sync::Lazy;
@@ -33,13 +33,12 @@ const REGION: &str = "us-west-2";
 static TRACING: Lazy<()> = Lazy::new(|| {
     use tracing_subscriber::EnvFilter;
 
-    if env::var("RUST_LOG").is_err() {
-        env::set_var("RUST_LOG", "it_aws=error,s3s_sqlite=debug,s3s=error");
-    }
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("it_aws=error,s3s_sqlite=debug,s3s=error"));
 
     tracing_subscriber::fmt()
         .pretty()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(env_filter)
         .with_test_writer()
         .init();
 });
@@ -150,6 +149,10 @@ async fn put_object(c: &Client, bucket: &str, key: &str, body: &'static [u8]) ->
     Ok(())
 }
 
+fn object_identifier(key: &str) -> Result<ObjectIdentifier> {
+    Ok(ObjectIdentifier::builder().key(key).build()?)
+}
+
 async fn upload_part(
     c: &Client,
     bucket: &str,
@@ -158,13 +161,32 @@ async fn upload_part(
     part_number: i32,
     body: &'static [u8],
 ) -> Result<CompletedPart> {
+    upload_part_body(
+        c,
+        bucket,
+        key,
+        upload_id,
+        part_number,
+        ByteStream::from_static(body),
+    )
+    .await
+}
+
+async fn upload_part_body(
+    c: &Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: i32,
+    body: ByteStream,
+) -> Result<CompletedPart> {
     let part = c
         .upload_part()
         .bucket(bucket)
         .key(key)
         .upload_id(upload_id)
         .part_number(part_number)
-        .body(ByteStream::from_static(body))
+        .body(body)
         .send()
         .await?;
 
@@ -209,9 +231,9 @@ async fn test_list_buckets() -> Result<()> {
 
     // test
     let result = context.list_buckets().send().await;
-    match result {
-        Ok(ref ans) => debug!(?ans),
-        Err(ref err) => error!(?err),
+    match &result {
+        Ok(ans) => debug!(?ans),
+        Err(err) => error!(?err),
     }
     let list_buckets = result?;
 
@@ -240,9 +262,15 @@ async fn test_single_object() -> Result<()> {
     let content_bytes = content.as_bytes();
     let mut md5_hash = Md5::new();
     md5_hash.update(content_bytes);
-    let content_md5 = base64(md5_hash.finalize());
+    let md5_bytes = md5_hash.finalize();
+    let content_md5 = base64(md5_bytes);
+    let content_etag = md5_bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
 
     // create_bucket
+    create_bucket(&context, &bucket).await?;
     create_bucket(&context, &bucket).await?;
 
     // put_object
@@ -262,6 +290,20 @@ async fn test_single_object() -> Result<()> {
 
     assert_eq!(content_length as usize, content.len());
     assert_eq!(body.as_ref(), content.as_bytes());
+
+    // head_object
+    let head_object_output = context
+        .head_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+    assert_eq!(
+        head_object_output
+            .e_tag()
+            .map(|etag| etag.trim_matches('"')),
+        Some(content_etag.as_str())
+    );
 
     // delete_object
     delete_object(&context, &bucket, key).await?;
@@ -524,6 +566,182 @@ async fn test_list_objects_prefix_delimiter_and_pagination() -> Result<()> {
 
 #[tokio::test]
 #[tracing::instrument]
+async fn test_list_objects_ceph_edge_semantics() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await;
+
+    let bucket = format!("test-list-ceph-edges-{}", Uuid::new_v4());
+    create_bucket(&context, &bucket).await?;
+
+    for key in ["foo+1/bar", "foo/bar/xyzzy", "quux ab/thud", "asdf+b"] {
+        put_object(&context, &bucket, key, b"x").await?;
+    }
+
+    let encoded_v2 = context
+        .list_objects_v2()
+        .bucket(&bucket)
+        .delimiter("/")
+        .encoding_type(EncodingType::Url)
+        .send()
+        .await?;
+    let encoded_v2_keys = encoded_v2
+        .contents()
+        .iter()
+        .filter_map(|object| object.key())
+        .collect::<Vec<_>>();
+    let encoded_v2_prefixes = encoded_v2
+        .common_prefixes()
+        .iter()
+        .filter_map(|common_prefix| common_prefix.prefix())
+        .collect::<Vec<_>>();
+    assert_eq!(encoded_v2.delimiter(), Some("/"));
+    assert_eq!(encoded_v2_keys, vec!["asdf%2Bb"]);
+    assert_eq!(encoded_v2_prefixes, vec!["foo%2B1/", "foo/", "quux%20ab/"]);
+
+    let encoded_v1 = context
+        .list_objects()
+        .bucket(&bucket)
+        .delimiter("/")
+        .encoding_type(EncodingType::Url)
+        .send()
+        .await?;
+    let encoded_v1_keys = encoded_v1
+        .contents()
+        .iter()
+        .filter_map(|object| object.key())
+        .collect::<Vec<_>>();
+    let encoded_v1_prefixes = encoded_v1
+        .common_prefixes()
+        .iter()
+        .filter_map(|common_prefix| common_prefix.prefix())
+        .collect::<Vec<_>>();
+    assert_eq!(encoded_v1.delimiter(), Some("/"));
+    assert_eq!(encoded_v1_keys, vec!["asdf%2Bb"]);
+    assert_eq!(encoded_v1_prefixes, vec!["foo%2B1/", "foo/", "quux%20ab/"]);
+
+    for key in ["foo+1/bar", "foo/bar/xyzzy", "quux ab/thud", "asdf+b"] {
+        delete_object(&context, &bucket, key).await?;
+    }
+    for key in [
+        "asdf",
+        "boo/bar",
+        "boo/baz/xyzzy",
+        "cquux/thud",
+        "cquux/bla",
+    ] {
+        put_object(&context, &bucket, key, b"x").await?;
+    }
+
+    let v1_first = context
+        .list_objects()
+        .bucket(&bucket)
+        .delimiter("/")
+        .max_keys(1)
+        .send()
+        .await?;
+    assert_eq!(v1_first.next_marker(), Some("asdf"));
+    let v1_second = context
+        .list_objects()
+        .bucket(&bucket)
+        .delimiter("/")
+        .marker(v1_first.next_marker().unwrap())
+        .max_keys(1)
+        .send()
+        .await?;
+    assert_eq!(v1_second.next_marker(), Some("boo/"));
+    let v1_third = context
+        .list_objects()
+        .bucket(&bucket)
+        .delimiter("/")
+        .marker(v1_second.next_marker().unwrap())
+        .max_keys(1)
+        .send()
+        .await?;
+    let v1_third_prefixes = v1_third
+        .common_prefixes()
+        .iter()
+        .filter_map(|common_prefix| common_prefix.prefix())
+        .collect::<Vec<_>>();
+    assert_eq!(v1_third_prefixes, vec!["cquux/"]);
+    assert_eq!(v1_third.is_truncated(), Some(false));
+    assert_eq!(v1_third.next_marker(), None);
+
+    let v2_first = context
+        .list_objects_v2()
+        .bucket(&bucket)
+        .delimiter("/")
+        .max_keys(1)
+        .send()
+        .await?;
+    let v2_second = context
+        .list_objects_v2()
+        .bucket(&bucket)
+        .delimiter("/")
+        .continuation_token(v2_first.next_continuation_token().unwrap())
+        .max_keys(1)
+        .send()
+        .await?;
+    let v2_third = context
+        .list_objects_v2()
+        .bucket(&bucket)
+        .delimiter("/")
+        .continuation_token(v2_second.next_continuation_token().unwrap())
+        .max_keys(1)
+        .send()
+        .await?;
+    let v2_third_prefixes = v2_third
+        .common_prefixes()
+        .iter()
+        .filter_map(|common_prefix| common_prefix.prefix())
+        .collect::<Vec<_>>();
+    assert_eq!(v2_third_prefixes, vec!["cquux/"]);
+    assert_eq!(v2_third.is_truncated(), Some(false));
+
+    let empty_delimiter = context
+        .list_objects_v2()
+        .bucket(&bucket)
+        .delimiter("")
+        .send()
+        .await?;
+    assert_eq!(empty_delimiter.delimiter(), None);
+
+    let empty_token = context
+        .list_objects_v2()
+        .bucket(&bucket)
+        .continuation_token("")
+        .send()
+        .await?;
+    assert_eq!(empty_token.continuation_token(), Some(""));
+
+    let fetch_owner = context
+        .list_objects_v2()
+        .bucket(&bucket)
+        .fetch_owner(true)
+        .send()
+        .await?;
+    assert!(
+        fetch_owner
+            .contents()
+            .iter()
+            .all(|object| object.owner().is_some())
+    );
+
+    for key in [
+        "asdf",
+        "boo/bar",
+        "boo/baz/xyzzy",
+        "cquux/thud",
+        "cquux/bla",
+    ] {
+        delete_object(&context, &bucket, key).await?;
+    }
+    delete_bucket(&context, &bucket).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
 async fn test_list_object_versions_for_unversioned_bucket() -> Result<()> {
     let _guard = serial().await;
     let context = TestContext::new(None).await;
@@ -552,14 +770,18 @@ async fn test_list_object_versions_for_unversioned_bucket() -> Result<()> {
     assert_eq!(first_page.is_truncated(), Some(true));
     assert_eq!(first_page.next_key_marker(), Some("version/b"));
     assert_eq!(first_page.next_version_id_marker(), Some("null"));
-    assert!(first_page
-        .versions()
-        .iter()
-        .all(|version| version.is_latest().unwrap_or(false)));
-    assert!(first_page
-        .versions()
-        .iter()
-        .all(|version| version.version_id() == Some("null")));
+    assert!(
+        first_page
+            .versions()
+            .iter()
+            .all(|version| version.is_latest().unwrap_or(false))
+    );
+    assert!(
+        first_page
+            .versions()
+            .iter()
+            .all(|version| version.version_id() == Some("null"))
+    );
 
     let second_page = context
         .list_object_versions()
@@ -607,6 +829,82 @@ async fn test_list_object_versions_for_unversioned_bucket() -> Result<()> {
 
 #[tokio::test]
 #[tracing::instrument]
+async fn test_delete_and_trailing_slash_conformance() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await;
+
+    let bucket = format!("test-delete-conformance-{}", Uuid::new_v4());
+    create_bucket(&context, &bucket).await?;
+
+    put_object(&context, &bucket, "folder/", b"folder/").await?;
+    let folder = context
+        .get_object()
+        .bucket(&bucket)
+        .key("folder/")
+        .send()
+        .await?;
+    assert_eq!(
+        folder.body.collect().await?.into_bytes().as_ref(),
+        b"folder/"
+    );
+
+    let err = context
+        .delete_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap_err();
+    assert_error_contains(err, "BucketNotEmpty");
+
+    let delete = Delete::builder()
+        .objects(object_identifier("folder/")?)
+        .objects(object_identifier("missing")?)
+        .build()?;
+    let deleted = context
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(delete)
+        .send()
+        .await?;
+    let deleted_keys = deleted
+        .deleted()
+        .iter()
+        .filter_map(|object| object.key())
+        .collect::<Vec<_>>();
+    assert_eq!(deleted_keys, vec!["folder/", "missing"]);
+
+    let delete_again = Delete::builder()
+        .objects(object_identifier("folder/")?)
+        .objects(object_identifier("missing")?)
+        .build()?;
+    let deleted_again = context
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(delete_again)
+        .send()
+        .await?;
+    assert_eq!(deleted_again.deleted().len(), 2);
+
+    let too_many = (0..=1000)
+        .map(|index| object_identifier(&format!("key-{index}")))
+        .collect::<Result<Vec<_>>>()?;
+    let too_many = Delete::builder().set_objects(Some(too_many)).build()?;
+    let err = context
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(too_many)
+        .send()
+        .await
+        .unwrap_err();
+    assert_error_contains(err, "MalformedXML");
+
+    delete_bucket(&context, &bucket).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
 async fn test_multipart() -> Result<()> {
     let _guard = serial().await;
     let context = TestContext::new(None).await;
@@ -629,8 +927,8 @@ async fn test_multipart() -> Result<()> {
             .send()
             .await;
         match &result {
-            Ok(ref ans) => debug!(?ans),
-            Err(ref err) => error!(?err),
+            Ok(ans) => debug!(?ans),
+            Err(err) => error!(?err),
         }
         result?.upload_id.unwrap()
     };
@@ -652,8 +950,8 @@ async fn test_multipart() -> Result<()> {
             .await;
 
         match &result {
-            Ok(ref ans) => debug!(?ans),
-            Err(ref err) => error!(?err),
+            Ok(ans) => debug!(?ans),
+            Err(err) => error!(?err),
         }
 
         let part = CompletedPart::builder()
@@ -691,7 +989,7 @@ async fn test_multipart() -> Result<()> {
                 assert_eq!(content_length as usize, content.len());
                 assert_eq!(body.as_ref(), content.as_bytes());
             }
-            Err(ref err) => error!(?err),
+            Err(err) => error!(?err),
         }
     }
 
@@ -712,6 +1010,33 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
     let bucket = format!("test-multipart-validation-{}", Uuid::new_v4());
     create_bucket(&context, &bucket).await?;
 
+    let small_key = "small.txt";
+    let small_upload_id = context
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key(small_key)
+        .send()
+        .await?
+        .upload_id
+        .unwrap();
+    let small_part1 =
+        upload_part(&context, &bucket, small_key, &small_upload_id, 1, b"one").await?;
+    let small_part2 =
+        upload_part(&context, &bucket, small_key, &small_upload_id, 2, b"two").await?;
+    let small_upload = CompletedMultipartUpload::builder()
+        .set_parts(Some(vec![small_part1, small_part2]))
+        .build();
+    let err = context
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key(small_key)
+        .upload_id(&small_upload_id)
+        .multipart_upload(small_upload)
+        .send()
+        .await
+        .unwrap_err();
+    assert_error_contains(err, "EntityTooSmall");
+
     let key = "valid.txt";
     let upload_id = context
         .create_multipart_upload()
@@ -721,7 +1046,18 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
         .await?
         .upload_id
         .unwrap();
-    let part1 = upload_part(&context, &bucket, key, &upload_id, 1, b"hello ").await?;
+    let first_part = vec![b'a'; 5 * 1024 * 1024];
+    let mut expected = first_part.clone();
+    expected.extend_from_slice(b"world");
+    let part1 = upload_part_body(
+        &context,
+        &bucket,
+        key,
+        &upload_id,
+        1,
+        ByteStream::from(first_part),
+    )
+    .await?;
     let part2 = upload_part(&context, &bucket, key, &upload_id, 2, b"world").await?;
     let upload = CompletedMultipartUpload::builder()
         .set_parts(Some(vec![part1.clone(), part2.clone()]))
@@ -739,7 +1075,7 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
     let object = context.get_object().bucket(&bucket).key(key).send().await?;
     assert_eq!(
         object.body.collect().await?.into_bytes().as_ref(),
-        b"hello world"
+        expected.as_slice()
     );
 
     let missing_key = "missing.txt";
@@ -795,10 +1131,12 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
     let _wrong_part =
         upload_part(&context, &bucket, wrong_key, &wrong_upload_id, 1, b"one").await?;
     let wrong_upload = CompletedMultipartUpload::builder()
-        .set_parts(Some(vec![CompletedPart::builder()
-            .part_number(1)
-            .e_tag("00000000000000000000000000000000")
-            .build()]))
+        .set_parts(Some(vec![
+            CompletedPart::builder()
+                .part_number(1)
+                .e_tag("00000000000000000000000000000000")
+                .build(),
+        ]))
         .build();
     let err = context
         .complete_multipart_upload()
@@ -839,6 +1177,56 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
     assert_error_contains(err, "InvalidPartOrder");
 
     delete_object(&context, &bucket, key).await?;
+    delete_bucket(&context, &bucket).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_abort_multipart_upload() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await;
+
+    let bucket = format!("test-multipart-abort-{}", Uuid::new_v4());
+    let key = "aborted.txt";
+    create_bucket(&context, &bucket).await?;
+
+    let upload_id = context
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?
+        .upload_id
+        .unwrap();
+    upload_part(&context, &bucket, key, &upload_id, 1, b"unused").await?;
+
+    context
+        .abort_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .send()
+        .await?;
+    let objects = context
+        .list_objects_v2()
+        .bucket(&bucket)
+        .prefix(key)
+        .send()
+        .await?;
+    assert!(objects.contents().is_empty());
+
+    let err = context
+        .abort_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id("56788")
+        .send()
+        .await
+        .unwrap_err();
+    assert_error_contains(err, "NoSuchUpload");
+
     delete_bucket(&context, &bucket).await?;
 
     Ok(())
