@@ -80,8 +80,8 @@ impl From<hyper::Error> for S3ite {
     }
 }
 
-impl From<serde_yaml::Error> for S3ite {
-    fn from(_value: serde_yaml::Error) -> Self {
+impl From<yaml_serde::Error> for S3ite {
+    fn from(_value: yaml_serde::Error) -> Self {
         Self::Yaml
     }
 }

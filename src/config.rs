@@ -1,12 +1,82 @@
 use std::{
     collections::HashMap,
+    fs,
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
     str::FromStr,
 };
 
-use clap::ValueEnum;
+use clap::{Parser, ValueEnum};
 use serde::Deserialize;
+
+use crate::error::{Result, S3ite};
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct ConfigArgs {
+    /// The base path where the `.sqlite3` files will be created.
+    /// All `.sqlite3` files at this path will be loaded at startup and exposed via this service.
+    #[clap(long)]
+    root: Option<PathBuf>,
+
+    /// Path to a YAML configuration file.
+    #[clap(long)]
+    config: Option<PathBuf>,
+
+    /// The IP address to listen on for this service. Use `0.0.0.0` to listen on all interfaces.
+    #[clap(long)]
+    host: Option<IpAddr>,
+
+    /// The port to listen on for this service.
+    #[clap(long)]
+    port: Option<u16>,
+
+    /// Allow permissive Cross-Origin Resource Sharing (`CORS`) requests.
+    /// This can be enabled to allow users to access this service from a web service running on a different host.
+    #[clap(long)]
+    permissive_cors: Option<bool>,
+
+    /// The access key ID that is used to authenticate for this service.
+    #[clap(long, requires = "secret_key")]
+    access_key: Option<String>,
+
+    /// The secret access key that is used to authenticate for this service.
+    #[clap(long, requires = "access_key")]
+    secret_key: Option<String>,
+
+    /// The domain to use to allow parsing virtual-hosted-style requests.
+    #[clap(long)]
+    domain_name: Option<String>,
+
+    /// Enforces a limit on the concurrent number of requests the underlying service can handle.
+    /// This can be tuned depending on infrastructure as `SSD`/`HDD` will deal with resource contention very differently.
+    #[clap(long)]
+    concurrency_limit: Option<u16>,
+
+    /// If this service should be read-only.
+    #[clap(long)]
+    read_only: Option<bool>,
+
+    /// Controls the `SQLite` `journal_mode` flag pragma.
+    #[clap(long)]
+    journal_mode: Option<JournalMode>,
+
+    /// Controls the `SQLite` `synchronous` pragma.
+    #[clap(long)]
+    synchronous: Option<Synchronous>,
+
+    /// Controls the `SQLite` `temp_store` pragma.
+    #[clap(long)]
+    temp_store: Option<TempStore>,
+
+    /// Controls the `SQLite` `cache_size` pragma in kilobytes.
+    #[clap(long)]
+    cache_size: Option<u32>,
+
+    /// Controls the number of reader connections to `SQLite`.
+    #[clap(long)]
+    readers: Option<usize>,
+}
 
 #[derive(Clone, Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
@@ -80,6 +150,72 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Loads configuration from command-line arguments and an optional YAML file.
+    pub fn from_args() -> Result<Self> {
+        Self::from_config_args(ConfigArgs::parse())
+    }
+
+    fn from_config_args(args: ConfigArgs) -> Result<Self> {
+        let mut config = args
+            .config
+            .as_ref()
+            .map(|path| {
+                let config = fs::read_to_string(path)?;
+                Ok::<_, S3ite>(yaml_serde::from_str::<Self>(&config)?)
+            })
+            .transpose()?
+            .unwrap_or_default();
+
+        config.apply_args(args);
+
+        Ok(config)
+    }
+
+    fn apply_args(&mut self, args: ConfigArgs) {
+        if let Some(root) = args.root {
+            self.root = root;
+        }
+        if let Some(host) = args.host {
+            self.host = host;
+        }
+        if let Some(port) = args.port {
+            self.port = port;
+        }
+        if let Some(access_key) = args.access_key {
+            self.access_key = Some(access_key);
+        }
+        if let Some(secret_key) = args.secret_key {
+            self.secret_key = Some(secret_key);
+        }
+        if let Some(permissive_cors) = args.permissive_cors {
+            self.permissive_cors = permissive_cors;
+        }
+        if let Some(domain_name) = args.domain_name {
+            self.domain_name = Some(domain_name);
+        }
+        if let Some(concurrency_limit) = args.concurrency_limit {
+            self.concurrency_limit = concurrency_limit;
+        }
+        if let Some(readers) = args.readers {
+            self.readers = readers;
+        }
+        if let Some(read_only) = args.read_only {
+            self.read_only = read_only;
+        }
+        if let Some(journal_mode) = args.journal_mode {
+            self.sqlite.journal_mode = journal_mode;
+        }
+        if let Some(synchronous) = args.synchronous {
+            self.sqlite.synchronous = synchronous;
+        }
+        if let Some(temp_store) = args.temp_store {
+            self.sqlite.temp_store = temp_store;
+        }
+        if let Some(cache_size) = args.cache_size {
+            self.sqlite.cache_size = cache_size;
+        }
+    }
+
     #[must_use]
     pub fn read_only(&self, bucket: Option<&str>) -> bool {
         bucket
@@ -323,7 +459,41 @@ mod tests {
     fn readers_default_and_deserialize_override() {
         assert_eq!(Config::default().readers, 4);
 
-        let config: Config = serde_yaml::from_str("readers: 7\n").unwrap();
+        let config: Config = yaml_serde::from_str("readers: 7\n").unwrap();
         assert_eq!(config.readers, 7);
+    }
+
+    #[test]
+    fn cli_args_override_yaml_config() {
+        use clap::Parser as _;
+
+        let path = std::env::temp_dir().join(format!("s3ite-{}.yaml", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            "
+            port: 9000
+            readers: 2
+            cache_size: 512
+            ",
+        )
+        .unwrap();
+
+        let args = ConfigArgs::try_parse_from([
+            "s3ite",
+            "--config",
+            path.to_str().unwrap(),
+            "--port",
+            "9001",
+            "--cache-size",
+            "1024",
+        ])
+        .unwrap();
+        let config = Config::from_config_args(args).unwrap();
+
+        assert_eq!(config.port, 9001);
+        assert_eq!(config.readers, 2);
+        assert_eq!(config.sqlite.cache_size, 1024);
+
+        std::fs::remove_file(path).ok();
     }
 }
