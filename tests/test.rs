@@ -524,6 +524,89 @@ async fn test_list_objects_prefix_delimiter_and_pagination() -> Result<()> {
 
 #[tokio::test]
 #[tracing::instrument]
+async fn test_list_object_versions_for_unversioned_bucket() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await;
+
+    let bucket = format!("test-list-object-versions-{}", Uuid::new_v4());
+    create_bucket(&context, &bucket).await?;
+
+    let keys = ["version/a", "version/b", "version/c", "version/dir/child"];
+    for key in keys {
+        put_object(&context, &bucket, key, b"x").await?;
+    }
+
+    let first_page = context
+        .list_object_versions()
+        .bucket(&bucket)
+        .prefix("version/")
+        .max_keys(2)
+        .send()
+        .await?;
+    let first_page_keys = first_page
+        .versions()
+        .iter()
+        .filter_map(|version| version.key())
+        .collect::<Vec<_>>();
+    assert_eq!(first_page_keys, vec!["version/a", "version/b"]);
+    assert_eq!(first_page.is_truncated(), Some(true));
+    assert_eq!(first_page.next_key_marker(), Some("version/b"));
+    assert_eq!(first_page.next_version_id_marker(), Some("null"));
+    assert!(first_page
+        .versions()
+        .iter()
+        .all(|version| version.is_latest().unwrap_or(false)));
+    assert!(first_page
+        .versions()
+        .iter()
+        .all(|version| version.version_id() == Some("null")));
+
+    let second_page = context
+        .list_object_versions()
+        .bucket(&bucket)
+        .prefix("version/")
+        .key_marker(first_page.next_key_marker().unwrap())
+        .version_id_marker(first_page.next_version_id_marker().unwrap())
+        .send()
+        .await?;
+    let second_page_keys = second_page
+        .versions()
+        .iter()
+        .filter_map(|version| version.key())
+        .collect::<Vec<_>>();
+    assert_eq!(second_page_keys, vec!["version/c", "version/dir/child"]);
+    assert_eq!(second_page.is_truncated(), Some(false));
+
+    let grouped = context
+        .list_object_versions()
+        .bucket(&bucket)
+        .prefix("version/")
+        .delimiter("/")
+        .send()
+        .await?;
+    let grouped_prefixes = grouped
+        .common_prefixes()
+        .iter()
+        .filter_map(|common_prefix| common_prefix.prefix())
+        .collect::<Vec<_>>();
+    let grouped_keys = grouped
+        .versions()
+        .iter()
+        .filter_map(|version| version.key())
+        .collect::<Vec<_>>();
+    assert_eq!(grouped_prefixes, vec!["version/dir/"]);
+    assert_eq!(grouped_keys, vec!["version/a", "version/b", "version/c"]);
+
+    for key in keys {
+        delete_object(&context, &bucket, key).await?;
+    }
+    delete_bucket(&context, &bucket).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
 async fn test_multipart() -> Result<()> {
     let _guard = serial().await;
     let context = TestContext::new(None).await;

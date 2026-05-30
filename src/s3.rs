@@ -82,6 +82,121 @@ fn object_from_key_size(key_size: KeySize) -> S3Result<Object> {
     })
 }
 
+fn object_version_from_key_size(key_size: KeySize) -> S3Result<ObjectVersion> {
+    Ok(ObjectVersion {
+        e_tag: key_size.md5.map(ETag::Strong),
+        is_latest: Some(true),
+        key: Some(key_size.key),
+        last_modified: Some(key_size.last_modified.into()),
+        size: Some(i64::try_from(key_size.size).map_err(S3Error::internal_error)?),
+        storage_class: Some(ObjectVersionStorageClass::from_static(
+            ObjectVersionStorageClass::STANDARD,
+        )),
+        version_id: Some("null".to_string()),
+        ..Default::default()
+    })
+}
+
+struct KeyListing {
+    keys: Vec<KeySize>,
+    common_prefixes: Vec<CommonPrefix>,
+    key_count: usize,
+    next_after_key: Option<String>,
+    is_truncated: bool,
+}
+
+impl Sqlite {
+    async fn list_keys(
+        &self,
+        bucket: &str,
+        prefix_filter: &str,
+        delimiter_filter: Option<&str>,
+        mut after_key: Option<String>,
+        max_keys: usize,
+    ) -> S3Result<KeyListing> {
+        let connection = self.try_get_connection(bucket).await?;
+        let mut keys = Vec::new();
+        let mut common_prefixes = Vec::new();
+        let mut seen_common_prefixes = HashSet::new();
+        let mut key_count = 0usize;
+        let mut is_truncated = false;
+
+        if max_keys > 0 {
+            'pages: loop {
+                let prefix = prefix_filter.to_string();
+                let after_key_query = after_key.clone();
+                let key_sizes = connection
+                    .read(move |connection| {
+                        let transaction = connection.transaction()?;
+                        Ok(Self::try_list_objects(
+                            &transaction,
+                            Some(&prefix),
+                            after_key_query.as_deref(),
+                            LIST_BATCH_SIZE,
+                        )?)
+                    })
+                    .await?;
+
+                if key_sizes.is_empty() {
+                    break;
+                }
+
+                let key_sizes_len = key_sizes.len();
+                for key_size in key_sizes {
+                    if prefix_filter.is_empty().not()
+                        && key_size.key.starts_with(prefix_filter).not()
+                    {
+                        break 'pages;
+                    }
+
+                    if let Some(common_prefix) =
+                        common_prefix_for_key(&key_size.key, prefix_filter, delimiter_filter)
+                    {
+                        if seen_common_prefixes.contains(&common_prefix) {
+                            after_key = Some(key_size.key);
+                            continue;
+                        }
+
+                        if key_count == max_keys {
+                            is_truncated = true;
+                            break 'pages;
+                        }
+
+                        seen_common_prefixes.insert(common_prefix.clone());
+                        common_prefixes.push(CommonPrefix {
+                            prefix: Some(common_prefix),
+                        });
+                        key_count += 1;
+                        after_key = Some(key_size.key);
+                        continue;
+                    }
+
+                    if key_count == max_keys {
+                        is_truncated = true;
+                        break 'pages;
+                    }
+
+                    after_key = Some(key_size.key.clone());
+                    keys.push(key_size);
+                    key_count += 1;
+                }
+
+                if key_sizes_len < LIST_BATCH_SIZE {
+                    break;
+                }
+            }
+        }
+
+        Ok(KeyListing {
+            keys,
+            common_prefixes,
+            key_count,
+            next_after_key: after_key,
+            is_truncated,
+        })
+    }
+}
+
 #[async_trait::async_trait]
 impl S3 for Sqlite {
     #[tracing::instrument]
@@ -511,6 +626,70 @@ impl S3 for Sqlite {
     }
 
     #[tracing::instrument]
+    async fn list_object_versions(
+        &self,
+        req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        let ListObjectVersionsInput {
+            bucket,
+            prefix,
+            max_keys,
+            key_marker,
+            version_id_marker,
+            delimiter,
+            encoding_type,
+            ..
+        } = req.input;
+
+        let max_keys = max_keys.unwrap_or(1000).clamp(0, 1000);
+        let max_keys_usize = try_!(usize::try_from(max_keys));
+        let key_marker_clone = key_marker.clone();
+        let version_id_marker_clone = version_id_marker.clone();
+        let prefix_filter = prefix.clone().unwrap_or_default();
+        let delimiter_filter = delimiter.clone();
+
+        let listing = self
+            .list_keys(
+                &bucket,
+                &prefix_filter,
+                delimiter_filter.as_deref(),
+                key_marker.clone(),
+                max_keys_usize,
+            )
+            .await?;
+        let versions = listing
+            .keys
+            .into_iter()
+            .map(object_version_from_key_size)
+            .collect::<S3Result<Vec<_>>>()?;
+
+        let next_key_marker = listing
+            .is_truncated
+            .then(|| listing.next_after_key.clone())
+            .flatten();
+        let next_version_id_marker = next_key_marker.as_ref().map(|_| "null".to_string());
+
+        let output = ListObjectVersionsOutput {
+            common_prefixes: delimiter.as_ref().map(|_| listing.common_prefixes),
+            delete_markers: Some(Vec::new()),
+            delimiter,
+            encoding_type,
+            is_truncated: Some(next_key_marker.is_some()),
+            key_marker: key_marker_clone,
+            max_keys: Some(max_keys),
+            name: Some(bucket),
+            next_key_marker,
+            next_version_id_marker,
+            prefix,
+            version_id_marker: version_id_marker_clone,
+            versions: Some(versions),
+            ..Default::default()
+        };
+
+        Ok(S3Response::new(output))
+    }
+
+    #[tracing::instrument]
     async fn list_objects_v2(
         &self,
         req: S3Request<ListObjectsV2Input>,
@@ -531,91 +710,37 @@ impl S3 for Sqlite {
         let continuation_token_clone = continuation_token.clone();
         let prefix_filter = prefix.clone().unwrap_or_default();
         let delimiter_filter = delimiter.clone();
-        let mut after_key = match continuation_token.as_deref() {
+        let after_key = match continuation_token.as_deref() {
             Some(continuation_token) => Some(decode_continuation_token(continuation_token)?),
             None => start_after.clone(),
         };
 
-        let connection = self.try_get_connection(&bucket).await?;
-        let mut objects = Vec::new();
-        let mut common_prefixes = Vec::new();
-        let mut seen_common_prefixes = HashSet::new();
-        let mut key_count = 0usize;
-        let mut is_truncated = false;
+        let listing = self
+            .list_keys(
+                &bucket,
+                &prefix_filter,
+                delimiter_filter.as_deref(),
+                after_key,
+                max_keys_usize,
+            )
+            .await?;
+        let objects = listing
+            .keys
+            .into_iter()
+            .map(object_from_key_size)
+            .collect::<S3Result<Vec<_>>>()?;
 
-        if max_keys_usize > 0 {
-            'pages: loop {
-                let prefix = prefix_filter.clone();
-                let after_key_query = after_key.clone();
-                let key_sizes = connection
-                    .read(move |connection| {
-                        let transaction = connection.transaction()?;
-                        Ok(Self::try_list_objects(
-                            &transaction,
-                            Some(&prefix),
-                            after_key_query.as_deref(),
-                            LIST_BATCH_SIZE,
-                        )?)
-                    })
-                    .await?;
-
-                if key_sizes.is_empty() {
-                    break;
-                }
-
-                let key_sizes_len = key_sizes.len();
-                for key_size in key_sizes {
-                    if prefix_filter.is_empty().not()
-                        && key_size.key.starts_with(&prefix_filter).not()
-                    {
-                        break 'pages;
-                    }
-
-                    if let Some(common_prefix) = common_prefix_for_key(
-                        &key_size.key,
-                        &prefix_filter,
-                        delimiter_filter.as_deref(),
-                    ) {
-                        if seen_common_prefixes.contains(&common_prefix) {
-                            after_key = Some(key_size.key);
-                            continue;
-                        }
-
-                        if key_count == max_keys_usize {
-                            is_truncated = true;
-                            break 'pages;
-                        }
-
-                        seen_common_prefixes.insert(common_prefix.clone());
-                        common_prefixes.push(CommonPrefix {
-                            prefix: Some(common_prefix),
-                        });
-                        key_count += 1;
-                        after_key = Some(key_size.key);
-                        continue;
-                    }
-
-                    if key_count == max_keys_usize {
-                        is_truncated = true;
-                        break 'pages;
-                    }
-
-                    after_key = Some(key_size.key.clone());
-                    objects.push(object_from_key_size(key_size)?);
-                    key_count += 1;
-                }
-
-                if key_sizes_len < LIST_BATCH_SIZE {
-                    break;
-                }
-            }
-        }
-
-        let next_continuation_token = is_truncated
-            .then(|| after_key.as_deref().map(encode_continuation_token))
+        let next_continuation_token = listing
+            .is_truncated
+            .then(|| {
+                listing
+                    .next_after_key
+                    .as_deref()
+                    .map(encode_continuation_token)
+            })
             .flatten();
 
-        let key_count = try_!(i32::try_from(key_count));
+        let key_count = try_!(i32::try_from(listing.key_count));
 
         let output = ListObjectsV2Output {
             key_count: Some(key_count),
@@ -623,7 +748,7 @@ impl S3 for Sqlite {
             continuation_token: continuation_token_clone,
             is_truncated: Some(next_continuation_token.is_some()),
             contents: Some(objects),
-            common_prefixes: delimiter.as_ref().map(|_| common_prefixes),
+            common_prefixes: delimiter.as_ref().map(|_| listing.common_prefixes),
             delimiter,
             encoding_type,
             name: Some(bucket),
