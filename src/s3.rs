@@ -1,12 +1,12 @@
 use std::{collections::HashSet, fmt::Write as _, ops::Not};
 
 use bytes::Bytes;
-use futures::{TryStreamExt, stream};
+use futures::{Stream, StreamExt, TryStreamExt, stream};
 use md5::{Digest, Md5};
 use s3s::{
     S3, S3Error,
     S3ErrorCode::InternalError,
-    S3Request, S3Response, S3Result,
+    S3Request, S3Response, S3Result, StdError,
     auth::Credentials,
     dto::{
         AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, CommonPrefix,
@@ -26,20 +26,86 @@ use s3s::{
     s3_error,
 };
 use time::OffsetDateTime;
-use tokio::fs;
+use tokio::{
+    fs,
+    io::{AsyncWrite, AsyncWriteExt},
+};
 use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
     error::S3ite,
     sqlite::{KeySize, KeyValue, Multipart, MultipartUploadState, Sqlite},
-    utils::{base64, copy_bytes, hex},
 };
 
 const LIST_BATCH_SIZE: usize = 1024;
 const CONTINUATION_TOKEN_PREFIX: &str = "s3ite:v1:";
 const OWNER_DISPLAY_NAME: &str = "s3ite";
 const OWNER_ID: &str = "s3ite";
+
+/// Copies a streaming S3 request body into an async writer.
+async fn copy_bytes<S, W>(mut stream: S, writer: &mut W) -> std::result::Result<u64, S3ite>
+where
+    S: Stream<Item = std::result::Result<Bytes, StdError>> + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut nwritten: u64 = 0;
+    while let Some(result) = stream.next().await {
+        let bytes = result.map_err(|_| S3ite::Copy)?;
+        writer.write_all(&bytes).await?;
+        nwritten += bytes.len() as u64;
+    }
+    writer.flush().await?;
+    Ok(nwritten)
+}
+
+/// Encodes bytes as lowercase hexadecimal text.
+fn hex(input: impl AsRef<[u8]>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let input = input.as_ref();
+    let mut encoded = String::with_capacity(input.len() * 2);
+    for byte in input {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+/// Encodes bytes as standard base64 text.
+fn base64(input: impl AsRef<[u8]>) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let input = input.as_ref();
+    let mut encoded = String::with_capacity(input.len().div_ceil(3) * 4);
+
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+
+        encoded.push(char::from(TABLE[usize::from(b0 >> 2)]));
+        encoded.push(char::from(
+            TABLE[usize::from(((b0 & 0x03) << 4) | (b1 >> 4))],
+        ));
+
+        if chunk.len() > 1 {
+            encoded.push(char::from(
+                TABLE[usize::from(((b1 & 0x0f) << 2) | (b2 >> 6))],
+            ));
+        } else {
+            encoded.push('=');
+        }
+
+        if chunk.len() > 2 {
+            encoded.push(char::from(TABLE[usize::from(b2 & 0x3f)]));
+        } else {
+            encoded.push('=');
+        }
+    }
+
+    encoded
+}
 
 /// Returns the common prefix produced by applying an S3 delimiter to a key.
 fn common_prefix_for_key(key: &str, prefix: &str, delimiter: Option<&str>) -> Option<String> {

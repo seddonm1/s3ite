@@ -210,9 +210,39 @@ async fn delete_bucket(c: &Client, bucket: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn base64(input: impl AsRef<[u8]>) -> String {
-    let base64 = base64_simd::STANDARD;
-    base64.encode_to_string(input)
+#[must_use]
+fn base64(input: impl AsRef<[u8]>) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let input = input.as_ref();
+    let mut encoded = String::with_capacity(input.len().div_ceil(3) * 4);
+
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+
+        encoded.push(char::from(TABLE[usize::from(b0 >> 2)]));
+        encoded.push(char::from(
+            TABLE[usize::from(((b0 & 0x03) << 4) | (b1 >> 4))],
+        ));
+
+        if chunk.len() > 1 {
+            encoded.push(char::from(
+                TABLE[usize::from(((b1 & 0x0f) << 2) | (b2 >> 6))],
+            ));
+        } else {
+            encoded.push('=');
+        }
+
+        if chunk.len() > 2 {
+            encoded.push(char::from(TABLE[usize::from(b2 & 0x3f)]));
+        } else {
+            encoded.push('=');
+        }
+    }
+
+    encoded
 }
 
 fn assert_error_contains(error: impl std::fmt::Debug, text: &str) {

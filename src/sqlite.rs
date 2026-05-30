@@ -17,7 +17,7 @@ use time::{Duration, OffsetDateTime};
 use tokio::{fs, sync::RwLock};
 use uuid::Uuid;
 
-use crate::{database::BucketConnection, error::Result, utils::repeat_vars};
+use crate::{database::BucketConnection, error::Result};
 
 fn row_u64(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<u64> {
     let value = row.get::<_, i64>(idx)?;
@@ -32,6 +32,13 @@ fn row_u64(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<u64> {
 
 fn sql_i64(value: u64) -> rusqlite::Result<i64> {
     i64::try_from(value).map_err(|err| ToSqlConversionFailure(Box::new(err)))
+}
+
+fn repeat_vars(count: usize) -> String {
+    assert_ne!(count, 0);
+    let mut vars = "?,".repeat(count);
+    vars.pop();
+    vars
 }
 
 #[derive(Debug)]

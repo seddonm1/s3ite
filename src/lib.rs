@@ -13,6 +13,5 @@ mod config;
 mod database;
 mod s3;
 mod sqlite;
-mod utils;
 
 pub use self::{config::*, error::*, sqlite::*};
