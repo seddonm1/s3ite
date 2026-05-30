@@ -1,6 +1,8 @@
+#[cfg(feature = "binary")]
 use std::panic::Location;
 
 use s3s::S3Error;
+#[cfg(feature = "binary")]
 use tracing::error;
 
 pub type Result<T> = std::result::Result<T, S3ite>;
@@ -74,12 +76,14 @@ impl From<std::num::TryFromIntError> for S3ite {
     }
 }
 
+#[cfg(feature = "hyper")]
 impl From<hyper::Error> for S3ite {
     fn from(_value: hyper::Error) -> Self {
         Self::Hyper
     }
 }
 
+#[cfg(feature = "yaml_serde")]
 impl From<yaml_serde::Error> for S3ite {
     fn from(_value: yaml_serde::Error) -> Self {
         Self::Yaml
@@ -88,19 +92,23 @@ impl From<yaml_serde::Error> for S3ite {
 
 #[inline]
 #[track_caller]
+#[cfg(feature = "binary")]
 pub(crate) fn log(source: &dyn std::error::Error) {
-    if cfg!(feature = "binary") {
-        let location = Location::caller();
-        let span_trace = tracing_error::SpanTrace::capture();
+    let location = Location::caller();
+    let span_trace = tracing_error::SpanTrace::capture();
 
-        error!(
-            target: "s3s_fs_internal_error",
-            %location,
-            error=%source,
-            "span trace:\n{span_trace}"
-        );
-    }
+    error!(
+        target: "s3s_fs_internal_error",
+        %location,
+        error=%source,
+        "span trace:\n{span_trace}"
+    );
 }
+
+#[inline]
+#[track_caller]
+#[cfg(not(feature = "binary"))]
+pub(crate) fn log(_source: &dyn std::error::Error) {}
 
 macro_rules! try_ {
     ($result:expr) => {

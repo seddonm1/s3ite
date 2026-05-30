@@ -1,15 +1,17 @@
 use std::{
     collections::HashMap,
-    fs,
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
 };
 
+#[cfg(feature = "binary")]
 use clap::{Parser, ValueEnum};
 use serde::Deserialize;
 
+#[cfg(feature = "binary")]
 use crate::error::{Result, S3ite};
 
+#[cfg(feature = "binary")]
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct ConfigArgs {
@@ -154,16 +156,18 @@ impl Config {
     /// # Errors
     ///
     /// Returns an error if the configured YAML file cannot be read or parsed.
+    #[cfg(feature = "binary")]
     pub fn from_args() -> Result<Self> {
         Self::from_config_args(ConfigArgs::parse())
     }
 
+    #[cfg(feature = "binary")]
     fn from_config_args(args: ConfigArgs) -> Result<Self> {
         let mut config = args
             .config
             .as_ref()
             .map(|path| {
-                let config = fs::read_to_string(path)?;
+                let config = std::fs::read_to_string(path)?;
                 Ok::<_, S3ite>(yaml_serde::from_str::<Self>(&config)?)
             })
             .transpose()?
@@ -174,6 +178,7 @@ impl Config {
         Ok(config)
     }
 
+    #[cfg(feature = "binary")]
     fn apply_args(&mut self, args: ConfigArgs) {
         if let Some(root) = args.root {
             self.root = root;
@@ -348,7 +353,8 @@ pub struct BucketPragmas {
     pub cache_size: Option<u32>,
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, ValueEnum)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[cfg_attr(feature = "binary", derive(ValueEnum))]
 pub enum JournalMode {
     DELETE,
     TRUNCATE,
@@ -359,7 +365,8 @@ pub enum JournalMode {
     OFF,
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, ValueEnum)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[cfg_attr(feature = "binary", derive(ValueEnum))]
 pub enum Synchronous {
     OFF,
     #[default]
@@ -368,7 +375,8 @@ pub enum Synchronous {
     EXTRA,
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, ValueEnum)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[cfg_attr(feature = "binary", derive(ValueEnum))]
 pub enum TempStore {
     DEFAULT,
     FILE,
@@ -469,6 +477,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "binary")]
     #[test]
     fn cli_args_override_yaml_config() -> std::result::Result<(), Box<dyn std::error::Error>> {
         use clap::Parser as _;

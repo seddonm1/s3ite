@@ -6,7 +6,7 @@
     clippy::unwrap_used, //
 )]
 
-use std::{collections::HashMap, fs, ops::Deref, path::PathBuf};
+use std::{collections::HashMap, fs, ops::Deref, path::PathBuf, sync::LazyLock};
 
 use anyhow::Result;
 use aws_config::SdkConfig;
@@ -20,8 +20,6 @@ use aws_sdk_s3::{
         CreateBucketConfiguration, Delete, EncodingType, ObjectIdentifier,
     },
 };
-use md5::{Digest, Md5};
-use once_cell::sync::Lazy;
 use s3ite::{Bucket, Config, Sqlite};
 use s3s::{auth::SimpleAuth, host::MultiDomain, service::S3ServiceBuilder};
 use tokio::sync::{Mutex, MutexGuard};
@@ -32,7 +30,7 @@ const FS_ROOT: &str = concat!(env!("CARGO_TARGET_TMPDIR"), "/s3s-sqlite-tests-aw
 const DOMAIN_NAME: &str = "localhost:8014";
 const REGION: &str = "us-west-2";
 
-static TRACING: Lazy<()> = Lazy::new(|| {
+static TRACING: LazyLock<()> = LazyLock::new(|| {
     use tracing_subscriber::EnvFilter;
 
     let env_filter = EnvFilter::try_from_default_env()
@@ -61,7 +59,7 @@ impl TestContext {
         root: PathBuf,
         cleanup: bool,
     ) -> Result<Self> {
-        Lazy::force(&TRACING);
+        LazyLock::force(&TRACING);
 
         // Fake credentials
         let cred = Credentials::for_tests();
@@ -120,7 +118,7 @@ impl Drop for TestContext {
 }
 
 async fn serial() -> MutexGuard<'static, ()> {
-    static LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+    static LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
     LOCK.lock().await
 }
 
@@ -210,41 +208,6 @@ async fn delete_bucket(c: &Client, bucket: &str) -> Result<()> {
     Ok(())
 }
 
-#[must_use]
-fn base64(input: impl AsRef<[u8]>) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    let input = input.as_ref();
-    let mut encoded = String::with_capacity(input.len().div_ceil(3) * 4);
-
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
-
-        encoded.push(char::from(TABLE[usize::from(b0 >> 2)]));
-        encoded.push(char::from(
-            TABLE[usize::from(((b0 & 0x03) << 4) | (b1 >> 4))],
-        ));
-
-        if chunk.len() > 1 {
-            encoded.push(char::from(
-                TABLE[usize::from(((b1 & 0x0f) << 2) | (b2 >> 6))],
-            ));
-        } else {
-            encoded.push('=');
-        }
-
-        if chunk.len() > 2 {
-            encoded.push(char::from(TABLE[usize::from(b2 & 0x3f)]));
-        } else {
-            encoded.push('=');
-        }
-    }
-
-    encoded
-}
-
 fn assert_error_contains(error: impl std::fmt::Debug, text: &str) {
     let error = format!("{error:?}");
     assert!(error.contains(text), "expected {text:?} in {error}");
@@ -299,14 +262,8 @@ async fn test_single_object() -> Result<()> {
     let key = "sample.txt";
     let content = "hello world\n你好世界\n";
     let content_bytes = content.as_bytes();
-    let mut md5_hash = Md5::new();
-    md5_hash.update(content_bytes);
-    let md5_bytes = md5_hash.finalize();
-    let content_md5 = base64(md5_bytes);
-    let content_etag = md5_bytes
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let content_md5 = "SpRKmvVRaPLiBjkHxCGwYQ==";
+    let content_etag = "4a944a9af55168f2e2063907c421b061";
 
     // create_bucket
     create_bucket(&context, &bucket).await?;
@@ -343,7 +300,7 @@ async fn test_single_object() -> Result<()> {
         head_object_output
             .e_tag()
             .map(|etag| etag.trim_matches('"')),
-        Some(content_etag.as_str())
+        Some(content_etag)
     );
 
     // delete_object
@@ -984,9 +941,7 @@ async fn test_multipart() -> Result<()> {
     let key = "sample.txt";
     let content = "abcdefghijklmnopqrstuvwxyz/0123456789/!@#$%^&*();\n";
     let content_bytes = content.as_bytes();
-    let mut md5_hash = Md5::new();
-    md5_hash.update(content_bytes);
-    let content_md5 = base64(md5_hash.finalize());
+    let content_md5 = "H6dHQaYjxrasUfXrWk55IQ==";
 
     let upload_id = {
         let result = context
