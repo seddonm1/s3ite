@@ -72,7 +72,7 @@ fn decode_continuation_token(token: &str) -> S3Result<String> {
     String::from_utf8(decoded).map_err(|_| s3_error!(InvalidToken))
 }
 
-/// Decodes a part ETag into its binary MD5 digest.
+/// Decodes a part `ETag` into its binary MD5 digest.
 fn decode_md5_hex(value: &str) -> S3Result<[u8; 16]> {
     let decoded = decode_hex(value).ok_or_else(|| s3_error!(InvalidPart))?;
     decoded
@@ -429,7 +429,7 @@ impl S3 for Sqlite {
         Ok(S3Response::new(output))
     }
 
-    /// Deletes an empty bucket database and its SQLite sidecar files.
+    /// Deletes an empty bucket database and its `SQLite` sidecar files.
     #[tracing::instrument]
     async fn delete_bucket(
         &self,
@@ -786,7 +786,7 @@ impl S3 for Sqlite {
         Ok(S3Response::new(output))
     }
 
-    /// Lists objects using the original ListObjects marker protocol.
+    /// Lists objects using the original `ListObjects` marker protocol.
     #[tracing::instrument]
     async fn list_objects(
         &self,
@@ -876,7 +876,7 @@ impl S3 for Sqlite {
         Ok(S3Response::new(output))
     }
 
-    /// Lists unversioned objects using the ListObjectVersions response shape.
+    /// Lists unversioned objects using the `ListObjectVersions` response shape.
     #[tracing::instrument]
     async fn list_object_versions(
         &self,
@@ -966,7 +966,7 @@ impl S3 for Sqlite {
         Ok(S3Response::new(output))
     }
 
-    /// Lists objects using the ListObjectsV2 continuation-token protocol.
+    /// Lists objects using the `ListObjectsV2` continuation-token protocol.
     #[tracing::instrument]
     async fn list_objects_v2(
         &self,

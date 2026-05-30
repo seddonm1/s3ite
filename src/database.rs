@@ -1,21 +1,3 @@
-#![forbid(unsafe_code)]
-#![warn(
-    clippy::await_holding_lock,
-    clippy::cargo_common_metadata,
-    clippy::dbg_macro,
-    clippy::empty_enums,
-    clippy::enum_glob_use,
-    clippy::inefficient_to_string,
-    clippy::mem_forget,
-    clippy::mutex_integer,
-    clippy::needless_continue,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::wildcard_imports,
-    missing_docs,
-    missing_debug_implementations
-)]
-
 use std::{
     fmt::{self, Debug},
     path::Path,
@@ -27,7 +9,7 @@ use std::{
     thread::JoinHandle,
 };
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender, TrySendError};
 use rusqlite::{OpenFlags, TransactionBehavior};
 use tokio::sync::oneshot;
 use tracing::{debug, error};
@@ -37,18 +19,21 @@ use crate::{
     error::{Result, S3ite},
 };
 
-static MESSAGE_BOUND: usize = 100;
+/// Maximum number of queued commands per worker queue.
+const QUEUE_BOUND: usize = 100;
 
-const BUG_TEXT: &str = "bug in tokio-rusqlite, please report";
-
+/// Unit of work executed by a worker-owned database connection.
 type CallFn = Box<dyn FnOnce(&mut rusqlite::Connection) + Send + 'static>;
 
-pub enum Message {
+/// Command sent to a database worker thread.
+enum WorkerCommand {
+    /// Runs a closure against the worker-owned database connection.
     Execute(CallFn),
+    /// Closes the worker-owned database connection and exits the worker loop.
     Close,
 }
 
-impl Debug for Message {
+impl Debug for WorkerCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Execute(_arg0) => f.debug_tuple("Execute").finish(),
@@ -57,21 +42,30 @@ impl Debug for Message {
     }
 }
 
-/// A handle to call functions in background thread.
+/// Handle for scheduling work on a bucket's database worker threads.
 #[derive(Clone)]
-pub struct Connection {
-    inner: Arc<ConnectionInner>,
+pub struct BucketConnection {
+    inner: Arc<BucketConnectionInner>,
 }
 
-struct ConnectionInner {
-    writer_sender: Sender<Message>,
-    reader_sender: Sender<Message>,
+impl Debug for BucketConnection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BucketConnection")
+            .field("closed", &self.inner.closed)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Shared worker state behind cloned connection handles.
+struct BucketConnectionInner {
+    writer_sender: Sender<WorkerCommand>,
+    reader_sender: Sender<WorkerCommand>,
     writer_handle: Mutex<Option<JoinHandle<()>>>,
     reader_handles: Mutex<Vec<JoinHandle<()>>>,
     closed: AtomicBool,
 }
 
-impl Drop for Connection {
+impl Drop for BucketConnection {
     fn drop(&mut self) {
         if Arc::strong_count(&self.inner) == 1 {
             self.inner.close_blocking().ok();
@@ -79,17 +73,16 @@ impl Drop for Connection {
     }
 }
 
-impl Connection {
-    /// Open a new connection to a `SQLite` database.
+impl BucketConnection {
+    /// Opens a bucket database with one writer and configured readers.
     ///
-    /// `Connection::open(path)` is equivalent to
-    /// `Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE |
-    /// OpenFlags::SQLITE_OPEN_CREATE)`.
+    /// The writer uses the bucket's configured pragmas, while readers open
+    /// read-only connections with deferred transactions.
     ///
-    /// # Failure
+    /// # Errors
     ///
-    /// Will return `Err` if `path` cannot be converted to a C-compatible
-    /// string or if the underlying `SQLite` open call fails.
+    /// Returns an error when no readers are configured, the database cannot open, or
+    /// the configured pragmas fail.
     pub(crate) async fn open<P: AsRef<Path>>(
         path: P,
         config: &Config,
@@ -107,7 +100,7 @@ impl Connection {
             ));
         }
 
-        connect(
+        let inner = BucketConnectionInner::connect(
             move || {
                 let mut writer = rusqlite::Connection::open(path)?;
                 writer.set_transaction_behavior(TransactionBehavior::Immediate);
@@ -126,86 +119,56 @@ impl Connection {
             }),
             readers,
         )
-        .await
+        .await?;
+
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
     }
 
-    /// Call a function in background thread and get the result
-    /// asynchronously.
+    /// Runs a closure on the writer connection.
     ///
-    /// # Failure
+    /// The closure runs on the dedicated writer thread and its result is
+    /// returned asynchronously to the caller.
     ///
-    /// Will return `Err` if the database connection has been closed.
+    /// # Errors
+    ///
+    /// Returns an error if the connection is closed, the bounded work queue is
+    /// full, the response channel closes, or the closure returns an error.
     pub(crate) async fn write<F, R>(&self, function: F) -> Result<R>
     where
         F: FnOnce(&mut rusqlite::Connection) -> Result<R> + 'static + Send,
         R: Send + 'static,
     {
-        let (sender, receiver) = oneshot::channel::<Result<R>>();
-
-        if self.inner.closed.load(Ordering::Acquire) {
-            return Err(S3ite::DatabaseQueueClosed);
-        }
-
-        self.inner
-            .writer_sender
-            .try_send(Message::Execute(Box::new(move |conn| {
-                let value = function(conn);
-                let _ = sender.send(value);
-            })))?;
-
-        if self.inner.closed.load(Ordering::Acquire) {
-            return Err(S3ite::DatabaseQueueClosed);
-        }
-
-        receiver.await?
+        self.inner.call(&self.inner.writer_sender, function).await
     }
 
-    /// Call a function in background thread and get the result
-    /// asynchronously.
+    /// Runs a closure on a reader connection.
     ///
-    /// # Failure
+    /// The closure runs on one of the dedicated reader threads and its result is
+    /// returned asynchronously to the caller.
     ///
-    /// Will return `Err` if the database connection has been closed.
+    /// # Errors
+    ///
+    /// Returns an error if the connection is closed, the bounded work queue is
+    /// full, the response channel closes, or the closure returns an error.
     pub(crate) async fn read<F, R>(&self, function: F) -> Result<R>
     where
         F: FnOnce(&mut rusqlite::Connection) -> Result<R> + 'static + Send,
         R: Send + 'static,
     {
-        let (sender, receiver) = oneshot::channel::<Result<R>>();
-
-        if self.inner.closed.load(Ordering::Acquire) {
-            return Err(S3ite::DatabaseQueueClosed);
-        }
-
-        self.inner
-            .reader_sender
-            .try_send(Message::Execute(Box::new(move |conn| {
-                let value = function(conn);
-                let _ = sender.send(value);
-            })))?;
-
-        if self.inner.closed.load(Ordering::Acquire) {
-            return Err(S3ite::DatabaseQueueClosed);
-        }
-
-        receiver.await?
+        self.inner.call(&self.inner.reader_sender, function).await
     }
 
-    /// Close the database connection.
+    /// Closes all database worker threads.
     ///
-    /// This is functionally equivalent to the `Drop` implementation for
-    /// `Connection`. It consumes the `Connection`, but on error returns it
-    /// to the caller for retry purposes.
+    /// Closing is idempotent across cloned handles. After close begins, new
+    /// read and write calls fail with a closed-queue error.
     ///
-    /// If successful, any following `close` operations performed
-    /// on `Connection` copies will succeed immediately.
+    /// # Errors
     ///
-    /// On the other hand, any calls to [`Connection::call`] will return a [`Error::ConnectionClosed`],
-    /// and any calls to [`Connection::call_unwrap`] will cause a `panic`.
-    ///
-    /// # Failure
-    ///
-    /// Will return `Err` if the underlying `SQLite` close call fails.
+    /// Returns an error if the blocking close task or a worker thread fails to
+    /// join.
     pub(crate) async fn close(&self) -> Result<()> {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || inner.close_blocking())
@@ -214,7 +177,87 @@ impl Connection {
     }
 }
 
-impl ConnectionInner {
+impl BucketConnectionInner {
+    /// Spawns database worker threads and waits for each connection to open.
+    async fn connect<F, G>(open_writer: F, open_reader: Arc<G>, readers: usize) -> Result<Self>
+    where
+        F: FnOnce() -> rusqlite::Result<rusqlite::Connection> + Send + 'static,
+        G: Fn() -> rusqlite::Result<rusqlite::Connection> + Send + Sync + 'static,
+    {
+        let (writer_sender, writer_receiver) =
+            crossbeam_channel::bounded::<WorkerCommand>(QUEUE_BOUND);
+        let (writer_handle, writer_started) =
+            WorkerRole::Writer.spawn(writer_receiver, open_writer);
+        Self::wait_for_worker(writer_started).await?;
+
+        let (reader_sender, reader_receiver) =
+            crossbeam_channel::bounded::<WorkerCommand>(QUEUE_BOUND);
+        let mut reader_handles = Vec::with_capacity(readers);
+        for _ in 0..readers {
+            let reader_receiver = reader_receiver.clone();
+            let open_reader = open_reader.clone();
+            let (reader_handle, reader_started) =
+                WorkerRole::Reader.spawn(reader_receiver, move || open_reader());
+            Self::wait_for_worker(reader_started).await?;
+            reader_handles.push(reader_handle);
+        }
+
+        Ok(Self {
+            writer_sender,
+            reader_sender,
+            writer_handle: Mutex::new(Some(writer_handle)),
+            reader_handles: Mutex::new(reader_handles),
+            closed: AtomicBool::new(false),
+        })
+    }
+
+    /// Runs work on the selected worker queue and returns the closure result.
+    async fn call<F, R>(&self, queue: &Sender<WorkerCommand>, function: F) -> Result<R>
+    where
+        F: FnOnce(&mut rusqlite::Connection) -> Result<R> + 'static + Send,
+        R: Send + 'static,
+    {
+        let (sender, receiver) = oneshot::channel::<Result<R>>();
+
+        if self.closed.load(Ordering::Acquire) {
+            return Err(S3ite::DatabaseQueueClosed);
+        }
+
+        queue
+            .try_send(WorkerCommand::Execute(Box::new(move |conn| {
+                let value = function(conn);
+                let _ = sender.send(value);
+            })))
+            .map_err(Self::queue_send_error)?;
+
+        if self.closed.load(Ordering::Acquire) {
+            return Err(S3ite::DatabaseQueueClosed);
+        }
+
+        receiver.await?
+    }
+
+    /// Waits for a worker thread to finish opening its database connection.
+    async fn wait_for_worker(receiver: oneshot::Receiver<rusqlite::Result<()>>) -> Result<()> {
+        receiver.await.map_err(|_| S3ite::ThreadJoin)??;
+        Ok(())
+    }
+
+    /// Converts bounded queue send failures into database queue errors.
+    fn queue_send_error<T>(error: TrySendError<T>) -> S3ite {
+        match error {
+            TrySendError::Full(value) => {
+                drop(value);
+                S3ite::DatabaseQueueFull
+            }
+            TrySendError::Disconnected(value) => {
+                drop(value);
+                S3ite::DatabaseQueueClosed
+            }
+        }
+    }
+
+    /// Signals workers to close and joins their threads.
     fn close_blocking(&self) -> Result<()> {
         let should_signal = self
             .closed
@@ -224,10 +267,10 @@ impl ConnectionInner {
         if should_signal {
             let reader_count = self.reader_handles.lock().unwrap().len();
             for _ in 0..reader_count {
-                self.reader_sender.send(Message::Close).ok();
+                self.reader_sender.send(WorkerCommand::Close).ok();
             }
 
-            self.writer_sender.send(Message::Close).ok();
+            self.writer_sender.send(WorkerCommand::Close).ok();
         }
 
         let mut join_failed = false;
@@ -258,122 +301,89 @@ impl ConnectionInner {
     }
 }
 
-impl Debug for Connection {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Connection").finish()
-    }
+/// Identifies the kind of database worker being spawned or closed.
+#[derive(Clone, Copy)]
+enum WorkerRole {
+    /// Worker role used for read-only database connections.
+    Reader,
+    /// Worker role used for the single writable database connection.
+    Writer,
 }
 
-async fn connect<F, G>(open_writer: F, open_reader: Arc<G>, readers: usize) -> Result<Connection>
-where
-    F: FnOnce() -> rusqlite::Result<rusqlite::Connection> + Send + 'static,
-    G: Fn() -> rusqlite::Result<rusqlite::Connection> + Send + Sync + 'static,
-{
-    let (writer_sender, writer_receiver) = crossbeam_channel::bounded::<Message>(MESSAGE_BOUND);
-    let (writer_result_sender, writer_result_receiver) = oneshot::channel();
-
-    let writer_handle = thread::spawn(move || {
-        debug!(
-            "spawn writer on thread id: {:?}",
-            std::thread::current().id()
-        );
-        let mut conn = match open_writer() {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = writer_result_sender.send(Err(e));
-                return;
-            }
-        };
-
-        if let Err(_e) = writer_result_sender.send(Ok(())) {
-            return;
+impl WorkerRole {
+    /// Returns the role name used in tracing output.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Reader => "reader",
+            Self::Writer => "writer",
         }
+    }
 
-        while let Ok(message) = writer_receiver.recv() {
-            match message {
-                Message::Execute(f) => f(&mut conn),
-                Message::Close => {
-                    debug!(
-                        "close writer on thread id: {:?}",
-                        std::thread::current().id()
-                    );
-
-                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE);", ()).ok();
-
-                    match conn.close() {
-                        Ok(()) => {
-                            break;
-                        }
-                        Err((_c, e)) => {
-                            error!("{:?}", e);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    });
-    writer_result_receiver.await.expect(BUG_TEXT)?;
-
-    let (reader_sender, reader_receiver) = crossbeam_channel::bounded::<Message>(MESSAGE_BOUND);
-    let mut reader_handles = Vec::with_capacity(readers);
-    for _ in 0..readers {
-        let (reader_result_sender, reader_result_receiver) = oneshot::channel();
-        let reader_receiver = reader_receiver.clone();
-        let open_reader = open_reader.clone();
-        reader_handles.push(thread::spawn(move || {
+    /// Spawns a worker thread and returns a startup notification receiver.
+    fn spawn<F>(
+        self,
+        receiver: Receiver<WorkerCommand>,
+        open_connection: F,
+    ) -> (JoinHandle<()>, oneshot::Receiver<rusqlite::Result<()>>)
+    where
+        F: FnOnce() -> rusqlite::Result<rusqlite::Connection> + Send + 'static,
+    {
+        let (result_sender, result_receiver) = oneshot::channel();
+        let handle = thread::spawn(move || {
             debug!(
-                "spawn reader on thread id: {:?}",
+                "spawn {} on thread id: {:?}",
+                self.name(),
                 std::thread::current().id()
             );
-
-            let mut conn = match open_reader() {
-                Ok(c) => c,
-                Err(e) => {
-                    error!("{:?}", e);
-                    let _ = reader_result_sender.send(Err(e));
+            let conn = match open_connection() {
+                Ok(connection) => connection,
+                Err(error) => {
+                    let _ = result_sender.send(Err(error));
                     return;
                 }
             };
 
-            if let Err(_e) = reader_result_sender.send(Ok(())) {
+            if result_sender.send(Ok(())).is_err() {
                 return;
             }
 
-            while let Ok(message) = reader_receiver.recv() {
-                match message {
-                    Message::Execute(f) => f(&mut conn),
-                    Message::Close => {
-                        debug!(
-                            "close reader on thread id: {:?}",
-                            std::thread::current().id()
-                        );
+            self.run(conn, &receiver);
+        });
 
-                        match conn.close() {
-                            Ok(()) => {
-                                break;
-                            }
-                            Err((_c, e)) => {
-                                error!("{:?}", e);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }));
-        reader_result_receiver.await.expect(BUG_TEXT)?;
+        (handle, result_receiver)
     }
 
-    Ok(Connection {
-        inner: Arc::new(ConnectionInner {
-            writer_sender,
-            reader_sender,
-            writer_handle: Mutex::new(Some(writer_handle)),
-            reader_handles: Mutex::new(reader_handles),
-            closed: AtomicBool::new(false),
-        }),
-    })
+    /// Runs the worker command loop until the queue closes or shutdown is requested.
+    fn run(self, mut connection: rusqlite::Connection, receiver: &Receiver<WorkerCommand>) {
+        while let Ok(message) = receiver.recv() {
+            match message {
+                WorkerCommand::Execute(function) => function(&mut connection),
+                WorkerCommand::Close => {
+                    self.close_connection(connection);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Closes a worker-owned database connection.
+    fn close_connection(self, connection: rusqlite::Connection) {
+        debug!(
+            "close {} on thread id: {:?}",
+            self.name(),
+            std::thread::current().id()
+        );
+
+        if matches!(self, Self::Writer) {
+            connection
+                .execute("PRAGMA wal_checkpoint(TRUNCATE);", ())
+                .ok();
+        }
+
+        if let Err((_connection, error)) = connection.close() {
+            error!("{:?}", error);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -389,7 +399,9 @@ mod tests {
             readers: 1,
             ..Default::default()
         };
-        let connection = Connection::open(&path, &config, "bucket").await.unwrap();
+        let connection = BucketConnection::open(&path, &config, "bucket")
+            .await
+            .unwrap();
 
         connection.close().await.unwrap();
         connection.close().await.unwrap();

@@ -3,8 +3,6 @@ use std::panic::Location;
 use s3s::S3Error;
 use tracing::error;
 
-use crate::database::Message;
-
 pub type Result<T> = std::result::Result<T, S3ite>;
 
 #[derive(Debug, thiserror::Error)]
@@ -61,21 +59,6 @@ impl From<std::io::Error> for S3ite {
 impl From<rusqlite::Error> for S3ite {
     fn from(value: rusqlite::Error) -> Self {
         Self::Rusqlite(value)
-    }
-}
-
-impl From<crossbeam_channel::SendError<Message>> for S3ite {
-    fn from(_value: crossbeam_channel::SendError<Message>) -> Self {
-        Self::Crossbeam
-    }
-}
-
-impl From<crossbeam_channel::TrySendError<Message>> for S3ite {
-    fn from(value: crossbeam_channel::TrySendError<Message>) -> Self {
-        match value {
-            crossbeam_channel::TrySendError::Full(_) => Self::DatabaseQueueFull,
-            crossbeam_channel::TrySendError::Disconnected(_) => Self::DatabaseQueueClosed,
-        }
     }
 }
 

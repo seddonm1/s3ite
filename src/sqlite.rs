@@ -18,7 +18,7 @@ use time::{Duration, OffsetDateTime};
 use tokio::{fs, sync::RwLock};
 use uuid::Uuid;
 
-use crate::{database::Connection, error::Result, utils::repeat_vars};
+use crate::{database::BucketConnection, error::Result, utils::repeat_vars};
 
 fn row_u64(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<u64> {
     let value = row.get::<_, i64>(idx)?;
@@ -39,7 +39,7 @@ fn sql_i64(value: u64) -> rusqlite::Result<i64> {
 pub struct Sqlite {
     pub(crate) root: PathBuf,
     pub(crate) config: crate::Config,
-    pub(crate) buckets: Arc<RwLock<HashMap<String, Arc<Connection>>>>,
+    pub(crate) buckets: Arc<RwLock<HashMap<String, Arc<BucketConnection>>>>,
 }
 
 #[derive(Debug)]
@@ -129,8 +129,14 @@ impl Sqlite {
                 if let Some(extension) = path.extension()
                     && extension == "sqlite3"
                 {
-                    let bucket = path.file_stem().unwrap().to_str().unwrap().to_string();
-                    let connection = Connection::open(path, &config, &bucket).await?;
+                    let Some(bucket) = path
+                        .file_stem()
+                        .and_then(|file_stem| file_stem.to_str())
+                        .map(str::to_string)
+                    else {
+                        continue;
+                    };
+                    let connection = BucketConnection::open(path, &config, &bucket).await?;
                     if config.read_only(Some(&bucket)).not() {
                         let bucket_clone = bucket.clone();
                         connection
@@ -229,7 +235,7 @@ impl Sqlite {
     }
 
     /// Returns an open database connection for a bucket.
-    pub(crate) async fn try_get_connection(&self, bucket: &str) -> Result<Arc<Connection>> {
+    pub(crate) async fn try_get_connection(&self, bucket: &str) -> Result<Arc<BucketConnection>> {
         Ok(self
             .buckets
             .read()
@@ -243,7 +249,7 @@ impl Sqlite {
     pub(crate) async fn try_create_bucket(&self, bucket: &str, file_path: PathBuf) -> Result<()> {
         let config = self.config.clone();
 
-        let connection = Connection::open(file_path, &config, bucket).await?;
+        let connection = BucketConnection::open(file_path, &config, bucket).await?;
 
         connection
             .write(move |connection| {
