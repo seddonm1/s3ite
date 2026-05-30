@@ -12,11 +12,3 @@ Cargo.lock
 
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
-
-# Reference code
-clone/
-
-# Local s3-tests runtime
-.local/
-.s3tests/
-.venv-s3tests/

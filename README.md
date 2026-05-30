@@ -184,21 +184,16 @@ s3ite --root . --host 0.0.0.0 --port 8014 --access-key AKIAIOSFODNN7EXAMPLE --se
 
 ## Conformance Tests
 
-The repository includes a helper for running a local Ceph `s3-tests` environment. Clone `s3-tests` into `clone/s3-tests`, then run:
+The repository includes a helper for running a local Ceph `s3-tests` environment. Run the full functional suite with:
 
 ```bash
-scripts/setup-s3-tests.sh
-cargo run --features binary -- --config .s3tests/s3ite-server.yaml
+scripts/run-s3-tests.sh
 ```
 
-In another shell:
+The helper clones Ceph `s3-tests` if needed, installs `uv` if needed, creates the Python environment, builds and starts a local `s3ite` server, runs pytest, and stops the server before exiting. By default, the checkout, virtual environment, Cargo target directory, generated configs, data root, and logs live under `${TMPDIR:-/tmp}/s3ite-s3-tests`.
+
+To run a specific test, pass pytest arguments directly:
 
 ```bash
-scripts/setup-s3-tests.sh --run-curated
-```
-
-To run a specific test, pass pytest arguments after `--run`:
-
-```bash
-scripts/setup-s3-tests.sh --run clone/s3-tests/s3tests/functional/test_s3.py::test_object_write_read_update_read_delete
+scripts/run-s3-tests.sh s3tests/functional/test_s3.py::test_object_write_read_update_read_delete
 ```

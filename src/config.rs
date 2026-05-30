@@ -11,6 +11,7 @@ use serde::Deserialize;
 #[cfg(feature = "binary")]
 use crate::error::{Result, S3ite};
 
+/// Command-line arguments that override YAML or default configuration.
 #[cfg(feature = "binary")]
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -79,6 +80,10 @@ struct ConfigArgs {
     readers: Option<usize>,
 }
 
+/// Runtime configuration for the s3ite service.
+///
+/// Values can be loaded from YAML and, when the `binary` feature is enabled,
+/// selectively overridden by command-line arguments.
 #[derive(Clone, Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -101,9 +106,9 @@ pub struct Config {
     /// The secret access key that is used to authenticate for this service.
     pub secret_key: Option<String>,
 
-    #[serde(default = "default_concurrency_limit")]
     /// Enforces a limit on the concurrent number of requests the underlying service can handle.
     /// This can be tuned depending on infrastructure as SSD/HDD will deal with resource contention very differently.
+    #[serde(default = "default_concurrency_limit")]
     pub concurrency_limit: u16,
 
     /// Controls the number of reader connections to `SQLite`.
@@ -118,15 +123,15 @@ pub struct Config {
     /// The domain to use to allow parsing virtual-hosted-style requests.
     pub domain_name: Option<String>,
 
-    /// If this service should be read-only
+    /// Whether this service should reject write operations by default.
     #[serde(default = "default_read_only")]
     pub read_only: bool,
 
-    /// Service level `SQLite` configurations
+    /// Service-level `SQLite` pragmas applied to each bucket database.
     #[serde(flatten, default = "default_pragmas")]
     pub sqlite: Pragmas,
 
-    /// Bucket specific configurations
+    /// Bucket-specific settings keyed by bucket name.
     #[serde(default = "HashMap::new")]
     pub buckets: HashMap<String, Bucket>,
 }
@@ -161,6 +166,14 @@ impl Config {
         Self::from_config_args(ConfigArgs::parse())
     }
 
+    /// Loads configuration from parsed command-line arguments.
+    ///
+    /// If a YAML config path is provided, values from the file are loaded first
+    /// and then overridden by any command-line values present in `args`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the YAML file cannot be read or parsed.
     #[cfg(feature = "binary")]
     fn from_config_args(args: ConfigArgs) -> Result<Self> {
         let mut config = args
@@ -178,6 +191,7 @@ impl Config {
         Ok(config)
     }
 
+    /// Applies command-line values over the current configuration.
     #[cfg(feature = "binary")]
     fn apply_args(&mut self, args: ConfigArgs) {
         if let Some(root) = args.root {
@@ -224,6 +238,10 @@ impl Config {
         }
     }
 
+    /// Returns whether a bucket should reject write operations.
+    ///
+    /// A bucket-level `read_only` override wins when present; otherwise the
+    /// service-level `read_only` value is used.
     #[must_use]
     pub fn read_only(&self, bucket: Option<&str>) -> bool {
         bucket
@@ -231,6 +249,10 @@ impl Config {
             .unwrap_or(self.read_only)
     }
 
+    /// Returns the effective `SQLite` `journal_mode` for a bucket connection.
+    ///
+    /// A bucket-level pragma override wins when present; otherwise the
+    /// service-level pragma is used.
     #[must_use]
     pub fn journal_mode(&self, bucket: Option<&str>) -> JournalMode {
         bucket
@@ -245,6 +267,10 @@ impl Config {
             .unwrap_or(self.sqlite.journal_mode)
     }
 
+    /// Returns the effective `SQLite` `synchronous` mode for a bucket connection.
+    ///
+    /// A bucket-level pragma override wins when present; otherwise the
+    /// service-level pragma is used.
     #[must_use]
     pub fn synchronous(&self, bucket: Option<&str>) -> Synchronous {
         bucket
@@ -256,6 +282,10 @@ impl Config {
             .unwrap_or(self.sqlite.synchronous)
     }
 
+    /// Returns the effective `SQLite` `temp_store` mode for a bucket connection.
+    ///
+    /// A bucket-level pragma override wins when present; otherwise the
+    /// service-level pragma is used.
     #[must_use]
     pub fn temp_store(&self, bucket: Option<&str>) -> TempStore {
         bucket
@@ -267,6 +297,10 @@ impl Config {
             .unwrap_or(self.sqlite.temp_store)
     }
 
+    /// Returns the effective `SQLite` cache size in kibibytes.
+    ///
+    /// A bucket-level pragma override wins when present; otherwise the
+    /// service-level pragma is used.
     #[must_use]
     pub fn cache_size(&self, bucket: Option<&str>) -> u32 {
         bucket
@@ -278,6 +312,10 @@ impl Config {
             .unwrap_or(self.sqlite.cache_size)
     }
 
+    /// Renders the `SQLite` PRAGMA statements for a bucket connection.
+    ///
+    /// `SQLite` interprets negative `cache_size` values as kibibytes, so the
+    /// configured positive KiB value is emitted as `PRAGMA cache_size=-N`.
     #[must_use]
     pub fn to_sql(&self, bucket: Option<&str>) -> String {
         format!(
@@ -299,6 +337,7 @@ impl Config {
     }
 }
 
+/// `SQLite` PRAGMA settings applied at service level.
 #[derive(Clone, Deserialize, Debug)]
 pub struct Pragmas {
     /// Controls the `SQLite` `journal_mode` flag pragma.
@@ -329,15 +368,17 @@ impl Default for Pragmas {
     }
 }
 
+/// Bucket-specific configuration overrides.
 #[derive(Clone, Deserialize, Debug)]
 pub struct Bucket {
-    /// If this bucket should be read-only
+    /// Whether this bucket should reject write operations.
     pub read_only: Option<bool>,
 
-    /// Bucket level `SQLite` configurations
+    /// Bucket-level `SQLite` pragma overrides.
     pub sqlite: Option<BucketPragmas>,
 }
 
+/// Optional `SQLite` PRAGMA overrides for one bucket.
 #[derive(Clone, Deserialize, Debug)]
 pub struct BucketPragmas {
     /// Controls the `SQLite` `journal_mode` flag pragma.
@@ -353,33 +394,49 @@ pub struct BucketPragmas {
     pub cache_size: Option<u32>,
 }
 
+/// `SQLite` `journal_mode` values supported by configuration.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[cfg_attr(feature = "binary", derive(ValueEnum))]
 pub enum JournalMode {
+    /// Use `SQLite`'s rollback journal and delete it after each transaction.
     DELETE,
+    /// Use `SQLite`'s rollback journal and truncate it after each transaction.
     TRUNCATE,
+    /// Use `SQLite`'s rollback journal and keep it after each transaction.
     PERSIST,
+    /// Store the rollback journal in memory.
     MEMORY,
+    /// Use `SQLite` write-ahead logging.
     #[default]
     WAL,
+    /// Disable rollback journaling.
     OFF,
 }
 
+/// `SQLite` `synchronous` values supported by configuration.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[cfg_attr(feature = "binary", derive(ValueEnum))]
 pub enum Synchronous {
+    /// Let `SQLite` skip sync calls for maximum throughput and lowest durability.
     OFF,
+    /// Sync at critical moments while avoiding the extra checks of `FULL`.
     #[default]
     NORMAL,
+    /// Sync after each critical write for stronger durability guarantees.
     FULL,
+    /// Use `SQLite`'s strongest sync setting with additional directory syncs.
     EXTRA,
 }
 
+/// `SQLite` `temp_store` values supported by configuration.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[cfg_attr(feature = "binary", derive(ValueEnum))]
 pub enum TempStore {
+    /// Let `SQLite` choose the temporary storage location.
     DEFAULT,
+    /// Store temporary tables and indexes in files.
     FILE,
+    /// Store temporary tables and indexes in memory.
     #[default]
     MEMORY,
 }

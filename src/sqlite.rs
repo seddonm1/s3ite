@@ -281,7 +281,7 @@ impl Sqlite {
     }
 
     /// Ensures the bucket database schema exists and applies additive migrations.
-    pub(crate) fn try_create_tables(transaction: &Transaction) -> rusqlite::Result<usize> {
+    pub(crate) fn try_create_tables(transaction: &Transaction) -> rusqlite::Result<()> {
         transaction.execute(
             "CREATE TABLE IF NOT EXISTS data (
                     key TEXT PRIMARY KEY,
@@ -344,8 +344,10 @@ impl Sqlite {
             (),
         )?;
 
-        // `CREATE TABLE IF NOT EXISTS` does not update existing bucket databases,
-        // so keep additive schema changes here until a formal migration system exists.
+        // s3ite 0.7.0 started persisting HTTP metadata on objects and multipart
+        // uploads. `CREATE TABLE IF NOT EXISTS` leaves pre-0.7.0 bucket databases
+        // unchanged, so keep these additive compatibility changes here until a
+        // formal migration system exists.
         for (table, column, definition) in [
             ("metadata", "content_type", "content_type TEXT"),
             ("metadata", "cache_control", "cache_control TEXT"),
@@ -361,7 +363,7 @@ impl Sqlite {
             }
         }
 
-        Ok(0)
+        Ok(())
     }
 
     /// Returns whether a table already contains a column.

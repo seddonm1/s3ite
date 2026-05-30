@@ -23,6 +23,7 @@ use s3s::{
         ObjectVersion, ObjectVersionStorageClass, Owner, Part, Permission, PutObjectInput,
         PutObjectOutput, StreamingBlob, Timestamp, Type, UploadPartInput, UploadPartOutput,
     },
+    header::CONTENT_MD5,
     s3_error,
 };
 use time::OffsetDateTime;
@@ -72,39 +73,82 @@ fn hex(input: impl AsRef<[u8]>) -> String {
     encoded
 }
 
-/// Encodes bytes as standard base64 text.
-fn base64(input: impl AsRef<[u8]>) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    let input = input.as_ref();
-    let mut encoded = String::with_capacity(input.len().div_ceil(3) * 4);
-
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
-
-        encoded.push(char::from(TABLE[usize::from(b0 >> 2)]));
-        encoded.push(char::from(
-            TABLE[usize::from(((b0 & 0x03) << 4) | (b1 >> 4))],
-        ));
-
-        if chunk.len() > 1 {
-            encoded.push(char::from(
-                TABLE[usize::from(((b1 & 0x0f) << 2) | (b2 >> 6))],
-            ));
-        } else {
-            encoded.push('=');
-        }
-
-        if chunk.len() > 2 {
-            encoded.push(char::from(TABLE[usize::from(b2 & 0x3f)]));
-        } else {
-            encoded.push('=');
+/// Decodes standard base64 text.
+fn decode_base64(value: &str) -> Option<Vec<u8>> {
+    fn sextet(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
         }
     }
 
-    encoded
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.len().is_multiple_of(4).not() {
+        return None;
+    }
+
+    let chunk_count = bytes.len() / 4;
+    let mut decoded = Vec::with_capacity(chunk_count * 3);
+    for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+        let is_last = index + 1 == chunk_count;
+        let padding = match (chunk[2], chunk[3]) {
+            (b'=', b'=') => 2,
+            (b'=', _) => return None,
+            (_, b'=') => 1,
+            _ => 0,
+        };
+
+        if padding > 0 && is_last.not() {
+            return None;
+        }
+
+        let b0 = sextet(chunk[0])?;
+        let b1 = sextet(chunk[1])?;
+        let b2 = if padding == 2 { 0 } else { sextet(chunk[2])? };
+        let b3 = if padding > 0 { 0 } else { sextet(chunk[3])? };
+
+        if (padding == 2 && (b1 & 0x0f) != 0) || (padding == 1 && (b2 & 0x03) != 0) {
+            return None;
+        }
+
+        decoded.push((b0 << 2) | (b1 >> 4));
+        if padding < 2 {
+            decoded.push((b1 << 4) | (b2 >> 2));
+        }
+        if padding == 0 {
+            decoded.push((b2 << 6) | b3);
+        }
+    }
+
+    Some(decoded)
+}
+
+/// Verifies the optional `Content-MD5` header against the computed body digest.
+fn validate_content_md5(
+    header_present: bool,
+    content_md5: Option<&str>,
+    computed_md5: &[u8],
+) -> S3Result<()> {
+    let Some(content_md5) = content_md5 else {
+        if header_present {
+            return Err(s3_error!(InvalidDigest));
+        }
+        return Ok(());
+    };
+
+    let decoded = decode_base64(content_md5).ok_or_else(|| s3_error!(InvalidDigest))?;
+    if decoded.len() != 16 {
+        return Err(s3_error!(InvalidDigest));
+    }
+    if decoded != computed_md5 {
+        return Err(s3_error!(BadDigest));
+    }
+
+    Ok(())
 }
 
 /// Returns the common prefix produced by applying an S3 delimiter to a key.
@@ -1161,6 +1205,7 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
+        let S3Request { input, headers, .. } = req;
         let PutObjectInput {
             body,
             bucket,
@@ -1173,7 +1218,7 @@ impl S3 for Sqlite {
             expires,
             storage_class,
             ..
-        } = req.input;
+        } = input;
 
         self.validate_mutable_bucket(&bucket)?;
 
@@ -1201,12 +1246,11 @@ impl S3 for Sqlite {
         let md5_bytes = md5_hash.finalize();
         let md5 = hex(md5_bytes);
 
-        // if provided verify content_md5
-        if let Some(content_md5) = content_md5
-            && content_md5 != base64(md5_bytes)
-        {
-            return Err(s3_error!(BadDigest));
-        }
+        validate_content_md5(
+            headers.contains_key(CONTENT_MD5),
+            content_md5.as_deref(),
+            md5_bytes.as_ref(),
+        )?;
 
         debug!(path = %key, ?size, %md5, "write file");
 
@@ -1298,6 +1342,7 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
+        let S3Request { input, headers, .. } = req;
         let UploadPartInput {
             body,
             bucket,
@@ -1306,7 +1351,7 @@ impl S3 for Sqlite {
             part_number,
             content_md5,
             ..
-        } = req.input;
+        } = input;
 
         self.validate_mutable_bucket(&bucket)?;
 
@@ -1321,12 +1366,11 @@ impl S3 for Sqlite {
         let md5 = hex(md5_bytes);
         let size = try_!(i64::try_from(value.len()));
 
-        // if provided verify content_md5
-        if let Some(content_md5) = content_md5
-            && content_md5 != base64(md5_bytes)
-        {
-            return Err(s3_error!(BadDigest));
-        }
+        validate_content_md5(
+            headers.contains_key(CONTENT_MD5),
+            content_md5.as_deref(),
+            md5_bytes.as_ref(),
+        )?;
 
         let md5_clone = md5.clone();
         let connection = self.try_get_connection(&bucket).await?;
@@ -1645,5 +1689,57 @@ impl S3 for Sqlite {
             ..Default::default()
         };
         Ok(S3Response::new(output))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use s3s::S3ErrorCode;
+
+    use super::{decode_base64, validate_content_md5};
+
+    fn assert_error_code(result: s3s::S3Result<()>, code: &S3ErrorCode) {
+        match result {
+            Ok(()) => panic!("expected {code:?}"),
+            Err(err) => assert_eq!(err.code(), code),
+        }
+    }
+
+    #[test]
+    fn decodes_standard_base64() {
+        assert_eq!(
+            decode_base64("SpRKmvVRaPLiBjkHxCGwYQ=="),
+            Some(
+                [
+                    0x4a, 0x94, 0x4a, 0x9a, 0xf5, 0x51, 0x68, 0xf2, 0xe2, 0x06, 0x39, 0x07, 0xc4,
+                    0x21, 0xb0, 0x61
+                ]
+                .to_vec()
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_content_md5() {
+        assert_error_code(
+            validate_content_md5(true, None, &[0; 16]),
+            &S3ErrorCode::InvalidDigest,
+        );
+        assert_error_code(
+            validate_content_md5(true, Some("YWJyYWNhZGFicmE="), &[0; 16]),
+            &S3ErrorCode::InvalidDigest,
+        );
+        assert_error_code(
+            validate_content_md5(true, Some("not base64"), &[0; 16]),
+            &S3ErrorCode::InvalidDigest,
+        );
+    }
+
+    #[test]
+    fn distinguishes_wrong_content_md5() {
+        assert_error_code(
+            validate_content_md5(true, Some("rL0Y20xC+Fzt72VPzMSk2A=="), &[0; 16]),
+            &S3ErrorCode::BadDigest,
+        );
     }
 }
