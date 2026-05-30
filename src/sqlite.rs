@@ -107,7 +107,7 @@ pub(crate) struct CompletedMultipartUploadState {
 }
 
 impl Sqlite {
-    /// # Panics
+    /// Opens configured bucket databases and starts background maintenance.
     pub async fn new(config: &crate::Config) -> Result<Self> {
         if config.readers == 0 {
             Err(crate::S3ite::Configuration(
@@ -217,16 +217,18 @@ impl Sqlite {
         })
     }
 
+    /// Resolves a path relative to the configured virtual root.
     pub(crate) fn resolve_abs_path(&self, path: impl AsRef<Path>) -> Result<PathBuf> {
         Ok(path.as_ref().absolutize_virtually(&self.root)?.into_owned())
     }
 
-    /// resolve bucket path under the virtual root
+    /// Resolves the database file path for a bucket.
     pub(crate) fn get_bucket_path(&self, bucket: &str) -> Result<PathBuf> {
         let dir = PathBuf::from_str(&format!("{}.sqlite3", &bucket)).unwrap();
         self.resolve_abs_path(dir)
     }
 
+    /// Returns an open database connection for a bucket.
     pub(crate) async fn try_get_connection(&self, bucket: &str) -> Result<Arc<Connection>> {
         Ok(self
             .buckets
@@ -237,6 +239,7 @@ impl Sqlite {
             .to_owned())
     }
 
+    /// Creates a bucket database and registers its connection.
     pub(crate) async fn try_create_bucket(&self, bucket: &str, file_path: PathBuf) -> Result<()> {
         let config = self.config.clone();
 
@@ -260,7 +263,7 @@ impl Sqlite {
         Ok(())
     }
 
-    /// resolve object path under the virtual root
+    /// Ensures the bucket database schema exists and applies additive migrations.
     pub(crate) fn try_create_tables(transaction: &Transaction) -> rusqlite::Result<usize> {
         transaction.execute(
             "CREATE TABLE IF NOT EXISTS data (
@@ -324,6 +327,8 @@ impl Sqlite {
             (),
         )?;
 
+        // `CREATE TABLE IF NOT EXISTS` does not update existing bucket databases,
+        // so keep additive schema changes here until a formal migration system exists.
         for (table, column, definition) in [
             ("metadata", "content_type", "content_type TEXT"),
             ("metadata", "cache_control", "cache_control TEXT"),
@@ -342,6 +347,7 @@ impl Sqlite {
         Ok(0)
     }
 
+    /// Returns whether a table already contains a column.
     fn try_has_column(
         transaction: &Transaction,
         table: &str,
@@ -355,7 +361,7 @@ impl Sqlite {
         Ok(columns.iter().any(|name| name == column))
     }
 
-    /// resolve object path under the virtual root
+    /// Lists object metadata ordered by key for keyset pagination.
     pub(crate) fn try_list_objects(
         transaction: &Transaction,
         prefix: Option<&str>,
@@ -407,12 +413,13 @@ impl Sqlite {
         Ok(objects)
     }
 
+    /// Returns whether the bucket contains any objects.
     pub(crate) fn try_has_objects(transaction: &Transaction) -> rusqlite::Result<bool> {
         let mut stmt = transaction.prepare_cached("SELECT EXISTS(SELECT 1 FROM metadata);")?;
         stmt.query_row((), |row| row.get(0))
     }
 
-    /// resolve object path under the virtual root
+    /// Fetches an object body and metadata by key.
     pub(crate) fn try_get_object(
         transaction: &Transaction,
         key: &str,
@@ -460,6 +467,7 @@ impl Sqlite {
         .optional()
     }
 
+    /// Fetches object metadata by key without reading the body.
     pub(crate) fn try_get_metadata(
         transaction: &Transaction,
         key: &str,
@@ -502,7 +510,7 @@ impl Sqlite {
         .optional()
     }
 
-    /// resolve object path under the virtual root
+    /// Inserts or replaces an object body and metadata.
     pub(crate) fn try_put_object(
         transaction: &Transaction,
         kv: KeyValue,
@@ -541,7 +549,7 @@ impl Sqlite {
         ))
     }
 
-    /// resolve object path under the virtual root
+    /// Deletes an object by key.
     pub(crate) fn try_delete_object(
         transaction: &Transaction,
         key: &str,
@@ -554,6 +562,7 @@ impl Sqlite {
         stmt.execute([key])
     }
 
+    /// Deletes multiple objects and returns the keys that existed.
     pub(crate) fn try_delete_objects(
         transaction: &Transaction,
         keys: &[String],
@@ -574,6 +583,7 @@ impl Sqlite {
         Ok(keys)
     }
 
+    /// Creates multipart upload state for an upload ID.
     pub(crate) fn try_create_multipart_upload(
         transaction: &Transaction,
         upload_id: Uuid,
@@ -605,6 +615,7 @@ impl Sqlite {
         ))
     }
 
+    /// Fetches multipart upload state for validation and completion.
     pub(crate) fn try_get_multipart_upload_state(
         transaction: &Transaction,
         upload_id: Uuid,
@@ -640,6 +651,7 @@ impl Sqlite {
         .optional()
     }
 
+    /// Records a completed multipart upload for idempotent retries.
     pub(crate) fn try_put_completed_multipart_upload(
         transaction: &Transaction,
         upload_id: Uuid,
@@ -666,6 +678,7 @@ impl Sqlite {
         ))
     }
 
+    /// Fetches completed multipart upload state by upload ID.
     pub(crate) fn try_get_completed_multipart_upload(
         transaction: &Transaction,
         upload_id: Uuid,
@@ -688,6 +701,7 @@ impl Sqlite {
         .optional()
     }
 
+    /// Inserts or replaces a multipart upload part.
     pub(crate) fn try_put_multipart(
         transaction: &Transaction,
         multipart: Multipart,
@@ -710,6 +724,7 @@ impl Sqlite {
         ))
     }
 
+    /// Lists multipart upload part metadata ordered by part number.
     pub(crate) fn try_list_multipart(
         transaction: &Transaction,
         upload_id: Uuid,
@@ -739,6 +754,7 @@ impl Sqlite {
         Ok(objects)
     }
 
+    /// Fetches multipart upload parts with bodies ordered by part number.
     pub(crate) fn try_get_multiparts(
         transaction: &Transaction,
         upload_id: Uuid,
@@ -773,6 +789,7 @@ impl Sqlite {
         Ok(objects)
     }
 
+    /// Deletes multipart upload state and cascading parts.
     pub(crate) fn try_delete_multipart(
         transaction: &Transaction,
         upload_id: Uuid,
@@ -785,6 +802,7 @@ impl Sqlite {
         stmt.execute([upload_id])
     }
 
+    /// Deletes multipart uploads older than the expiration timestamp.
     pub(crate) fn try_delete_multipart_expired(
         transaction: &Transaction,
         expire_before: OffsetDateTime,
@@ -799,6 +817,7 @@ impl Sqlite {
         Ok(())
     }
 
+    /// Rejects mutations for read-only bucket configuration.
     pub(crate) fn validate_mutable_bucket(&self, bucket: &str) -> Result<()> {
         if self.config.read_only(Some(bucket)) {
             Err(S3Error::with_message(

@@ -7,7 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.7.0] - 2026-05-30
 
-- Bump package versions in `Cargo.toml`.
+### Added
+
+- Add a `scripts/setup-s3-tests.sh` helper to install `uv`, configure Ceph `s3-tests`, and run curated or custom conformance tests against a local s3ite server.
+- Add `Config::readers` with a default of `4` and wire it to the existing `--readers` CLI option, separating SQLite reader threads from HTTP request concurrency.
+- Add unversioned `ListObjectVersions` support that reports current objects as `VersionId = null`.
+- Add minimal object ACL reads for conformance tests, returning the stable local owner with full control.
+- Add `AbortMultipartUpload` support.
+
+### Changed
+
+- Upgrade dependencies, including `s3s` to `0.13`, `rusqlite` to `0.40`, Tokio/Hyper/Tower updates, and the AWS test stack pinned to compatible versions.
+- Upgrade the crate to Rust edition 2024.
+- Change the default SQLite cache size from `67_108_864` KiB to `65_536` KiB.
+- Rework SQLite connection management so read threads are configured independently, database queues fail fast when full or closed, and shutdown joins worker threads instead of busy-waiting.
+- Replace process-global listing continuation snapshots with keyset pagination over ordered keys.
+- Ignore local reference clones and local `s3-tests` runtime artifacts.
+
+### Fixed
+
+- Fix ranged `GetObject` responses to use normalized inclusive/exclusive byte bounds consistently, including suffix ranges, zero-byte objects, `Content-Range`, and `Accept-Ranges`.
+- Enforce read-only buckets for `DeleteObject` and `UploadPart`.
+- Fix bucket deletion to reject non-empty buckets before closing/removing the SQLite database.
+- Make object deletes and multi-object deletes match S3 idempotency expectations, including missing keys, quiet deletes, request size limits, and trailing-slash object keys.
+- Fix `ListObjects`, `ListObjectsV2`, and `ListObjectVersions` prefix, delimiter, common-prefix, marker, continuation-token, `KeyCount`, owner, and URL-encoding semantics, including literal `%` and `_` key characters.
+- Preserve and return object `ETag` from `HeadObject`.
+- Persist and return object HTTP metadata such as `Content-Type`, `Cache-Control`, and `Expires`, including copy and multipart completion paths.
+- Fix `CopyObject` metadata replacement, self-copy behavior, and metadata retention.
+- Fix multipart completion validation for missing, mismatched, out-of-order, and too-small parts.
+- Compute multipart ETags as `md5(concat(part-md5s))-N` and build completed objects with preallocated buffers.
+- Allow resent multipart parts to replace the previous stored part.
+- Make repeated multipart completion idempotently return the completed multipart ETag.
+- Remove stray stdout from bucket creation.
 
 ## [0.6.0] - 2025-06-13
 

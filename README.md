@@ -2,19 +2,19 @@
 
 This is an experimental binding using the [s3s](https://crates.io/crates/s3s) crate backed by [SQLite](https://www.sqlite.org).
 
-**HIGHLY EXPERIMENTAL** do not use in production as only basic tests have been run and data loss cannot be guaranteed.
+**HIGHLY EXPERIMENTAL** do not use in production. The project now has broader local and Ceph `s3-tests` coverage, but the API surface is still incomplete and data loss cannot be guaranteed.
 
 ## Why
 
-This crate was built to test the feasiblity of using SQLite as an alternative to formats like [TFRecord](https://www.tensorflow.org/tutorials/load_data/tfrecord) for storing a large number of machine learning training data with an accessible API. Although `TFRecord` and SQLite share a similar few-large-storage-files architecture - making backups and data movement efficient/easy - having both a SQLite interface and [Amazon S3](https://aws.amazon.com/s3/)/`http` API makes access to the contained data easier with tooling that likely already exists on your machine.
+This crate was built to test the feasibility of using SQLite as an alternative to formats like [TFRecord](https://www.tensorflow.org/tutorials/load_data/tfrecord) for storing a large number of machine learning training data with an accessible API. Although `TFRecord` and SQLite share a similar few-large-storage-files architecture - making backups and data movement efficient/easy - having both a SQLite interface and [Amazon S3](https://aws.amazon.com/s3/)/`http` API makes access to the contained data easier with tooling that likely already exists on your machine.
 
-This concept is backed by benchmarks from SQLite showing that it can be [faster than filesytems](https://www.sqlite.org/fasterthanfs.html) for certain data access patterns.
+This concept is backed by benchmarks from SQLite showing that it can be [faster than filesystems](https://www.sqlite.org/fasterthanfs.html) for certain data access patterns.
 
 ## Architecture
 
 Each `bucket` is saved to a separate `.sqlite3` database named after the `bucket` name. The [smithy](https://github.com/awslabs/smithy) generated bindings for `s3` are then mapped to the correct SQL calls against a very simple schema that is designed to be human accessible.
 
-`content-md5` verification (if available) and SQLite [database transactions](https://sqlite.org/transactional.html) are used to prevent data loss or partial updates.
+`Content-MD5` verification (if available) and SQLite [database transactions](https://sqlite.org/transactional.html) are used to prevent data loss or partial updates.
 
 ### Data
 
@@ -30,15 +30,20 @@ CREATE TABLE IF NOT EXISTS metadata (
     key TEXT PRIMARY KEY,
     size INTEGER NOT NULL,
     metadata TEXT,
+    content_type TEXT,
+    cache_control TEXT,
+    expires TEXT,
     last_modified TEXT NOT NULL,
     md5 TEXT,
     FOREIGN KEY (key) REFERENCES data (key) ON DELETE CASCADE
 ) WITHOUT ROWID;
 ```
 
+Existing bucket databases are checked at startup and migrated forward for newly-added metadata columns where possible.
+
 ### Multipart Uploads
 
-For `multipart` uploads two temporary tables are used:
+For multipart uploads, s3ite uses temporary upload tables plus a completion ledger for idempotent completion responses:
 
 ```sql
 CREATE TABLE IF NOT EXISTS multipart_upload (
@@ -47,6 +52,10 @@ CREATE TABLE IF NOT EXISTS multipart_upload (
     key                     TEXT NOT NULL,
     last_modified           TEXT NOT NULL,
     access_key              TEXT,
+    metadata                TEXT,
+    content_type            TEXT,
+    cache_control           TEXT,
+    expires                 TEXT,
     UNIQUE(upload_id, bucket, key)
 );
 
@@ -60,13 +69,23 @@ CREATE TABLE IF NOT EXISTS multipart_upload_part (
     PRIMARY KEY (upload_id, part_number),
     FOREIGN KEY (upload_id) REFERENCES multipart_upload (upload_id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS completed_multipart_upload (
+    upload_id               BLOB NOT NULL PRIMARY KEY,
+    bucket                  TEXT NOT NULL,
+    key                     TEXT NOT NULL,
+    access_key              TEXT,
+    md5                     TEXT NOT NULL,
+    last_modified           TEXT NOT NULL,
+    UNIQUE(upload_id, bucket, key)
+);
 ```
 
 ## Configuration
 
-`s3ite` provides configuration options at the `service` level (i.e. the global level that apply to all buckets or control the API behavior) or at the `bucket` level for changing specific bucket behavior. To set them `sqlite` has two methods of configuration: a `yaml` configuration file or the command-line-interface.
+`s3ite` provides configuration options at the `service` level (i.e. the global level that applies to all buckets or controls API behavior) or at the `bucket` level for changing specific bucket behavior. These can be set with a YAML configuration file or the command-line interface.
 
-The `yaml` configuration (provided via the `--config` argument) differs from the `command-line-interface` options in that it allows parameters be specified at the `service` and `bucket` levels whereas the `command-line-interface` provides only `service` level configuration.
+The YAML configuration (provided via the `--config` argument) differs from the command-line options in that it allows parameters to be specified at the `service` and `bucket` levels, whereas the command-line interface provides only `service` level configuration.
 
 The options are:
 
@@ -75,20 +94,21 @@ The options are:
 - `port`: The port to listen on for this service.
 - `access_key`: The access key ID that is used to authenticate for this service.
 - `secret_key`: The secret access key that is used to authenticate for this service.
-- `concurrency_limit`: Enforces a limit on the concurrent number of requests the underlying service can handle. This can be tuned depending on infrastructure as SSD/HDD will handle resource contention very differently.
+- `concurrency_limit`: Enforces a limit on the concurrent number of HTTP requests the service can handle. This can be tuned depending on infrastructure as SSD/HDD will handle resource contention very differently.
+- `readers`: Controls the number of SQLite reader connections. Defaults to `4`.
 - `permissive_cors`: Allow permissive Cross-Origin Resource Sharing (CORS) requests. This can be enabled to allow users to access this service from a web service running on a different host.
 - `domain_name`: The domain to use to allow parsing virtual-hosted-style requests.
 - `read_only`: Prevent mutations to any of the databases connected to this service.
 - `journal_mode`: Controls the default SQLite [journal_mode](https://www.sqlite.org/pragma.html#pragma_journal_mode) pragma.
 - `synchronous`: Controls the default SQLite [synchronous](https://www.sqlite.org/pragma.html#pragma_synchronous) pragma.
 - `temp_store`: Controls the default SQLite [temp_store](https://www.sqlite.org/pragma.html#pragma_temp_store) pragma.
-- `cache_size`: Controls the default SQLite [cache_size](https://www.sqlite.org/pragma.html#pragma_cache_size) pragma.
+- `cache_size`: Controls the default SQLite [cache_size](https://www.sqlite.org/pragma.html#pragma_cache_size) pragma in KiB. Defaults to `65536`.
 
-This structure is heirarchical where:
+This structure is hierarchical where:
 
 ### Command-Line Service Configuration
 
-`command-line-interface` arguments will take precedence over any `service` level configuration like below where the default `root` value `.` is overridden with `/data`.
+Command-line arguments take precedence over any `service` level configuration, like below where the default `root` value `.` is overridden with `/data`.
 
 ```bash
 s3ite --root /data
@@ -98,7 +118,7 @@ s3ite --root /data
 
 If set, `bucket` level configurations will take precedence over the `service` level configurations.
 
-This design allows setting specific `bucket` level configurations like below where the `mybucket` bucket will be set to `read-only` on startup and all other buckets will be writable. An error will be raised if any specified bucket does not exist (in this case and error is raised if `mybucket.sqlite3` is not found and accessible).
+This design allows setting specific `bucket` level configurations like below where the `mybucket` bucket will be set to `read-only` on startup and all other buckets will be writable. An error will be raised if any specified bucket does not exist (in this case, an error is raised if `mybucket.sqlite3` is not found and accessible).
 
 ```yaml
 root: /data
@@ -107,18 +127,21 @@ port: 8014
 access_key: AKIAIOSFODNN7EXAMPLE
 secret_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 permissive_cors: true
-concurrency: 16
+concurrency_limit: 16
+readers: 4
 read_only: false
 journal_mode: WAL
 synchronous: NORMAL
 temp_store: MEMORY
-cache_size: 67108864
+cache_size: 65536
 buckets:
   mybucket:
     read_only: true
     sqlite:
-      cache_size: 134217728
+      cache_size: 131072
 ```
+
+If `access_key` and `secret_key` are omitted, authentication is disabled.
 
 ## Docker
 
@@ -133,6 +156,7 @@ s3ite:latest \
 --host 0.0.0.0 \
 --port 8014 \
 --concurrency-limit 16 \
+--readers 4 \
 --access-key AKIAIOSFODNN7EXAMPLE \
 --secret-key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 ```
@@ -140,7 +164,7 @@ s3ite:latest \
 
 ## Build
 
-This code can be used as a library or a standalone binary. To build the binary:
+This code can be used as a library or a standalone binary. It uses Rust edition 2024, so use a compatible Rust toolchain. To build the binary:
 
 ```bash
 cargo build --release
@@ -158,3 +182,23 @@ cargo install --path .
 s3ite --root . --host 0.0.0.0 --port 8014 --access-key AKIAIOSFODNN7EXAMPLE --secret-key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 ```
 
+## Conformance Tests
+
+The repository includes a helper for running a local Ceph `s3-tests` environment. Clone `s3-tests` into `clone/s3-tests`, then run:
+
+```bash
+scripts/setup-s3-tests.sh
+cargo run --features binary -- --config .s3tests/s3ite-server.yaml
+```
+
+In another shell:
+
+```bash
+scripts/setup-s3-tests.sh --run-curated
+```
+
+To run a specific test, pass pytest arguments after `--run`:
+
+```bash
+scripts/setup-s3-tests.sh --run clone/s3-tests/s3tests/functional/test_s3.py::test_object_write_read_update_read_delete
+```
