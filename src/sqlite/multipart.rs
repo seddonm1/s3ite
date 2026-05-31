@@ -5,7 +5,7 @@ use rusqlite::{Error::ToSqlConversionFailure, OptionalExtension, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::checksum::{ChecksumAlgorithmKind, ChecksumTypeKind};
+use crate::checksum::{ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKind};
 
 use super::{
     CompletedMultipartUploadOutcome, CompletedMultipartUploadRecord, CompletedMultipartUploadState,
@@ -14,7 +14,7 @@ use super::{
     MultipartMetadata, MultipartUploadState, MultipartUploadSummary, PartChecksum, Sqlite,
     SqliteError, SqliteResult, StoredChecksum, decode_base64, decode_md5_hex, encode_hex,
     optional_multipart_checksum_config, optional_part_checksum, required_stored_checksum, row_size,
-    sql_limit, sql_size, stored_checksum,
+    sql_limit, sql_size,
 };
 
 /// Buffered completed multipart object and its persisted part boundaries.
@@ -174,9 +174,17 @@ impl Sqlite {
             return Err(SqliteError::InvalidMultipartPart);
         }
 
+        let checksum_config = Self::try_completed_multipart_checksum_config(
+            upload_checksum,
+            requested_checksum,
+            default_checksum,
+        );
         let mut value = Vec::with_capacity(Self::try_total_multipart_size(&parts)?);
         let mut completed_parts = Vec::with_capacity(parts.len());
-        let mut part_md5s = Vec::with_capacity(parts.len() * 16);
+        let mut md5_hash = Md5::new();
+        let mut full_object_checksum = (checksum_config.checksum_type
+            == ChecksumTypeKind::FullObject)
+            .then(|| ChecksumAccumulator::new(checksum_config.algorithm));
         let final_part_number = requested_parts.len();
         let mut offset = 0;
         let algorithm = upload_checksum.map(|checksum| checksum.algorithm);
@@ -195,7 +203,7 @@ impl Sqlite {
                 .md5
                 .as_deref()
                 .ok_or(SqliteError::InvalidMultipartPart)?;
-            part_md5s.extend_from_slice(&decode_md5_hex(stored_md5)?);
+            md5_hash.update(decode_md5_hex(stored_md5)?);
             completed_parts.push(CompletedObjectPart {
                 part_number: part.part_number,
                 start: offset,
@@ -206,11 +214,12 @@ impl Sqlite {
             offset = offset
                 .checked_add(part.size)
                 .ok_or(SqliteError::MultipartObjectTooLarge)?;
+            if let Some(full_object_checksum) = &mut full_object_checksum {
+                full_object_checksum.update(&part.value);
+            }
             value.extend_from_slice(&part.value);
         }
 
-        let mut md5_hash = Md5::new();
-        md5_hash.update(&part_md5s);
         let md5 = format!(
             "{}-{}",
             encode_hex(md5_hash.finalize()),
@@ -218,10 +227,9 @@ impl Sqlite {
         );
         let size = i64::try_from(value.len()).map_err(|_| SqliteError::MultipartObjectTooLarge)?;
         let checksum = Self::try_completed_multipart_checksum(
-            upload_checksum,
+            checksum_config,
             requested_checksum,
-            default_checksum,
-            &value,
+            full_object_checksum,
             &completed_parts,
         )?;
         Ok(CompletedMultipartObject {
@@ -231,6 +239,30 @@ impl Sqlite {
             checksum,
             parts: completed_parts,
         })
+    }
+
+    /// Resolves the final checksum algorithm and type for multipart completion.
+    fn try_completed_multipart_checksum_config(
+        upload_checksum: Option<MultipartChecksumConfig>,
+        requested_checksum: &MultipartCompletionChecksum,
+        default_checksum: MultipartChecksumConfig,
+    ) -> MultipartChecksumConfig {
+        let algorithm = upload_checksum
+            .map(|checksum| checksum.algorithm)
+            .or(requested_checksum.algorithm())
+            .unwrap_or(default_checksum.algorithm);
+
+        let checksum_type = if upload_checksum.is_some() || requested_checksum.algorithm().is_some()
+        {
+            requested_checksum
+                .checksum_type()
+                .or(upload_checksum.map(|checksum| checksum.checksum_type))
+                .unwrap_or(default_checksum.checksum_type)
+        } else {
+            default_checksum.checksum_type
+        };
+
+        MultipartChecksumConfig::new(algorithm, checksum_type)
     }
 
     /// Returns the total body size for uploaded multipart parts.
@@ -284,47 +316,35 @@ impl Sqlite {
 
     /// Computes and validates the final checksum for a completed multipart object.
     fn try_completed_multipart_checksum(
-        upload_checksum: Option<MultipartChecksumConfig>,
+        checksum_config: MultipartChecksumConfig,
         requested_checksum: &MultipartCompletionChecksum,
-        default_checksum: MultipartChecksumConfig,
-        value: &[u8],
+        full_object_checksum: Option<ChecksumAccumulator>,
         parts: &[CompletedObjectPart],
     ) -> SqliteResult<crate::checksum::StoredChecksum> {
-        let algorithm = upload_checksum
-            .map(|checksum| checksum.algorithm)
-            .or(requested_checksum.algorithm())
-            .unwrap_or(default_checksum.algorithm);
-
-        let checksum_type = if upload_checksum.is_some() || requested_checksum.algorithm().is_some()
-        {
-            requested_checksum
-                .checksum_type()
-                .or(upload_checksum.map(|checksum| checksum.checksum_type))
-                .unwrap_or(default_checksum.checksum_type)
-        } else {
-            default_checksum.checksum_type
-        };
-        let computed = match checksum_type {
-            ChecksumTypeKind::FullObject => algorithm.checksum_value(value),
+        let checksum = match checksum_config.checksum_type {
+            ChecksumTypeKind::FullObject => full_object_checksum
+                .ok_or(SqliteError::ChecksumMismatch)?
+                .finish_stored(ChecksumTypeKind::FullObject)
+                .ok_or(SqliteError::ChecksumMismatch)?,
             ChecksumTypeKind::Composite => {
-                let mut combined = Vec::new();
+                let mut accumulator = ChecksumAccumulator::new(checksum_config.algorithm);
                 for part in parts {
                     let checksum = part
                         .checksum
                         .as_ref()
-                        .and_then(|checksum| checksum.value_for(algorithm))
+                        .and_then(|checksum| checksum.value_for(checksum_config.algorithm))
                         .ok_or(SqliteError::ChecksumMismatch)?;
                     let checksum = decode_base64(checksum).ok_or(SqliteError::ChecksumMismatch)?;
-                    combined.extend_from_slice(&checksum);
+                    accumulator.update(&checksum);
                 }
-                format!("{}-{}", algorithm.checksum_value(&combined), parts.len())
+                accumulator
+                    .finish_composite(parts.len())
+                    .ok_or(SqliteError::ChecksumMismatch)?
             }
         };
 
-        let checksum = stored_checksum(algorithm, checksum_type, computed)?;
-
-        if let Some(requested) = requested_checksum.value_for(algorithm)
-            && checksum.value_for(algorithm) != Some(requested)
+        if let Some(requested) = requested_checksum.value_for(checksum_config.algorithm)
+            && checksum.value_for(checksum_config.algorithm) != Some(requested)
         {
             return Err(SqliteError::ChecksumMismatch);
         }

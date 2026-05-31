@@ -13,11 +13,12 @@ use super::{
     SqliteError, SqliteResult, StorageClass, StoredChecksum, StreamingBlob, TryStreamExt,
     checksum_algorithm_from_request, checksum_crc32, checksum_crc32c, checksum_crc64nvme,
     checksum_mode_enabled, checksum_sha1, checksum_sha256, checksum_struct, checksum_type_output,
-    copy_bytes, debug, hex, list_limit, not_found_delete_marker_error, not_modified_error,
-    object_checksum_for_part, object_write_checksum_from_value, object_write_conditions,
-    requested_part_range, s3_error, s3_error_from_sqlite, s3_error_with_message, stream,
-    validate_content_md5, validate_copy_source_conditions, validate_delete_conditions,
-    validate_part_number, validate_payload_checksum, validate_read_conditions,
+    copy_bytes, debug, finish_payload_checksum, hex, list_limit, not_found_delete_marker_error,
+    not_modified_error, object_checksum_for_part, object_write_checksum_from_value,
+    object_write_conditions, payload_checksum_accumulator, requested_part_range, s3_error,
+    s3_error_from_sqlite, s3_error_with_message, stream, validate_content_md5,
+    validate_copy_source_conditions, validate_delete_conditions, validate_part_number,
+    validate_read_conditions,
 };
 
 use crate::database::BucketConnection;
@@ -1020,7 +1021,13 @@ async fn read_put_object_body(
     checksum_input: ChecksumInput,
 ) -> S3Result<BufferedObjectBody> {
     let mut md5_hash = Md5::new();
-    let stream = body.inspect_ok(|bytes| md5_hash.update(bytes.as_ref()));
+    let mut checksum_accumulator =
+        payload_checksum_accumulator(&checksum_input, ChecksumPolicy::DefaultCrc64NvmeFullObject)?;
+    let stream = body.inspect_ok(|bytes| {
+        let bytes = bytes.as_ref();
+        md5_hash.update(bytes);
+        checksum_accumulator.update(bytes);
+    });
     let mut value = Vec::new();
     let size =
         i64::try_from(copy_bytes(stream, &mut value).await?).map_err(S3Error::internal_error)?;
@@ -1033,10 +1040,9 @@ async fn read_put_object_body(
         md5_bytes.as_ref(),
     )?;
 
-    let checksum = validate_payload_checksum(
+    let checksum = finish_payload_checksum(
         &checksum_input,
-        &value,
-        ChecksumPolicy::DefaultCrc64NvmeFullObject,
+        checksum_accumulator,
         ChecksumTypeKind::FullObject,
     )?;
 

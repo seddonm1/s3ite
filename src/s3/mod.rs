@@ -63,10 +63,10 @@ use self::{
     checksum::{
         ChecksumInput, ChecksumPolicy, checksum_algorithm_from_request, checksum_algorithm_output,
         checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_mode_enabled, checksum_sha1,
-        checksum_sha256, checksum_struct, checksum_type_output, copied_part_checksum,
-        default_crc64nvme_full_object_checksum, hex, multipart_checksum_config,
-        object_checksum_for_part, object_write_checksum_from_value, validate_content_md5,
-        validate_part_payload_checksum, validate_payload_checksum,
+        checksum_sha256, checksum_struct, checksum_type_output, configured_part_checksum,
+        default_crc64nvme_full_object_checksum, finish_part_checksum, finish_payload_checksum, hex,
+        multipart_checksum_config, object_checksum_for_part, object_write_checksum_from_value,
+        part_checksum_accumulator, payload_checksum_accumulator, validate_content_md5,
     },
     conditions::{
         ObjectDeleteConditions, ObjectReadConditionFailure, ObjectReadConditions,

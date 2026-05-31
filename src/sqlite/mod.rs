@@ -32,7 +32,6 @@ use self::{
     checksum::{
         decode_base64, decode_md5_hex, encode_hex, optional_multipart_checksum_config,
         optional_part_checksum, optional_stored_checksum, required_stored_checksum,
-        stored_checksum,
     },
     types::{row_bool, row_size, sql_limit, sql_size},
 };

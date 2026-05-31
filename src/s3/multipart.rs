@@ -12,11 +12,12 @@ use super::{
     SqliteResult, StorageClass, TryStreamExt, UploadPartCopyInput, UploadPartCopyOutput,
     UploadPartInput, UploadPartOutput, Uuid, checksum_algorithm_output, checksum_crc32,
     checksum_crc32c, checksum_crc64nvme, checksum_sha1, checksum_sha256, checksum_type_output,
-    common_prefix_for_key, copied_part_checksum, copy_bytes, debug, decode_list_input_value,
-    default_crc64nvme_full_object_checksum, encode_list_value, hex, is_url_encoding,
-    multipart_checksum_config, normalize_content_encoding, object_write_conditions,
-    output_delimiter, owner, s3_error, s3_error_from_sqlite, s3_error_with_message,
-    validate_content_md5, validate_copy_source_conditions, validate_part_payload_checksum,
+    common_prefix_for_key, configured_part_checksum, copy_bytes, debug, decode_list_input_value,
+    default_crc64nvme_full_object_checksum, encode_list_value, finish_part_checksum, hex,
+    is_url_encoding, multipart_checksum_config, normalize_content_encoding,
+    object_write_conditions, output_delimiter, owner, part_checksum_accumulator, s3_error,
+    s3_error_from_sqlite, s3_error_with_message, validate_content_md5,
+    validate_copy_source_conditions,
 };
 
 /// Normalizes a completed multipart part list while preserving S3 ordering rules.
@@ -309,7 +310,7 @@ fn store_upload_part_copy(
 
     let now = OffsetDateTime::now_utc();
     let md5 = copied_part.md5;
-    let checksum = copied_part_checksum(upload_state.checksum, &copied_part.value);
+    let checksum = configured_part_checksum(upload_state.checksum, &copied_part.value);
     Sqlite::try_touch_multipart_upload(transaction, request.upload_id)?;
     Sqlite::try_put_multipart(
         transaction,
@@ -724,8 +725,24 @@ pub(super) async fn upload_part(
     let upload_id = parse_upload_id(&upload_id)?;
     validate_part_number(part_number)?;
 
+    let checksum_input = ChecksumInput {
+        algorithm: checksum_algorithm,
+        crc32: request_checksum_crc32,
+        crc32c: request_checksum_crc32c,
+        crc64nvme: request_checksum_crc64nvme,
+        sha1: request_checksum_sha1,
+        sha256: request_checksum_sha256,
+        ..ChecksumInput::default()
+    };
+    let mut checksum_accumulator = part_checksum_accumulator(&checksum_input)?;
     let mut md5_hash = Md5::new();
-    let stream = body.inspect_ok(|bytes| md5_hash.update(bytes.as_ref()));
+    let stream = body.inspect_ok(|bytes| {
+        let bytes = bytes.as_ref();
+        md5_hash.update(bytes);
+        if let Some(checksum_accumulator) = &mut checksum_accumulator {
+            checksum_accumulator.update(bytes);
+        }
+    });
     let mut value = Vec::new();
     copy_bytes(stream, &mut value).await?;
     let md5_bytes = md5_hash.finalize();
@@ -737,16 +754,7 @@ pub(super) async fn upload_part(
         content_md5.as_deref(),
         md5_bytes.as_ref(),
     )?;
-    let checksum_input = ChecksumInput {
-        algorithm: checksum_algorithm,
-        crc32: request_checksum_crc32,
-        crc32c: request_checksum_crc32c,
-        crc64nvme: request_checksum_crc64nvme,
-        sha1: request_checksum_sha1,
-        sha256: request_checksum_sha256,
-        ..ChecksumInput::default()
-    };
-    let explicit_checksum = validate_part_payload_checksum(&checksum_input, &value)?;
+    let explicit_checksum = finish_part_checksum(&checksum_input, checksum_accumulator)?;
 
     let md5_clone = md5.clone();
     let connection = sqlite
@@ -767,8 +775,8 @@ pub(super) async fn upload_part(
                     .map(|credentials| credentials.access_key.as_str()),
             )?;
 
-            let checksum =
-                explicit_checksum.or_else(|| copied_part_checksum(upload_state.checksum, &value));
+            let checksum = explicit_checksum
+                .or_else(|| configured_part_checksum(upload_state.checksum, &value));
 
             Sqlite::try_touch_multipart_upload(&transaction, upload_id)?;
             Sqlite::try_put_multipart(

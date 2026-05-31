@@ -12,8 +12,9 @@ use s3s::{
 
 use crate::{
     checksum::{
-        ChecksumAlgorithmKind, ChecksumTypeKind, ChecksumView, MultipartChecksumConfig,
-        MultipartCompletionChecksum, PartChecksum, StoredChecksum, decode_base64,
+        ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKind, ChecksumView,
+        MultipartChecksumConfig, MultipartCompletionChecksum, PartChecksum, StoredChecksum,
+        decode_base64,
     },
     sqlite::{CompletedObjectPart, KeyValue, SqliteError, SqliteResult},
 };
@@ -227,18 +228,64 @@ pub(super) fn validate_content_md5(
     Ok(())
 }
 
-/// Computes, validates, and stores the checksum for a completed object body.
-pub(super) fn validate_payload_checksum(
+/// Creates an accumulator for an object payload checksum.
+pub(super) fn payload_checksum_accumulator(
     input: &ChecksumInput,
-    value: &[u8],
     policy: ChecksumPolicy,
+) -> S3Result<ChecksumAccumulator> {
+    let explicit_kind = input.algorithm_kind()?;
+    Ok(ChecksumAccumulator::new(
+        explicit_kind.unwrap_or_else(|| policy.default_kind()),
+    ))
+}
+
+/// Finalizes and validates an object payload checksum accumulator.
+pub(super) fn finish_payload_checksum(
+    input: &ChecksumInput,
+    accumulator: ChecksumAccumulator,
     checksum_type: ChecksumTypeKind,
 ) -> S3Result<StoredChecksum> {
-    let explicit_kind = input.algorithm_kind()?;
-    let kind = explicit_kind.unwrap_or_else(|| policy.default_kind());
+    let checksum = accumulator
+        .finish_stored(checksum_type)
+        .ok_or(SqliteError::ChecksumMismatch)
+        .map_err(s3_error_from_sqlite)?;
+    validate_stored_checksum(input, checksum)
+}
 
-    let checksum =
-        checksum_metadata(kind, value, checksum_type, None).map_err(s3_error_from_sqlite)?;
+/// Creates an accumulator for an explicitly requested part checksum.
+pub(super) fn part_checksum_accumulator(
+    input: &ChecksumInput,
+) -> S3Result<Option<ChecksumAccumulator>> {
+    let Some(kind) = input.algorithm_kind()? else {
+        return Ok(None);
+    };
+    Ok(Some(ChecksumAccumulator::new(kind)))
+}
+
+/// Finalizes and validates an explicitly requested part checksum accumulator.
+pub(super) fn finish_part_checksum(
+    input: &ChecksumInput,
+    accumulator: Option<ChecksumAccumulator>,
+) -> S3Result<Option<PartChecksum>> {
+    let Some(accumulator) = accumulator else {
+        return Ok(None);
+    };
+    let kind = accumulator.algorithm();
+    let checksum = accumulator.finish_part();
+    if let Some(requested) = input.requested_for(kind)
+        && checksum.value_for(kind) != Some(requested)
+    {
+        return Err(s3_error(S3ErrorCode::BadDigest));
+    }
+    Ok(Some(checksum))
+}
+
+/// Validates a computed object checksum against request-provided checksum text.
+fn validate_stored_checksum(
+    input: &ChecksumInput,
+    checksum: StoredChecksum,
+) -> S3Result<StoredChecksum> {
+    let kind = checksum.algorithm();
     if let Some(requested) = input.requested_for(kind)
         && checksum.value_for(kind) != Some(requested)
     {
@@ -246,23 +293,6 @@ pub(super) fn validate_payload_checksum(
     }
 
     Ok(checksum)
-}
-
-/// Computes and validates a part-level checksum from explicit request fields.
-pub(super) fn validate_part_payload_checksum(
-    input: &ChecksumInput,
-    value: &[u8],
-) -> S3Result<Option<PartChecksum>> {
-    let Some(kind) = input.algorithm_kind()? else {
-        return Ok(None);
-    };
-    let computed = kind.checksum_value(value);
-    if let Some(requested) = input.requested_for(kind)
-        && computed != requested
-    {
-        return Err(s3_error(S3ErrorCode::BadDigest));
-    }
-    Ok(Some(PartChecksum::new(kind, computed)))
 }
 
 /// Builds stored checksum metadata from either computed bytes or a supplied value.
@@ -292,16 +322,23 @@ pub(super) fn object_write_checksum_from_value(
     let value = object.value.as_deref().ok_or_else(|| {
         SqliteError::Configuration("object metadata has no stored value".to_string())
     })?;
-    StoredChecksum::compute(kind, ChecksumTypeKind::FullObject, value)
+    let mut accumulator = ChecksumAccumulator::new(kind);
+    accumulator.update(value);
+    accumulator
+        .finish_stored(ChecksumTypeKind::FullObject)
         .ok_or(SqliteError::ChecksumMismatch)
 }
 
 /// Computes per-part checksum metadata for `UploadPartCopy`.
-pub(super) fn copied_part_checksum(
+pub(super) fn configured_part_checksum(
     upload_checksum: Option<MultipartChecksumConfig>,
     value: &[u8],
 ) -> Option<PartChecksum> {
-    upload_checksum.map(|checksum| PartChecksum::compute(checksum.algorithm, value))
+    upload_checksum.map(|checksum| {
+        let mut accumulator = ChecksumAccumulator::new(checksum.algorithm);
+        accumulator.update(value);
+        accumulator.finish_part()
+    })
 }
 
 /// Converts stored checksum algorithm metadata into an S3 response DTO.
@@ -389,10 +426,10 @@ mod tests {
 
     use super::{
         ChecksumAlgorithmKind, ChecksumInput, ChecksumPolicy, checksum_algorithm_from_request,
-        checksum_metadata, checksum_mode_enabled, checksum_type_name, copied_part_checksum,
-        default_crc64nvme_full_object_checksum, multipart_checksum_config, multipart_checksum_type,
-        object_checksum_for_part, validate_content_md5, validate_part_payload_checksum,
-        validate_payload_checksum,
+        checksum_metadata, checksum_mode_enabled, checksum_type_name, configured_part_checksum,
+        default_crc64nvme_full_object_checksum, finish_part_checksum, finish_payload_checksum,
+        multipart_checksum_config, multipart_checksum_type, object_checksum_for_part,
+        part_checksum_accumulator, payload_checksum_accumulator, validate_content_md5,
     };
 
     fn assert_error_code<T>(result: s3s::S3Result<T>, code: &S3ErrorCode) {
@@ -498,15 +535,20 @@ mod tests {
 
     #[test]
     fn computes_default_payload_checksum() {
-        let checksum = match validate_payload_checksum(
-            &ChecksumInput::default(),
-            b"test data",
+        let input = ChecksumInput::default();
+        let mut accumulator = match payload_checksum_accumulator(
+            &input,
             ChecksumPolicy::DefaultCrc64NvmeFullObject,
-            ChecksumTypeKind::FullObject,
         ) {
-            Ok(checksum) => checksum,
+            Ok(accumulator) => accumulator,
             Err(err) => panic!("unexpected error: {err:?}"),
         };
+        accumulator.update(b"test data");
+        let checksum =
+            match finish_payload_checksum(&input, accumulator, ChecksumTypeKind::FullObject) {
+                Ok(checksum) => checksum,
+                Err(err) => panic!("unexpected error: {err:?}"),
+            };
         assert_eq!(
             checksum,
             StoredChecksum::Full(FullObjectChecksum::Crc64Nvme("rsrzr5yYqFU=".to_string()))
@@ -520,13 +562,16 @@ mod tests {
             sha256: Some("wrong".to_string()),
             ..ChecksumInput::default()
         };
+        let mut accumulator = match payload_checksum_accumulator(
+            &input,
+            ChecksumPolicy::DefaultCrc64NvmeFullObject,
+        ) {
+            Ok(accumulator) => accumulator,
+            Err(err) => panic!("unexpected error: {err:?}"),
+        };
+        accumulator.update(b"test data");
         assert_error_code(
-            validate_payload_checksum(
-                &input,
-                b"test data",
-                ChecksumPolicy::DefaultCrc64NvmeFullObject,
-                ChecksumTypeKind::FullObject,
-            ),
+            finish_payload_checksum(&input, accumulator, ChecksumTypeKind::FullObject),
             &S3ErrorCode::BadDigest,
         );
     }
@@ -555,7 +600,13 @@ mod tests {
             algorithm: Some(ChecksumAlgorithm::from_static(ChecksumAlgorithm::SHA256)),
             ..ChecksumInput::default()
         };
-        let checksum = match validate_part_payload_checksum(&input, b"test data") {
+        let mut accumulator = match part_checksum_accumulator(&input) {
+            Ok(Some(accumulator)) => accumulator,
+            Ok(None) => panic!("expected checksum accumulator"),
+            Err(err) => panic!("unexpected error: {err:?}"),
+        };
+        accumulator.update(b"test data");
+        let checksum = match finish_part_checksum(&input, Some(accumulator)) {
             Ok(Some(checksum)) => checksum,
             Ok(None) => panic!("expected part checksum"),
             Err(err) => panic!("unexpected error: {err:?}"),
@@ -567,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn computes_copied_part_checksum_when_upload_requested_one() {
+    fn computes_configured_part_checksum_when_upload_requested_one() {
         let config = match multipart_checksum_config(
             Some(ChecksumAlgorithm::from_static(ChecksumAlgorithm::SHA256)),
             None,
@@ -575,7 +626,7 @@ mod tests {
             Ok(config) => config,
             Err(err) => panic!("unexpected error: {err:?}"),
         };
-        let Some(checksum) = copied_part_checksum(config, b"test data") else {
+        let Some(checksum) = configured_part_checksum(config, b"test data") else {
             panic!("expected copied part checksum");
         };
         assert_eq!(
