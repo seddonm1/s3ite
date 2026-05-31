@@ -36,10 +36,10 @@ use uuid::Uuid;
 
 use crate::{
     error::S3ite,
-    sqlite::{KeySize, KeyValue, Multipart, MultipartUploadState, Sqlite},
+    sqlite::{KeyMetadata, KeyValue, Multipart, MultipartUploadState, ObjectSummary, Sqlite},
 };
 
-const LIST_BATCH_SIZE: usize = 1024;
+const LIST_BATCH_SIZE: i64 = 1024;
 const CONTINUATION_TOKEN_PREFIX: &str = "s3ite:v1:";
 const OWNER_DISPLAY_NAME: &str = "s3ite";
 const OWNER_ID: &str = "s3ite";
@@ -297,45 +297,41 @@ fn validate_multipart_access(
     }
 }
 
-/// Converts stored object metadata into an S3 list object.
-fn object_from_key_size(
-    key_size: KeySize,
-    encode_keys: bool,
-    owner: Option<&Owner>,
-) -> S3Result<Object> {
-    Ok(Object {
-        key: Some(encode_list_value(key_size.key, encode_keys)),
-        last_modified: Some(key_size.last_modified.into()),
-        size: Some(i64::try_from(key_size.size).map_err(S3Error::internal_error)?),
-        e_tag: key_size.md5.map(ETag::Strong),
+/// Converts a stored object summary into an S3 list object.
+fn object_from_summary(summary: ObjectSummary, encode_keys: bool, owner: Option<&Owner>) -> Object {
+    Object {
+        key: Some(encode_list_value(summary.key, encode_keys)),
+        last_modified: Some(summary.last_modified.into()),
+        size: Some(summary.size),
+        e_tag: summary.md5.map(ETag::Strong),
         owner: owner.cloned(),
         ..Default::default()
-    })
+    }
 }
 
-/// Converts stored object metadata into an S3 object-version entry.
-fn object_version_from_key_size(
-    key_size: KeySize,
+/// Converts a stored object summary into an S3 object-version entry.
+fn object_version_from_summary(
+    summary: ObjectSummary,
     encode_keys: bool,
     owner: Option<&Owner>,
-) -> S3Result<ObjectVersion> {
-    Ok(ObjectVersion {
-        e_tag: key_size.md5.map(ETag::Strong),
+) -> ObjectVersion {
+    ObjectVersion {
+        e_tag: summary.md5.map(ETag::Strong),
         is_latest: Some(true),
-        key: Some(encode_list_value(key_size.key, encode_keys)),
-        last_modified: Some(key_size.last_modified.into()),
+        key: Some(encode_list_value(summary.key, encode_keys)),
+        last_modified: Some(summary.last_modified.into()),
         owner: owner.cloned(),
-        size: Some(i64::try_from(key_size.size).map_err(S3Error::internal_error)?),
+        size: Some(summary.size),
         storage_class: Some(ObjectVersionStorageClass::from_static(
             ObjectVersionStorageClass::STANDARD,
         )),
         version_id: Some("null".to_string()),
         ..Default::default()
-    })
+    }
 }
 
 struct KeyListing {
-    keys: Vec<KeySize>,
+    keys: Vec<ObjectSummary>,
     common_prefixes: Vec<CommonPrefix>,
     key_count: usize,
     next_marker: Option<String>,
@@ -360,12 +356,13 @@ impl Sqlite {
         let marker_filter = after_key.clone();
         let mut next_marker = None;
         let mut is_truncated = false;
+        let list_batch_len = usize::try_from(LIST_BATCH_SIZE).map_err(S3Error::internal_error)?;
 
         if max_keys > 0 {
             'pages: loop {
                 let prefix = prefix_filter.to_string();
                 let after_key_query = after_key.clone();
-                let key_sizes = connection
+                let summaries = connection
                     .read(move |connection| {
                         let transaction = connection.transaction()?;
                         Ok(Self::try_list_objects(
@@ -377,31 +374,31 @@ impl Sqlite {
                     })
                     .await?;
 
-                if key_sizes.is_empty() {
+                if summaries.is_empty() {
                     break;
                 }
 
-                let key_sizes_len = key_sizes.len();
-                for key_size in key_sizes {
+                let summary_count = summaries.len();
+                for summary in summaries {
                     if prefix_filter.is_empty().not()
-                        && key_size.key.starts_with(prefix_filter).not()
+                        && summary.key.starts_with(prefix_filter).not()
                     {
                         break 'pages;
                     }
 
                     if let Some(common_prefix) =
-                        common_prefix_for_key(&key_size.key, prefix_filter, delimiter_filter)
+                        common_prefix_for_key(&summary.key, prefix_filter, delimiter_filter)
                     {
                         if marker_filter
                             .as_ref()
                             .is_some_and(|marker| common_prefix.as_str() <= marker.as_str())
                         {
-                            after_key = Some(key_size.key);
+                            after_key = Some(summary.key);
                             continue;
                         }
 
                         if seen_common_prefixes.contains(&common_prefix) {
-                            after_key = Some(key_size.key);
+                            after_key = Some(summary.key);
                             continue;
                         }
 
@@ -416,7 +413,7 @@ impl Sqlite {
                             prefix: Some(common_prefix),
                         });
                         key_count += 1;
-                        after_key = Some(key_size.key);
+                        after_key = Some(summary.key);
                         continue;
                     }
 
@@ -425,13 +422,13 @@ impl Sqlite {
                         break 'pages;
                     }
 
-                    after_key = Some(key_size.key.clone());
-                    next_marker = Some(key_size.key.clone());
-                    keys.push(key_size);
+                    after_key = Some(summary.key.clone());
+                    next_marker = Some(summary.key.clone());
+                    keys.push(summary);
                     key_count += 1;
                 }
 
-                if key_sizes_len < LIST_BATCH_SIZE {
+                if summary_count < list_batch_len {
                     break;
                 }
             }
@@ -459,7 +456,9 @@ impl S3 for Sqlite {
 
         self.try_create_bucket(&bucket).await?;
 
-        let output = CreateBucketOutput::default(); // TODO: handle other fields
+        let output = CreateBucketOutput {
+            location: Some(format!("/{bucket}")),
+        };
         Ok(S3Response::new(output))
     }
 
@@ -514,15 +513,15 @@ impl S3 for Sqlite {
         // replace key with target key
         object.key = tgt_key.clone();
         if replace_metadata {
-            object.metadata = metadata;
-            object.content_type = content_type;
-            object.cache_control = cache_control;
-            object.expires = expires.map(Into::into);
+            object.key_metadata.metadata = metadata;
+            object.key_metadata.content_type = content_type;
+            object.key_metadata.cache_control = cache_control;
+            object.key_metadata.expires = expires.map(Into::into);
         }
 
         let copy_object_result = CopyObjectResult {
-            e_tag: object.md5.clone().map(ETag::Strong),
-            last_modified: Some(object.last_modified.into()),
+            e_tag: object.key_metadata.md5.clone().map(ETag::Strong),
+            last_modified: Some(object.key_metadata.last_modified.into()),
             ..Default::default()
         };
 
@@ -607,8 +606,7 @@ impl S3 for Sqlite {
             })
             .await?;
 
-        let output = DeleteObjectOutput::default(); // TODO: handle other fields
-        Ok(S3Response::new(output))
+        Ok(S3Response::new(DeleteObjectOutput::default()))
     }
 
     /// Deletes a batch of objects and returns S3 multi-delete results.
@@ -703,10 +701,11 @@ impl S3 for Sqlite {
                 })
                 .await?;
 
+        let object_size = try_!(u64::try_from(object.key_metadata.size));
         let object_range = match range.as_ref() {
-            None => 0..object.size,
+            None => 0..object_size,
             Some(range) => {
-                let object_range = range.check(object.size)?;
+                let object_range = range.check(object_size)?;
                 if object_range.is_empty() {
                     return Err(s3_error!(InvalidRange));
                 }
@@ -718,7 +717,7 @@ impl S3 for Sqlite {
 
         let value = match object.value {
             Some(value) => value,
-            None if object.size == 0 => Vec::new(),
+            None if object.key_metadata.size == 0 => Vec::new(),
             None => {
                 return Err(S3Error::with_message(
                     InternalError,
@@ -741,21 +740,21 @@ impl S3 for Sqlite {
         let output = GetObjectOutput {
             body: Some(StreamingBlob::wrap::<_, S3Error>(body)),
             accept_ranges: Some("bytes".to_string()),
-            cache_control: object.cache_control,
+            cache_control: object.key_metadata.cache_control,
             content_range: range.is_some().then(|| {
                 format!(
                     "bytes {}-{}/{}",
                     object_range.start,
                     object_range.end - 1,
-                    object.size
+                    object_size
                 )
             }),
             content_length: Some(content_length_i64),
-            content_type: object.content_type,
-            expires: object.expires.map(Into::into),
-            last_modified: Some(object.last_modified.into()),
-            metadata: object.metadata,
-            e_tag: object.md5.map(ETag::Strong),
+            content_type: object.key_metadata.content_type,
+            expires: object.key_metadata.expires.map(Into::into),
+            last_modified: Some(object.key_metadata.last_modified.into()),
+            metadata: object.key_metadata.metadata,
+            e_tag: object.key_metadata.md5.map(ETag::Strong),
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -804,7 +803,6 @@ impl S3 for Sqlite {
             })
             .await?;
 
-        // TODO: detect content type
         let content_type = object
             .content_type
             .unwrap_or_else(|| mime::APPLICATION_OCTET_STREAM.to_string());
@@ -812,7 +810,7 @@ impl S3 for Sqlite {
         let output = HeadObjectOutput {
             accept_ranges: Some("bytes".to_string()),
             cache_control: object.cache_control,
-            content_length: Some(try_!(i64::try_from(object.size))),
+            content_length: Some(object.size),
             content_type: Some(content_type),
             e_tag: object.md5.map(ETag::Strong),
             expires: object.expires.map(Into::into),
@@ -950,8 +948,8 @@ impl S3 for Sqlite {
         let objects = listing
             .keys
             .into_iter()
-            .map(|key_size| object_from_key_size(key_size, encode_keys, Some(&owner)))
-            .collect::<S3Result<Vec<_>>>()?;
+            .map(|summary| object_from_summary(summary, encode_keys, Some(&owner)))
+            .collect::<Vec<_>>();
         let next_marker = listing
             .is_truncated
             .then(|| {
@@ -1035,8 +1033,8 @@ impl S3 for Sqlite {
         let versions = listing
             .keys
             .into_iter()
-            .map(|key_size| object_version_from_key_size(key_size, encode_keys, Some(&owner)))
-            .collect::<S3Result<Vec<_>>>()?;
+            .map(|summary| object_version_from_summary(summary, encode_keys, Some(&owner)))
+            .collect::<Vec<_>>();
 
         let next_key_marker = listing
             .is_truncated
@@ -1140,8 +1138,8 @@ impl S3 for Sqlite {
         let objects = listing
             .keys
             .into_iter()
-            .map(|key_size| object_from_key_size(key_size, encode_keys, owner.as_ref()))
-            .collect::<S3Result<Vec<_>>>()?;
+            .map(|summary| object_from_summary(summary, encode_keys, owner.as_ref()))
+            .collect::<Vec<_>>();
 
         let next_continuation_token = listing
             .is_truncated
@@ -1227,7 +1225,7 @@ impl S3 for Sqlite {
         let mut md5_hash = Md5::new();
         let stream = body.inspect_ok(|bytes| md5_hash.update(bytes.as_ref()));
         let mut value = Vec::new();
-        let size = copy_bytes(stream, &mut value).await?;
+        let size = try_!(i64::try_from(copy_bytes(stream, &mut value).await?));
         let md5_bytes = md5_hash.finalize();
         let md5 = hex(md5_bytes);
 
@@ -1248,13 +1246,15 @@ impl S3 for Sqlite {
                     KeyValue {
                         key,
                         value: Some(value),
-                        size,
-                        metadata,
-                        content_type,
-                        cache_control,
-                        expires: expires.map(Into::into),
-                        last_modified: OffsetDateTime::now_utc(),
-                        md5: Some(md5_clone),
+                        key_metadata: KeyMetadata {
+                            size,
+                            metadata,
+                            content_type,
+                            cache_control,
+                            expires: expires.map(Into::into),
+                            last_modified: OffsetDateTime::now_utc(),
+                            md5: Some(md5_clone),
+                        },
                     },
                 )?;
                 Ok(transaction.commit()?)
@@ -1629,20 +1629,22 @@ impl S3 for Sqlite {
                 let mut md5_hash = Md5::new();
                 md5_hash.update(&part_md5s);
                 let md5 = format!("{}-{}", hex(md5_hash.finalize()), requested_parts.len());
-                let size = try_!(u64::try_from(value.len()));
+                let size = try_!(i64::try_from(value.len()));
 
                 Self::try_put_object(
                     &transaction,
                     KeyValue {
                         key: key_clone.clone(),
                         value: Some(value),
-                        size,
-                        metadata: upload_state.metadata,
-                        content_type: upload_state.content_type,
-                        cache_control: upload_state.cache_control,
-                        expires: upload_state.expires,
-                        last_modified: OffsetDateTime::now_utc(),
-                        md5: Some(md5.clone()),
+                        key_metadata: KeyMetadata {
+                            size,
+                            metadata: upload_state.metadata,
+                            content_type: upload_state.content_type,
+                            cache_control: upload_state.cache_control,
+                            expires: upload_state.expires,
+                            last_modified: OffsetDateTime::now_utc(),
+                            md5: Some(md5.clone()),
+                        },
                     },
                 )
                 .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;

@@ -8,7 +8,6 @@ use std::{
 
 use path_absolutize::Absolutize;
 use rusqlite::{Error::ToSqlConversionFailure, OptionalExtension, Transaction};
-use s3s::dto;
 use time::{Duration, OffsetDateTime};
 use tokio::{fs, sync::RwLock};
 use tracing::debug;
@@ -19,19 +18,38 @@ use crate::{
     error::{Result, S3ite},
 };
 
-fn row_u64(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<u64> {
+#[derive(Debug, thiserror::Error)]
+#[error("object size is negative")]
+struct NegativeObjectSize;
+
+#[derive(Debug, thiserror::Error)]
+#[error("SQL limit is negative")]
+struct NegativeSqlLimit;
+
+fn row_size(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<i64> {
     let value = row.get::<_, i64>(idx)?;
-    u64::try_from(value).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(
+    if value < 0 {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
             idx,
             rusqlite::types::Type::Integer,
-            Box::new(err),
-        )
-    })
+            Box::new(NegativeObjectSize),
+        ));
+    }
+    Ok(value)
 }
 
-fn sql_i64(value: u64) -> rusqlite::Result<i64> {
-    i64::try_from(value).map_err(|err| ToSqlConversionFailure(Box::new(err)))
+fn sql_size(value: i64) -> rusqlite::Result<i64> {
+    if value < 0 {
+        return Err(ToSqlConversionFailure(Box::new(NegativeObjectSize)));
+    }
+    Ok(value)
+}
+
+fn sql_limit(value: i64) -> rusqlite::Result<i64> {
+    if value < 0 {
+        return Err(ToSqlConversionFailure(Box::new(NegativeSqlLimit)));
+    }
+    Ok(value)
 }
 
 fn repeat_vars(count: usize) -> String {
@@ -41,6 +59,7 @@ fn repeat_vars(count: usize) -> String {
     vars
 }
 
+/// SQLite-backed storage state and open bucket connections.
 #[derive(Debug)]
 pub struct Sqlite {
     pub(crate) root: PathBuf,
@@ -48,31 +67,28 @@ pub struct Sqlite {
     pub(crate) buckets: Arc<RwLock<HashMap<String, Arc<BucketConnection>>>>,
 }
 
+/// Object body and metadata loaded from the bucket database.
 #[derive(Debug)]
 pub(crate) struct KeyValue {
     pub(crate) key: String,
     pub(crate) value: Option<Vec<u8>>,
-    pub(crate) size: u64,
-    pub(crate) metadata: Option<dto::Metadata>,
-    pub(crate) content_type: Option<String>,
-    pub(crate) cache_control: Option<String>,
-    pub(crate) expires: Option<OffsetDateTime>,
-    pub(crate) last_modified: OffsetDateTime,
-    pub(crate) md5: Option<String>,
+    pub(crate) key_metadata: KeyMetadata,
 }
 
+/// Minimal object metadata returned by list queries.
 #[derive(Debug)]
-pub(crate) struct KeySize {
+pub(crate) struct ObjectSummary {
     pub(crate) key: String,
-    pub(crate) size: u64,
+    pub(crate) size: i64,
     pub(crate) last_modified: OffsetDateTime,
     pub(crate) md5: Option<String>,
 }
 
+/// Object metadata loaded without the object body.
 #[derive(Debug)]
 pub(crate) struct KeyMetadata {
-    pub(crate) size: u64,
-    pub(crate) metadata: Option<dto::Metadata>,
+    pub(crate) size: i64,
+    pub(crate) metadata: Option<HashMap<String, String>>,
     pub(crate) content_type: Option<String>,
     pub(crate) cache_control: Option<String>,
     pub(crate) expires: Option<OffsetDateTime>,
@@ -80,6 +96,7 @@ pub(crate) struct KeyMetadata {
     pub(crate) md5: Option<String>,
 }
 
+/// Stored multipart upload part with its body and checksum metadata.
 #[derive(Debug)]
 pub(crate) struct Multipart {
     pub(crate) upload_id: Uuid,
@@ -90,6 +107,7 @@ pub(crate) struct Multipart {
     pub(crate) md5: Option<String>,
 }
 
+/// Multipart upload part metadata returned by list-parts queries.
 #[derive(Debug)]
 pub(crate) struct MultipartMetadata {
     pub(crate) part_number: i32,
@@ -97,15 +115,17 @@ pub(crate) struct MultipartMetadata {
     pub(crate) size: i64,
 }
 
+/// Initiated multipart upload state shared by all uploaded parts.
 #[derive(Debug)]
 pub(crate) struct MultipartUploadState {
     pub(crate) access_key: Option<String>,
-    pub(crate) metadata: Option<dto::Metadata>,
+    pub(crate) metadata: Option<HashMap<String, String>>,
     pub(crate) content_type: Option<String>,
     pub(crate) cache_control: Option<String>,
     pub(crate) expires: Option<OffsetDateTime>,
 }
 
+/// Completion ledger entry used to make multipart completion idempotent.
 #[derive(Debug)]
 pub(crate) struct CompletedMultipartUploadState {
     pub(crate) access_key: Option<String>,
@@ -392,14 +412,14 @@ impl Sqlite {
         transaction: &Transaction,
         prefix: Option<&str>,
         after_key: Option<&str>,
-        limit: usize,
-    ) -> rusqlite::Result<Vec<KeySize>> {
-        let limit = i64::try_from(limit).map_err(|err| ToSqlConversionFailure(Box::new(err)))?;
+        limit: i64,
+    ) -> rusqlite::Result<Vec<ObjectSummary>> {
+        let limit = sql_limit(limit)?;
         let prefix = prefix.and_then(|prefix| prefix.is_empty().not().then_some(prefix));
-        let map_key_size = |row: &rusqlite::Row<'_>| {
-            Ok(KeySize {
+        let map_summary = |row: &rusqlite::Row<'_>| {
+            Ok(ObjectSummary {
                 key: row.get(0)?,
-                size: row_u64(row, 1)?,
+                size: row_size(row, 1)?,
                 last_modified: row.get(2)?,
                 md5: row.get(3)?,
             })
@@ -410,28 +430,28 @@ impl Sqlite {
                 let mut stmt = transaction.prepare_cached(
                     "SELECT key, size, last_modified, md5 FROM metadata WHERE key >= ?1 AND key > ?2 ORDER BY key LIMIT ?3;",
                 )?;
-                stmt.query_map((prefix, after_key, limit), map_key_size)?
+                stmt.query_map((prefix, after_key, limit), map_summary)?
                     .collect::<rusqlite::Result<Vec<_>>>()?
             }
             (Some(prefix), None) => {
                 let mut stmt = transaction.prepare_cached(
                     "SELECT key, size, last_modified, md5 FROM metadata WHERE key >= ?1 ORDER BY key LIMIT ?2;",
                 )?;
-                stmt.query_map((prefix, limit), map_key_size)?
+                stmt.query_map((prefix, limit), map_summary)?
                     .collect::<rusqlite::Result<Vec<_>>>()?
             }
             (None, Some(after_key)) => {
                 let mut stmt = transaction.prepare_cached(
                     "SELECT key, size, last_modified, md5 FROM metadata WHERE key > ?1 ORDER BY key LIMIT ?2;",
                 )?;
-                stmt.query_map((after_key, limit), map_key_size)?
+                stmt.query_map((after_key, limit), map_summary)?
                     .collect::<rusqlite::Result<Vec<_>>>()?
             }
             (None, None) => {
                 let mut stmt = transaction.prepare_cached(
                     "SELECT key, size, last_modified, md5 FROM metadata ORDER BY key LIMIT ?1;",
                 )?;
-                stmt.query_map([limit], map_key_size)?
+                stmt.query_map([limit], map_summary)?
                     .collect::<rusqlite::Result<Vec<_>>>()?
             }
         };
@@ -471,23 +491,25 @@ impl Sqlite {
             Ok(KeyValue {
                 key: row.get(0)?,
                 value: row.get(1)?,
-                size: row_u64(row, 2)?,
-                metadata: row
-                    .get::<_, Option<String>>(3)?
-                    .map(|metadata| serde_json::from_str(&metadata))
-                    .transpose()
-                    .map_err(|err| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            3,
-                            rusqlite::types::Type::Text,
-                            Box::new(err),
-                        )
-                    })?,
-                content_type: row.get(4)?,
-                cache_control: row.get(5)?,
-                expires: row.get(6)?,
-                last_modified: row.get(7)?,
-                md5: row.get(8)?,
+                key_metadata: KeyMetadata {
+                    size: row_size(row, 2)?,
+                    metadata: row
+                        .get::<_, Option<String>>(3)?
+                        .map(|metadata| serde_json::from_str(&metadata))
+                        .transpose()
+                        .map_err(|err| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                rusqlite::types::Type::Text,
+                                Box::new(err),
+                            )
+                        })?,
+                    content_type: row.get(4)?,
+                    cache_control: row.get(5)?,
+                    expires: row.get(6)?,
+                    last_modified: row.get(7)?,
+                    md5: row.get(8)?,
+                },
             })
         })
         .optional()
@@ -514,7 +536,7 @@ impl Sqlite {
 
         stmt.query_row([key], |row| {
             Ok(KeyMetadata {
-                size: row_u64(row, 0)?,
+                size: row_size(row, 0)?,
                 metadata: row
                     .get::<_, Option<String>>(1)?
                     .map(|metadata| serde_json::from_str(&metadata))
@@ -541,6 +563,12 @@ impl Sqlite {
         transaction: &Transaction,
         kv: KeyValue,
     ) -> rusqlite::Result<usize> {
+        let KeyValue {
+            key,
+            value,
+            key_metadata,
+        } = kv;
+
         let mut stmt = transaction.prepare_cached(
             "
             INSERT INTO data (key, value)
@@ -549,7 +577,7 @@ impl Sqlite {
             SET value=excluded.value;",
         )?;
 
-        stmt.execute((&kv.key, kv.value))?;
+        stmt.execute((&key, value))?;
 
         let mut stmt = transaction.prepare_cached(
             "
@@ -559,19 +587,20 @@ impl Sqlite {
             SET size=excluded.size, metadata=excluded.metadata, content_type=excluded.content_type, cache_control=excluded.cache_control, expires=excluded.expires, last_modified=excluded.last_modified, md5=excluded.md5;",
         )?;
 
-        let size = sql_i64(kv.size)?;
+        let size = sql_size(key_metadata.size)?;
         stmt.execute((
-            kv.key,
+            key,
             size,
-            kv.metadata
+            key_metadata
+                .metadata
                 .map(|metadata| serde_json::to_string(&metadata))
                 .transpose()
                 .map_err(|err| ToSqlConversionFailure(Box::new(err)))?,
-            kv.content_type,
-            kv.cache_control,
-            kv.expires,
-            kv.last_modified,
-            kv.md5,
+            key_metadata.content_type,
+            key_metadata.cache_control,
+            key_metadata.expires,
+            key_metadata.last_modified,
+            key_metadata.md5,
         ))
     }
 
@@ -740,12 +769,13 @@ impl Sqlite {
             SET last_modified=excluded.last_modified, value=excluded.value, size=excluded.size, md5=excluded.md5;",
         )?;
 
+        let size = sql_size(multipart.size)?;
         stmt.execute((
             multipart.upload_id,
             multipart.last_modified,
             multipart.part_number,
             multipart.value,
-            multipart.size,
+            size,
             multipart.md5,
         ))
     }
@@ -772,7 +802,7 @@ impl Sqlite {
                 Ok(MultipartMetadata {
                     last_modified: row.get(0)?,
                     part_number: row.get(1)?,
-                    size: row.get(2)?,
+                    size: row_size(row, 2)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -806,7 +836,7 @@ impl Sqlite {
                     last_modified: row.get(0)?,
                     part_number: row.get(1)?,
                     value: row.get(2)?,
-                    size: row.get(3)?,
+                    size: row_size(row, 3)?,
                     md5: row.get(4)?,
                 })
             })?
