@@ -5,7 +5,7 @@ use rusqlite::{Error::ToSqlConversionFailure, OptionalExtension, Transaction};
 use super::{
     BucketVersioningState, KeyMetadata, KeyValue, NULL_VERSION_ID, ObjectDeleteOutcome,
     ObjectTagCondition, ObjectWriteConditions, ObjectWriteOutcome, Sqlite, SqliteError,
-    SqliteResult, row_bool, row_checksum, row_size, sql_size,
+    SqliteResult, optional_stored_checksum, row_bool, row_size, sql_size,
 };
 
 impl Sqlite {
@@ -111,11 +111,7 @@ impl Sqlite {
                 md5,
                 checksum_algorithm,
                 checksum_type,
-                checksum_crc32,
-                checksum_crc32c,
-                checksum_crc64nvme,
-                checksum_sha1,
-                checksum_sha256,
+                checksum_value,
                 is_latest,
                 is_delete_marker
             FROM object_version
@@ -151,9 +147,13 @@ impl Sqlite {
                         expires: row.get(8)?,
                         last_modified: row.get(9)?,
                         md5: row.get(10)?,
-                        checksum: row_checksum(row, Some(11), Some(12), 13)?,
-                        is_latest: row_bool(row, 18)?,
-                        is_delete_marker: row_bool(row, 19)?,
+                        checksum: optional_stored_checksum(
+                            row.get(11)?,
+                            row.get(12)?,
+                            row.get(13)?,
+                        )?,
+                        is_latest: row_bool(row, 14)?,
+                        is_delete_marker: row_bool(row, 15)?,
                     },
                 })
             })
@@ -195,11 +195,7 @@ impl Sqlite {
                 md5,
                 checksum_algorithm,
                 checksum_type,
-                checksum_crc32,
-                checksum_crc32c,
-                checksum_crc64nvme,
-                checksum_sha1,
-                checksum_sha256,
+                checksum_value,
                 is_latest,
                 is_delete_marker
             FROM object_version
@@ -230,9 +226,9 @@ impl Sqlite {
                     expires: row.get(6)?,
                     last_modified: row.get(7)?,
                     md5: row.get(8)?,
-                    checksum: row_checksum(row, Some(9), Some(10), 11)?,
-                    is_latest: row_bool(row, 16)?,
-                    is_delete_marker: row_bool(row, 17)?,
+                    checksum: optional_stored_checksum(row.get(9)?, row.get(10)?, row.get(11)?)?,
+                    is_latest: row_bool(row, 12)?,
+                    is_delete_marker: row_bool(row, 13)?,
                 })
             })
             .optional()?)
@@ -268,11 +264,7 @@ impl Sqlite {
                 md5,
                 checksum_algorithm,
                 checksum_type,
-                checksum_crc32,
-                checksum_crc32c,
-                checksum_crc64nvme,
-                checksum_sha1,
-                checksum_sha256,
+                checksum_value,
                 is_latest,
                 is_delete_marker
             FROM object_version
@@ -304,9 +296,9 @@ impl Sqlite {
                     expires: row.get(6)?,
                     last_modified: row.get(7)?,
                     md5: row.get(8)?,
-                    checksum: row_checksum(row, Some(9), Some(10), 11)?,
-                    is_latest: row_bool(row, 16)?,
-                    is_delete_marker: row_bool(row, 17)?,
+                    checksum: optional_stored_checksum(row.get(9)?, row.get(10)?, row.get(11)?)?,
+                    is_latest: row_bool(row, 12)?,
+                    is_delete_marker: row_bool(row, 13)?,
                 })
             })
             .optional()?)
@@ -357,16 +349,16 @@ impl Sqlite {
                 md5,
                 checksum_algorithm,
                 checksum_type,
-                checksum_crc32,
-                checksum_crc32c,
-                checksum_crc64nvme,
-                checksum_sha1,
-                checksum_sha256
+                checksum_value
             )
-            VALUES (?1, ?2, 1, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18);",
+            VALUES (?1, ?2, 1, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14);",
         )?;
 
         let size = sql_size(key_metadata.size)?;
+        let checksum = key_metadata
+            .checksum
+            .as_ref()
+            .ok_or(SqliteError::ChecksumMismatch)?;
         stmt.execute(rusqlite::params![
             &key,
             &version_id,
@@ -383,13 +375,9 @@ impl Sqlite {
             key_metadata.expires,
             key_metadata.last_modified,
             key_metadata.md5.as_deref(),
-            key_metadata.checksum.algorithm.as_deref(),
-            key_metadata.checksum.checksum_type.as_deref(),
-            key_metadata.checksum.crc32.as_deref(),
-            key_metadata.checksum.crc32c.as_deref(),
-            key_metadata.checksum.crc64nvme.as_deref(),
-            key_metadata.checksum.sha1.as_deref(),
-            key_metadata.checksum.sha256.as_deref(),
+            checksum.algorithm(),
+            checksum.checksum_type(),
+            checksum.as_str(),
         ])?;
 
         Ok(ObjectWriteOutcome {

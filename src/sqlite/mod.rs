@@ -26,7 +26,9 @@ mod versioning;
 
 pub use self::error::{SqliteError, SqliteResult};
 pub(crate) use self::{
-    checksum::ChecksumMetadata,
+    checksum::{
+        MultipartChecksumConfig, MultipartCompletionChecksum, PartChecksum, StoredChecksum,
+    },
     types::{
         BucketVersioningState, CompletedMultipartUploadOutcome, CompletedMultipartUploadRecord,
         CompletedMultipartUploadState, CompletedObjectPart, KeyMetadata, KeyValue, Multipart,
@@ -38,8 +40,9 @@ pub(crate) use self::{
 };
 use self::{
     checksum::{
-        CHECKSUM_TYPE_COMPOSITE, CHECKSUM_TYPE_FULL_OBJECT, checksum_value, decode_base64,
-        decode_md5_hex, encode_hex, row_checksum,
+        checksum_value, decode_base64, decode_md5_hex, encode_hex,
+        optional_multipart_checksum_config, optional_part_checksum, optional_stored_checksum,
+        required_stored_checksum, stored_checksum,
     },
     types::{row_bool, row_size, sql_limit, sql_size},
 };

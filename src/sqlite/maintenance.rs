@@ -166,9 +166,12 @@ mod tests {
     use time::{Duration, OffsetDateTime};
     use uuid::Uuid;
 
-    use crate::sqlite::{
-        ChecksumMetadata, CompletedMultipartUploadRecord, Multipart, MultipartUploadState,
-        NULL_VERSION_ID, Sqlite, SqliteResult,
+    use crate::{
+        checksum::{FullObjectChecksum, StoredChecksum},
+        sqlite::{
+            CompletedMultipartUploadRecord, Multipart, MultipartUploadState, NULL_VERSION_ID,
+            Sqlite, SqliteResult,
+        },
     };
     use rusqlite::Connection;
 
@@ -197,7 +200,7 @@ mod tests {
                 content_encoding: None,
                 cache_control: None,
                 expires: None,
-                checksum: ChecksumMetadata::default(),
+                checksum: None,
             },
         )?;
         transaction.execute(
@@ -241,7 +244,7 @@ mod tests {
                 content_encoding: None,
                 cache_control: None,
                 expires: None,
-                checksum: ChecksumMetadata::default(),
+                checksum: None,
             },
         )?;
         Sqlite::try_put_multipart(
@@ -253,7 +256,7 @@ mod tests {
                 value: b"part".to_vec(),
                 size: 4,
                 md5: None,
-                checksum: ChecksumMetadata::default(),
+                checksum: None,
             },
         )?;
         transaction.execute(
@@ -265,6 +268,7 @@ mod tests {
         )?;
 
         let completed_upload_id = Uuid::new_v4();
+        let checksum = StoredChecksum::Full(FullObjectChecksum::Crc64Nvme("crc".to_string()));
         Sqlite::try_put_completed_multipart_upload(
             &transaction,
             CompletedMultipartUploadRecord {
@@ -275,7 +279,7 @@ mod tests {
                 md5: "etag",
                 version_id: NULL_VERSION_ID,
                 returned_version_id: None,
-                checksum: &ChecksumMetadata::default(),
+                checksum: &checksum,
             },
         )?;
         transaction.execute(

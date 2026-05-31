@@ -6,7 +6,9 @@ use uuid::Uuid;
 
 use crate::sqlite::error::{NegativeObjectSize, NegativeSqlLimit};
 
-use super::ChecksumMetadata;
+use crate::checksum::{PartChecksum, StoredChecksum};
+
+use super::{MultipartChecksumConfig, MultipartCompletionChecksum};
 
 pub(super) fn row_size(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<i64> {
     let value = row.get::<_, i64>(idx)?;
@@ -122,7 +124,7 @@ pub(crate) struct MultipartUploadState {
     pub(crate) content_encoding: Option<String>,
     pub(crate) cache_control: Option<String>,
     pub(crate) expires: Option<OffsetDateTime>,
-    pub(crate) checksum: ChecksumMetadata,
+    pub(crate) checksum: Option<MultipartChecksumConfig>,
 }
 
 /// Active multipart upload row returned by multipart upload listing.
@@ -131,7 +133,7 @@ pub(crate) struct MultipartUploadSummary {
     pub(crate) key: String,
     pub(crate) upload_id: Uuid,
     pub(crate) initiated: OffsetDateTime,
-    pub(crate) checksum: ChecksumMetadata,
+    pub(crate) checksum: Option<MultipartChecksumConfig>,
 }
 
 /// Completion ledger entry used to make multipart completion idempotent.
@@ -141,7 +143,7 @@ pub(crate) struct CompletedMultipartUploadState {
     pub(crate) md5: String,
     pub(crate) version_id: String,
     pub(crate) returned_version_id: Option<String>,
-    pub(crate) checksum: ChecksumMetadata,
+    pub(crate) checksum: StoredChecksum,
 }
 
 /// Values inserted into the multipart completion ledger.
@@ -154,7 +156,7 @@ pub(crate) struct CompletedMultipartUploadRecord<'a> {
     pub(crate) md5: &'a str,
     pub(crate) version_id: &'a str,
     pub(crate) returned_version_id: Option<&'a str>,
-    pub(crate) checksum: &'a ChecksumMetadata,
+    pub(crate) checksum: &'a StoredChecksum,
 }
 
 /// Result of materializing multipart upload parts into an object version.
@@ -163,7 +165,7 @@ pub(crate) struct CompletedMultipartUploadOutcome {
     pub(crate) md5: String,
     pub(crate) version_id: String,
     pub(crate) returned_version_id: Option<String>,
-    pub(crate) checksum: ChecksumMetadata,
+    pub(crate) checksum: StoredChecksum,
 }
 
 /// Object metadata loaded without the object body.
@@ -178,7 +180,7 @@ pub(crate) struct KeyMetadata {
     pub(crate) expires: Option<OffsetDateTime>,
     pub(crate) last_modified: OffsetDateTime,
     pub(crate) md5: Option<String>,
-    pub(crate) checksum: ChecksumMetadata,
+    pub(crate) checksum: Option<StoredChecksum>,
     pub(crate) is_latest: bool,
     pub(crate) is_delete_marker: bool,
 }
@@ -209,7 +211,7 @@ pub(crate) struct Multipart {
     pub(crate) value: Vec<u8>,
     pub(crate) size: i64,
     pub(crate) md5: Option<String>,
-    pub(crate) checksum: ChecksumMetadata,
+    pub(crate) checksum: Option<PartChecksum>,
 }
 
 /// Multipart upload part metadata returned by list-parts queries.
@@ -219,7 +221,7 @@ pub(crate) struct MultipartMetadata {
     pub(crate) last_modified: OffsetDateTime,
     pub(crate) size: i64,
     pub(crate) md5: Option<String>,
-    pub(crate) checksum: ChecksumMetadata,
+    pub(crate) checksum: Option<PartChecksum>,
 }
 
 /// Stored part boundary for a completed multipart object.
@@ -229,7 +231,7 @@ pub(crate) struct CompletedObjectPart {
     pub(crate) start: i64,
     pub(crate) size: i64,
     pub(crate) md5: Option<String>,
-    pub(crate) checksum: ChecksumMetadata,
+    pub(crate) checksum: Option<PartChecksum>,
 }
 
 /// Client-requested multipart part checksum used during completion.
@@ -237,7 +239,7 @@ pub(crate) struct CompletedObjectPart {
 pub(crate) struct MultipartCompletionPart {
     pub(crate) part_number: i32,
     pub(crate) md5: String,
-    pub(crate) checksum: ChecksumMetadata,
+    pub(crate) checksum: Option<PartChecksum>,
 }
 
 /// Request data needed to complete a multipart upload transactionally.
@@ -247,8 +249,8 @@ pub(crate) struct MultipartCompletionRequest {
     pub(crate) key: String,
     pub(crate) upload_id: Uuid,
     pub(crate) requested_parts: Vec<MultipartCompletionPart>,
-    pub(crate) requested_checksum: ChecksumMetadata,
-    pub(crate) default_checksum: Option<ChecksumMetadata>,
+    pub(crate) requested_checksum: MultipartCompletionChecksum,
+    pub(crate) default_checksum: MultipartChecksumConfig,
     pub(crate) access_key: Option<String>,
     pub(crate) write_conditions: ObjectWriteConditions,
 }

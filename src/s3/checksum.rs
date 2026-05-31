@@ -1,4 +1,9 @@
-use std::ops::Not;
+//! S3 protocol checksum validation and response mapping.
+//!
+//! Request DTOs expose checksum values as optional S3 header fields. Storage
+//! uses closed Rust types, so this module is the boundary that validates wire
+//! input, calculates missing defaults, and shapes typed checksums back into S3
+//! responses.
 
 use s3s::{
     S3ErrorCode, S3Result,
@@ -7,95 +12,60 @@ use s3s::{
 
 use crate::{
     checksum::{
-        CHECKSUM_TYPE_COMPOSITE, CHECKSUM_TYPE_FULL_OBJECT,
-        ChecksumAlgorithmKind as StorageChecksumAlgorithmKind, checksum_value, decode_base64,
+        ChecksumAlgorithmKind as StorageChecksumAlgorithmKind, ChecksumTypeKind, PartChecksum,
+        StoredChecksum, checksum_value, decode_base64,
     },
-    sqlite::{ChecksumMetadata, CompletedObjectPart, KeyValue, SqliteError, SqliteResult},
+    sqlite::{
+        CompletedObjectPart, KeyValue, MultipartChecksumConfig, MultipartCompletionChecksum,
+        SqliteError, SqliteResult,
+    },
 };
 
 use super::{s3_error, s3_error_from_sqlite, s3_error_with_message};
 
+/// Re-exported lowercase hexadecimal encoder used for S3 `ETag` formatting.
 pub(super) use crate::checksum::encode_hex as hex;
 
-/// Verifies the optional `Content-MD5` header against the computed body digest.
-pub(super) fn validate_content_md5(
-    header_present: bool,
-    content_md5: Option<&str>,
-    computed_md5: &[u8],
-) -> S3Result<()> {
-    let Some(content_md5) = content_md5 else {
-        if header_present {
-            return Err(s3_error(S3ErrorCode::InvalidDigest));
-        }
-        return Ok(());
-    };
-
-    let decoded = decode_base64(content_md5).ok_or_else(|| s3_error(S3ErrorCode::InvalidDigest))?;
-    if decoded.len() != 16 {
-        return Err(s3_error(S3ErrorCode::InvalidDigest));
-    }
-    if decoded != computed_md5 {
-        return Err(s3_error(S3ErrorCode::BadDigest));
-    }
-
-    Ok(())
-}
-
+/// Storage-neutral checksum algorithm kind used by S3 request handling.
 pub(super) type ChecksumAlgorithmKind = StorageChecksumAlgorithmKind;
 
-pub(super) fn checksum_algorithm_from_request(
-    algorithm: Option<ChecksumAlgorithm>,
-) -> S3Result<Option<ChecksumAlgorithmKind>> {
-    let Some(algorithm) = algorithm else {
-        return Ok(None);
-    };
-    let kind = ChecksumAlgorithmKind::from_name(algorithm.as_str()).ok_or_else(|| {
-        s3_error_with_message(
-            S3ErrorCode::InvalidArgument,
-            "unsupported checksum algorithm",
-        )
-    })?;
-    Ok(Some(kind))
-}
-
-pub(super) fn checksum_algorithm_from_name(algorithm: &str) -> SqliteResult<ChecksumAlgorithmKind> {
-    ChecksumAlgorithmKind::from_name(algorithm).ok_or(SqliteError::ChecksumMismatch)
-}
-
+/// Policy for implicit checksum calculation when a request omits checksum input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ChecksumPolicy {
-    ExplicitOnly,
+    /// Attach S3's default full-object `CRC64NVME` checksum when omitted.
     DefaultCrc64NvmeFullObject,
 }
 
 impl ChecksumPolicy {
-    fn default_kind(self) -> Option<ChecksumAlgorithmKind> {
+    /// Returns the implicit algorithm for this policy.
+    fn default_kind(self) -> ChecksumAlgorithmKind {
         match self {
-            Self::ExplicitOnly => None,
-            Self::DefaultCrc64NvmeFullObject => Some(ChecksumAlgorithmKind::Crc64Nvme),
-        }
-    }
-
-    fn default_type(self) -> Option<&'static str> {
-        match self {
-            Self::ExplicitOnly => None,
-            Self::DefaultCrc64NvmeFullObject => Some(ChecksumType::FULL_OBJECT),
+            Self::DefaultCrc64NvmeFullObject => ChecksumAlgorithmKind::Crc64Nvme,
         }
     }
 }
 
+/// Raw S3 checksum fields extracted from object or multipart requests.
 #[derive(Clone, Debug, Default)]
 pub(super) struct ChecksumInput {
+    /// Requested checksum algorithm, if the request supplied one.
     pub(super) algorithm: Option<ChecksumAlgorithm>,
+    /// Requested checksum type, usually `COMPOSITE` or `FULL_OBJECT`.
     pub(super) checksum_type: Option<ChecksumType>,
+    /// Request-provided `CRC32` checksum.
     pub(super) crc32: Option<String>,
+    /// Request-provided `CRC32C` checksum.
     pub(super) crc32c: Option<String>,
+    /// Request-provided `CRC64NVME` checksum.
     pub(super) crc64nvme: Option<String>,
+    /// Request-provided `SHA1` checksum.
     pub(super) sha1: Option<String>,
+    /// Request-provided `SHA256` checksum.
     pub(super) sha256: Option<String>,
 }
 
 impl ChecksumInput {
+    /// Returns the explicitly requested algorithm or infers it from one value field.
     fn algorithm_kind(&self) -> S3Result<Option<ChecksumAlgorithmKind>> {
         if self.algorithm.is_some() {
             return checksum_algorithm_from_request(self.algorithm.clone());
@@ -123,6 +93,7 @@ impl ChecksumInput {
         Ok(first)
     }
 
+    /// Returns the request-provided checksum value for the selected algorithm.
     fn requested_for(&self, kind: ChecksumAlgorithmKind) -> Option<&str> {
         match kind {
             ChecksumAlgorithmKind::Crc32 => self.crc32.as_deref(),
@@ -133,81 +104,149 @@ impl ChecksumInput {
         }
     }
 
-    pub(super) fn into_requested_metadata(self) -> S3Result<ChecksumMetadata> {
-        let algorithm = self.algorithm_kind()?.map(|kind| kind.as_str().to_string());
-        let checksum_type = checksum_type_name(self.checksum_type)?;
-        Ok(ChecksumMetadata {
-            algorithm,
-            checksum_type,
-            crc32: self.crc32,
-            crc32c: self.crc32c,
-            crc64nvme: self.crc64nvme,
-            sha1: self.sha1,
-            sha256: self.sha256,
+    /// Converts completion checksum fields into a typed request checksum.
+    pub(super) fn into_completion_checksum(self) -> S3Result<MultipartCompletionChecksum> {
+        let algorithm = self.algorithm_kind()?;
+        let checksum_type = checksum_type_name(self.checksum_type.clone())?;
+        let Some(algorithm) = algorithm else {
+            return Ok(MultipartCompletionChecksum {
+                checksum_type,
+                checksum: None,
+            });
+        };
+        let Some(value) = self.requested_for(algorithm) else {
+            return Ok(MultipartCompletionChecksum {
+                checksum_type: checksum_type.or_else(|| Some(multipart_checksum_type(algorithm))),
+                checksum: None,
+            });
+        };
+        let checksum_type = checksum_type.unwrap_or_else(|| multipart_checksum_type(algorithm));
+        let checksum = checksum_metadata(algorithm, value.as_bytes(), checksum_type, Some(value))
+            .map_err(s3_error_from_sqlite)?;
+        Ok(MultipartCompletionChecksum {
+            checksum_type: Some(checksum_type),
+            checksum: Some(checksum),
         })
     }
-}
 
-pub(super) fn multipart_checksum_type(kind: ChecksumAlgorithmKind) -> &'static str {
-    match kind {
-        ChecksumAlgorithmKind::Crc64Nvme => CHECKSUM_TYPE_FULL_OBJECT,
-        ChecksumAlgorithmKind::Crc32
-        | ChecksumAlgorithmKind::Crc32c
-        | ChecksumAlgorithmKind::Sha1
-        | ChecksumAlgorithmKind::Sha256 => CHECKSUM_TYPE_COMPOSITE,
+    /// Converts checksum value fields into a part-level checksum.
+    pub(super) fn into_part_checksum(self) -> S3Result<Option<PartChecksum>> {
+        let Some(algorithm) = self.algorithm_kind()? else {
+            return Ok(None);
+        };
+        let Some(value) = self.requested_for(algorithm) else {
+            return Ok(None);
+        };
+        Ok(Some(PartChecksum::new(algorithm, value.to_string())))
     }
 }
 
-pub(super) fn checksum_type_name(checksum_type: Option<ChecksumType>) -> S3Result<Option<String>> {
+/// Converts an S3 checksum algorithm DTO into the internal algorithm kind.
+pub(super) fn checksum_algorithm_from_request(
+    algorithm: Option<ChecksumAlgorithm>,
+) -> S3Result<Option<ChecksumAlgorithmKind>> {
+    let Some(algorithm) = algorithm else {
+        return Ok(None);
+    };
+    let kind = ChecksumAlgorithmKind::from_name(algorithm.as_str()).ok_or_else(|| {
+        s3_error_with_message(
+            S3ErrorCode::InvalidArgument,
+            "unsupported checksum algorithm",
+        )
+    })?;
+    Ok(Some(kind))
+}
+
+/// Converts an optional S3 checksum type DTO into its internal kind.
+pub(super) fn checksum_type_name(
+    checksum_type: Option<ChecksumType>,
+) -> S3Result<Option<ChecksumTypeKind>> {
     let Some(checksum_type) = checksum_type else {
         return Ok(None);
     };
-    match checksum_type.as_str() {
-        ChecksumType::COMPOSITE | ChecksumType::FULL_OBJECT => {
-            Ok(Some(checksum_type.as_str().to_string()))
-        }
-        _ => Err(s3_error_with_message(
-            S3ErrorCode::InvalidArgument,
-            "unsupported checksum type",
-        )),
+    ChecksumTypeKind::from_name(checksum_type.as_str())
+        .map(Some)
+        .ok_or_else(|| {
+            s3_error_with_message(S3ErrorCode::InvalidArgument, "unsupported checksum type")
+        })
+}
+
+/// Returns S3's default multipart checksum type for an initiated algorithm.
+pub(super) fn multipart_checksum_type(kind: ChecksumAlgorithmKind) -> ChecksumTypeKind {
+    match kind {
+        ChecksumAlgorithmKind::Crc64Nvme => ChecksumTypeKind::FullObject,
+        ChecksumAlgorithmKind::Crc32
+        | ChecksumAlgorithmKind::Crc32c
+        | ChecksumAlgorithmKind::Sha1
+        | ChecksumAlgorithmKind::Sha256 => ChecksumTypeKind::Composite,
     }
 }
 
-pub(super) fn checksum_metadata(
-    kind: ChecksumAlgorithmKind,
-    value: &[u8],
-    checksum_type: Option<&str>,
-) -> SqliteResult<ChecksumMetadata> {
-    let computed = checksum_value(kind, value);
-    let mut checksum = ChecksumMetadata {
-        algorithm: Some(kind.as_str().to_string()),
-        checksum_type: checksum_type.map(str::to_string),
-        ..ChecksumMetadata::default()
+/// Builds checksum configuration for an initiated multipart upload.
+pub(super) fn multipart_checksum_config(
+    algorithm: Option<ChecksumAlgorithm>,
+    checksum_type: Option<ChecksumType>,
+) -> S3Result<Option<MultipartChecksumConfig>> {
+    let checksum_kind = checksum_algorithm_from_request(algorithm)?;
+    let checksum_type = checksum_type_name(checksum_type)?;
+    let Some(algorithm) = checksum_kind else {
+        if checksum_type.is_some() {
+            return Err(s3_error_with_message(
+                S3ErrorCode::InvalidArgument,
+                "checksum type requires checksum algorithm",
+            ));
+        }
+        return Ok(None);
     };
-    checksum.set_value(kind.as_str(), computed)?;
-    Ok(checksum)
+    Ok(Some(MultipartChecksumConfig::new(
+        algorithm,
+        checksum_type.unwrap_or_else(|| multipart_checksum_type(algorithm)),
+    )))
 }
 
+/// Returns whether a request asked checksum fields to be included in read responses.
+pub(super) fn checksum_mode_enabled(checksum_mode: Option<&ChecksumMode>) -> bool {
+    checksum_mode.is_some_and(|mode| mode.as_str() == ChecksumMode::ENABLED)
+}
+
+/// Verifies the optional `Content-MD5` header against the computed body digest.
+pub(super) fn validate_content_md5(
+    header_present: bool,
+    content_md5: Option<&str>,
+    computed_md5: &[u8],
+) -> S3Result<()> {
+    let Some(content_md5) = content_md5 else {
+        if header_present {
+            return Err(s3_error(S3ErrorCode::InvalidDigest));
+        }
+        return Ok(());
+    };
+
+    let decoded = decode_base64(content_md5).ok_or_else(|| s3_error(S3ErrorCode::InvalidDigest))?;
+    if decoded.len() != 16 {
+        return Err(s3_error(S3ErrorCode::InvalidDigest));
+    }
+    if decoded != computed_md5 {
+        return Err(s3_error(S3ErrorCode::BadDigest));
+    }
+
+    Ok(())
+}
+
+/// Computes, validates, and stores the checksum for a completed object body.
 pub(super) fn validate_payload_checksum(
     input: &ChecksumInput,
     value: &[u8],
     policy: ChecksumPolicy,
-    checksum_type: Option<&str>,
-) -> S3Result<ChecksumMetadata> {
+    checksum_type: ChecksumTypeKind,
+) -> S3Result<StoredChecksum> {
     let explicit_kind = input.algorithm_kind()?;
-    let Some(kind) = explicit_kind.or_else(|| policy.default_kind()) else {
-        return Ok(ChecksumMetadata::default());
-    };
-    let checksum_type = checksum_type.or_else(|| {
-        explicit_kind
-            .is_none()
-            .then(|| policy.default_type())
-            .flatten()
-    });
+    let kind = explicit_kind.unwrap_or_else(|| policy.default_kind());
 
-    let checksum = checksum_metadata(kind, value, checksum_type).map_err(s3_error_from_sqlite)?;
+    let checksum =
+        checksum_metadata(kind, value, checksum_type, None).map_err(s3_error_from_sqlite)?;
     if let Some(requested) = input.requested_for(kind)
-        && checksum.value_for(kind.as_str()) != Some(requested)
+        && checksum.value_for(kind) != Some(requested)
     {
         return Err(s3_error(S3ErrorCode::BadDigest));
     }
@@ -215,96 +254,358 @@ pub(super) fn validate_payload_checksum(
     Ok(checksum)
 }
 
-pub(super) fn default_crc64nvme_full_object_checksum() -> ChecksumMetadata {
-    ChecksumMetadata {
-        algorithm: Some(ChecksumAlgorithm::CRC64NVME.to_string()),
-        checksum_type: Some(ChecksumType::FULL_OBJECT.to_string()),
-        ..ChecksumMetadata::default()
+/// Computes and validates a part-level checksum from explicit request fields.
+pub(super) fn validate_part_payload_checksum(
+    input: &ChecksumInput,
+    value: &[u8],
+) -> S3Result<Option<PartChecksum>> {
+    let Some(kind) = input.algorithm_kind()? else {
+        return Ok(None);
+    };
+    let computed = checksum_value(kind, value);
+    if let Some(requested) = input.requested_for(kind)
+        && computed != requested
+    {
+        return Err(s3_error(S3ErrorCode::BadDigest));
     }
+    Ok(Some(PartChecksum::new(kind, computed)))
 }
 
+/// Builds stored checksum metadata from either computed bytes or a supplied value.
+pub(super) fn checksum_metadata(
+    kind: ChecksumAlgorithmKind,
+    value: &[u8],
+    checksum_type: ChecksumTypeKind,
+    supplied: Option<&str>,
+) -> SqliteResult<StoredChecksum> {
+    let checksum_value = supplied.map_or_else(|| checksum_value(kind, value), str::to_string);
+    StoredChecksum::new(kind, checksum_type, checksum_value).ok_or(SqliteError::ChecksumMismatch)
+}
+
+/// Creates the default completed-object checksum configuration.
+pub(super) fn default_crc64nvme_full_object_checksum() -> MultipartChecksumConfig {
+    MultipartChecksumConfig::new(
+        ChecksumAlgorithmKind::Crc64Nvme,
+        ChecksumTypeKind::FullObject,
+    )
+}
+
+/// Computes full-object checksum metadata for an object write.
 pub(super) fn object_write_checksum_from_value(
     kind: ChecksumAlgorithmKind,
     object: &KeyValue,
-) -> SqliteResult<ChecksumMetadata> {
+) -> SqliteResult<StoredChecksum> {
     let value = object.value.as_deref().ok_or_else(|| {
         SqliteError::Configuration("object metadata has no stored value".to_string())
     })?;
-    checksum_metadata(kind, value, Some(ChecksumType::FULL_OBJECT))
+    checksum_metadata(kind, value, ChecksumTypeKind::FullObject, None)
 }
 
+/// Computes per-part checksum metadata for `UploadPartCopy`.
 pub(super) fn copied_part_checksum(
-    upload_checksum: &ChecksumMetadata,
+    upload_checksum: Option<MultipartChecksumConfig>,
     value: &[u8],
-) -> SqliteResult<ChecksumMetadata> {
-    let Some(algorithm) = upload_checksum.algorithm.as_deref() else {
-        return Ok(ChecksumMetadata::default());
-    };
-    let kind = checksum_algorithm_from_name(algorithm)?;
-    checksum_metadata(kind, value, None)
+) -> Option<PartChecksum> {
+    upload_checksum.map(|checksum| {
+        PartChecksum::new(
+            checksum.algorithm,
+            checksum_value(checksum.algorithm, value),
+        )
+    })
 }
 
-pub(super) fn checksum_algorithm_output(checksum: &ChecksumMetadata) -> Option<ChecksumAlgorithm> {
+/// Shared view used to project typed checksums back into S3 response fields.
+pub(super) trait ChecksumResponse {
+    /// Returns the checksum algorithm when one is present.
+    fn algorithm_kind(&self) -> Option<ChecksumAlgorithmKind>;
+    /// Returns the checksum type when one is present.
+    fn checksum_type_kind(&self) -> Option<ChecksumTypeKind>;
+    /// Returns the checksum value for an algorithm.
+    fn value_for(&self, kind: ChecksumAlgorithmKind) -> Option<&str>;
+    /// Returns whether this response view carries a checksum value.
+    fn has_value(&self) -> bool;
+}
+
+impl ChecksumResponse for StoredChecksum {
+    fn algorithm_kind(&self) -> Option<ChecksumAlgorithmKind> {
+        Some(self.algorithm())
+    }
+
+    fn checksum_type_kind(&self) -> Option<ChecksumTypeKind> {
+        Some(self.checksum_type())
+    }
+
+    fn value_for(&self, kind: ChecksumAlgorithmKind) -> Option<&str> {
+        self.value_for(kind)
+    }
+
+    fn has_value(&self) -> bool {
+        true
+    }
+}
+
+impl ChecksumResponse for Option<StoredChecksum> {
+    fn algorithm_kind(&self) -> Option<ChecksumAlgorithmKind> {
+        self.as_ref().map(StoredChecksum::algorithm)
+    }
+
+    fn checksum_type_kind(&self) -> Option<ChecksumTypeKind> {
+        self.as_ref().map(StoredChecksum::checksum_type)
+    }
+
+    fn value_for(&self, kind: ChecksumAlgorithmKind) -> Option<&str> {
+        self.as_ref().and_then(|checksum| checksum.value_for(kind))
+    }
+
+    fn has_value(&self) -> bool {
+        self.is_some()
+    }
+}
+
+impl ChecksumResponse for PartChecksum {
+    fn algorithm_kind(&self) -> Option<ChecksumAlgorithmKind> {
+        Some(self.algorithm())
+    }
+
+    fn checksum_type_kind(&self) -> Option<ChecksumTypeKind> {
+        None
+    }
+
+    fn value_for(&self, kind: ChecksumAlgorithmKind) -> Option<&str> {
+        self.value_for(kind)
+    }
+
+    fn has_value(&self) -> bool {
+        true
+    }
+}
+
+impl ChecksumResponse for Option<PartChecksum> {
+    fn algorithm_kind(&self) -> Option<ChecksumAlgorithmKind> {
+        self.as_ref().map(PartChecksum::algorithm)
+    }
+
+    fn checksum_type_kind(&self) -> Option<ChecksumTypeKind> {
+        None
+    }
+
+    fn value_for(&self, kind: ChecksumAlgorithmKind) -> Option<&str> {
+        self.as_ref().and_then(|checksum| checksum.value_for(kind))
+    }
+
+    fn has_value(&self) -> bool {
+        self.is_some()
+    }
+}
+
+impl ChecksumResponse for MultipartChecksumConfig {
+    fn algorithm_kind(&self) -> Option<ChecksumAlgorithmKind> {
+        Some(self.algorithm)
+    }
+
+    fn checksum_type_kind(&self) -> Option<ChecksumTypeKind> {
+        Some(self.checksum_type)
+    }
+
+    fn value_for(&self, _kind: ChecksumAlgorithmKind) -> Option<&str> {
+        None
+    }
+
+    fn has_value(&self) -> bool {
+        false
+    }
+}
+
+impl ChecksumResponse for Option<MultipartChecksumConfig> {
+    fn algorithm_kind(&self) -> Option<ChecksumAlgorithmKind> {
+        self.as_ref().map(|checksum| checksum.algorithm)
+    }
+
+    fn checksum_type_kind(&self) -> Option<ChecksumTypeKind> {
+        self.as_ref().map(|checksum| checksum.checksum_type)
+    }
+
+    fn value_for(&self, _kind: ChecksumAlgorithmKind) -> Option<&str> {
+        None
+    }
+
+    fn has_value(&self) -> bool {
+        false
+    }
+}
+
+/// Converts stored checksum algorithm metadata into an S3 response DTO.
+pub(super) fn checksum_algorithm_output<T: ChecksumResponse + ?Sized>(
+    checksum: &T,
+) -> Option<ChecksumAlgorithm> {
     checksum
-        .algorithm
-        .as_deref()
-        .map(|algorithm| ChecksumAlgorithm::from(algorithm.to_string()))
+        .algorithm_kind()
+        .map(|algorithm| ChecksumAlgorithm::from(algorithm.as_str().to_string()))
 }
 
-pub(super) fn checksum_type_output(checksum: &ChecksumMetadata) -> Option<ChecksumType> {
+/// Converts stored checksum type metadata into an S3 response DTO.
+pub(super) fn checksum_type_output<T: ChecksumResponse + ?Sized>(
+    checksum: &T,
+) -> Option<ChecksumType> {
     checksum
-        .checksum_type
-        .as_deref()
-        .map(|checksum_type| ChecksumType::from(checksum_type.to_string()))
+        .checksum_type_kind()
+        .map(|checksum_type| ChecksumType::from(checksum_type.as_str().to_string()))
 }
 
-pub(super) fn checksum_struct(checksum: &ChecksumMetadata) -> Option<S3Checksum> {
+/// Returns a checksum response field for an algorithm.
+fn checksum_field<T: ChecksumResponse + ?Sized>(
+    checksum: &T,
+    kind: ChecksumAlgorithmKind,
+) -> Option<String> {
+    checksum.value_for(kind).map(str::to_string)
+}
+
+/// Returns the `CRC32` checksum response field.
+pub(super) fn checksum_crc32<T: ChecksumResponse + ?Sized>(checksum: &T) -> Option<String> {
+    checksum_field(checksum, ChecksumAlgorithmKind::Crc32)
+}
+
+/// Returns the `CRC32C` checksum response field.
+pub(super) fn checksum_crc32c<T: ChecksumResponse + ?Sized>(checksum: &T) -> Option<String> {
+    checksum_field(checksum, ChecksumAlgorithmKind::Crc32c)
+}
+
+/// Returns the `CRC64NVME` checksum response field.
+pub(super) fn checksum_crc64nvme<T: ChecksumResponse + ?Sized>(checksum: &T) -> Option<String> {
+    checksum_field(checksum, ChecksumAlgorithmKind::Crc64Nvme)
+}
+
+/// Returns the `SHA1` checksum response field.
+pub(super) fn checksum_sha1<T: ChecksumResponse + ?Sized>(checksum: &T) -> Option<String> {
+    checksum_field(checksum, ChecksumAlgorithmKind::Sha1)
+}
+
+/// Returns the `SHA256` checksum response field.
+pub(super) fn checksum_sha256<T: ChecksumResponse + ?Sized>(checksum: &T) -> Option<String> {
+    checksum_field(checksum, ChecksumAlgorithmKind::Sha256)
+}
+
+/// Converts stored checksum metadata into the nested `GetObjectAttributes` checksum DTO.
+pub(super) fn checksum_struct<T: ChecksumResponse + ?Sized>(checksum: &T) -> Option<S3Checksum> {
     checksum.has_value().then(|| S3Checksum {
-        checksum_crc32: checksum.crc32.clone(),
-        checksum_crc32c: checksum.crc32c.clone(),
-        checksum_crc64nvme: checksum.crc64nvme.clone(),
-        checksum_sha1: checksum.sha1.clone(),
-        checksum_sha256: checksum.sha256.clone(),
+        checksum_crc32: checksum_crc32(checksum),
+        checksum_crc32c: checksum_crc32c(checksum),
+        checksum_crc64nvme: checksum_crc64nvme(checksum),
+        checksum_sha1: checksum_sha1(checksum),
+        checksum_sha256: checksum_sha256(checksum),
         checksum_type: checksum_type_output(checksum),
     })
 }
 
+/// Selects the checksum metadata that should be returned for a whole object or part read.
 pub(super) fn object_checksum_for_part(
-    object_checksum: &ChecksumMetadata,
+    object_checksum: Option<&StoredChecksum>,
     part: Option<&CompletedObjectPart>,
-) -> ChecksumMetadata {
+) -> Option<StoredChecksum> {
     let Some(part) = part else {
-        return object_checksum.clone();
+        return object_checksum.cloned();
     };
-    if part.checksum.has_value().not() {
-        return ChecksumMetadata::default();
-    }
-    ChecksumMetadata {
-        algorithm: object_checksum.algorithm.clone(),
-        checksum_type: object_checksum.checksum_type.clone(),
-        crc32: part.checksum.crc32.clone(),
-        crc32c: part.checksum.crc32c.clone(),
-        crc64nvme: part.checksum.crc64nvme.clone(),
-        sha1: part.checksum.sha1.clone(),
-        sha256: part.checksum.sha256.clone(),
-    }
-}
-
-pub(super) fn checksum_mode_enabled(checksum_mode: Option<&ChecksumMode>) -> bool {
-    checksum_mode.is_some_and(|mode| mode.as_str() == ChecksumMode::ENABLED)
+    let part_checksum = part.checksum.as_ref()?;
+    let object_checksum = object_checksum?;
+    StoredChecksum::new(
+        part_checksum.algorithm(),
+        object_checksum.checksum_type(),
+        part_checksum.as_str().to_string(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use s3s::S3ErrorCode;
+    use s3s::{S3ErrorCode, dto::ChecksumAlgorithm};
 
-    use super::validate_content_md5;
+    use crate::{
+        checksum::{ChecksumTypeKind, FullObjectChecksum, PartChecksum, StoredChecksum},
+        sqlite::CompletedObjectPart,
+    };
 
-    fn assert_error_code(result: s3s::S3Result<()>, code: &S3ErrorCode) {
+    use super::{
+        ChecksumAlgorithmKind, ChecksumInput, ChecksumPolicy, checksum_algorithm_from_request,
+        checksum_metadata, checksum_mode_enabled, checksum_type_name, copied_part_checksum,
+        default_crc64nvme_full_object_checksum, multipart_checksum_config, multipart_checksum_type,
+        object_checksum_for_part, validate_content_md5, validate_part_payload_checksum,
+        validate_payload_checksum,
+    };
+
+    fn assert_error_code<T>(result: s3s::S3Result<T>, code: &S3ErrorCode) {
         match result {
-            Ok(()) => panic!("expected {code:?}"),
+            Ok(_) => panic!("expected {code:?}"),
             Err(err) => assert_eq!(err.code(), code),
         }
+    }
+
+    #[test]
+    fn parses_request_checksum_algorithm() {
+        assert_eq!(
+            checksum_algorithm_from_request(Some(ChecksumAlgorithm::from_static(
+                ChecksumAlgorithm::CRC64NVME
+            )))
+            .ok()
+            .flatten(),
+            Some(ChecksumAlgorithmKind::Crc64Nvme)
+        );
+        assert_error_code(
+            checksum_algorithm_from_request(Some(ChecksumAlgorithm::from("UNKNOWN".to_string()))),
+            &S3ErrorCode::InvalidArgument,
+        );
+    }
+
+    #[test]
+    fn validates_checksum_type_names() {
+        assert_eq!(
+            checksum_type_name(Some(s3s::dto::ChecksumType::from_static(
+                s3s::dto::ChecksumType::FULL_OBJECT
+            )))
+            .ok()
+            .flatten(),
+            Some(ChecksumTypeKind::FullObject)
+        );
+        assert_error_code(
+            checksum_type_name(Some(s3s::dto::ChecksumType::from("BOGUS".to_string()))),
+            &S3ErrorCode::InvalidArgument,
+        );
+    }
+
+    #[test]
+    fn maps_multipart_default_checksum_type() {
+        assert_eq!(
+            multipart_checksum_type(ChecksumAlgorithmKind::Crc64Nvme),
+            ChecksumTypeKind::FullObject
+        );
+        assert_eq!(
+            multipart_checksum_type(ChecksumAlgorithmKind::Sha256),
+            ChecksumTypeKind::Composite
+        );
+    }
+
+    #[test]
+    fn builds_multipart_checksum_config() {
+        let config = match multipart_checksum_config(
+            Some(ChecksumAlgorithm::from_static(ChecksumAlgorithm::SHA256)),
+            None,
+        ) {
+            Ok(Some(config)) => config,
+            Ok(None) => panic!("expected checksum config"),
+            Err(err) => panic!("unexpected error: {err:?}"),
+        };
+        assert_eq!(config.algorithm, ChecksumAlgorithmKind::Sha256);
+        assert_eq!(config.checksum_type, ChecksumTypeKind::Composite);
+
+        let default = default_crc64nvme_full_object_checksum();
+        assert_eq!(default.algorithm, ChecksumAlgorithmKind::Crc64Nvme);
+        assert_eq!(default.checksum_type, ChecksumTypeKind::FullObject);
+    }
+
+    #[test]
+    fn detects_enabled_checksum_mode() {
+        assert!(checksum_mode_enabled(Some(
+            &s3s::dto::ChecksumMode::from_static(s3s::dto::ChecksumMode::ENABLED)
+        )));
+        assert!(!checksum_mode_enabled(None));
     }
 
     #[test]
@@ -328,6 +629,111 @@ mod tests {
         assert_error_code(
             validate_content_md5(true, Some("rL0Y20xC+Fzt72VPzMSk2A=="), &[0; 16]),
             &S3ErrorCode::BadDigest,
+        );
+    }
+
+    #[test]
+    fn computes_default_payload_checksum() {
+        let checksum = match validate_payload_checksum(
+            &ChecksumInput::default(),
+            b"test data",
+            ChecksumPolicy::DefaultCrc64NvmeFullObject,
+            ChecksumTypeKind::FullObject,
+        ) {
+            Ok(checksum) => checksum,
+            Err(err) => panic!("unexpected error: {err:?}"),
+        };
+        assert_eq!(
+            checksum,
+            StoredChecksum::Full(FullObjectChecksum::Crc64Nvme("rsrzr5yYqFU=".to_string()))
+        );
+    }
+
+    #[test]
+    fn rejects_mismatched_payload_checksum() {
+        let input = ChecksumInput {
+            algorithm: Some(ChecksumAlgorithm::from_static(ChecksumAlgorithm::SHA256)),
+            sha256: Some("wrong".to_string()),
+            ..ChecksumInput::default()
+        };
+        assert_error_code(
+            validate_payload_checksum(
+                &input,
+                b"test data",
+                ChecksumPolicy::DefaultCrc64NvmeFullObject,
+                ChecksumTypeKind::FullObject,
+            ),
+            &S3ErrorCode::BadDigest,
+        );
+    }
+
+    #[test]
+    fn builds_checksum_metadata_for_selected_algorithm() {
+        let checksum = match checksum_metadata(
+            ChecksumAlgorithmKind::Sha1,
+            b"test data",
+            ChecksumTypeKind::FullObject,
+            None,
+        ) {
+            Ok(checksum) => checksum,
+            Err(err) => panic!("unexpected error: {err:?}"),
+        };
+        assert_eq!(checksum.algorithm(), ChecksumAlgorithmKind::Sha1);
+        assert_eq!(
+            checksum.value_for(ChecksumAlgorithmKind::Sha1),
+            Some("9I3YU4IIYIFsddVND1hNyGMyenw=")
+        );
+    }
+
+    #[test]
+    fn computes_part_checksum_from_explicit_input() {
+        let input = ChecksumInput {
+            algorithm: Some(ChecksumAlgorithm::from_static(ChecksumAlgorithm::SHA256)),
+            ..ChecksumInput::default()
+        };
+        let checksum = match validate_part_payload_checksum(&input, b"test data") {
+            Ok(Some(checksum)) => checksum,
+            Ok(None) => panic!("expected part checksum"),
+            Err(err) => panic!("unexpected error: {err:?}"),
+        };
+        assert_eq!(
+            checksum,
+            PartChecksum::Sha256("kW8AJ6V1B0znKjMXd8NHjWUT94alkb2JLaGld78jNfk=".to_string())
+        );
+    }
+
+    #[test]
+    fn computes_copied_part_checksum_when_upload_requested_one() {
+        let config = match multipart_checksum_config(
+            Some(ChecksumAlgorithm::from_static(ChecksumAlgorithm::SHA256)),
+            None,
+        ) {
+            Ok(config) => config,
+            Err(err) => panic!("unexpected error: {err:?}"),
+        };
+        let Some(checksum) = copied_part_checksum(config, b"test data") else {
+            panic!("expected copied part checksum");
+        };
+        assert_eq!(
+            checksum,
+            PartChecksum::Sha256("kW8AJ6V1B0znKjMXd8NHjWUT94alkb2JLaGld78jNfk=".to_string())
+        );
+    }
+
+    #[test]
+    fn suppresses_part_checksum_when_part_has_none() {
+        let object_checksum =
+            StoredChecksum::Full(FullObjectChecksum::Crc64Nvme("rsrzr5yYqFU=".to_string()));
+        let part = CompletedObjectPart {
+            part_number: 1,
+            start: 0,
+            size: 9,
+            md5: None,
+            checksum: None,
+        };
+        assert_eq!(
+            object_checksum_for_part(Some(&object_checksum), Some(&part)),
+            None
         );
     }
 }

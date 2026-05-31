@@ -9,24 +9,23 @@ use s3s::{
     S3Request, S3Response, S3Result, StdError,
     dto::{
         AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketVersioningStatus,
-        ChecksumMode, ChecksumType, CommonPrefix, CompleteMultipartUploadInput,
-        CompleteMultipartUploadOutput, CompletedPart, CopyObjectInput, CopyObjectOutput,
-        CopyObjectResult, CopyPartResult, CopySource, CreateBucketInput, CreateBucketOutput,
-        CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketInput,
-        DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput,
-        DeleteObjectsOutput, DeletedObject, ETag, ETagCondition, Error as DeleteError,
-        GetBucketLocationInput, GetBucketLocationOutput, GetBucketVersioningInput,
-        GetBucketVersioningOutput, GetObjectAclInput, GetObjectAclOutput, GetObjectAttributesInput,
-        GetObjectAttributesOutput, GetObjectAttributesParts, GetObjectInput, GetObjectOutput,
-        Grant, Grantee, HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput,
-        Initiator, ListBucketsInput, ListBucketsOutput, ListMultipartUploadsInput,
-        ListMultipartUploadsOutput, ListObjectVersionsInput, ListObjectVersionsOutput,
-        ListObjectsInput, ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output,
-        ListPartsInput, ListPartsOutput, MFADelete, MetadataDirective, MultipartUpload,
-        ObjectAttributes, ObjectPart, Owner, Part, Permission, PutBucketVersioningInput,
-        PutBucketVersioningOutput, PutObjectInput, PutObjectOutput, Range as S3Range, StorageClass,
-        StreamingBlob, Timestamp, Type, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput,
-        UploadPartOutput,
+        ChecksumMode, CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
+        CompletedPart, CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopyPartResult,
+        CopySource, CreateBucketInput, CreateBucketOutput, CreateMultipartUploadInput,
+        CreateMultipartUploadOutput, DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput,
+        DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
+        ETagCondition, Error as DeleteError, GetBucketLocationInput, GetBucketLocationOutput,
+        GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectAclInput, GetObjectAclOutput,
+        GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectAttributesParts,
+        GetObjectInput, GetObjectOutput, Grant, Grantee, HeadBucketInput, HeadBucketOutput,
+        HeadObjectInput, HeadObjectOutput, Initiator, ListBucketsInput, ListBucketsOutput,
+        ListMultipartUploadsInput, ListMultipartUploadsOutput, ListObjectVersionsInput,
+        ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
+        ListObjectsV2Output, ListPartsInput, ListPartsOutput, MFADelete, MetadataDirective,
+        MultipartUpload, ObjectAttributes, ObjectPart, Owner, Part, Permission,
+        PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectInput, PutObjectOutput,
+        Range as S3Range, StorageClass, StreamingBlob, Timestamp, Type, UploadPartCopyInput,
+        UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
     },
     header::{CONTENT_MD5, CONTENT_TYPE, ETAG, X_AMZ_DELETE_MARKER, X_AMZ_REQUEST_ID},
 };
@@ -38,10 +37,11 @@ use tokio::{
 use tracing::debug;
 use uuid::Uuid;
 
+use crate::checksum::ChecksumTypeKind;
 use crate::sqlite::{
-    BucketVersioningState, ChecksumMetadata, CompletedObjectPart, KeyMetadata, KeyValue, Multipart,
+    BucketVersioningState, CompletedObjectPart, KeyMetadata, KeyValue, Multipart,
     MultipartCompletionPart, MultipartCompletionRequest, MultipartUploadState,
-    MultipartUploadSummary, ObjectDeleteOutcome, Sqlite, SqliteError, SqliteResult,
+    MultipartUploadSummary, ObjectDeleteOutcome, Sqlite, SqliteError, SqliteResult, StoredChecksum,
 };
 
 const LIST_BATCH_SIZE: i64 = 1024;
@@ -62,10 +62,11 @@ use self::{
     bucket::owner,
     checksum::{
         ChecksumAlgorithmKind, ChecksumInput, ChecksumPolicy, checksum_algorithm_from_request,
-        checksum_algorithm_output, checksum_mode_enabled, checksum_struct, checksum_type_name,
+        checksum_algorithm_output, checksum_crc32, checksum_crc32c, checksum_crc64nvme,
+        checksum_mode_enabled, checksum_sha1, checksum_sha256, checksum_struct,
         checksum_type_output, copied_part_checksum, default_crc64nvme_full_object_checksum, hex,
-        multipart_checksum_type, object_checksum_for_part, object_write_checksum_from_value,
-        validate_content_md5, validate_payload_checksum,
+        multipart_checksum_config, object_checksum_for_part, object_write_checksum_from_value,
+        validate_content_md5, validate_part_payload_checksum, validate_payload_checksum,
     },
     conditions::{
         ObjectDeleteConditions, ObjectReadConditionFailure, ObjectReadConditions,

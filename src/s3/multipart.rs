@@ -2,21 +2,21 @@ use std::collections::HashSet;
 
 use super::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, ByteRange, CONTENT_MD5, ChecksumInput,
-    ChecksumMetadata, ChecksumPolicy, ChecksumType, CommonPrefix, CompleteMultipartUploadInput,
-    CompleteMultipartUploadOutput, CompletedObjectPart, CompletedPart, CopyPartResult, CopySource,
-    CreateMultipartUploadInput, CreateMultipartUploadOutput, Digest, ETag, Initiator,
-    InternalError, KeyValue, LIST_BATCH_SIZE, ListMultipartUploadsInput,
-    ListMultipartUploadsOutput, ListPartsInput, ListPartsOutput, Md5, Multipart,
-    MultipartCompletionPart, MultipartCompletionRequest, MultipartUpload, MultipartUploadState,
-    MultipartUploadSummary, Not, ObjectReadConditions, OffsetDateTime, Part, S3Error, S3ErrorCode,
-    S3Range, S3Request, S3Response, S3Result, Sqlite, SqliteError, SqliteResult, StorageClass,
-    TryStreamExt, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
-    Uuid, checksum_algorithm_from_request, checksum_algorithm_output, checksum_type_name,
-    checksum_type_output, common_prefix_for_key, copied_part_checksum, copy_bytes, debug,
-    decode_list_input_value, default_crc64nvme_full_object_checksum, encode_list_value, hex,
-    is_url_encoding, multipart_checksum_type, normalize_content_encoding, object_write_conditions,
+    CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CompletedObjectPart,
+    CompletedPart, CopyPartResult, CopySource, CreateMultipartUploadInput,
+    CreateMultipartUploadOutput, Digest, ETag, Initiator, InternalError, KeyValue, LIST_BATCH_SIZE,
+    ListMultipartUploadsInput, ListMultipartUploadsOutput, ListPartsInput, ListPartsOutput, Md5,
+    Multipart, MultipartCompletionPart, MultipartCompletionRequest, MultipartUpload,
+    MultipartUploadState, MultipartUploadSummary, Not, ObjectReadConditions, OffsetDateTime, Part,
+    S3Error, S3ErrorCode, S3Range, S3Request, S3Response, S3Result, Sqlite, SqliteError,
+    SqliteResult, StorageClass, TryStreamExt, UploadPartCopyInput, UploadPartCopyOutput,
+    UploadPartInput, UploadPartOutput, Uuid, checksum_algorithm_output, checksum_crc32,
+    checksum_crc32c, checksum_crc64nvme, checksum_sha1, checksum_sha256, checksum_type_output,
+    common_prefix_for_key, copied_part_checksum, copy_bytes, debug, decode_list_input_value,
+    default_crc64nvme_full_object_checksum, encode_list_value, hex, is_url_encoding,
+    multipart_checksum_config, normalize_content_encoding, object_write_conditions,
     output_delimiter, owner, s3_error, s3_error_from_sqlite, s3_error_with_message,
-    validate_content_md5, validate_copy_source_conditions, validate_payload_checksum,
+    validate_content_md5, validate_copy_source_conditions, validate_part_payload_checksum,
 };
 
 /// Normalizes a completed multipart part list while preserving S3 ordering rules.
@@ -41,14 +41,15 @@ pub(super) fn normalize_completion_parts(
             && previous.part_number == part_number
         {
             previous.md5 = e_tag;
-            previous.checksum = ChecksumMetadata {
+            previous.checksum = ChecksumInput {
                 crc32: part.checksum_crc32,
                 crc32c: part.checksum_crc32c,
                 crc64nvme: part.checksum_crc64nvme,
                 sha1: part.checksum_sha1,
                 sha256: part.checksum_sha256,
-                ..ChecksumMetadata::default()
-            };
+                ..ChecksumInput::default()
+            }
+            .into_part_checksum()?;
             continue;
         }
 
@@ -60,14 +61,15 @@ pub(super) fn normalize_completion_parts(
         normalized.push(MultipartCompletionPart {
             part_number,
             md5: e_tag,
-            checksum: ChecksumMetadata {
+            checksum: ChecksumInput {
                 crc32: part.checksum_crc32,
                 crc32c: part.checksum_crc32c,
                 crc64nvme: part.checksum_crc64nvme,
                 sha1: part.checksum_sha1,
                 sha256: part.checksum_sha256,
-                ..ChecksumMetadata::default()
-            },
+                ..ChecksumInput::default()
+            }
+            .into_part_checksum()?,
         });
     }
 
@@ -307,7 +309,7 @@ fn store_upload_part_copy(
 
     let now = OffsetDateTime::now_utc();
     let md5 = copied_part.md5;
-    let checksum = copied_part_checksum(&upload_state.checksum, &copied_part.value)?;
+    let checksum = copied_part_checksum(upload_state.checksum, &copied_part.value);
     Sqlite::try_touch_multipart_upload(transaction, request.upload_id)?;
     Sqlite::try_put_multipart(
         transaction,
@@ -323,11 +325,11 @@ fn store_upload_part_copy(
     )?;
 
     Ok(CopyPartResult {
-        checksum_crc32: checksum.crc32,
-        checksum_crc32c: checksum.crc32c,
-        checksum_crc64nvme: checksum.crc64nvme,
-        checksum_sha1: checksum.sha1,
-        checksum_sha256: checksum.sha256,
+        checksum_crc32: checksum_crc32(&checksum),
+        checksum_crc32c: checksum_crc32c(&checksum),
+        checksum_crc64nvme: checksum_crc64nvme(&checksum),
+        checksum_sha1: checksum_sha1(&checksum),
+        checksum_sha256: checksum_sha256(&checksum),
         e_tag: Some(ETag::Strong(md5)),
         last_modified: Some(now.into()),
     })
@@ -648,14 +650,7 @@ pub(super) async fn create_multipart_upload(
         .map_err(s3_error_from_sqlite)?;
 
     let upload_id = Uuid::new_v4();
-    let checksum_kind = checksum_algorithm_from_request(checksum_algorithm.clone())?;
-    let checksum_type = checksum_type_name(checksum_type)?
-        .or_else(|| checksum_kind.map(|kind| multipart_checksum_type(kind).to_string()));
-    let checksum = ChecksumMetadata {
-        algorithm: checksum_kind.map(|kind| kind.as_str().to_string()),
-        checksum_type: checksum_type.clone(),
-        ..ChecksumMetadata::default()
-    };
+    let checksum = multipart_checksum_config(checksum_algorithm.clone(), checksum_type)?;
 
     let bucket_clone = bucket.clone();
     let key_clone = key.clone();
@@ -691,7 +686,7 @@ pub(super) async fn create_multipart_upload(
         key: Some(key),
         upload_id: Some(upload_id.to_string()),
         checksum_algorithm,
-        checksum_type: checksum_type.map(ChecksumType::from),
+        checksum_type: checksum_type_output(&checksum),
         ..Default::default()
     };
 
@@ -713,11 +708,11 @@ pub(super) async fn upload_part(
         part_number,
         content_md5,
         checksum_algorithm,
-        checksum_crc32,
-        checksum_crc32c,
-        checksum_crc64nvme,
-        checksum_sha1,
-        checksum_sha256,
+        checksum_crc32: request_checksum_crc32,
+        checksum_crc32c: request_checksum_crc32c,
+        checksum_crc64nvme: request_checksum_crc64nvme,
+        checksum_sha1: request_checksum_sha1,
+        checksum_sha256: request_checksum_sha256,
         ..
     } = input;
 
@@ -742,28 +737,23 @@ pub(super) async fn upload_part(
         content_md5.as_deref(),
         md5_bytes.as_ref(),
     )?;
-    let checksum = validate_payload_checksum(
-        &ChecksumInput {
-            algorithm: checksum_algorithm,
-            crc32: checksum_crc32,
-            crc32c: checksum_crc32c,
-            crc64nvme: checksum_crc64nvme,
-            sha1: checksum_sha1,
-            sha256: checksum_sha256,
-            ..ChecksumInput::default()
-        },
-        &value,
-        ChecksumPolicy::ExplicitOnly,
-        None,
-    )?;
+    let checksum_input = ChecksumInput {
+        algorithm: checksum_algorithm,
+        crc32: request_checksum_crc32,
+        crc32c: request_checksum_crc32c,
+        crc64nvme: request_checksum_crc64nvme,
+        sha1: request_checksum_sha1,
+        sha256: request_checksum_sha256,
+        ..ChecksumInput::default()
+    };
+    let explicit_checksum = validate_part_payload_checksum(&checksum_input, &value)?;
 
     let md5_clone = md5.clone();
-    let checksum_clone = checksum.clone();
     let connection = sqlite
         .try_get_connection(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
-    connection
+    let checksum = connection
         .write(move |connection| {
             let transaction = connection.transaction()?;
 
@@ -777,6 +767,9 @@ pub(super) async fn upload_part(
                     .map(|credentials| credentials.access_key.as_str()),
             )?;
 
+            let checksum =
+                explicit_checksum.or_else(|| copied_part_checksum(upload_state.checksum, &value));
+
             Sqlite::try_touch_multipart_upload(&transaction, upload_id)?;
             Sqlite::try_put_multipart(
                 &transaction,
@@ -787,22 +780,23 @@ pub(super) async fn upload_part(
                     value,
                     size,
                     md5: Some(md5_clone),
-                    checksum: checksum_clone,
+                    checksum: checksum.clone(),
                 },
             )?;
 
-            Ok(transaction.commit()?)
+            transaction.commit()?;
+            Ok(checksum)
         })
         .await
         .map_err(s3_error_from_sqlite)?;
 
     let output = UploadPartOutput {
         e_tag: Some(ETag::Strong(md5)),
-        checksum_crc32: checksum.crc32,
-        checksum_crc32c: checksum.crc32c,
-        checksum_crc64nvme: checksum.crc64nvme,
-        checksum_sha1: checksum.sha1,
-        checksum_sha256: checksum.sha256,
+        checksum_crc32: checksum_crc32(&checksum),
+        checksum_crc32c: checksum_crc32c(&checksum),
+        checksum_crc64nvme: checksum_crc64nvme(&checksum),
+        checksum_sha1: checksum_sha1(&checksum),
+        checksum_sha256: checksum_sha256(&checksum),
         ..Default::default()
     };
     Ok(S3Response::new(output))
@@ -909,11 +903,11 @@ pub(super) async fn list_parts(
     let parts = parts
         .into_iter()
         .map(|part| Part {
-            checksum_crc32: part.checksum.crc32,
-            checksum_crc32c: part.checksum.crc32c,
-            checksum_crc64nvme: part.checksum.crc64nvme,
-            checksum_sha1: part.checksum.sha1,
-            checksum_sha256: part.checksum.sha256,
+            checksum_crc32: checksum_crc32(&part.checksum),
+            checksum_crc32c: checksum_crc32c(&part.checksum),
+            checksum_crc64nvme: checksum_crc64nvme(&part.checksum),
+            checksum_sha1: checksum_sha1(&part.checksum),
+            checksum_sha256: checksum_sha256(&part.checksum),
             e_tag: part.md5.map(ETag::Strong),
             last_modified: Some(part.last_modified.into()),
             part_number: Some(part.part_number),
@@ -1000,11 +994,11 @@ pub(super) async fn complete_multipart_upload(
         upload_id,
         if_match,
         if_none_match,
-        checksum_crc32,
-        checksum_crc32c,
-        checksum_crc64nvme,
-        checksum_sha1,
-        checksum_sha256,
+        checksum_crc32: request_checksum_crc32,
+        checksum_crc32c: request_checksum_crc32c,
+        checksum_crc64nvme: request_checksum_crc64nvme,
+        checksum_sha1: request_checksum_sha1,
+        checksum_sha256: request_checksum_sha256,
         checksum_type,
         ..
     } = req.input;
@@ -1031,14 +1025,14 @@ pub(super) async fn complete_multipart_upload(
     let requested_parts = normalize_completion_parts(requested_parts)?;
     let requested_checksum = ChecksumInput {
         checksum_type,
-        crc32: checksum_crc32,
-        crc32c: checksum_crc32c,
-        crc64nvme: checksum_crc64nvme,
-        sha1: checksum_sha1,
-        sha256: checksum_sha256,
+        crc32: request_checksum_crc32,
+        crc32c: request_checksum_crc32c,
+        crc64nvme: request_checksum_crc64nvme,
+        sha1: request_checksum_sha1,
+        sha256: request_checksum_sha256,
         ..ChecksumInput::default()
     }
-    .into_requested_metadata()?;
+    .into_completion_checksum()?;
 
     let access_key = req.credentials.map(|credentials| credentials.access_key);
     let completed = sqlite
@@ -1048,7 +1042,7 @@ pub(super) async fn complete_multipart_upload(
             upload_id,
             requested_parts,
             requested_checksum,
-            default_checksum: Some(default_crc64nvme_full_object_checksum()),
+            default_checksum: default_crc64nvme_full_object_checksum(),
             access_key,
             write_conditions,
         })
@@ -1062,11 +1056,11 @@ pub(super) async fn complete_multipart_upload(
         key: Some(key),
         e_tag: Some(ETag::Strong(completed.md5)),
         version_id: completed.returned_version_id,
-        checksum_crc32: completed.checksum.crc32,
-        checksum_crc32c: completed.checksum.crc32c,
-        checksum_crc64nvme: completed.checksum.crc64nvme,
-        checksum_sha1: completed.checksum.sha1,
-        checksum_sha256: completed.checksum.sha256,
+        checksum_crc32: checksum_crc32(&completed.checksum),
+        checksum_crc32c: checksum_crc32c(&completed.checksum),
+        checksum_crc64nvme: checksum_crc64nvme(&completed.checksum),
+        checksum_sha1: checksum_sha1(&completed.checksum),
+        checksum_sha256: checksum_sha256(&completed.checksum),
         checksum_type: completed_checksum_type,
         ..Default::default()
     };

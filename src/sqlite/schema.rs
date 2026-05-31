@@ -1,6 +1,6 @@
 use super::{Sqlite, SqliteError, SqliteResult, Transaction};
 
-pub(super) const BUCKET_SCHEMA_VERSION: i32 = 3;
+pub(super) const BUCKET_SCHEMA_VERSION: i32 = 5;
 pub(super) const BUCKET_SCHEMA_SQL: &str = "
 CREATE TABLE bucket_state (
     id INTEGER PRIMARY KEY CHECK(id = 1),
@@ -22,19 +22,18 @@ CREATE TABLE object_version (
     expires TEXT,
     last_modified TEXT NOT NULL,
     md5 TEXT,
-    checksum_algorithm TEXT,
-    checksum_type TEXT,
-    checksum_crc32 TEXT,
-    checksum_crc32c TEXT,
-    checksum_crc64nvme TEXT,
-    checksum_sha1 TEXT,
-    checksum_sha256 TEXT,
+    checksum_algorithm INTEGER CHECK(checksum_algorithm BETWEEN 1 AND 5),
+    checksum_type INTEGER CHECK(checksum_type BETWEEN 1 AND 2),
+    checksum_value TEXT,
     UNIQUE(key, version_id),
     CHECK (
         (
             is_delete_marker = 0
             AND body IS NOT NULL
             AND md5 IS NOT NULL
+            AND checksum_algorithm IS NOT NULL
+            AND checksum_type IS NOT NULL
+            AND checksum_value IS NOT NULL
         )
         OR
         (
@@ -49,11 +48,7 @@ CREATE TABLE object_version (
             AND md5 IS NULL
             AND checksum_algorithm IS NULL
             AND checksum_type IS NULL
-            AND checksum_crc32 IS NULL
-            AND checksum_crc32c IS NULL
-            AND checksum_crc64nvme IS NULL
-            AND checksum_sha1 IS NULL
-            AND checksum_sha256 IS NULL
+            AND checksum_value IS NULL
         )
     )
 ) STRICT;
@@ -74,13 +69,24 @@ CREATE TABLE completed_object_part (
     start INTEGER NOT NULL CHECK(start >= 0),
     size INTEGER NOT NULL CHECK(size >= 0),
     md5 TEXT,
-    checksum_crc32 TEXT,
-    checksum_crc32c TEXT,
-    checksum_crc64nvme TEXT,
-    checksum_sha1 TEXT,
-    checksum_sha256 TEXT,
+    checksum_algorithm INTEGER CHECK(checksum_algorithm BETWEEN 1 AND 5),
+    checksum_type INTEGER CHECK(checksum_type BETWEEN 1 AND 2),
+    checksum_value TEXT,
     PRIMARY KEY (key, version_id, part_number),
-    FOREIGN KEY (key, version_id) REFERENCES object_version (key, version_id) ON DELETE CASCADE
+    FOREIGN KEY (key, version_id) REFERENCES object_version (key, version_id) ON DELETE CASCADE,
+    CHECK (
+        (
+            checksum_algorithm IS NULL
+            AND checksum_type IS NULL
+            AND checksum_value IS NULL
+        )
+        OR
+        (
+            checksum_algorithm IS NOT NULL
+            AND checksum_type IS NULL
+            AND checksum_value IS NOT NULL
+        )
+    )
 ) WITHOUT ROWID, STRICT;
 
 CREATE TABLE multipart_upload (
@@ -95,9 +101,23 @@ CREATE TABLE multipart_upload (
     content_encoding TEXT,
     cache_control TEXT,
     expires TEXT,
-    checksum_algorithm TEXT,
-    checksum_type TEXT,
-    UNIQUE(upload_id, bucket, key)
+    checksum_algorithm INTEGER CHECK(checksum_algorithm BETWEEN 1 AND 5),
+    checksum_type INTEGER CHECK(checksum_type BETWEEN 1 AND 2),
+    checksum_value TEXT,
+    UNIQUE(upload_id, bucket, key),
+    CHECK (
+        (
+            checksum_algorithm IS NULL
+            AND checksum_type IS NULL
+            AND checksum_value IS NULL
+        )
+        OR
+        (
+            checksum_algorithm IS NOT NULL
+            AND checksum_type IS NOT NULL
+            AND checksum_value IS NULL
+        )
+    )
 ) STRICT;
 
 CREATE TABLE multipart_upload_part (
@@ -107,13 +127,24 @@ CREATE TABLE multipart_upload_part (
     value BLOB NOT NULL,
     size INTEGER NOT NULL CHECK(size >= 0),
     md5 TEXT,
-    checksum_crc32 TEXT,
-    checksum_crc32c TEXT,
-    checksum_crc64nvme TEXT,
-    checksum_sha1 TEXT,
-    checksum_sha256 TEXT,
+    checksum_algorithm INTEGER CHECK(checksum_algorithm BETWEEN 1 AND 5),
+    checksum_type INTEGER CHECK(checksum_type BETWEEN 1 AND 2),
+    checksum_value TEXT,
     PRIMARY KEY (upload_id, part_number),
-    FOREIGN KEY (upload_id) REFERENCES multipart_upload (upload_id) ON DELETE CASCADE
+    FOREIGN KEY (upload_id) REFERENCES multipart_upload (upload_id) ON DELETE CASCADE,
+    CHECK (
+        (
+            checksum_algorithm IS NULL
+            AND checksum_type IS NULL
+            AND checksum_value IS NULL
+        )
+        OR
+        (
+            checksum_algorithm IS NOT NULL
+            AND checksum_type IS NULL
+            AND checksum_value IS NOT NULL
+        )
+    )
 ) WITHOUT ROWID, STRICT;
 
 CREATE TABLE completed_multipart_upload (
@@ -124,12 +155,9 @@ CREATE TABLE completed_multipart_upload (
     md5 TEXT NOT NULL,
     version_id TEXT NOT NULL,
     returned_version_id TEXT,
-    checksum_type TEXT,
-    checksum_crc32 TEXT,
-    checksum_crc32c TEXT,
-    checksum_crc64nvme TEXT,
-    checksum_sha1 TEXT,
-    checksum_sha256 TEXT,
+    checksum_algorithm INTEGER NOT NULL CHECK(checksum_algorithm BETWEEN 1 AND 5),
+    checksum_type INTEGER NOT NULL CHECK(checksum_type BETWEEN 1 AND 2),
+    checksum_value TEXT NOT NULL,
     last_modified TEXT NOT NULL,
     UNIQUE(upload_id, bucket, key)
 ) STRICT;
@@ -137,7 +165,7 @@ CREATE TABLE completed_multipart_upload (
 INSERT INTO bucket_state (id, versioning_state)
 VALUES (1, 'never_configured');
 
-PRAGMA user_version = 3;
+PRAGMA user_version = 5;
 ";
 
 impl Sqlite {
@@ -175,6 +203,120 @@ impl Sqlite {
 
         transaction.execute_batch(BUCKET_SCHEMA_SQL)?;
 
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+    use time::OffsetDateTime;
+    use uuid::Uuid;
+
+    use super::Sqlite;
+    use crate::sqlite::SqliteResult;
+
+    fn open_schema() -> SqliteResult<Connection> {
+        let mut connection = Connection::open_in_memory()?;
+        let transaction = connection.transaction()?;
+        Sqlite::try_create_tables(&transaction)?;
+        transaction.commit()?;
+        Ok(connection)
+    }
+
+    #[test]
+    fn object_rows_require_checksum_for_live_objects() -> SqliteResult<()> {
+        let connection = open_schema()?;
+        let result = connection.execute(
+            "
+            INSERT INTO object_version (
+                key, version_id, is_latest, is_delete_marker, body, size, last_modified, md5
+            )
+            VALUES ('key', 'null', 1, 0, X'00', 1, ?1, 'md5');",
+            [OffsetDateTime::now_utc()],
+        );
+
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn delete_markers_reject_checksum_columns() -> SqliteResult<()> {
+        let connection = open_schema()?;
+        let result = connection.execute(
+            "
+            INSERT INTO object_version (
+                key,
+                version_id,
+                is_latest,
+                is_delete_marker,
+                body,
+                size,
+                last_modified,
+                md5,
+                checksum_algorithm,
+                checksum_type,
+                checksum_value
+            )
+            VALUES ('key', 'null', 1, 1, NULL, 0, ?1, NULL, 3, 2, 'crc');",
+            [OffsetDateTime::now_utc()],
+        );
+
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn multipart_config_rows_reject_values() -> SqliteResult<()> {
+        let connection = open_schema()?;
+        let result = connection.execute(
+            "
+            INSERT INTO multipart_upload (
+                upload_id,
+                bucket,
+                key,
+                initiated,
+                last_modified,
+                checksum_algorithm,
+                checksum_type,
+                checksum_value
+            )
+            VALUES (?1, 'bucket', 'key', ?2, ?2, 5, 1, 'sha');",
+            (Uuid::new_v4(), OffsetDateTime::now_utc()),
+        );
+
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn multipart_part_rows_reject_checksum_types() -> SqliteResult<()> {
+        let connection = open_schema()?;
+        let upload_id = Uuid::new_v4();
+        connection.execute(
+            "
+            INSERT INTO multipart_upload (upload_id, bucket, key, initiated, last_modified)
+            VALUES (?1, 'bucket', 'key', ?2, ?2);",
+            (upload_id, OffsetDateTime::now_utc()),
+        )?;
+
+        let result = connection.execute(
+            "
+            INSERT INTO multipart_upload_part (
+                upload_id,
+                last_modified,
+                part_number,
+                value,
+                size,
+                checksum_algorithm,
+                checksum_type,
+                checksum_value
+            )
+            VALUES (?1, ?2, 1, X'00', 1, 5, 1, 'sha');",
+            (upload_id, OffsetDateTime::now_utc()),
+        );
+
+        assert!(result.is_err());
         Ok(())
     }
 }

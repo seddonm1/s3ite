@@ -5,13 +5,16 @@ use rusqlite::{Error::ToSqlConversionFailure, OptionalExtension, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::checksum::{ChecksumAlgorithmKind, ChecksumTypeKind};
+
 use super::{
-    CHECKSUM_TYPE_COMPOSITE, CHECKSUM_TYPE_FULL_OBJECT, ChecksumMetadata,
     CompletedMultipartUploadOutcome, CompletedMultipartUploadRecord, CompletedMultipartUploadState,
-    CompletedObjectPart, KeyMetadata, KeyValue, Multipart, MultipartCompletionPart,
-    MultipartCompletionRequest, MultipartMetadata, MultipartUploadState, MultipartUploadSummary,
-    Sqlite, SqliteError, SqliteResult, checksum_value, decode_base64, decode_md5_hex, encode_hex,
-    row_checksum, row_size, sql_limit, sql_size,
+    CompletedObjectPart, KeyMetadata, KeyValue, Multipart, MultipartChecksumConfig,
+    MultipartCompletionChecksum, MultipartCompletionPart, MultipartCompletionRequest,
+    MultipartMetadata, MultipartUploadState, MultipartUploadSummary, PartChecksum, Sqlite,
+    SqliteError, SqliteResult, StoredChecksum, checksum_value, decode_base64, decode_md5_hex,
+    encode_hex, optional_multipart_checksum_config, optional_part_checksum,
+    required_stored_checksum, row_size, sql_limit, sql_size, stored_checksum,
 };
 
 /// Buffered completed multipart object and its persisted part boundaries.
@@ -20,8 +23,16 @@ struct CompletedMultipartObject {
     value: Vec<u8>,
     size: i64,
     md5: String,
-    checksum: ChecksumMetadata,
+    checksum: StoredChecksum,
     parts: Vec<CompletedObjectPart>,
+}
+
+fn part_checksum_algorithm(checksum: Option<&PartChecksum>) -> Option<ChecksumAlgorithmKind> {
+    checksum.map(PartChecksum::algorithm)
+}
+
+fn part_checksum_value(checksum: Option<&PartChecksum>) -> Option<&str> {
+    checksum.map(PartChecksum::as_str)
 }
 
 impl Sqlite {
@@ -87,9 +98,9 @@ impl Sqlite {
             transaction,
             request.upload_id,
             &request.requested_parts,
-            &upload_state.checksum,
+            upload_state.checksum,
             &request.requested_checksum,
-            request.default_checksum.as_ref(),
+            request.default_checksum,
         )?;
 
         Self::try_check_object_write_conditions(
@@ -113,7 +124,7 @@ impl Sqlite {
                     expires: upload_state.expires,
                     last_modified: OffsetDateTime::now_utc(),
                     md5: Some(completed_object.md5.clone()),
-                    checksum: completed_object.checksum.clone(),
+                    checksum: Some(completed_object.checksum.clone()),
                     is_latest: true,
                     is_delete_marker: false,
                 },
@@ -154,9 +165,9 @@ impl Sqlite {
         transaction: &Transaction,
         upload_id: Uuid,
         requested_parts: &[MultipartCompletionPart],
-        upload_checksum: &ChecksumMetadata,
-        requested_checksum: &ChecksumMetadata,
-        default_checksum: Option<&ChecksumMetadata>,
+        upload_checksum: Option<MultipartChecksumConfig>,
+        requested_checksum: &MultipartCompletionChecksum,
+        default_checksum: MultipartChecksumConfig,
     ) -> SqliteResult<CompletedMultipartObject> {
         let parts = Self::try_get_multiparts(transaction, upload_id)?;
         if parts.len() != requested_parts.len() {
@@ -168,7 +179,7 @@ impl Sqlite {
         let mut part_md5s = Vec::with_capacity(parts.len() * 16);
         let final_part_number = requested_parts.len();
         let mut offset = 0;
-        let algorithm = upload_checksum.algorithm.as_deref();
+        let algorithm = upload_checksum.map(|checksum| checksum.algorithm);
         let require_requested_part_checksums = requested_checksum.has_value();
         for (index, (requested_part, part)) in requested_parts.iter().zip(parts.iter()).enumerate()
         {
@@ -239,7 +250,7 @@ impl Sqlite {
         final_part_number: usize,
         requested_part: &MultipartCompletionPart,
         part: &Multipart,
-        algorithm: Option<&str>,
+        algorithm: Option<ChecksumAlgorithmKind>,
         require_requested_checksum: bool,
     ) -> SqliteResult<()> {
         if part.part_number != requested_part.part_number {
@@ -252,9 +263,17 @@ impl Sqlite {
             return Err(SqliteError::InvalidMultipartPart);
         }
         if let Some(algorithm) = algorithm {
-            match requested_part.checksum.value_for(algorithm) {
+            match requested_part
+                .checksum
+                .as_ref()
+                .and_then(|checksum| checksum.value_for(algorithm))
+            {
                 Some(requested_checksum)
-                    if part.checksum.value_for(algorithm) == Some(requested_checksum) => {}
+                    if part
+                        .checksum
+                        .as_ref()
+                        .and_then(|checksum| checksum.value_for(algorithm))
+                        == Some(requested_checksum) => {}
                 Some(_) => return Err(SqliteError::ChecksumMismatch),
                 None if require_requested_checksum => return Err(SqliteError::ChecksumMismatch),
                 None => {}
@@ -265,64 +284,44 @@ impl Sqlite {
 
     /// Computes and validates the final checksum for a completed multipart object.
     fn try_completed_multipart_checksum(
-        upload_checksum: &ChecksumMetadata,
-        requested_checksum: &ChecksumMetadata,
-        default_checksum: Option<&ChecksumMetadata>,
+        upload_checksum: Option<MultipartChecksumConfig>,
+        requested_checksum: &MultipartCompletionChecksum,
+        default_checksum: MultipartChecksumConfig,
         value: &[u8],
         parts: &[CompletedObjectPart],
-    ) -> SqliteResult<ChecksumMetadata> {
-        let empty_default_checksum = ChecksumMetadata::default();
-        let default_checksum = default_checksum.unwrap_or(&empty_default_checksum);
+    ) -> SqliteResult<crate::checksum::StoredChecksum> {
         let algorithm = upload_checksum
-            .algorithm
-            .as_deref()
-            .or(requested_checksum.algorithm.as_deref())
-            .or(default_checksum.algorithm.as_deref());
-        let Some(algorithm) = algorithm else {
-            if requested_checksum.has_value() {
-                return Err(SqliteError::ChecksumMismatch);
-            }
-            return Ok(ChecksumMetadata::default());
-        };
+            .map(|checksum| checksum.algorithm)
+            .or(requested_checksum.algorithm())
+            .unwrap_or(default_checksum.algorithm);
 
-        let checksum_type =
-            if upload_checksum.algorithm.is_some() || requested_checksum.algorithm.is_some() {
-                requested_checksum
-                    .checksum_type
-                    .as_deref()
-                    .or(upload_checksum.checksum_type.as_deref())
-                    .or(default_checksum.checksum_type.as_deref())
-                    .unwrap_or(CHECKSUM_TYPE_COMPOSITE)
-            } else {
-                default_checksum
-                    .checksum_type
-                    .as_deref()
-                    .or(requested_checksum.checksum_type.as_deref())
-                    .unwrap_or(CHECKSUM_TYPE_COMPOSITE)
-            };
+        let checksum_type = if upload_checksum.is_some() || requested_checksum.algorithm().is_some()
+        {
+            requested_checksum
+                .checksum_type()
+                .or(upload_checksum.map(|checksum| checksum.checksum_type))
+                .unwrap_or(default_checksum.checksum_type)
+        } else {
+            default_checksum.checksum_type
+        };
         let computed = match checksum_type {
-            CHECKSUM_TYPE_FULL_OBJECT => checksum_value(algorithm, value)?,
-            CHECKSUM_TYPE_COMPOSITE => {
+            ChecksumTypeKind::FullObject => checksum_value(algorithm, value),
+            ChecksumTypeKind::Composite => {
                 let mut combined = Vec::new();
                 for part in parts {
                     let checksum = part
                         .checksum
-                        .value_for(algorithm)
+                        .as_ref()
+                        .and_then(|checksum| checksum.value_for(algorithm))
                         .ok_or(SqliteError::ChecksumMismatch)?;
                     let checksum = decode_base64(checksum).ok_or(SqliteError::ChecksumMismatch)?;
                     combined.extend_from_slice(&checksum);
                 }
-                format!("{}-{}", checksum_value(algorithm, &combined)?, parts.len())
+                format!("{}-{}", checksum_value(algorithm, &combined), parts.len())
             }
-            _ => return Err(SqliteError::ChecksumMismatch),
         };
 
-        let mut checksum = ChecksumMetadata {
-            algorithm: Some(algorithm.to_string()),
-            checksum_type: Some(checksum_type.to_string()),
-            ..ChecksumMetadata::default()
-        };
-        checksum.set_value(algorithm, computed)?;
+        let checksum = stored_checksum(algorithm, checksum_type, computed)?;
 
         if let Some(requested) = requested_checksum.value_for(algorithm)
             && checksum.value_for(algorithm) != Some(requested)
@@ -355,9 +354,10 @@ impl Sqlite {
                 cache_control,
                 expires,
                 checksum_algorithm,
-                checksum_type
+                checksum_type,
+                checksum_value
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13);",
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14);",
         )?;
 
         let now = OffsetDateTime::now_utc();
@@ -377,8 +377,9 @@ impl Sqlite {
             state.content_encoding,
             state.cache_control,
             state.expires,
-            state.checksum.algorithm.as_deref(),
-            state.checksum.checksum_type.as_deref(),
+            state.checksum.map(|checksum| checksum.algorithm),
+            state.checksum.map(|checksum| checksum.checksum_type),
+            Option::<String>::None,
         ))?)
     }
 
@@ -399,7 +400,8 @@ impl Sqlite {
                 cache_control,
                 expires,
                 checksum_algorithm,
-                checksum_type
+                checksum_type,
+                checksum_value
             FROM multipart_upload
             WHERE upload_id = ?1 AND bucket = ?2 AND key = ?3;",
         )?;
@@ -423,11 +425,11 @@ impl Sqlite {
                     content_encoding: row.get(3)?,
                     cache_control: row.get(4)?,
                     expires: row.get(5)?,
-                    checksum: ChecksumMetadata {
-                        algorithm: row.get(6)?,
-                        checksum_type: row.get(7)?,
-                        ..ChecksumMetadata::default()
-                    },
+                    checksum: optional_multipart_checksum_config(
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    )?,
                 })
             })
             .optional()?)
@@ -462,17 +464,14 @@ impl Sqlite {
                 md5,
                 version_id,
                 returned_version_id,
+                checksum_algorithm,
                 checksum_type,
-                checksum_crc32,
-                checksum_crc32c,
-                checksum_crc64nvme,
-                checksum_sha1,
-                checksum_sha256,
+                checksum_value,
                 last_modified
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             ON CONFLICT(upload_id) DO UPDATE
-            SET bucket=excluded.bucket, key=excluded.key, access_key=excluded.access_key, md5=excluded.md5, version_id=excluded.version_id, returned_version_id=excluded.returned_version_id, checksum_type=excluded.checksum_type, checksum_crc32=excluded.checksum_crc32, checksum_crc32c=excluded.checksum_crc32c, checksum_crc64nvme=excluded.checksum_crc64nvme, checksum_sha1=excluded.checksum_sha1, checksum_sha256=excluded.checksum_sha256, last_modified=excluded.last_modified;",
+            SET bucket=excluded.bucket, key=excluded.key, access_key=excluded.access_key, md5=excluded.md5, version_id=excluded.version_id, returned_version_id=excluded.returned_version_id, checksum_algorithm=excluded.checksum_algorithm, checksum_type=excluded.checksum_type, checksum_value=excluded.checksum_value, last_modified=excluded.last_modified;",
         )?;
 
         Ok(stmt.execute((
@@ -483,12 +482,9 @@ impl Sqlite {
             record.md5,
             record.version_id,
             record.returned_version_id,
-            record.checksum.checksum_type.as_deref(),
-            record.checksum.crc32.as_deref(),
-            record.checksum.crc32c.as_deref(),
-            record.checksum.crc64nvme.as_deref(),
-            record.checksum.sha1.as_deref(),
-            record.checksum.sha256.as_deref(),
+            record.checksum.algorithm(),
+            record.checksum.checksum_type(),
+            record.checksum.as_str(),
             OffsetDateTime::now_utc(),
         ))?)
     }
@@ -507,12 +503,9 @@ impl Sqlite {
                 md5,
                 version_id,
                 returned_version_id,
+                checksum_algorithm,
                 checksum_type,
-                checksum_crc32,
-                checksum_crc32c,
-                checksum_crc64nvme,
-                checksum_sha1,
-                checksum_sha256
+                checksum_value
             FROM completed_multipart_upload
             WHERE upload_id = ?1 AND bucket = ?2 AND key = ?3;",
         )?;
@@ -524,7 +517,7 @@ impl Sqlite {
                     md5: row.get(1)?,
                     version_id: row.get(2)?,
                     returned_version_id: row.get(3)?,
-                    checksum: row_checksum(row, None, Some(4), 5)?,
+                    checksum: required_stored_checksum(row.get(4)?, row.get(5)?, row.get(6)?)?,
                 })
             })
             .optional()?)
@@ -544,15 +537,13 @@ impl Sqlite {
                 value,
                 size,
                 md5,
-                checksum_crc32,
-                checksum_crc32c,
-                checksum_crc64nvme,
-                checksum_sha1,
-                checksum_sha256
+                checksum_algorithm,
+                checksum_type,
+                checksum_value
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             ON CONFLICT(upload_id, part_number) DO UPDATE
-            SET last_modified=excluded.last_modified, value=excluded.value, size=excluded.size, md5=excluded.md5, checksum_crc32=excluded.checksum_crc32, checksum_crc32c=excluded.checksum_crc32c, checksum_crc64nvme=excluded.checksum_crc64nvme, checksum_sha1=excluded.checksum_sha1, checksum_sha256=excluded.checksum_sha256;",
+            SET last_modified=excluded.last_modified, value=excluded.value, size=excluded.size, md5=excluded.md5, checksum_algorithm=excluded.checksum_algorithm, checksum_type=excluded.checksum_type, checksum_value=excluded.checksum_value;",
         )?;
 
         let size = sql_size(multipart.size)?;
@@ -563,11 +554,9 @@ impl Sqlite {
             multipart.value,
             size,
             multipart.md5,
-            multipart.checksum.crc32.as_deref(),
-            multipart.checksum.crc32c.as_deref(),
-            multipart.checksum.crc64nvme.as_deref(),
-            multipart.checksum.sha1.as_deref(),
-            multipart.checksum.sha256.as_deref(),
+            part_checksum_algorithm(multipart.checksum.as_ref()),
+            Option::<ChecksumTypeKind>::None,
+            part_checksum_value(multipart.checksum.as_ref()),
         ))?)
     }
 
@@ -586,11 +575,9 @@ impl Sqlite {
                 part_number,
                 size,
                 md5,
-                checksum_crc32,
-                checksum_crc32c,
-                checksum_crc64nvme,
-                checksum_sha1,
-                checksum_sha256
+                checksum_algorithm,
+                checksum_type,
+                checksum_value
             FROM multipart_upload_part
             WHERE upload_id = ?1
                 AND part_number > ?2
@@ -606,7 +593,7 @@ impl Sqlite {
                     part_number: row.get(1)?,
                     size: row_size(row, 2)?,
                     md5: row.get(3)?,
-                    checksum: row_checksum(row, None, None, 4)?,
+                    checksum: optional_part_checksum(row.get(4)?, row.get(5)?, row.get(6)?)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -629,18 +616,18 @@ impl Sqlite {
                 key: row.get(0)?,
                 upload_id: row.get(1)?,
                 initiated: row.get(2)?,
-                checksum: ChecksumMetadata {
-                    algorithm: row.get(3)?,
-                    checksum_type: row.get(4)?,
-                    ..ChecksumMetadata::default()
-                },
+                checksum: optional_multipart_checksum_config(
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                )?,
             })
         };
 
         let uploads = match (prefix, after_key, after_upload_id) {
             (Some(prefix), Some(after_key), Some(after_upload_id)) => {
                 let mut stmt = transaction.prepare_cached(
-                    "SELECT key, upload_id, initiated, checksum_algorithm, checksum_type FROM multipart_upload WHERE key >= ?1 AND (key > ?2 OR (key = ?2 AND upload_id > ?3)) ORDER BY key, upload_id LIMIT ?4;",
+                    "SELECT key, upload_id, initiated, checksum_algorithm, checksum_type, checksum_value FROM multipart_upload WHERE key >= ?1 AND (key > ?2 OR (key = ?2 AND upload_id > ?3)) ORDER BY key, upload_id LIMIT ?4;",
                 )?;
                 stmt.query_map(
                     rusqlite::params![prefix, after_key, after_upload_id, limit],
@@ -650,21 +637,21 @@ impl Sqlite {
             }
             (Some(prefix), Some(after_key), None) => {
                 let mut stmt = transaction.prepare_cached(
-                    "SELECT key, upload_id, initiated, checksum_algorithm, checksum_type FROM multipart_upload WHERE key >= ?1 AND key > ?2 ORDER BY key, upload_id LIMIT ?3;",
+                    "SELECT key, upload_id, initiated, checksum_algorithm, checksum_type, checksum_value FROM multipart_upload WHERE key >= ?1 AND key > ?2 ORDER BY key, upload_id LIMIT ?3;",
                 )?;
                 stmt.query_map(rusqlite::params![prefix, after_key, limit], map_upload)?
                     .collect::<rusqlite::Result<Vec<_>>>()?
             }
             (Some(prefix), None, _) => {
                 let mut stmt = transaction.prepare_cached(
-                    "SELECT key, upload_id, initiated, checksum_algorithm, checksum_type FROM multipart_upload WHERE key >= ?1 ORDER BY key, upload_id LIMIT ?2;",
+                    "SELECT key, upload_id, initiated, checksum_algorithm, checksum_type, checksum_value FROM multipart_upload WHERE key >= ?1 ORDER BY key, upload_id LIMIT ?2;",
                 )?;
                 stmt.query_map(rusqlite::params![prefix, limit], map_upload)?
                     .collect::<rusqlite::Result<Vec<_>>>()?
             }
             (None, Some(after_key), Some(after_upload_id)) => {
                 let mut stmt = transaction.prepare_cached(
-                    "SELECT key, upload_id, initiated, checksum_algorithm, checksum_type FROM multipart_upload WHERE key > ?1 OR (key = ?1 AND upload_id > ?2) ORDER BY key, upload_id LIMIT ?3;",
+                    "SELECT key, upload_id, initiated, checksum_algorithm, checksum_type, checksum_value FROM multipart_upload WHERE key > ?1 OR (key = ?1 AND upload_id > ?2) ORDER BY key, upload_id LIMIT ?3;",
                 )?;
                 stmt.query_map(
                     rusqlite::params![after_key, after_upload_id, limit],
@@ -674,14 +661,14 @@ impl Sqlite {
             }
             (None, Some(after_key), None) => {
                 let mut stmt = transaction.prepare_cached(
-                    "SELECT key, upload_id, initiated, checksum_algorithm, checksum_type FROM multipart_upload WHERE key > ?1 ORDER BY key, upload_id LIMIT ?2;",
+                    "SELECT key, upload_id, initiated, checksum_algorithm, checksum_type, checksum_value FROM multipart_upload WHERE key > ?1 ORDER BY key, upload_id LIMIT ?2;",
                 )?;
                 stmt.query_map(rusqlite::params![after_key, limit], map_upload)?
                     .collect::<rusqlite::Result<Vec<_>>>()?
             }
             (None, None, _) => {
                 let mut stmt = transaction.prepare_cached(
-                    "SELECT key, upload_id, initiated, checksum_algorithm, checksum_type FROM multipart_upload ORDER BY key, upload_id LIMIT ?1;",
+                    "SELECT key, upload_id, initiated, checksum_algorithm, checksum_type, checksum_value FROM multipart_upload ORDER BY key, upload_id LIMIT ?1;",
                 )?;
                 stmt.query_map([limit], map_upload)?
                     .collect::<rusqlite::Result<Vec<_>>>()?
@@ -705,11 +692,9 @@ impl Sqlite {
                 start,
                 size,
                 md5,
-                checksum_crc32,
-                checksum_crc32c,
-                checksum_crc64nvme,
-                checksum_sha1,
-                checksum_sha256
+                checksum_algorithm,
+                checksum_type,
+                checksum_value
             FROM completed_object_part
             WHERE key = ?1 AND version_id = ?2 AND part_number = ?3;",
         )?;
@@ -721,7 +706,7 @@ impl Sqlite {
                     start: row_size(row, 1)?,
                     size: row_size(row, 2)?,
                     md5: row.get(3)?,
-                    checksum: row_checksum(row, None, None, 4)?,
+                    checksum: optional_part_checksum(row.get(4)?, row.get(5)?, row.get(6)?)?,
                 })
             })
             .optional()?)
@@ -743,11 +728,9 @@ impl Sqlite {
                 start,
                 size,
                 md5,
-                checksum_crc32,
-                checksum_crc32c,
-                checksum_crc64nvme,
-                checksum_sha1,
-                checksum_sha256
+                checksum_algorithm,
+                checksum_type,
+                checksum_value
             FROM completed_object_part
             WHERE key = ?1
                 AND version_id = ?2
@@ -763,7 +746,7 @@ impl Sqlite {
                     start: row_size(row, 1)?,
                     size: row_size(row, 2)?,
                     md5: row.get(3)?,
-                    checksum: row_checksum(row, None, None, 4)?,
+                    checksum: optional_part_checksum(row.get(4)?, row.get(5)?, row.get(6)?)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?)
@@ -798,13 +781,11 @@ impl Sqlite {
                 start,
                 size,
                 md5,
-                checksum_crc32,
-                checksum_crc32c,
-                checksum_crc64nvme,
-                checksum_sha1,
-                checksum_sha256
+                checksum_algorithm,
+                checksum_type,
+                checksum_value
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11);",
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);",
         )?;
 
         for part in parts {
@@ -815,11 +796,9 @@ impl Sqlite {
                 sql_size(part.start)?,
                 sql_size(part.size)?,
                 &part.md5,
-                part.checksum.crc32.as_deref(),
-                part.checksum.crc32c.as_deref(),
-                part.checksum.crc64nvme.as_deref(),
-                part.checksum.sha1.as_deref(),
-                part.checksum.sha256.as_deref(),
+                part_checksum_algorithm(part.checksum.as_ref()),
+                Option::<ChecksumTypeKind>::None,
+                part_checksum_value(part.checksum.as_ref()),
             ))?;
         }
 
@@ -839,11 +818,9 @@ impl Sqlite {
                 value,
                 size,
                 md5,
-                checksum_crc32,
-                checksum_crc32c,
-                checksum_crc64nvme,
-                checksum_sha1,
-                checksum_sha256
+                checksum_algorithm,
+                checksum_type,
+                checksum_value
             FROM multipart_upload_part
             WHERE upload_id = ?1
             ORDER BY part_number;",
@@ -859,7 +836,7 @@ impl Sqlite {
                     value: row.get(2)?,
                     size: row_size(row, 3)?,
                     md5: row.get(4)?,
-                    checksum: row_checksum(row, None, None, 5)?,
+                    checksum: optional_part_checksum(row.get(5)?, row.get(6)?, row.get(7)?)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

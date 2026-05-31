@@ -1,17 +1,18 @@
 use std::{collections::HashMap, ops::Range as ByteRange};
 
 use super::{
-    Bytes, CONTENT_MD5, ChecksumAlgorithmKind, ChecksumInput, ChecksumMetadata, ChecksumMode,
-    ChecksumPolicy, ChecksumType, CompletedObjectPart, CopyObjectInput, CopyObjectOutput,
-    CopyObjectResult, CopySource, DeleteError, DeleteObjectInput, DeleteObjectOutput,
-    DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, Digest, ETag, ETagCondition,
-    GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectAttributesParts, GetObjectInput,
-    GetObjectOutput, HeadObjectInput, HeadObjectOutput, InternalError, KeyMetadata, KeyValue, Md5,
+    Bytes, CONTENT_MD5, ChecksumAlgorithmKind, ChecksumInput, ChecksumMode, ChecksumPolicy,
+    ChecksumTypeKind, CompletedObjectPart, CopyObjectInput, CopyObjectOutput, CopyObjectResult,
+    CopySource, DeleteError, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput,
+    DeleteObjectsOutput, DeletedObject, Digest, ETag, ETagCondition, GetObjectAttributesInput,
+    GetObjectAttributesOutput, GetObjectAttributesParts, GetObjectInput, GetObjectOutput,
+    HeadObjectInput, HeadObjectOutput, InternalError, KeyMetadata, KeyValue, Md5,
     MetadataDirective, Not, ObjectAttributes, ObjectDeleteConditions, ObjectDeleteOutcome,
     ObjectPart, ObjectReadConditionFailure, ObjectReadConditions, OffsetDateTime, PutObjectInput,
     PutObjectOutput, S3Error, S3ErrorCode, S3Range, S3Request, S3Response, S3Result, Sqlite,
-    SqliteError, SqliteResult, StorageClass, StreamingBlob, TryStreamExt,
-    checksum_algorithm_from_request, checksum_mode_enabled, checksum_struct, checksum_type_output,
+    SqliteError, SqliteResult, StorageClass, StoredChecksum, StreamingBlob, TryStreamExt,
+    checksum_algorithm_from_request, checksum_crc32, checksum_crc32c, checksum_crc64nvme,
+    checksum_mode_enabled, checksum_sha1, checksum_sha256, checksum_struct, checksum_type_output,
     copy_bytes, debug, hex, list_limit, not_found_delete_marker_error, not_modified_error,
     object_checksum_for_part, object_write_checksum_from_value, object_write_conditions,
     requested_part_range, s3_error, s3_error_from_sqlite, s3_error_with_message, stream,
@@ -152,7 +153,7 @@ fn load_copy_source_object(
 fn prepare_copied_object(
     mut object: KeyValue,
     request: &CopyObjectRequest,
-) -> SqliteResult<(KeyValue, ChecksumMetadata)> {
+) -> SqliteResult<(KeyValue, StoredChecksum)> {
     object.key.clone_from(&request.target_key);
     object.key_metadata.last_modified = OffsetDateTime::now_utc();
     if request.replace_metadata {
@@ -172,22 +173,22 @@ fn prepare_copied_object(
         object.key_metadata.expires = request.expires;
     }
     let checksum = object_write_checksum_from_value(request.target_checksum_kind, &object)?;
-    object.key_metadata.checksum = checksum.clone();
+    object.key_metadata.checksum = Some(checksum.clone());
     Ok((object, checksum))
 }
 
 fn copy_object_result(
-    checksum: ChecksumMetadata,
+    checksum: &StoredChecksum,
     md5: Option<String>,
     last_modified: OffsetDateTime,
 ) -> CopyObjectResult {
-    let checksum_type = checksum_type_output(&checksum);
+    let checksum_type = checksum_type_output(checksum);
     CopyObjectResult {
-        checksum_crc32: checksum.crc32,
-        checksum_crc32c: checksum.crc32c,
-        checksum_crc64nvme: checksum.crc64nvme,
-        checksum_sha1: checksum.sha1,
-        checksum_sha256: checksum.sha256,
+        checksum_crc32: checksum_crc32(checksum),
+        checksum_crc32c: checksum_crc32c(checksum),
+        checksum_crc64nvme: checksum_crc64nvme(checksum),
+        checksum_sha1: checksum_sha1(checksum),
+        checksum_sha256: checksum_sha256(checksum),
         checksum_type,
         e_tag: md5.map(ETag::Strong),
         last_modified: Some(last_modified.into()),
@@ -214,7 +215,7 @@ async fn copy_object_same_bucket(
             let (object, checksum) = prepare_copied_object(object, &request)?;
             let write_outcome = Sqlite::try_put_object(&transaction, object)?;
             let result = copy_object_result(
-                checksum,
+                &checksum,
                 write_outcome.md5.clone(),
                 write_outcome.last_modified,
             );
@@ -258,7 +259,7 @@ async fn copy_object_cross_bucket(
             let transaction = connection.transaction()?;
             let write_outcome = Sqlite::try_put_object(&transaction, object)?;
             let result = copy_object_result(
-                checksum,
+                &checksum,
                 write_outcome.md5.clone(),
                 write_outcome.last_modified,
             );
@@ -530,16 +531,16 @@ fn content_range_header(
 }
 
 fn response_checksum(
-    object_checksum: &ChecksumMetadata,
+    object_checksum: Option<&StoredChecksum>,
     completed_part: Option<&CompletedObjectPart>,
     part_number_requested: bool,
     checksum_mode: Option<&ChecksumMode>,
     range_requested: bool,
-) -> ChecksumMetadata {
+) -> Option<StoredChecksum> {
     if part_number_requested || (checksum_mode_enabled(checksum_mode) && range_requested.not()) {
         object_checksum_for_part(object_checksum, completed_part)
     } else {
-        ChecksumMetadata::default()
+        None
     }
 }
 
@@ -676,7 +677,7 @@ fn get_object_output(
     let value = Bytes::from(value).slice(start..end);
     let body = stream::once(async { Ok(value) });
     let response_checksum = response_checksum(
-        &key_metadata.checksum,
+        key_metadata.checksum.as_ref(),
         read.completed_part.as_ref(),
         part_number.is_some(),
         checksum_mode,
@@ -688,11 +689,11 @@ fn get_object_output(
         body: Some(StreamingBlob::wrap::<_, S3Error>(body)),
         accept_ranges: Some("bytes".to_string()),
         cache_control: key_metadata.cache_control,
-        checksum_crc32: response_checksum.crc32,
-        checksum_crc32c: response_checksum.crc32c,
-        checksum_crc64nvme: response_checksum.crc64nvme,
-        checksum_sha1: response_checksum.sha1,
-        checksum_sha256: response_checksum.sha256,
+        checksum_crc32: checksum_crc32(&response_checksum),
+        checksum_crc32c: checksum_crc32c(&response_checksum),
+        checksum_crc64nvme: checksum_crc64nvme(&response_checksum),
+        checksum_sha1: checksum_sha1(&response_checksum),
+        checksum_sha256: checksum_sha256(&response_checksum),
         checksum_type,
         content_encoding: key_metadata.content_encoding,
         content_range: content_range_header(
@@ -745,7 +746,7 @@ fn head_object_output(
     let content_length =
         i64::try_from(object_range.end - object_range.start).map_err(S3Error::internal_error)?;
     let response_checksum = response_checksum(
-        &object.checksum,
+        object.checksum.as_ref(),
         read.completed_part.as_ref(),
         part_number.is_some(),
         checksum_mode,
@@ -756,11 +757,11 @@ fn head_object_output(
     Ok(HeadObjectOutput {
         accept_ranges: Some("bytes".to_string()),
         cache_control: object.cache_control,
-        checksum_crc32: response_checksum.crc32,
-        checksum_crc32c: response_checksum.crc32c,
-        checksum_crc64nvme: response_checksum.crc64nvme,
-        checksum_sha1: response_checksum.sha1,
-        checksum_sha256: response_checksum.sha256,
+        checksum_crc32: checksum_crc32(&response_checksum),
+        checksum_crc32c: checksum_crc32c(&response_checksum),
+        checksum_crc64nvme: checksum_crc64nvme(&response_checksum),
+        checksum_sha1: checksum_sha1(&response_checksum),
+        checksum_sha256: checksum_sha256(&response_checksum),
         checksum_type,
         content_encoding: object.content_encoding,
         content_length: Some(content_length),
@@ -881,11 +882,11 @@ fn object_attributes_parts(
     let parts = parts
         .into_iter()
         .map(|part| ObjectPart {
-            checksum_crc32: part.checksum.crc32,
-            checksum_crc32c: part.checksum.crc32c,
-            checksum_crc64nvme: part.checksum.crc64nvme,
-            checksum_sha1: part.checksum.sha1,
-            checksum_sha256: part.checksum.sha256,
+            checksum_crc32: checksum_crc32(&part.checksum),
+            checksum_crc32c: checksum_crc32c(&part.checksum),
+            checksum_crc64nvme: checksum_crc64nvme(&part.checksum),
+            checksum_sha1: checksum_sha1(&part.checksum),
+            checksum_sha256: checksum_sha256(&part.checksum),
             part_number: Some(part.part_number),
             size: Some(part.size),
         })
@@ -1009,7 +1010,7 @@ struct BufferedObjectBody {
     value: Vec<u8>,
     size: i64,
     md5: String,
-    checksum: ChecksumMetadata,
+    checksum: StoredChecksum,
 }
 
 async fn read_put_object_body(
@@ -1036,7 +1037,7 @@ async fn read_put_object_body(
         &checksum_input,
         &value,
         ChecksumPolicy::DefaultCrc64NvmeFullObject,
-        Some(ChecksumType::FULL_OBJECT),
+        ChecksumTypeKind::FullObject,
     )?;
 
     Ok(BufferedObjectBody {
@@ -1059,18 +1060,18 @@ fn validate_put_storage_class(storage_class: Option<&StorageClass>) -> S3Result<
 
 fn put_object_output(
     md5: String,
-    checksum: ChecksumMetadata,
+    checksum: &StoredChecksum,
     version_id: Option<String>,
 ) -> PutObjectOutput {
-    let checksum_type = checksum_type_output(&checksum);
+    let checksum_type = checksum_type_output(checksum);
     PutObjectOutput {
         e_tag: Some(ETag::Strong(md5)),
         version_id,
-        checksum_crc32: checksum.crc32,
-        checksum_crc32c: checksum.crc32c,
-        checksum_crc64nvme: checksum.crc64nvme,
-        checksum_sha1: checksum.sha1,
-        checksum_sha256: checksum.sha256,
+        checksum_crc32: checksum_crc32(checksum),
+        checksum_crc32c: checksum_crc32c(checksum),
+        checksum_crc64nvme: checksum_crc64nvme(checksum),
+        checksum_sha1: checksum_sha1(checksum),
+        checksum_sha256: checksum_sha256(checksum),
         checksum_type,
         ..Default::default()
     }
@@ -1172,7 +1173,7 @@ pub(super) async fn put_object(
                         expires: expires.map(Into::into),
                         last_modified: OffsetDateTime::now_utc(),
                         md5: Some(md5_clone),
-                        checksum: checksum_clone,
+                        checksum: Some(checksum_clone),
                         is_latest: true,
                         is_delete_marker: false,
                     },
@@ -1184,6 +1185,6 @@ pub(super) async fn put_object(
         .await
         .map_err(s3_error_from_sqlite)?;
 
-    let output = put_object_output(md5, checksum, write_outcome.returned_version_id);
+    let output = put_object_output(md5, &checksum, write_outcome.returned_version_id);
     Ok(S3Response::new(output))
 }
