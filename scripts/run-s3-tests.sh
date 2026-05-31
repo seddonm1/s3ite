@@ -75,14 +75,6 @@ host: $s3ite_host
 port: $s3ite_port
 access_key: $s3ite_access_key
 secret_key: $s3ite_secret_key
-permissive_cors: true
-concurrency_limit: 16
-readers: 4
-read_only: false
-journal_mode: WAL
-synchronous: NORMAL
-temp_store: MEMORY
-cache_size: 65536
 EOF
 }
 

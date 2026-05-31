@@ -8,8 +8,21 @@ use std::{
 use clap::{Parser, ValueEnum};
 use serde::Deserialize;
 
+/// Result type returned by binary configuration loading.
 #[cfg(feature = "binary")]
-use crate::error::{Result, S3ite};
+pub type ConfigResult<T> = std::result::Result<T, ConfigError>;
+
+/// Errors raised while loading binary configuration.
+#[cfg(feature = "binary")]
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    /// A configuration file could not be read.
+    #[error("Io {0}")]
+    Io(#[from] std::io::Error),
+    /// A configuration file could not be parsed as YAML.
+    #[error("Yaml {0}")]
+    Yaml(#[from] yaml_serde::Error),
+}
 
 /// Command-line arguments that override YAML or default configuration.
 #[cfg(feature = "binary")]
@@ -78,6 +91,22 @@ struct ConfigArgs {
     /// Controls the number of reader connections to `SQLite`.
     #[clap(long)]
     readers: Option<usize>,
+
+    /// Interval, in seconds, for background database maintenance. Set to `0` to disable.
+    #[clap(long)]
+    maintenance_interval_seconds: Option<u64>,
+
+    /// Number of free pages to reclaim during each maintenance pass. Set to `0` to disable.
+    #[clap(long)]
+    maintenance_vacuum_pages: Option<u32>,
+
+    /// TTL, in seconds, for inactive incomplete multipart uploads. Set to `0` to disable.
+    #[clap(long)]
+    multipart_upload_ttl_seconds: Option<u64>,
+
+    /// TTL, in seconds, for completed multipart idempotency records. Set to `0` to disable.
+    #[clap(long)]
+    completed_multipart_upload_ttl_seconds: Option<u64>,
 }
 
 /// Runtime configuration for the s3ite service.
@@ -115,6 +144,31 @@ pub struct Config {
     #[serde(default = "default_readers")]
     pub readers: usize,
 
+    /// Interval, in seconds, for background database maintenance.
+    ///
+    /// Set to `0` to disable periodic maintenance. Startup cleanup still runs.
+    #[serde(default = "default_maintenance_interval_seconds")]
+    pub maintenance_interval_seconds: u64,
+
+    /// Number of free pages to reclaim during each maintenance pass.
+    ///
+    /// Set to `0` to skip `PRAGMA incremental_vacuum(N)`.
+    #[serde(default = "default_maintenance_vacuum_pages")]
+    pub maintenance_vacuum_pages: u32,
+
+    /// TTL, in seconds, for inactive incomplete multipart uploads.
+    ///
+    /// Set to `0` to disable background cleanup of incomplete multipart
+    /// uploads.
+    #[serde(default = "default_multipart_upload_ttl_seconds")]
+    pub multipart_upload_ttl_seconds: u64,
+
+    /// TTL, in seconds, for completed multipart idempotency records.
+    ///
+    /// Set to `0` to retain completion records until explicitly removed.
+    #[serde(default = "default_completed_upload_ttl_seconds")]
+    pub completed_multipart_upload_ttl_seconds: u64,
+
     /// Allow permissive Cross-Origin Resource Sharing (CORS) requests.
     /// This can be enabled to allow users to access this service from a web service running on a different host.
     #[serde(default = "default_permissive_cors")]
@@ -146,6 +200,10 @@ impl Default for Config {
             secret_key: None,
             concurrency_limit: default_concurrency_limit(),
             readers: default_readers(),
+            maintenance_interval_seconds: default_maintenance_interval_seconds(),
+            maintenance_vacuum_pages: default_maintenance_vacuum_pages(),
+            multipart_upload_ttl_seconds: default_multipart_upload_ttl_seconds(),
+            completed_multipart_upload_ttl_seconds: default_completed_upload_ttl_seconds(),
             permissive_cors: default_permissive_cors(),
             read_only: default_read_only(),
             domain_name: None,
@@ -162,7 +220,7 @@ impl Config {
     ///
     /// Returns an error if the configured YAML file cannot be read or parsed.
     #[cfg(feature = "binary")]
-    pub fn from_args() -> Result<Self> {
+    pub fn from_args() -> ConfigResult<Self> {
         Self::from_config_args(ConfigArgs::parse())
     }
 
@@ -175,13 +233,13 @@ impl Config {
     ///
     /// Returns an error if the YAML file cannot be read or parsed.
     #[cfg(feature = "binary")]
-    fn from_config_args(args: ConfigArgs) -> Result<Self> {
+    fn from_config_args(args: ConfigArgs) -> ConfigResult<Self> {
         let mut config = args
             .config
             .as_ref()
             .map(|path| {
                 let config = std::fs::read_to_string(path)?;
-                Ok::<_, S3ite>(yaml_serde::from_str::<Self>(&config)?)
+                Ok::<_, ConfigError>(yaml_serde::from_str::<Self>(&config)?)
             })
             .transpose()?
             .unwrap_or_default();
@@ -220,6 +278,20 @@ impl Config {
         }
         if let Some(readers) = args.readers {
             self.readers = readers;
+        }
+        if let Some(maintenance_interval_seconds) = args.maintenance_interval_seconds {
+            self.maintenance_interval_seconds = maintenance_interval_seconds;
+        }
+        if let Some(maintenance_vacuum_pages) = args.maintenance_vacuum_pages {
+            self.maintenance_vacuum_pages = maintenance_vacuum_pages;
+        }
+        if let Some(multipart_upload_ttl_seconds) = args.multipart_upload_ttl_seconds {
+            self.multipart_upload_ttl_seconds = multipart_upload_ttl_seconds;
+        }
+        if let Some(completed_multipart_upload_ttl_seconds) =
+            args.completed_multipart_upload_ttl_seconds
+        {
+            self.completed_multipart_upload_ttl_seconds = completed_multipart_upload_ttl_seconds;
         }
         if let Some(read_only) = args.read_only {
             self.read_only = read_only;
@@ -461,6 +533,22 @@ fn default_readers() -> usize {
     4
 }
 
+fn default_maintenance_interval_seconds() -> u64 {
+    60
+}
+
+fn default_maintenance_vacuum_pages() -> u32 {
+    100
+}
+
+fn default_multipart_upload_ttl_seconds() -> u64 {
+    86_400
+}
+
+fn default_completed_upload_ttl_seconds() -> u64 {
+    86_400
+}
+
 fn default_permissive_cors() -> bool {
     true
 }
@@ -493,6 +581,8 @@ fn default_cache_size() -> u32 {
 mod tests {
     use super::*;
 
+    type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
     #[test]
     fn default_sqlite_cache_size_is_kib() {
         let config = Config::default();
@@ -524,8 +614,7 @@ mod tests {
     }
 
     #[test]
-    fn readers_default_and_deserialize_override()
-    -> std::result::Result<(), Box<dyn std::error::Error>> {
+    fn readers_default_and_deserialize_override() -> TestResult {
         assert_eq!(Config::default().readers, 4);
 
         let config: Config = yaml_serde::from_str("readers: 7\n")?;
@@ -534,9 +623,62 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn maintenance_interval_default_and_deserialize_override() -> TestResult {
+        assert_eq!(Config::default().maintenance_interval_seconds, 60);
+        assert_eq!(Config::default().maintenance_vacuum_pages, 100);
+
+        let config: Config = yaml_serde::from_str(
+            "
+            maintenance_interval_seconds: 300
+            maintenance_vacuum_pages: 42
+            ",
+        )?;
+        assert_eq!(config.maintenance_interval_seconds, 300);
+        assert_eq!(config.maintenance_vacuum_pages, 42);
+
+        let config: Config = yaml_serde::from_str(
+            "
+            maintenance_interval_seconds: 0
+            maintenance_vacuum_pages: 0
+            ",
+        )?;
+        assert_eq!(config.maintenance_interval_seconds, 0);
+        assert_eq!(config.maintenance_vacuum_pages, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn multipart_cleanup_ttls_default_enabled_and_zero_disables() -> TestResult {
+        let config = Config::default();
+        assert_eq!(config.multipart_upload_ttl_seconds, 86_400);
+        assert_eq!(config.completed_multipart_upload_ttl_seconds, 86_400);
+
+        let config: Config = yaml_serde::from_str(
+            "
+            multipart_upload_ttl_seconds: 3600
+            completed_multipart_upload_ttl_seconds: 86400
+            ",
+        )?;
+        assert_eq!(config.multipart_upload_ttl_seconds, 3600);
+        assert_eq!(config.completed_multipart_upload_ttl_seconds, 86400);
+
+        let config: Config = yaml_serde::from_str(
+            "
+            multipart_upload_ttl_seconds: 0
+            completed_multipart_upload_ttl_seconds: 0
+            ",
+        )?;
+        assert_eq!(config.multipart_upload_ttl_seconds, 0);
+        assert_eq!(config.completed_multipart_upload_ttl_seconds, 0);
+
+        Ok(())
+    }
+
     #[cfg(feature = "binary")]
     #[test]
-    fn cli_args_override_yaml_config() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    fn cli_args_override_yaml_config() -> TestResult {
         use clap::Parser as _;
 
         let path = std::env::temp_dir().join(format!("s3ite-{}.yaml", uuid::Uuid::new_v4()));
@@ -545,7 +687,11 @@ mod tests {
             "
             port: 9000
             readers: 2
+            maintenance_interval_seconds: 60
+            maintenance_vacuum_pages: 50
             cache_size: 512
+            multipart_upload_ttl_seconds: 100
+            completed_multipart_upload_ttl_seconds: 200
             ",
         )?;
 
@@ -559,12 +705,24 @@ mod tests {
             "9001",
             "--cache-size",
             "1024",
+            "--maintenance-interval-seconds",
+            "120",
+            "--maintenance-vacuum-pages",
+            "75",
+            "--multipart-upload-ttl-seconds",
+            "300",
+            "--completed-multipart-upload-ttl-seconds",
+            "400",
         ])?;
         let config = Config::from_config_args(args)?;
 
         assert_eq!(config.port, 9001);
         assert_eq!(config.readers, 2);
+        assert_eq!(config.maintenance_interval_seconds, 120);
+        assert_eq!(config.maintenance_vacuum_pages, 75);
         assert_eq!(config.sqlite.cache_size, 1024);
+        assert_eq!(config.multipart_upload_ttl_seconds, 300);
+        assert_eq!(config.completed_multipart_upload_ttl_seconds, 400);
 
         std::fs::remove_file(path).ok();
         Ok(())

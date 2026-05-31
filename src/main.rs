@@ -13,7 +13,7 @@ use hyper_util::{
     server::conn::auto,
     service::TowerToHyperService,
 };
-use s3ite::{Config, Result, S3ite, Sqlite};
+use s3ite::{Config, ConfigError, Sqlite, SqliteError};
 use s3s::{auth::SimpleAuth, host::MultiDomain, service::S3ServiceBuilder};
 use tokio::net::TcpListener;
 use tower::limit::ConcurrencyLimitLayer;
@@ -21,9 +21,23 @@ use tower_http::cors::CorsLayer;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+type MainResult<T> = std::result::Result<T, MainError>;
+
+#[derive(Debug, thiserror::Error)]
+enum MainError {
+    #[error("Config {0}")]
+    Config(#[from] ConfigError),
+    #[error("SQLite {0}")]
+    Sqlite(#[from] SqliteError),
+    #[error("Io {0}")]
+    Io(#[from] std::io::Error),
+    #[error("configuration error: {0}")]
+    Configuration(String),
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
-async fn main() -> Result<()> {
+async fn main() -> MainResult<()> {
     let env_filter = EnvFilter::from_default_env();
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
@@ -44,8 +58,8 @@ async fn main() -> Result<()> {
         // Enable parsing virtual-hosted-style requests
         if let Some(domain_name) = &config.domain_name {
             let domains = [domain_name.as_str()];
-            let domains =
-                MultiDomain::new(&domains).map_err(|err| S3ite::Configuration(err.to_string()))?;
+            let domains = MultiDomain::new(&domains)
+                .map_err(|err| MainError::Configuration(err.to_string()))?;
             s3.set_host(domains);
         }
 

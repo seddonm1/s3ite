@@ -21,7 +21,6 @@ binary = [
     "tokio/signal",
     "tower",
     "tower-http",
-    "tracing-error",
     "tracing-subscriber",
     "yaml_serde",
 ]
@@ -62,7 +61,6 @@ tower-http = { version = "0.6.11", optional = true, default-features = false, fe
     "cors",
 ] }
 tracing = "0.1.44"
-tracing-error = { version = "0.2.1", optional = true }
 tracing-subscriber = { version = "0.3.23", optional = true, features = [
     "env-filter",
     "time",

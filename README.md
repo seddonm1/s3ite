@@ -87,7 +87,8 @@ CREATE TABLE IF NOT EXISTS completed_multipart_upload (
 
 The YAML configuration (provided via the `--config` argument) differs from the command-line options in that it allows parameters to be specified at the `service` and `bucket` levels, whereas the command-line interface provides only `service` level configuration.
 
-The options are:
+The defaults are intended to be enough for normal local execution; set options
+only when a deployment needs to override them. The available options are:
 
 - `root`: The base path where the `.sqlite3` files will be created.
 - `host`: The IP address to listen on for this service.
@@ -96,6 +97,10 @@ The options are:
 - `secret_key`: The secret access key that is used to authenticate for this service.
 - `concurrency_limit`: Enforces a limit on the concurrent number of HTTP requests the service can handle. This can be tuned depending on infrastructure as SSD/HDD will handle resource contention very differently.
 - `readers`: Controls the number of SQLite reader connections. Defaults to `4`.
+- `maintenance_interval_seconds`: Interval for background database maintenance. Defaults to `60`; set to `0` to disable periodic maintenance.
+- `maintenance_vacuum_pages`: Number of free SQLite pages to reclaim with `PRAGMA incremental_vacuum(N)` during each maintenance pass. Defaults to `100`; set to `0` to skip incremental vacuum.
+- `multipart_upload_ttl_seconds`: TTL for inactive incomplete multipart uploads. Defaults to `86400`; set to `0` to disable background cleanup.
+- `completed_multipart_upload_ttl_seconds`: TTL for completed multipart idempotency records. Defaults to `86400`; set to `0` to keep records until explicitly removed.
 - `permissive_cors`: Allow permissive Cross-Origin Resource Sharing (CORS) requests. This can be enabled to allow users to access this service from a web service running on a different host.
 - `domain_name`: The domain to use to allow parsing virtual-hosted-style requests.
 - `read_only`: Prevent mutations to any of the databases connected to this service.
@@ -122,18 +127,8 @@ This design allows setting specific `bucket` level configurations like below whe
 
 ```yaml
 root: /data
-host: 0.0.0.0
-port: 8014
 access_key: AKIAIOSFODNN7EXAMPLE
 secret_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-permissive_cors: true
-concurrency_limit: 16
-readers: 4
-read_only: false
-journal_mode: WAL
-synchronous: NORMAL
-temp_store: MEMORY
-cache_size: 65536
 buckets:
   mybucket:
     read_only: true

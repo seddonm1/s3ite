@@ -16,7 +16,7 @@ use tracing::{debug, error};
 
 use crate::{
     Config,
-    error::{Result, S3ite},
+    sqlite::{SqliteError, SqliteResult},
 };
 
 /// Maximum number of queued commands per worker queue.
@@ -90,7 +90,7 @@ impl BucketConnection {
         path: P,
         config: &Config,
         bucket: &str,
-    ) -> Result<Self> {
+    ) -> SqliteResult<Self> {
         let path = path.as_ref().to_owned();
         let path_clone = path.clone();
 
@@ -98,7 +98,7 @@ impl BucketConnection {
         let bucket = bucket.to_string();
         let readers = config.readers;
         if readers == 0 {
-            return Err(S3ite::Configuration(
+            return Err(SqliteError::Configuration(
                 "readers must be greater than zero".to_string(),
             ));
         }
@@ -138,9 +138,9 @@ impl BucketConnection {
     ///
     /// Returns an error if the connection is closed, the bounded work queue is
     /// full, the response channel closes, or the closure returns an error.
-    pub(crate) async fn write<F, R>(&self, function: F) -> Result<R>
+    pub(crate) async fn write<F, R>(&self, function: F) -> SqliteResult<R>
     where
-        F: FnOnce(&mut rusqlite::Connection) -> Result<R> + 'static + Send,
+        F: FnOnce(&mut rusqlite::Connection) -> SqliteResult<R> + 'static + Send,
         R: Send + 'static,
     {
         self.inner.call(&self.inner.writer_sender, function).await
@@ -155,9 +155,9 @@ impl BucketConnection {
     ///
     /// Returns an error if the connection is closed, the bounded work queue is
     /// full, the response channel closes, or the closure returns an error.
-    pub(crate) async fn read<F, R>(&self, function: F) -> Result<R>
+    pub(crate) async fn read<F, R>(&self, function: F) -> SqliteResult<R>
     where
-        F: FnOnce(&mut rusqlite::Connection) -> Result<R> + 'static + Send,
+        F: FnOnce(&mut rusqlite::Connection) -> SqliteResult<R> + 'static + Send,
         R: Send + 'static,
     {
         self.inner.call(&self.inner.reader_sender, function).await
@@ -172,17 +172,21 @@ impl BucketConnection {
     ///
     /// Returns an error if the blocking close task or a worker thread fails to
     /// join.
-    pub(crate) async fn close(&self) -> Result<()> {
+    pub(crate) async fn close(&self) -> SqliteResult<()> {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || inner.close_blocking())
             .await
-            .map_err(|_| S3ite::ThreadJoin)?
+            .map_err(|_| SqliteError::ThreadJoin)?
     }
 }
 
 impl BucketConnectionInner {
     /// Spawns database worker threads and waits for each connection to open.
-    async fn connect<F, G>(open_writer: F, open_reader: Arc<G>, readers: usize) -> Result<Self>
+    async fn connect<F, G>(
+        open_writer: F,
+        open_reader: Arc<G>,
+        readers: usize,
+    ) -> SqliteResult<Self>
     where
         F: FnOnce() -> rusqlite::Result<rusqlite::Connection> + Send + 'static,
         G: Fn() -> rusqlite::Result<rusqlite::Connection> + Send + Sync + 'static,
@@ -214,15 +218,15 @@ impl BucketConnectionInner {
     }
 
     /// Runs work on the selected worker queue and returns the closure result.
-    async fn call<F, R>(&self, queue: &SyncSender<WorkerCommand>, function: F) -> Result<R>
+    async fn call<F, R>(&self, queue: &SyncSender<WorkerCommand>, function: F) -> SqliteResult<R>
     where
-        F: FnOnce(&mut rusqlite::Connection) -> Result<R> + 'static + Send,
+        F: FnOnce(&mut rusqlite::Connection) -> SqliteResult<R> + 'static + Send,
         R: Send + 'static,
     {
-        let (sender, receiver) = oneshot::channel::<Result<R>>();
+        let (sender, receiver) = oneshot::channel::<SqliteResult<R>>();
 
         if self.closed.load(Ordering::Acquire) {
-            return Err(S3ite::DatabaseQueueClosed);
+            return Err(SqliteError::DatabaseQueueClosed);
         }
 
         queue
@@ -233,34 +237,36 @@ impl BucketConnectionInner {
             .map_err(Self::queue_send_error)?;
 
         if self.closed.load(Ordering::Acquire) {
-            return Err(S3ite::DatabaseQueueClosed);
+            return Err(SqliteError::DatabaseQueueClosed);
         }
 
-        receiver.await?
+        receiver.await.map_err(|_| SqliteError::ThreadJoin)?
     }
 
     /// Waits for a worker thread to finish opening its database connection.
-    async fn wait_for_worker(receiver: oneshot::Receiver<rusqlite::Result<()>>) -> Result<()> {
-        receiver.await.map_err(|_| S3ite::ThreadJoin)??;
+    async fn wait_for_worker(
+        receiver: oneshot::Receiver<rusqlite::Result<()>>,
+    ) -> SqliteResult<()> {
+        receiver.await.map_err(|_| SqliteError::ThreadJoin)??;
         Ok(())
     }
 
     /// Converts bounded queue send failures into database queue errors.
-    fn queue_send_error<T>(error: TrySendError<T>) -> S3ite {
+    fn queue_send_error<T>(error: TrySendError<T>) -> SqliteError {
         match error {
             TrySendError::Full(value) => {
                 drop(value);
-                S3ite::DatabaseQueueFull
+                SqliteError::DatabaseQueueFull
             }
             TrySendError::Disconnected(value) => {
                 drop(value);
-                S3ite::DatabaseQueueClosed
+                SqliteError::DatabaseQueueClosed
             }
         }
     }
 
     /// Signals workers to close and joins their threads.
-    fn close_blocking(&self) -> Result<()> {
+    fn close_blocking(&self) -> SqliteResult<()> {
         let should_signal = self
             .closed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -270,7 +276,7 @@ impl BucketConnectionInner {
             let reader_count = self
                 .reader_handles
                 .lock()
-                .map_err(|_| S3ite::ThreadJoin)?
+                .map_err(|_| SqliteError::ThreadJoin)?
                 .len();
             for _ in 0..reader_count {
                 self.reader_sender.send(WorkerCommand::Close).ok();
@@ -282,7 +288,10 @@ impl BucketConnectionInner {
         let mut join_failed = false;
 
         {
-            let mut reader_handles = self.reader_handles.lock().map_err(|_| S3ite::ThreadJoin)?;
+            let mut reader_handles = self
+                .reader_handles
+                .lock()
+                .map_err(|_| SqliteError::ThreadJoin)?;
             for reader_handle in reader_handles.drain(..) {
                 if reader_handle.join().is_err() {
                     join_failed = true;
@@ -291,7 +300,10 @@ impl BucketConnectionInner {
         }
 
         {
-            let mut writer_handle = self.writer_handle.lock().map_err(|_| S3ite::ThreadJoin)?;
+            let mut writer_handle = self
+                .writer_handle
+                .lock()
+                .map_err(|_| SqliteError::ThreadJoin)?;
             if let Some(writer_handle) = writer_handle.take()
                 && writer_handle.join().is_err()
             {
@@ -300,7 +312,7 @@ impl BucketConnectionInner {
         }
 
         if join_failed {
-            return Err(S3ite::ThreadJoin);
+            return Err(SqliteError::ThreadJoin);
         }
 
         Ok(())
@@ -408,7 +420,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn close_is_idempotent_and_rejects_later_operations() -> Result<()> {
+    async fn close_is_idempotent_and_rejects_later_operations() -> SqliteResult<()> {
         let path = std::env::temp_dir().join(format!("s3ite-{}.sqlite3", uuid::Uuid::new_v4()));
         std::fs::remove_file(&path).ok();
 
@@ -424,7 +436,7 @@ mod tests {
         let Err(err) = connection.read(|_| Ok(())).await else {
             panic!("read after close should fail");
         };
-        assert!(matches!(err, S3ite::DatabaseQueueClosed));
+        assert!(matches!(err, SqliteError::DatabaseQueueClosed));
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(format!("{}-wal", path.to_string_lossy())).ok();

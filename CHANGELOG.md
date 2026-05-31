@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add a `scripts/run-s3-tests.sh` helper for local Ceph `s3-tests` runs with optional pytest arguments, including temp-workspace checkout, `uv` setup, config generation, and local `s3ite` lifecycle management.
 - Add `Config::readers` with a default of `4` and wire it to the existing `--readers` CLI option, separating `SQLite` reader threads from HTTP request concurrency.
+- Add `maintenance_interval_seconds` configuration for periodic database maintenance, with `0` disabling the background task.
+- Add `maintenance_vacuum_pages` configuration for `PRAGMA incremental_vacuum(N)`, with `0` skipping incremental vacuum during maintenance.
+- Add default-on multipart cleanup TTL configuration for inactive incomplete uploads and completed-upload idempotency records, defaulting both to `86400` seconds with `0` disabling each cleanup.
 - Add unversioned `ListObjectVersions` support that reports current objects as `VersionId = null`.
 - Add minimal object ACL reads for conformance tests, returning the stable local owner with full control.
 - Add `AbortMultipartUpload` support.
@@ -22,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Upgrade the crate to Rust edition `2024`.
 - Change the default `SQLite` cache size from `67_108_864` KiB to `65_536` KiB.
 - Rework `SQLite` connection management so read threads are configured independently, database queues fail fast when full or closed, and shutdown joins worker threads instead of busy-waiting.
+- Return `SqliteResult`/`SqliteError` from `SQLite` storage operations, remove the crate-wide `S3ite` error module, and map storage outcomes to S3 errors at the service boundary.
 - Replace process-global listing continuation snapshots with keyset pagination over ordered keys.
 - Reduce the direct dependency surface by removing unused dependencies, feature-gating binary-only crates, and replacing `crossbeam-channel` worker queues with `std::sync::mpsc::sync_channel`.
 - Ignore local reference clones and local `s3-tests` runtime artifacts.
@@ -40,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Compute multipart ETags as `md5(concat(part-md5s))-N` and build completed objects with preallocated buffers.
 - Allow resent multipart parts to replace the previous stored part.
 - Make repeated multipart completion idempotently return the completed multipart ETag.
+- Refresh incomplete multipart upload activity when parts are uploaded, so cleanup is based on inactivity rather than creation time.
 - Return `InvalidDigest` for malformed `Content-MD5` values while preserving `BadDigest` for valid digests that do not match the request body.
 - Remove stray stdout from bucket creation.
 
