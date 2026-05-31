@@ -668,6 +668,12 @@ impl Sqlite {
         }
 
         let current = Self::try_get_metadata(transaction, key)?;
+        if current.is_none()
+            && matches!(conditions.if_match.as_ref(), Some(ObjectTagCondition::Any))
+        {
+            return Err(SqliteError::ObjectNotFound);
+        }
+
         let current_md5 = current
             .as_ref()
             .and_then(|metadata| metadata.md5.as_deref());

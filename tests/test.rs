@@ -495,7 +495,11 @@ async fn test_get_and_head_object_conditionals() -> Result<()> {
     else {
         anyhow::bail!("matching If-None-Match should return NotModified");
     };
-    assert_error_contains(err, "NotModified");
+    let response = err
+        .raw_response()
+        .ok_or_else(|| anyhow::anyhow!("NotModified response missing raw response"))?;
+    assert_eq!(response.headers().get("etag"), Some(etag.as_str()));
+    assert_error_contains(&err, "NotModified");
 
     let Err(err) = context
         .head_object()
@@ -519,7 +523,11 @@ async fn test_get_and_head_object_conditionals() -> Result<()> {
     else {
         anyhow::bail!("unmodified object should return NotModified");
     };
-    assert_error_contains(err, "NotModified");
+    let response = err
+        .raw_response()
+        .ok_or_else(|| anyhow::anyhow!("NotModified response missing raw response"))?;
+    assert_eq!(response.headers().get("etag"), Some(etag.as_str()));
+    assert_error_contains(&err, "NotModified");
 
     let Err(err) = context
         .head_object()
@@ -585,6 +593,19 @@ async fn test_put_object_conditionals_are_transactional() -> Result<()> {
     };
     assert_error_contains(err, "PreconditionFailed");
     assert_eq!(get_object_bytes(&context, &bucket, key).await?, b"old");
+
+    let Err(err) = context
+        .put_object()
+        .bucket(&bucket)
+        .key("missing-if-match.txt")
+        .if_match("*")
+        .body(ByteStream::from_static(b"blocked"))
+        .send()
+        .await
+    else {
+        anyhow::bail!("If-Match should reject writes to missing objects");
+    };
+    assert_error_contains(err, "NoSuchKey");
 
     context
         .put_object()

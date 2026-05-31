@@ -29,7 +29,7 @@ use s3s::{
         StreamingBlob, Timestamp, Type, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput,
         UploadPartOutput,
     },
-    header::CONTENT_MD5,
+    header::{CONTENT_MD5, CONTENT_TYPE, ETAG},
 };
 use time::OffsetDateTime;
 use tokio::{
@@ -81,6 +81,38 @@ fn s3_error(code: S3ErrorCode) -> S3Error {
 /// Builds an S3 protocol error with a custom message.
 fn s3_error_with_message(code: S3ErrorCode, message: &'static str) -> S3Error {
     S3Error::with_message(code, message)
+}
+
+/// Builds a 304 response error with object headers required by S3 clients.
+fn not_modified_error(md5: Option<&str>) -> S3Result<S3Error> {
+    let mut error = s3_error(S3ErrorCode::NotModified);
+    let Some(md5) = md5 else {
+        return Ok(error);
+    };
+
+    let mut headers = S3Response::new(()).headers;
+    headers.insert(
+        ETAG,
+        ETag::Strong(md5.to_string())
+            .to_http_header()
+            .map_err(|err| {
+                S3Error::with_message(
+                    InternalError,
+                    format!("invalid not-modified ETag header: {err}"),
+                )
+            })?,
+    );
+    headers.insert(
+        CONTENT_TYPE,
+        "application/xml".parse().map_err(|err| {
+            S3Error::with_message(
+                InternalError,
+                format!("invalid not-modified content type: {err}"),
+            )
+        })?,
+    );
+    error.set_headers(headers);
+    Ok(error)
 }
 
 /// Copies a streaming S3 request body into an async writer.
@@ -443,6 +475,12 @@ struct ObjectReadConditions {
     unmodified_since: Option<OffsetDateTime>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ObjectReadConditionFailure {
+    NotModified,
+    PreconditionFailed,
+}
+
 #[derive(Clone, Debug)]
 struct ObjectDeleteConditions {
     etag_matches: Option<ETagCondition>,
@@ -520,29 +558,29 @@ fn weak_etag_condition_matches(condition: &ETagCondition, md5: Option<&str>) -> 
 fn validate_read_conditions(
     metadata: &KeyMetadata,
     conditions: &ObjectReadConditions,
-) -> S3Result<()> {
+) -> Result<(), ObjectReadConditionFailure> {
     let md5 = metadata.md5.as_deref();
     if let Some(condition) = conditions.etag_matches.as_ref()
         && strong_etag_condition_matches(condition, md5).not()
     {
-        return Err(s3_error(S3ErrorCode::PreconditionFailed));
+        return Err(ObjectReadConditionFailure::PreconditionFailed);
     }
 
     if let Some(condition) = conditions.etag_none_matches.as_ref() {
         if weak_etag_condition_matches(condition, md5) {
-            return Err(s3_error(S3ErrorCode::NotModified));
+            return Err(ObjectReadConditionFailure::NotModified);
         }
     } else if let Some(since) = conditions.modified_since
         && http_date_time(metadata.last_modified) <= http_date_time(since)
     {
-        return Err(s3_error(S3ErrorCode::NotModified));
+        return Err(ObjectReadConditionFailure::NotModified);
     }
 
     if conditions.etag_matches.is_none()
         && let Some(since) = conditions.unmodified_since
         && http_date_time(metadata.last_modified) > http_date_time(since)
     {
-        return Err(s3_error(S3ErrorCode::PreconditionFailed));
+        return Err(ObjectReadConditionFailure::PreconditionFailed);
     }
 
     Ok(())
@@ -1294,7 +1332,7 @@ impl S3 for Sqlite {
             })
             .await
             .map_err(s3_error_from_sqlite)?;
-        validate_read_conditions(
+        if let Err(error) = validate_read_conditions(
             &object.key_metadata,
             &ObjectReadConditions {
                 etag_matches: if_match,
@@ -1302,7 +1340,16 @@ impl S3 for Sqlite {
                 etag_none_matches: if_none_match,
                 unmodified_since: if_unmodified_since.map(Into::into),
             },
-        )?;
+        ) {
+            return Err(match error {
+                ObjectReadConditionFailure::PreconditionFailed => {
+                    s3_error(S3ErrorCode::PreconditionFailed)
+                }
+                ObjectReadConditionFailure::NotModified => {
+                    not_modified_error(object.key_metadata.md5.as_deref())?
+                }
+            });
+        }
 
         let object_size =
             u64::try_from(object.key_metadata.size).map_err(S3Error::internal_error)?;
@@ -1446,7 +1493,7 @@ impl S3 for Sqlite {
             })
             .await
             .map_err(s3_error_from_sqlite)?;
-        validate_read_conditions(
+        if let Err(error) = validate_read_conditions(
             &object,
             &ObjectReadConditions {
                 etag_matches: if_match,
@@ -1454,7 +1501,16 @@ impl S3 for Sqlite {
                 etag_none_matches: if_none_match,
                 unmodified_since: if_unmodified_since.map(Into::into),
             },
-        )?;
+        ) {
+            return Err(match error {
+                ObjectReadConditionFailure::PreconditionFailed => {
+                    s3_error(S3ErrorCode::PreconditionFailed)
+                }
+                ObjectReadConditionFailure::NotModified => {
+                    not_modified_error(object.md5.as_deref())?
+                }
+            });
+        }
 
         let content_type = object
             .content_type
