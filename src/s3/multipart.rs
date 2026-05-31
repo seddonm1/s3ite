@@ -584,8 +584,8 @@ pub(super) async fn list_multipart_uploads(
         .uploads
         .into_iter()
         .map(|summary| MultipartUpload {
-            checksum_algorithm: checksum_algorithm_output(&summary.checksum),
-            checksum_type: checksum_type_output(&summary.checksum),
+            checksum_algorithm: checksum_algorithm_output(summary.checksum),
+            checksum_type: checksum_type_output(summary.checksum),
             initiated: Some(summary.initiated.into()),
             initiator: Some(initiator.clone()),
             key: Some(encode_list_value(summary.key, encode_keys)),
@@ -686,7 +686,7 @@ pub(super) async fn create_multipart_upload(
         key: Some(key),
         upload_id: Some(upload_id.to_string()),
         checksum_algorithm,
-        checksum_type: checksum_type_output(&checksum),
+        checksum_type: checksum_type_output(checksum),
         ..Default::default()
     };
 
@@ -917,8 +917,8 @@ pub(super) async fn list_parts(
 
     let output = ListPartsOutput {
         bucket: Some(bucket),
-        checksum_algorithm: checksum_algorithm_output(&upload_checksum),
-        checksum_type: checksum_type_output(&upload_checksum),
+        checksum_algorithm: checksum_algorithm_output(upload_checksum),
+        checksum_type: checksum_type_output(upload_checksum),
         is_truncated: Some(is_truncated),
         key: Some(key),
         max_parts: Some(max_parts),

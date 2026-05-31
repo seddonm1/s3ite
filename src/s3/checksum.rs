@@ -12,22 +12,16 @@ use s3s::{
 
 use crate::{
     checksum::{
-        ChecksumAlgorithmKind as StorageChecksumAlgorithmKind, ChecksumTypeKind, PartChecksum,
-        StoredChecksum, checksum_value, decode_base64,
+        ChecksumAlgorithmKind, ChecksumTypeKind, ChecksumView, MultipartChecksumConfig,
+        MultipartCompletionChecksum, PartChecksum, StoredChecksum, decode_base64,
     },
-    sqlite::{
-        CompletedObjectPart, KeyValue, MultipartChecksumConfig, MultipartCompletionChecksum,
-        SqliteError, SqliteResult,
-    },
+    sqlite::{CompletedObjectPart, KeyValue, SqliteError, SqliteResult},
 };
 
 use super::{s3_error, s3_error_from_sqlite, s3_error_with_message};
 
 /// Re-exported lowercase hexadecimal encoder used for S3 `ETag` formatting.
 pub(super) use crate::checksum::encode_hex as hex;
-
-/// Storage-neutral checksum algorithm kind used by S3 request handling.
-pub(super) type ChecksumAlgorithmKind = StorageChecksumAlgorithmKind;
 
 /// Policy for implicit checksum calculation when a request omits checksum input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,7 +142,7 @@ pub(super) fn checksum_algorithm_from_request(
     let Some(algorithm) = algorithm else {
         return Ok(None);
     };
-    let kind = ChecksumAlgorithmKind::from_name(algorithm.as_str()).ok_or_else(|| {
+    let kind = ChecksumAlgorithmKind::try_from(&algorithm).map_err(|()| {
         s3_error_with_message(
             S3ErrorCode::InvalidArgument,
             "unsupported checksum algorithm",
@@ -164,9 +158,9 @@ pub(super) fn checksum_type_name(
     let Some(checksum_type) = checksum_type else {
         return Ok(None);
     };
-    ChecksumTypeKind::from_name(checksum_type.as_str())
+    ChecksumTypeKind::try_from(&checksum_type)
         .map(Some)
-        .ok_or_else(|| {
+        .map_err(|()| {
             s3_error_with_message(S3ErrorCode::InvalidArgument, "unsupported checksum type")
         })
 }
@@ -262,7 +256,7 @@ pub(super) fn validate_part_payload_checksum(
     let Some(kind) = input.algorithm_kind()? else {
         return Ok(None);
     };
-    let computed = checksum_value(kind, value);
+    let computed = kind.checksum_value(value);
     if let Some(requested) = input.requested_for(kind)
         && computed != requested
     {
@@ -278,7 +272,7 @@ pub(super) fn checksum_metadata(
     checksum_type: ChecksumTypeKind,
     supplied: Option<&str>,
 ) -> SqliteResult<StoredChecksum> {
-    let checksum_value = supplied.map_or_else(|| checksum_value(kind, value), str::to_string);
+    let checksum_value = supplied.map_or_else(|| kind.checksum_value(value), str::to_string);
     StoredChecksum::new(kind, checksum_type, checksum_value).ok_or(SqliteError::ChecksumMismatch)
 }
 
@@ -298,7 +292,8 @@ pub(super) fn object_write_checksum_from_value(
     let value = object.value.as_deref().ok_or_else(|| {
         SqliteError::Configuration("object metadata has no stored value".to_string())
     })?;
-    checksum_metadata(kind, value, ChecksumTypeKind::FullObject, None)
+    StoredChecksum::compute(kind, ChecksumTypeKind::FullObject, value)
+        .ok_or(SqliteError::ChecksumMismatch)
 }
 
 /// Computes per-part checksum metadata for `UploadPartCopy`.
@@ -306,187 +301,56 @@ pub(super) fn copied_part_checksum(
     upload_checksum: Option<MultipartChecksumConfig>,
     value: &[u8],
 ) -> Option<PartChecksum> {
-    upload_checksum.map(|checksum| {
-        PartChecksum::new(
-            checksum.algorithm,
-            checksum_value(checksum.algorithm, value),
-        )
-    })
-}
-
-/// Shared view used to project typed checksums back into S3 response fields.
-pub(super) trait ChecksumResponse {
-    /// Returns the checksum algorithm when one is present.
-    fn algorithm_kind(&self) -> Option<ChecksumAlgorithmKind>;
-    /// Returns the checksum type when one is present.
-    fn checksum_type_kind(&self) -> Option<ChecksumTypeKind>;
-    /// Returns the checksum value for an algorithm.
-    fn value_for(&self, kind: ChecksumAlgorithmKind) -> Option<&str>;
-    /// Returns whether this response view carries a checksum value.
-    fn has_value(&self) -> bool;
-}
-
-impl ChecksumResponse for StoredChecksum {
-    fn algorithm_kind(&self) -> Option<ChecksumAlgorithmKind> {
-        Some(self.algorithm())
-    }
-
-    fn checksum_type_kind(&self) -> Option<ChecksumTypeKind> {
-        Some(self.checksum_type())
-    }
-
-    fn value_for(&self, kind: ChecksumAlgorithmKind) -> Option<&str> {
-        self.value_for(kind)
-    }
-
-    fn has_value(&self) -> bool {
-        true
-    }
-}
-
-impl ChecksumResponse for Option<StoredChecksum> {
-    fn algorithm_kind(&self) -> Option<ChecksumAlgorithmKind> {
-        self.as_ref().map(StoredChecksum::algorithm)
-    }
-
-    fn checksum_type_kind(&self) -> Option<ChecksumTypeKind> {
-        self.as_ref().map(StoredChecksum::checksum_type)
-    }
-
-    fn value_for(&self, kind: ChecksumAlgorithmKind) -> Option<&str> {
-        self.as_ref().and_then(|checksum| checksum.value_for(kind))
-    }
-
-    fn has_value(&self) -> bool {
-        self.is_some()
-    }
-}
-
-impl ChecksumResponse for PartChecksum {
-    fn algorithm_kind(&self) -> Option<ChecksumAlgorithmKind> {
-        Some(self.algorithm())
-    }
-
-    fn checksum_type_kind(&self) -> Option<ChecksumTypeKind> {
-        None
-    }
-
-    fn value_for(&self, kind: ChecksumAlgorithmKind) -> Option<&str> {
-        self.value_for(kind)
-    }
-
-    fn has_value(&self) -> bool {
-        true
-    }
-}
-
-impl ChecksumResponse for Option<PartChecksum> {
-    fn algorithm_kind(&self) -> Option<ChecksumAlgorithmKind> {
-        self.as_ref().map(PartChecksum::algorithm)
-    }
-
-    fn checksum_type_kind(&self) -> Option<ChecksumTypeKind> {
-        None
-    }
-
-    fn value_for(&self, kind: ChecksumAlgorithmKind) -> Option<&str> {
-        self.as_ref().and_then(|checksum| checksum.value_for(kind))
-    }
-
-    fn has_value(&self) -> bool {
-        self.is_some()
-    }
-}
-
-impl ChecksumResponse for MultipartChecksumConfig {
-    fn algorithm_kind(&self) -> Option<ChecksumAlgorithmKind> {
-        Some(self.algorithm)
-    }
-
-    fn checksum_type_kind(&self) -> Option<ChecksumTypeKind> {
-        Some(self.checksum_type)
-    }
-
-    fn value_for(&self, _kind: ChecksumAlgorithmKind) -> Option<&str> {
-        None
-    }
-
-    fn has_value(&self) -> bool {
-        false
-    }
-}
-
-impl ChecksumResponse for Option<MultipartChecksumConfig> {
-    fn algorithm_kind(&self) -> Option<ChecksumAlgorithmKind> {
-        self.as_ref().map(|checksum| checksum.algorithm)
-    }
-
-    fn checksum_type_kind(&self) -> Option<ChecksumTypeKind> {
-        self.as_ref().map(|checksum| checksum.checksum_type)
-    }
-
-    fn value_for(&self, _kind: ChecksumAlgorithmKind) -> Option<&str> {
-        None
-    }
-
-    fn has_value(&self) -> bool {
-        false
-    }
+    upload_checksum.map(|checksum| PartChecksum::compute(checksum.algorithm, value))
 }
 
 /// Converts stored checksum algorithm metadata into an S3 response DTO.
-pub(super) fn checksum_algorithm_output<T: ChecksumResponse + ?Sized>(
-    checksum: &T,
+pub(super) fn checksum_algorithm_output<'a>(
+    checksum: impl Into<ChecksumView<'a>>,
 ) -> Option<ChecksumAlgorithm> {
-    checksum
-        .algorithm_kind()
-        .map(|algorithm| ChecksumAlgorithm::from(algorithm.as_str().to_string()))
+    checksum.into().algorithm().map(Into::into)
 }
 
 /// Converts stored checksum type metadata into an S3 response DTO.
-pub(super) fn checksum_type_output<T: ChecksumResponse + ?Sized>(
-    checksum: &T,
+pub(super) fn checksum_type_output<'a>(
+    checksum: impl Into<ChecksumView<'a>>,
 ) -> Option<ChecksumType> {
-    checksum
-        .checksum_type_kind()
-        .map(|checksum_type| ChecksumType::from(checksum_type.as_str().to_string()))
+    checksum.into().checksum_type().map(Into::into)
 }
 
 /// Returns a checksum response field for an algorithm.
-fn checksum_field<T: ChecksumResponse + ?Sized>(
-    checksum: &T,
-    kind: ChecksumAlgorithmKind,
-) -> Option<String> {
+fn checksum_field(checksum: ChecksumView<'_>, kind: ChecksumAlgorithmKind) -> Option<String> {
     checksum.value_for(kind).map(str::to_string)
 }
 
 /// Returns the `CRC32` checksum response field.
-pub(super) fn checksum_crc32<T: ChecksumResponse + ?Sized>(checksum: &T) -> Option<String> {
-    checksum_field(checksum, ChecksumAlgorithmKind::Crc32)
+pub(super) fn checksum_crc32<'a>(checksum: impl Into<ChecksumView<'a>>) -> Option<String> {
+    checksum_field(checksum.into(), ChecksumAlgorithmKind::Crc32)
 }
 
 /// Returns the `CRC32C` checksum response field.
-pub(super) fn checksum_crc32c<T: ChecksumResponse + ?Sized>(checksum: &T) -> Option<String> {
-    checksum_field(checksum, ChecksumAlgorithmKind::Crc32c)
+pub(super) fn checksum_crc32c<'a>(checksum: impl Into<ChecksumView<'a>>) -> Option<String> {
+    checksum_field(checksum.into(), ChecksumAlgorithmKind::Crc32c)
 }
 
 /// Returns the `CRC64NVME` checksum response field.
-pub(super) fn checksum_crc64nvme<T: ChecksumResponse + ?Sized>(checksum: &T) -> Option<String> {
-    checksum_field(checksum, ChecksumAlgorithmKind::Crc64Nvme)
+pub(super) fn checksum_crc64nvme<'a>(checksum: impl Into<ChecksumView<'a>>) -> Option<String> {
+    checksum_field(checksum.into(), ChecksumAlgorithmKind::Crc64Nvme)
 }
 
 /// Returns the `SHA1` checksum response field.
-pub(super) fn checksum_sha1<T: ChecksumResponse + ?Sized>(checksum: &T) -> Option<String> {
-    checksum_field(checksum, ChecksumAlgorithmKind::Sha1)
+pub(super) fn checksum_sha1<'a>(checksum: impl Into<ChecksumView<'a>>) -> Option<String> {
+    checksum_field(checksum.into(), ChecksumAlgorithmKind::Sha1)
 }
 
 /// Returns the `SHA256` checksum response field.
-pub(super) fn checksum_sha256<T: ChecksumResponse + ?Sized>(checksum: &T) -> Option<String> {
-    checksum_field(checksum, ChecksumAlgorithmKind::Sha256)
+pub(super) fn checksum_sha256<'a>(checksum: impl Into<ChecksumView<'a>>) -> Option<String> {
+    checksum_field(checksum.into(), ChecksumAlgorithmKind::Sha256)
 }
 
 /// Converts stored checksum metadata into the nested `GetObjectAttributes` checksum DTO.
-pub(super) fn checksum_struct<T: ChecksumResponse + ?Sized>(checksum: &T) -> Option<S3Checksum> {
+pub(super) fn checksum_struct<'a>(checksum: impl Into<ChecksumView<'a>>) -> Option<S3Checksum> {
+    let checksum = checksum.into();
     checksum.has_value().then(|| S3Checksum {
         checksum_crc32: checksum_crc32(checksum),
         checksum_crc32c: checksum_crc32c(checksum),

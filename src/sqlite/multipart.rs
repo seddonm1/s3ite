@@ -12,9 +12,9 @@ use super::{
     CompletedObjectPart, KeyMetadata, KeyValue, Multipart, MultipartChecksumConfig,
     MultipartCompletionChecksum, MultipartCompletionPart, MultipartCompletionRequest,
     MultipartMetadata, MultipartUploadState, MultipartUploadSummary, PartChecksum, Sqlite,
-    SqliteError, SqliteResult, StoredChecksum, checksum_value, decode_base64, decode_md5_hex,
-    encode_hex, optional_multipart_checksum_config, optional_part_checksum,
-    required_stored_checksum, row_size, sql_limit, sql_size, stored_checksum,
+    SqliteError, SqliteResult, StoredChecksum, decode_base64, decode_md5_hex, encode_hex,
+    optional_multipart_checksum_config, optional_part_checksum, required_stored_checksum, row_size,
+    sql_limit, sql_size, stored_checksum,
 };
 
 /// Buffered completed multipart object and its persisted part boundaries.
@@ -305,7 +305,7 @@ impl Sqlite {
             default_checksum.checksum_type
         };
         let computed = match checksum_type {
-            ChecksumTypeKind::FullObject => checksum_value(algorithm, value),
+            ChecksumTypeKind::FullObject => algorithm.checksum_value(value),
             ChecksumTypeKind::Composite => {
                 let mut combined = Vec::new();
                 for part in parts {
@@ -317,7 +317,7 @@ impl Sqlite {
                     let checksum = decode_base64(checksum).ok_or(SqliteError::ChecksumMismatch)?;
                     combined.extend_from_slice(&checksum);
                 }
-                format!("{}-{}", checksum_value(algorithm, &combined), parts.len())
+                format!("{}-{}", algorithm.checksum_value(&combined), parts.len())
             }
         };
 

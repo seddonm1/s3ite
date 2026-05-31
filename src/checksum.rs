@@ -6,22 +6,10 @@
 
 use std::ops::Not;
 
-use s3s::crypto::{Checksum as _, Crc32, Crc32c, Crc64Nvme, Sha1, Sha256};
-
-/// S3 algorithm name for CRC32 checksums.
-pub(crate) const CHECKSUM_CRC32: &str = "CRC32";
-/// S3 algorithm name for CRC32C checksums.
-pub(crate) const CHECKSUM_CRC32C: &str = "CRC32C";
-/// S3 algorithm name for CRC64NVME checksums.
-pub(crate) const CHECKSUM_CRC64NVME: &str = "CRC64NVME";
-/// S3 algorithm name for SHA1 checksums.
-pub(crate) const CHECKSUM_SHA1: &str = "SHA1";
-/// S3 algorithm name for SHA256 checksums.
-pub(crate) const CHECKSUM_SHA256: &str = "SHA256";
-/// S3 checksum type name for checksums composed from per-part checksums.
-pub(crate) const CHECKSUM_TYPE_COMPOSITE: &str = "COMPOSITE";
-/// S3 checksum type name for checksums calculated over the complete object body.
-pub(crate) const CHECKSUM_TYPE_FULL_OBJECT: &str = "FULL_OBJECT";
+use s3s::{
+    crypto::{Checksum as _, Crc32, Crc32c, Crc64Nvme, Sha1, Sha256},
+    dto::{ChecksumAlgorithm, ChecksumType},
+};
 
 /// Checksum algorithms supported by S3-compatible checksum headers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,11 +31,11 @@ impl ChecksumAlgorithmKind {
     #[must_use]
     pub(crate) fn from_name(algorithm: &str) -> Option<Self> {
         let kind = match algorithm {
-            CHECKSUM_CRC32 => Self::Crc32,
-            CHECKSUM_CRC32C => Self::Crc32c,
-            CHECKSUM_CRC64NVME => Self::Crc64Nvme,
-            CHECKSUM_SHA1 => Self::Sha1,
-            CHECKSUM_SHA256 => Self::Sha256,
+            ChecksumAlgorithm::CRC32 => Self::Crc32,
+            ChecksumAlgorithm::CRC32C => Self::Crc32c,
+            ChecksumAlgorithm::CRC64NVME => Self::Crc64Nvme,
+            ChecksumAlgorithm::SHA1 => Self::Sha1,
+            ChecksumAlgorithm::SHA256 => Self::Sha256,
             _ => return None,
         };
         Some(kind)
@@ -57,12 +45,44 @@ impl ChecksumAlgorithmKind {
     #[must_use]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::Crc32 => CHECKSUM_CRC32,
-            Self::Crc32c => CHECKSUM_CRC32C,
-            Self::Crc64Nvme => CHECKSUM_CRC64NVME,
-            Self::Sha1 => CHECKSUM_SHA1,
-            Self::Sha256 => CHECKSUM_SHA256,
+            Self::Crc32 => ChecksumAlgorithm::CRC32,
+            Self::Crc32c => ChecksumAlgorithm::CRC32C,
+            Self::Crc64Nvme => ChecksumAlgorithm::CRC64NVME,
+            Self::Sha1 => ChecksumAlgorithm::SHA1,
+            Self::Sha256 => ChecksumAlgorithm::SHA256,
         }
+    }
+
+    /// Converts this checksum algorithm to the generated S3 DTO newtype.
+    #[must_use]
+    pub(crate) fn to_s3(self) -> ChecksumAlgorithm {
+        ChecksumAlgorithm::from_static(self.as_str())
+    }
+
+    /// Computes this checksum over a byte slice and base64-encodes the digest.
+    #[must_use]
+    pub(crate) fn checksum_value(self, value: &[u8]) -> String {
+        match self {
+            Self::Crc32 => encode_base64(Crc32::checksum(value).as_ref()),
+            Self::Crc32c => encode_base64(Crc32c::checksum(value).as_ref()),
+            Self::Crc64Nvme => encode_base64(Crc64Nvme::checksum(value).as_ref()),
+            Self::Sha1 => encode_base64(Sha1::checksum(value).as_ref()),
+            Self::Sha256 => encode_base64(Sha256::checksum(value).as_ref()),
+        }
+    }
+}
+
+impl From<ChecksumAlgorithmKind> for ChecksumAlgorithm {
+    fn from(kind: ChecksumAlgorithmKind) -> Self {
+        kind.to_s3()
+    }
+}
+
+impl TryFrom<&ChecksumAlgorithm> for ChecksumAlgorithmKind {
+    type Error = ();
+
+    fn try_from(algorithm: &ChecksumAlgorithm) -> Result<Self, Self::Error> {
+        Self::from_name(algorithm.as_str()).ok_or(())
     }
 }
 
@@ -80,8 +100,8 @@ impl ChecksumTypeKind {
     #[must_use]
     pub(crate) fn from_name(checksum_type: &str) -> Option<Self> {
         let kind = match checksum_type {
-            CHECKSUM_TYPE_COMPOSITE => Self::Composite,
-            CHECKSUM_TYPE_FULL_OBJECT => Self::FullObject,
+            ChecksumType::COMPOSITE => Self::Composite,
+            ChecksumType::FULL_OBJECT => Self::FullObject,
             _ => return None,
         };
         Some(kind)
@@ -91,9 +111,29 @@ impl ChecksumTypeKind {
     #[must_use]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::Composite => CHECKSUM_TYPE_COMPOSITE,
-            Self::FullObject => CHECKSUM_TYPE_FULL_OBJECT,
+            Self::Composite => ChecksumType::COMPOSITE,
+            Self::FullObject => ChecksumType::FULL_OBJECT,
         }
+    }
+
+    /// Converts this checksum type to the generated S3 DTO newtype.
+    #[must_use]
+    pub(crate) fn to_s3(self) -> ChecksumType {
+        ChecksumType::from_static(self.as_str())
+    }
+}
+
+impl From<ChecksumTypeKind> for ChecksumType {
+    fn from(kind: ChecksumTypeKind) -> Self {
+        kind.to_s3()
+    }
+}
+
+impl TryFrom<&ChecksumType> for ChecksumTypeKind {
+    type Error = ();
+
+    fn try_from(checksum_type: &ChecksumType) -> Result<Self, Self::Error> {
+        Self::from_name(checksum_type.as_str()).ok_or(())
     }
 }
 
@@ -123,6 +163,12 @@ impl PartChecksum {
             ChecksumAlgorithmKind::Sha1 => Self::Sha1(value),
             ChecksumAlgorithmKind::Sha256 => Self::Sha256(value),
         }
+    }
+
+    /// Computes a part checksum for the given algorithm.
+    #[must_use]
+    pub(crate) fn compute(kind: ChecksumAlgorithmKind, value: &[u8]) -> Self {
+        Self::new(kind, kind.checksum_value(value))
     }
 
     /// Returns the algorithm for this checksum value.
@@ -182,6 +228,12 @@ impl FullObjectChecksum {
             ChecksumAlgorithmKind::Sha1 => Self::Sha1(value),
             ChecksumAlgorithmKind::Sha256 => Self::Sha256(value),
         }
+    }
+
+    /// Computes a full-object checksum for the given algorithm.
+    #[must_use]
+    pub(crate) fn compute(algorithm: ChecksumAlgorithmKind, value: &[u8]) -> Self {
+        Self::new(algorithm, algorithm.checksum_value(value))
     }
 
     /// Returns the checksum algorithm.
@@ -284,6 +336,24 @@ impl StoredChecksum {
         Some(checksum)
     }
 
+    /// Computes a completed-object checksum for a supported algorithm/type pair.
+    #[must_use]
+    pub(crate) fn compute(
+        algorithm: ChecksumAlgorithmKind,
+        checksum_type: ChecksumTypeKind,
+        value: &[u8],
+    ) -> Option<Self> {
+        match checksum_type {
+            ChecksumTypeKind::FullObject => {
+                Some(Self::Full(FullObjectChecksum::compute(algorithm, value)))
+            }
+            ChecksumTypeKind::Composite => Some(Self::Composite(CompositeChecksum::new(
+                algorithm,
+                algorithm.checksum_value(value),
+            )?)),
+        }
+    }
+
     /// Returns the checksum algorithm.
     #[must_use]
     pub(crate) fn algorithm(&self) -> ChecksumAlgorithmKind {
@@ -315,6 +385,175 @@ impl StoredChecksum {
     #[must_use]
     pub(crate) fn value_for(&self, algorithm: ChecksumAlgorithmKind) -> Option<&str> {
         (self.algorithm() == algorithm).then(|| self.as_str())
+    }
+}
+
+/// Checksum algorithm and aggregation mode requested for an active multipart upload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MultipartChecksumConfig {
+    /// Algorithm used for uploaded parts and final multipart checksum metadata.
+    pub(crate) algorithm: ChecksumAlgorithmKind,
+    /// Aggregation mode used for the completed object checksum.
+    pub(crate) checksum_type: ChecksumTypeKind,
+}
+
+impl MultipartChecksumConfig {
+    /// Builds a checksum configuration for an active multipart upload.
+    #[must_use]
+    pub(crate) fn new(algorithm: ChecksumAlgorithmKind, checksum_type: ChecksumTypeKind) -> Self {
+        Self {
+            algorithm,
+            checksum_type,
+        }
+    }
+}
+
+/// Checksum fields supplied with a multipart completion request.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MultipartCompletionChecksum {
+    /// Requested checksum type, even when no final checksum value was supplied.
+    pub(crate) checksum_type: Option<ChecksumTypeKind>,
+    /// Client-supplied final checksum value.
+    pub(crate) checksum: Option<StoredChecksum>,
+}
+
+impl MultipartCompletionChecksum {
+    /// Returns the supplied checksum algorithm.
+    #[must_use]
+    pub(crate) fn algorithm(&self) -> Option<ChecksumAlgorithmKind> {
+        self.checksum.as_ref().map(StoredChecksum::algorithm)
+    }
+
+    /// Returns the requested checksum type.
+    #[must_use]
+    pub(crate) fn checksum_type(&self) -> Option<ChecksumTypeKind> {
+        self.checksum
+            .as_ref()
+            .map(StoredChecksum::checksum_type)
+            .or(self.checksum_type)
+    }
+
+    /// Returns the checksum value for an algorithm when supplied.
+    #[must_use]
+    pub(crate) fn value_for(&self, algorithm: ChecksumAlgorithmKind) -> Option<&str> {
+        self.checksum
+            .as_ref()
+            .and_then(|checksum| checksum.value_for(algorithm))
+    }
+
+    /// Returns whether the request supplied a checksum value.
+    #[must_use]
+    pub(crate) fn has_value(&self) -> bool {
+        self.checksum.is_some()
+    }
+}
+
+/// Borrowed checksum metadata in the shapes needed by S3 response headers.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ChecksumView<'a> {
+    /// No checksum metadata is available.
+    None,
+    /// Completed-object checksum metadata with algorithm, type, and value.
+    Object(&'a StoredChecksum),
+    /// Part-level checksum metadata with algorithm and value.
+    Part(&'a PartChecksum),
+    /// Active multipart checksum configuration with algorithm and type only.
+    MultipartConfig(MultipartChecksumConfig),
+}
+
+impl<'a> ChecksumView<'a> {
+    /// Returns the checksum algorithm when metadata is present.
+    #[must_use]
+    pub(crate) fn algorithm(self) -> Option<ChecksumAlgorithmKind> {
+        match self {
+            Self::None => None,
+            Self::Object(checksum) => Some(checksum.algorithm()),
+            Self::Part(checksum) => Some(checksum.algorithm()),
+            Self::MultipartConfig(checksum) => Some(checksum.algorithm),
+        }
+    }
+
+    /// Returns the object checksum aggregation type when metadata carries one.
+    #[must_use]
+    pub(crate) fn checksum_type(self) -> Option<ChecksumTypeKind> {
+        match self {
+            Self::None | Self::Part(_) => None,
+            Self::Object(checksum) => Some(checksum.checksum_type()),
+            Self::MultipartConfig(checksum) => Some(checksum.checksum_type),
+        }
+    }
+
+    /// Returns the checksum value for a specific algorithm.
+    #[must_use]
+    pub(crate) fn value_for(self, algorithm: ChecksumAlgorithmKind) -> Option<&'a str> {
+        match self {
+            Self::None | Self::MultipartConfig(_) => None,
+            Self::Object(checksum) => checksum.value_for(algorithm),
+            Self::Part(checksum) => checksum.value_for(algorithm),
+        }
+    }
+
+    /// Returns whether this view carries an actual checksum value.
+    #[must_use]
+    pub(crate) fn has_value(self) -> bool {
+        match self {
+            Self::None | Self::MultipartConfig(_) => false,
+            Self::Object(_) | Self::Part(_) => true,
+        }
+    }
+}
+
+impl<'a> From<&'a StoredChecksum> for ChecksumView<'a> {
+    fn from(checksum: &'a StoredChecksum) -> Self {
+        Self::Object(checksum)
+    }
+}
+
+impl<'a> From<Option<&'a StoredChecksum>> for ChecksumView<'a> {
+    fn from(checksum: Option<&'a StoredChecksum>) -> Self {
+        checksum.map_or(Self::None, Self::Object)
+    }
+}
+
+impl<'a> From<&'a Option<StoredChecksum>> for ChecksumView<'a> {
+    fn from(checksum: &'a Option<StoredChecksum>) -> Self {
+        checksum.as_ref().into()
+    }
+}
+
+impl<'a> From<&'a PartChecksum> for ChecksumView<'a> {
+    fn from(checksum: &'a PartChecksum) -> Self {
+        Self::Part(checksum)
+    }
+}
+
+impl<'a> From<Option<&'a PartChecksum>> for ChecksumView<'a> {
+    fn from(checksum: Option<&'a PartChecksum>) -> Self {
+        checksum.map_or(Self::None, Self::Part)
+    }
+}
+
+impl<'a> From<&'a Option<PartChecksum>> for ChecksumView<'a> {
+    fn from(checksum: &'a Option<PartChecksum>) -> Self {
+        checksum.as_ref().into()
+    }
+}
+
+impl From<MultipartChecksumConfig> for ChecksumView<'_> {
+    fn from(checksum: MultipartChecksumConfig) -> Self {
+        Self::MultipartConfig(checksum)
+    }
+}
+
+impl From<Option<MultipartChecksumConfig>> for ChecksumView<'_> {
+    fn from(checksum: Option<MultipartChecksumConfig>) -> Self {
+        checksum.map_or(Self::None, Self::MultipartConfig)
+    }
+}
+
+impl From<&Option<MultipartChecksumConfig>> for ChecksumView<'_> {
+    fn from(checksum: &Option<MultipartChecksumConfig>) -> Self {
+        (*checksum).into()
     }
 }
 
@@ -445,38 +684,34 @@ pub(crate) fn decode_base64(value: &str) -> Option<Vec<u8>> {
     Some(decoded)
 }
 
-/// Computes a checksum and returns its standard padded base64 representation.
-#[must_use]
-pub(crate) fn checksum_value(kind: ChecksumAlgorithmKind, value: &[u8]) -> String {
-    match kind {
-        ChecksumAlgorithmKind::Crc32 => encode_base64(Crc32::checksum(value).as_ref()),
-        ChecksumAlgorithmKind::Crc32c => encode_base64(Crc32c::checksum(value).as_ref()),
-        ChecksumAlgorithmKind::Crc64Nvme => encode_base64(Crc64Nvme::checksum(value).as_ref()),
-        ChecksumAlgorithmKind::Sha1 => encode_base64(Sha1::checksum(value).as_ref()),
-        ChecksumAlgorithmKind::Sha256 => encode_base64(Sha256::checksum(value).as_ref()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use s3s::dto::{ChecksumAlgorithm, ChecksumType};
+
     use super::{
-        CHECKSUM_CRC32, CHECKSUM_CRC32C, CHECKSUM_CRC64NVME, CHECKSUM_SHA1, CHECKSUM_SHA256,
-        CHECKSUM_TYPE_COMPOSITE, CHECKSUM_TYPE_FULL_OBJECT, ChecksumAlgorithmKind,
-        ChecksumTypeKind, FullObjectChecksum, PartChecksum, StoredChecksum, checksum_value,
+        ChecksumAlgorithmKind, ChecksumTypeKind, FullObjectChecksum, PartChecksum, StoredChecksum,
         decode_base64, decode_md5_hex, encode_base64, encode_hex,
     };
 
     #[test]
     fn maps_checksum_algorithm_names() {
         for (name, kind) in [
-            (CHECKSUM_CRC32, ChecksumAlgorithmKind::Crc32),
-            (CHECKSUM_CRC32C, ChecksumAlgorithmKind::Crc32c),
-            (CHECKSUM_CRC64NVME, ChecksumAlgorithmKind::Crc64Nvme),
-            (CHECKSUM_SHA1, ChecksumAlgorithmKind::Sha1),
-            (CHECKSUM_SHA256, ChecksumAlgorithmKind::Sha256),
+            (ChecksumAlgorithm::CRC32, ChecksumAlgorithmKind::Crc32),
+            (ChecksumAlgorithm::CRC32C, ChecksumAlgorithmKind::Crc32c),
+            (
+                ChecksumAlgorithm::CRC64NVME,
+                ChecksumAlgorithmKind::Crc64Nvme,
+            ),
+            (ChecksumAlgorithm::SHA1, ChecksumAlgorithmKind::Sha1),
+            (ChecksumAlgorithm::SHA256, ChecksumAlgorithmKind::Sha256),
         ] {
             assert_eq!(ChecksumAlgorithmKind::from_name(name), Some(kind));
             assert_eq!(kind.as_str(), name);
+            assert_eq!(
+                ChecksumAlgorithmKind::try_from(&ChecksumAlgorithm::from_static(name)),
+                Ok(kind)
+            );
+            assert_eq!(kind.to_s3().as_str(), name);
         }
         assert_eq!(ChecksumAlgorithmKind::from_name("MD5"), None);
     }
@@ -484,11 +719,16 @@ mod tests {
     #[test]
     fn maps_checksum_type_names() {
         for (name, kind) in [
-            (CHECKSUM_TYPE_COMPOSITE, ChecksumTypeKind::Composite),
-            (CHECKSUM_TYPE_FULL_OBJECT, ChecksumTypeKind::FullObject),
+            (ChecksumType::COMPOSITE, ChecksumTypeKind::Composite),
+            (ChecksumType::FULL_OBJECT, ChecksumTypeKind::FullObject),
         ] {
             assert_eq!(ChecksumTypeKind::from_name(name), Some(kind));
             assert_eq!(kind.as_str(), name);
+            assert_eq!(
+                ChecksumTypeKind::try_from(&ChecksumType::from_static(name)),
+                Ok(kind)
+            );
+            assert_eq!(kind.to_s3().as_str(), name);
         }
         assert_eq!(ChecksumTypeKind::from_name("LINEAR"), None);
     }
@@ -586,23 +826,23 @@ mod tests {
     fn computes_base64_checksum_values() {
         let value = b"test data";
         assert_eq!(
-            checksum_value(ChecksumAlgorithmKind::Crc32, value),
+            ChecksumAlgorithmKind::Crc32.checksum_value(value),
             "0wiusg=="
         );
         assert_eq!(
-            checksum_value(ChecksumAlgorithmKind::Crc32c, value),
+            ChecksumAlgorithmKind::Crc32c.checksum_value(value),
             "M3m0yg=="
         );
         assert_eq!(
-            checksum_value(ChecksumAlgorithmKind::Crc64Nvme, value),
+            ChecksumAlgorithmKind::Crc64Nvme.checksum_value(value),
             "rsrzr5yYqFU="
         );
         assert_eq!(
-            checksum_value(ChecksumAlgorithmKind::Sha1, value),
+            ChecksumAlgorithmKind::Sha1.checksum_value(value),
             "9I3YU4IIYIFsddVND1hNyGMyenw="
         );
         assert_eq!(
-            checksum_value(ChecksumAlgorithmKind::Sha256, value),
+            ChecksumAlgorithmKind::Sha256.checksum_value(value),
             "kW8AJ6V1B0znKjMXd8NHjWUT94alkb2JLaGld78jNfk="
         );
     }

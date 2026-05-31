@@ -11,7 +11,7 @@ use rusqlite::{
 };
 
 use crate::checksum::{
-    ChecksumAlgorithmKind, ChecksumTypeKind, checksum_value as storage_checksum_value,
+    ChecksumAlgorithmKind, ChecksumTypeKind, MultipartChecksumConfig,
     decode_md5_hex as decode_storage_md5_hex,
 };
 pub(crate) use crate::checksum::{PartChecksum, StoredChecksum};
@@ -27,66 +27,6 @@ const CHECKSUM_ALGORITHM_SHA1: i64 = 4;
 const CHECKSUM_ALGORITHM_SHA256: i64 = 5;
 const CHECKSUM_TYPE_COMPOSITE: i64 = 1;
 const CHECKSUM_TYPE_FULL_OBJECT: i64 = 2;
-
-/// Checksum settings recorded for an active multipart upload.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MultipartChecksumConfig {
-    /// Checksum algorithm used for uploaded parts and completion.
-    pub(crate) algorithm: ChecksumAlgorithmKind,
-    /// Checksum aggregation mode used for the completed object.
-    pub(crate) checksum_type: ChecksumTypeKind,
-}
-
-/// Checksum supplied with a multipart completion request.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct MultipartCompletionChecksum {
-    /// Requested checksum type, even when no final checksum value was supplied.
-    pub(crate) checksum_type: Option<ChecksumTypeKind>,
-    /// Client-supplied final checksum value.
-    pub(crate) checksum: Option<StoredChecksum>,
-}
-
-impl MultipartCompletionChecksum {
-    /// Returns the supplied checksum algorithm.
-    #[must_use]
-    pub(crate) fn algorithm(&self) -> Option<ChecksumAlgorithmKind> {
-        self.checksum.as_ref().map(StoredChecksum::algorithm)
-    }
-
-    /// Returns the requested checksum type.
-    #[must_use]
-    pub(crate) fn checksum_type(&self) -> Option<ChecksumTypeKind> {
-        self.checksum
-            .as_ref()
-            .map(StoredChecksum::checksum_type)
-            .or(self.checksum_type)
-    }
-
-    /// Returns the checksum value for an algorithm when supplied.
-    #[must_use]
-    pub(crate) fn value_for(&self, algorithm: ChecksumAlgorithmKind) -> Option<&str> {
-        self.checksum
-            .as_ref()
-            .and_then(|checksum| checksum.value_for(algorithm))
-    }
-
-    /// Returns whether the request supplied a checksum value.
-    #[must_use]
-    pub(crate) fn has_value(&self) -> bool {
-        self.checksum.is_some()
-    }
-}
-
-impl MultipartChecksumConfig {
-    /// Builds a checksum configuration for an active multipart upload.
-    #[must_use]
-    pub(crate) fn new(algorithm: ChecksumAlgorithmKind, checksum_type: ChecksumTypeKind) -> Self {
-        Self {
-            algorithm,
-            checksum_type,
-        }
-    }
-}
 
 impl ToSql for ChecksumAlgorithmKind {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
@@ -213,12 +153,6 @@ pub(super) fn checksum_conversion_error(error: SqliteError) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Integer, Box::new(error))
 }
 
-/// Computes a checksum by stored algorithm.
-#[must_use]
-pub(super) fn checksum_value(algorithm: ChecksumAlgorithmKind, value: &[u8]) -> String {
-    storage_checksum_value(algorithm, value)
-}
-
 #[cfg(test)]
 mod tests {
     use rusqlite::{Connection, params};
@@ -231,7 +165,7 @@ mod tests {
         },
     };
 
-    use super::{checksum_value, decode_base64, decode_md5_hex, encode_hex, stored_checksum};
+    use super::{decode_base64, decode_md5_hex, encode_hex, stored_checksum};
 
     fn assert_sqlite_error<T>(result: crate::sqlite::SqliteResult<T>, expected: &SqliteError) {
         match result {
@@ -394,7 +328,7 @@ mod tests {
     #[test]
     fn computes_checksum_by_storage_algorithm() {
         assert_eq!(
-            checksum_value(ChecksumAlgorithmKind::Crc64Nvme, b"test data"),
+            ChecksumAlgorithmKind::Crc64Nvme.checksum_value(b"test data"),
             "rsrzr5yYqFU="
         );
     }

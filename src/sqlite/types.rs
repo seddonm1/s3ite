@@ -6,9 +6,9 @@ use uuid::Uuid;
 
 use crate::sqlite::error::{NegativeObjectSize, NegativeSqlLimit};
 
-use crate::checksum::{PartChecksum, StoredChecksum};
-
-use super::{MultipartChecksumConfig, MultipartCompletionChecksum};
+use crate::checksum::{
+    MultipartChecksumConfig, MultipartCompletionChecksum, PartChecksum, StoredChecksum,
+};
 
 pub(super) fn row_size(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<i64> {
     let value = row.get::<_, i64>(idx)?;
