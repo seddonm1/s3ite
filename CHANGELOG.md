@@ -40,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Preserve and return object `ETag` from `HeadObject`.
 - Persist and return object HTTP metadata such as `Content-Type`, `Cache-Control`, and `Expires`, including copy and multipart completion paths.
 - Fix `CopyObject` metadata replacement, self-copy behavior, and metadata retention.
+- Apply conditional request headers for `GetObject`, `HeadObject`, `PutObject`, `CopyObject`, `DeleteObject`, multi-object delete, and multipart completion.
 - Fix multipart completion validation for missing, mismatched, out-of-order, and too-small parts.
 - Compute multipart ETags as `md5(concat(part-md5s))-N` and build completed objects with preallocated buffers.
 - Allow resent multipart parts to replace the previous stored part.

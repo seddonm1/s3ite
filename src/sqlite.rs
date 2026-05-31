@@ -43,6 +43,9 @@ pub enum SqliteError {
     /// A requested object does not exist.
     #[error("object does not exist")]
     ObjectNotFound,
+    /// Object write preconditions did not match current stored metadata.
+    #[error("object precondition failed")]
+    PreconditionFailed,
     /// Storage configuration is invalid.
     #[error("configuration error: {0}")]
     Configuration(String),
@@ -107,13 +110,6 @@ fn expiration_threshold(ttl_seconds: u64) -> Option<OffsetDateTime> {
 
     let seconds = i64::try_from(ttl_seconds).unwrap_or(i64::MAX);
     Some(OffsetDateTime::now_utc().saturating_sub(Duration::seconds(seconds)))
-}
-
-fn repeat_vars(count: usize) -> String {
-    assert_ne!(count, 0);
-    let mut vars = "?,".repeat(count);
-    vars.pop();
-    vars
 }
 
 fn encode_hex(input: impl AsRef<[u8]>) -> String {
@@ -213,6 +209,21 @@ pub(crate) struct MultipartMetadata {
 pub(crate) struct MultipartCompletionPart {
     pub(crate) part_number: i32,
     pub(crate) md5: String,
+}
+
+/// ETag-like object identity condition evaluated by the storage layer.
+#[derive(Clone, Debug)]
+pub(crate) enum ObjectTagCondition {
+    Any,
+    Md5(String),
+    Never,
+}
+
+/// Preconditions that must hold before replacing an object.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ObjectWriteConditions {
+    pub(crate) if_match: Option<ObjectTagCondition>,
+    pub(crate) if_none_match: Option<ObjectTagCondition>,
 }
 
 /// Initiated multipart upload state shared by all uploaded parts.
@@ -482,6 +493,7 @@ impl Sqlite {
         upload_id: Uuid,
         requested_parts: Vec<MultipartCompletionPart>,
         access_key: Option<String>,
+        write_conditions: ObjectWriteConditions,
     ) -> SqliteResult<String> {
         self.validate_mutable_bucket(&bucket)?;
 
@@ -496,6 +508,7 @@ impl Sqlite {
                     upload_id,
                     &requested_parts,
                     access_key,
+                    &write_conditions,
                 )?;
                 transaction.commit()?;
                 Ok(md5)
@@ -511,6 +524,7 @@ impl Sqlite {
         upload_id: Uuid,
         requested_parts: &[MultipartCompletionPart],
         access_key: Option<String>,
+        write_conditions: &ObjectWriteConditions,
     ) -> SqliteResult<String> {
         if requested_parts.is_empty() {
             return Err(SqliteError::InvalidMultipartPart);
@@ -578,6 +592,7 @@ impl Sqlite {
         );
         let size = i64::try_from(value.len()).map_err(|_| SqliteError::MultipartObjectTooLarge)?;
 
+        Self::try_check_object_write_conditions(transaction, key, write_conditions)?;
         Self::try_put_object(
             transaction,
             KeyValue {
@@ -606,6 +621,49 @@ impl Sqlite {
         )?;
 
         Ok(md5)
+    }
+
+    /// Checks object write preconditions against current metadata in the transaction.
+    pub(crate) fn try_check_object_write_conditions(
+        transaction: &Transaction,
+        key: &str,
+        conditions: &ObjectWriteConditions,
+    ) -> SqliteResult<()> {
+        if conditions.if_match.is_none() && conditions.if_none_match.is_none() {
+            return Ok(());
+        }
+
+        let current = Self::try_get_metadata(transaction, key)?;
+        let current_md5 = current
+            .as_ref()
+            .and_then(|metadata| metadata.md5.as_deref());
+
+        if let Some(condition) = conditions.if_match.as_ref()
+            && Self::object_tag_condition_matches(condition, current_md5).not()
+        {
+            return Err(SqliteError::PreconditionFailed);
+        }
+
+        if let Some(condition) = conditions.if_none_match.as_ref()
+            && Self::object_tag_condition_matches(condition, current_md5)
+        {
+            return Err(SqliteError::PreconditionFailed);
+        }
+
+        Ok(())
+    }
+
+    /// Returns whether stored object metadata satisfies an object tag condition.
+    #[must_use]
+    fn object_tag_condition_matches(
+        condition: &ObjectTagCondition,
+        current_md5: Option<&str>,
+    ) -> bool {
+        match condition {
+            ObjectTagCondition::Any => current_md5.is_some(),
+            ObjectTagCondition::Md5(md5) => current_md5 == Some(md5.as_str()),
+            ObjectTagCondition::Never => false,
+        }
     }
 
     /// Ensures the bucket database schema exists and applies additive migrations.
@@ -908,27 +966,6 @@ impl Sqlite {
             WHERE key = ?1;",
         )?;
         Ok(stmt.execute([key])?)
-    }
-
-    /// Deletes multiple objects and returns the keys that existed.
-    pub(crate) fn try_delete_objects(
-        transaction: &Transaction,
-        keys: &[String],
-    ) -> SqliteResult<Vec<String>> {
-        let vars = repeat_vars(keys.len());
-
-        let mut stmt = transaction.prepare(&format!(
-            "
-            DELETE FROM data
-            WHERE key IN ({vars})
-            RETURNING key;"
-        ))?;
-
-        let keys = stmt
-            .query_map(rusqlite::params_from_iter(keys), |row| row.get(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        Ok(keys)
     }
 
     /// Creates multipart upload state for an upload ID.

@@ -13,14 +13,15 @@ use s3s::{
         CopyObjectOutput, CopyObjectResult, CopySource, CreateBucketInput, CreateBucketOutput,
         CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketInput,
         DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput,
-        DeleteObjectsOutput, DeletedObject, ETag, EncodingType, GetBucketLocationInput,
-        GetBucketLocationOutput, GetObjectAclInput, GetObjectAclOutput, GetObjectInput,
-        GetObjectOutput, Grant, Grantee, HeadBucketInput, HeadBucketOutput, HeadObjectInput,
-        HeadObjectOutput, ListBucketsInput, ListBucketsOutput, ListObjectVersionsInput,
-        ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
-        ListObjectsV2Output, ListPartsInput, ListPartsOutput, MetadataDirective, Object,
-        ObjectVersion, ObjectVersionStorageClass, Owner, Part, Permission, PutObjectInput,
-        PutObjectOutput, StreamingBlob, Timestamp, Type, UploadPartInput, UploadPartOutput,
+        DeleteObjectsOutput, DeletedObject, ETag, ETagCondition, EncodingType,
+        Error as DeleteError, GetBucketLocationInput, GetBucketLocationOutput, GetObjectAclInput,
+        GetObjectAclOutput, GetObjectInput, GetObjectOutput, Grant, Grantee, HeadBucketInput,
+        HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput,
+        ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput,
+        ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput,
+        MetadataDirective, Object, ObjectVersion, ObjectVersionStorageClass, Owner, Part,
+        Permission, PutObjectInput, PutObjectOutput, StreamingBlob, Timestamp, Type,
+        UploadPartInput, UploadPartOutput,
     },
     header::CONTENT_MD5,
 };
@@ -34,7 +35,7 @@ use uuid::Uuid;
 
 use crate::sqlite::{
     KeyMetadata, KeyValue, Multipart, MultipartCompletionPart, MultipartUploadState, ObjectSummary,
-    Sqlite, SqliteError,
+    ObjectTagCondition, ObjectWriteConditions, Sqlite, SqliteError,
 };
 
 const LIST_BATCH_SIZE: i64 = 1024;
@@ -51,6 +52,7 @@ fn s3_error_from_sqlite(error: SqliteError) -> S3Error {
             "database is in read-only mode",
         ),
         SqliteError::ObjectNotFound => S3Error::new(S3ErrorCode::NoSuchKey),
+        SqliteError::PreconditionFailed => S3Error::new(S3ErrorCode::PreconditionFailed),
         SqliteError::MultipartUploadNotFound => S3Error::new(S3ErrorCode::NoSuchUpload),
         SqliteError::MultipartAccessDenied => S3Error::new(S3ErrorCode::AccessDenied),
         SqliteError::InvalidMultipartPart => S3Error::new(S3ErrorCode::InvalidPart),
@@ -309,6 +311,174 @@ fn output_delimiter(delimiter: Option<String>, encode: bool) -> Option<String> {
     })
 }
 
+#[derive(Clone, Debug)]
+struct ObjectReadConditions {
+    etag_matches: Option<ETagCondition>,
+    modified_since: Option<OffsetDateTime>,
+    etag_none_matches: Option<ETagCondition>,
+    unmodified_since: Option<OffsetDateTime>,
+}
+
+#[derive(Clone, Debug)]
+struct ObjectDeleteConditions {
+    etag_matches: Option<ETagCondition>,
+    last_modified_time: Option<OffsetDateTime>,
+    size: Option<i64>,
+}
+
+/// Converts S3 write condition headers into storage-neutral object conditions.
+#[must_use]
+fn object_write_conditions(
+    if_match: Option<ETagCondition>,
+    if_none_match: Option<ETagCondition>,
+) -> ObjectWriteConditions {
+    ObjectWriteConditions {
+        if_match: if_match.map(strong_object_tag_condition),
+        if_none_match: if_none_match.map(weak_object_tag_condition),
+    }
+}
+
+/// Converts an `If-Match` value into a strong storage tag condition.
+#[must_use]
+fn strong_object_tag_condition(condition: ETagCondition) -> ObjectTagCondition {
+    match condition {
+        ETagCondition::Any => ObjectTagCondition::Any,
+        ETagCondition::ETag(ETag::Strong(md5)) => ObjectTagCondition::Md5(md5),
+        ETagCondition::ETag(ETag::Weak(_)) => ObjectTagCondition::Never,
+    }
+}
+
+/// Converts an `If-None-Match` value into a weak storage tag condition.
+#[must_use]
+fn weak_object_tag_condition(condition: ETagCondition) -> ObjectTagCondition {
+    match condition {
+        ETagCondition::Any => ObjectTagCondition::Any,
+        ETagCondition::ETag(etag) => ObjectTagCondition::Md5(etag.into_value()),
+    }
+}
+
+/// Drops sub-second precision to match HTTP date validator precision.
+#[must_use]
+fn http_date_time(value: OffsetDateTime) -> OffsetDateTime {
+    match value.replace_nanosecond(0) {
+        Ok(value) => value,
+        Err(_) => value,
+    }
+}
+
+/// Returns whether an S3 `If-Match` style condition matches stored object metadata.
+#[must_use]
+fn strong_etag_condition_matches(condition: &ETagCondition, md5: Option<&str>) -> bool {
+    match condition {
+        ETagCondition::Any => md5.is_some(),
+        ETagCondition::ETag(ETag::Strong(value)) => md5 == Some(value.as_str()),
+        ETagCondition::ETag(ETag::Weak(_)) => false,
+    }
+}
+
+/// Returns whether an S3 `If-None-Match` style condition matches stored object metadata.
+#[must_use]
+fn weak_etag_condition_matches(condition: &ETagCondition, md5: Option<&str>) -> bool {
+    match condition {
+        ETagCondition::Any => md5.is_some(),
+        ETagCondition::ETag(etag) => md5 == Some(etag.value()),
+    }
+}
+
+/// Applies GET/HEAD conditional request semantics to loaded object metadata.
+fn validate_read_conditions(
+    metadata: &KeyMetadata,
+    conditions: &ObjectReadConditions,
+) -> S3Result<()> {
+    let md5 = metadata.md5.as_deref();
+    if let Some(condition) = conditions.etag_matches.as_ref()
+        && strong_etag_condition_matches(condition, md5).not()
+    {
+        return Err(s3_error(S3ErrorCode::PreconditionFailed));
+    }
+
+    if let Some(condition) = conditions.etag_none_matches.as_ref() {
+        if weak_etag_condition_matches(condition, md5) {
+            return Err(s3_error(S3ErrorCode::NotModified));
+        }
+    } else if let Some(since) = conditions.modified_since
+        && http_date_time(metadata.last_modified) <= http_date_time(since)
+    {
+        return Err(s3_error(S3ErrorCode::NotModified));
+    }
+
+    if conditions.etag_matches.is_none()
+        && let Some(since) = conditions.unmodified_since
+        && http_date_time(metadata.last_modified) > http_date_time(since)
+    {
+        return Err(s3_error(S3ErrorCode::PreconditionFailed));
+    }
+
+    Ok(())
+}
+
+/// Applies copy-source conditional request semantics to loaded source metadata.
+fn validate_copy_source_conditions(
+    metadata: &KeyMetadata,
+    conditions: &ObjectReadConditions,
+) -> Result<(), SqliteError> {
+    let md5 = metadata.md5.as_deref();
+    if let Some(condition) = conditions.etag_matches.as_ref()
+        && strong_etag_condition_matches(condition, md5).not()
+    {
+        return Err(SqliteError::PreconditionFailed);
+    }
+
+    if let Some(condition) = conditions.etag_none_matches.as_ref() {
+        if weak_etag_condition_matches(condition, md5) {
+            return Err(SqliteError::PreconditionFailed);
+        }
+    } else if let Some(since) = conditions.modified_since
+        && http_date_time(metadata.last_modified) <= http_date_time(since)
+    {
+        return Err(SqliteError::PreconditionFailed);
+    }
+
+    if conditions.etag_matches.is_none()
+        && let Some(since) = conditions.unmodified_since
+        && http_date_time(metadata.last_modified) > http_date_time(since)
+    {
+        return Err(SqliteError::PreconditionFailed);
+    }
+
+    Ok(())
+}
+
+/// Applies delete conditional request semantics inside a write transaction.
+fn validate_delete_conditions(
+    metadata: Option<&KeyMetadata>,
+    conditions: &ObjectDeleteConditions,
+) -> Result<(), SqliteError> {
+    let Some(metadata) = metadata else {
+        return Ok(());
+    };
+
+    if let Some(condition) = conditions.etag_matches.as_ref()
+        && strong_etag_condition_matches(condition, metadata.md5.as_deref()).not()
+    {
+        return Err(SqliteError::PreconditionFailed);
+    }
+
+    if let Some(last_modified_time) = conditions.last_modified_time
+        && http_date_time(metadata.last_modified) != http_date_time(last_modified_time)
+    {
+        return Err(SqliteError::PreconditionFailed);
+    }
+
+    if let Some(size) = conditions.size
+        && metadata.size != size
+    {
+        return Err(SqliteError::PreconditionFailed);
+    }
+
+    Ok(())
+}
+
 /// Converts a stored object summary into an S3 list object.
 fn object_from_summary(summary: ObjectSummary, encode_keys: bool, owner: Option<&Owner>) -> Object {
     Object {
@@ -492,6 +662,10 @@ impl S3 for Sqlite {
             cache_control,
             content_type,
             copy_source,
+            copy_source_if_match,
+            copy_source_if_modified_since,
+            copy_source_if_none_match,
+            copy_source_if_unmodified_since,
             expires,
             metadata,
             metadata_directive,
@@ -517,6 +691,52 @@ impl S3 for Sqlite {
                 "copy source must be different from target unless replacing metadata",
             ));
         }
+        let source_conditions = ObjectReadConditions {
+            etag_matches: copy_source_if_match,
+            modified_since: copy_source_if_modified_since.map(Into::into),
+            etag_none_matches: copy_source_if_none_match,
+            unmodified_since: copy_source_if_unmodified_since.map(Into::into),
+        };
+
+        if src_bucket.as_ref() == tgt_bucket.as_str() {
+            let connection = self
+                .try_get_connection(&tgt_bucket)
+                .await
+                .map_err(s3_error_from_sqlite)?;
+            let copy_object_result = connection
+                .write(move |connection| {
+                    let transaction = connection.transaction()?;
+                    let mut object = Self::try_get_object(&transaction, &src_key)?
+                        .ok_or(SqliteError::ObjectNotFound)?;
+                    validate_copy_source_conditions(&object.key_metadata, &source_conditions)?;
+
+                    object.key = tgt_key;
+                    if replace_metadata {
+                        object.key_metadata.metadata = metadata;
+                        object.key_metadata.content_type = content_type;
+                        object.key_metadata.cache_control = cache_control;
+                        object.key_metadata.expires = expires.map(Into::into);
+                    }
+
+                    let copy_object_result = CopyObjectResult {
+                        e_tag: object.key_metadata.md5.clone().map(ETag::Strong),
+                        last_modified: Some(object.key_metadata.last_modified.into()),
+                        ..Default::default()
+                    };
+
+                    Self::try_put_object(&transaction, object)?;
+                    transaction.commit()?;
+                    Ok(copy_object_result)
+                })
+                .await
+                .map_err(s3_error_from_sqlite)?;
+
+            let output = CopyObjectOutput {
+                copy_object_result: Some(copy_object_result),
+                ..Default::default()
+            };
+            return Ok(S3Response::new(output));
+        }
 
         // verify source and target buckets exist
         let connection = self
@@ -530,6 +750,8 @@ impl S3 for Sqlite {
                 Self::try_get_object(&transaction, &src_key)?.ok_or(SqliteError::ObjectNotFound)
             })
             .await
+            .map_err(s3_error_from_sqlite)?;
+        validate_copy_source_conditions(&object.key_metadata, &source_conditions)
             .map_err(s3_error_from_sqlite)?;
 
         // replace key with target key
@@ -625,7 +847,19 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
-        let DeleteObjectInput { bucket, key, .. } = req.input;
+        let DeleteObjectInput {
+            bucket,
+            key,
+            if_match,
+            if_match_last_modified_time,
+            if_match_size,
+            ..
+        } = req.input;
+        let conditions = ObjectDeleteConditions {
+            etag_matches: if_match,
+            last_modified_time: if_match_last_modified_time.map(Into::into),
+            size: if_match_size,
+        };
 
         self.validate_mutable_bucket(&bucket)
             .map_err(s3_error_from_sqlite)?;
@@ -638,6 +872,8 @@ impl S3 for Sqlite {
         connection
             .write(move |connection| {
                 let transaction = connection.transaction()?;
+                let metadata = Self::try_get_metadata(&transaction, &key)?;
+                validate_delete_conditions(metadata.as_ref(), &conditions)?;
                 Self::try_delete_object(&transaction, &key)?;
                 Ok(transaction.commit()?)
             })
@@ -659,12 +895,21 @@ impl S3 for Sqlite {
             .map_err(s3_error_from_sqlite)?;
 
         let quiet = delete.quiet.unwrap_or(false);
-        let delete_keys = delete
+        let delete_objects = delete
             .objects
             .into_iter()
-            .map(|object| object.key)
+            .map(|object| {
+                (
+                    object.key,
+                    ObjectDeleteConditions {
+                        etag_matches: object.e_tag.map(ETagCondition::ETag),
+                        last_modified_time: object.last_modified_time.map(Into::into),
+                        size: object.size,
+                    },
+                )
+            })
             .collect::<Vec<_>>();
-        if delete_keys.len() > 1000 {
+        if delete_objects.len() > 1000 {
             return Err(s3_error_with_message(
                 S3ErrorCode::MalformedXML,
                 "DeleteObjects supports at most 1000 keys",
@@ -676,13 +921,31 @@ impl S3 for Sqlite {
             .await
             .map_err(s3_error_from_sqlite)?;
 
-        let deleted_keys = delete_keys.clone();
-        connection
+        let (deleted_keys, errors) = connection
             .write(move |connection| {
                 let transaction = connection.transaction()?;
-                Self::try_delete_objects(&transaction, &delete_keys)?;
+                let mut deleted_keys = Vec::new();
+                let mut errors = Vec::new();
+
+                for (key, conditions) in delete_objects {
+                    let metadata = Self::try_get_metadata(&transaction, &key)?;
+                    match validate_delete_conditions(metadata.as_ref(), &conditions) {
+                        Ok(()) => {
+                            Self::try_delete_object(&transaction, &key)?;
+                            deleted_keys.push(key);
+                        }
+                        Err(SqliteError::PreconditionFailed) => errors.push(DeleteError {
+                            key: Some(key),
+                            code: Some("PreconditionFailed".to_string()),
+                            message: Some("At least one precondition failed".to_string()),
+                            ..Default::default()
+                        }),
+                        Err(err) => return Err(err),
+                    }
+                }
+
                 transaction.commit()?;
-                Ok(())
+                Ok((deleted_keys, errors))
             })
             .await
             .map_err(s3_error_from_sqlite)?;
@@ -697,6 +960,7 @@ impl S3 for Sqlite {
                     })
                     .collect::<Vec<_>>()
             }),
+            errors: errors.is_empty().not().then_some(errors),
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -732,7 +996,14 @@ impl S3 for Sqlite {
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
         let GetObjectInput {
-            bucket, key, range, ..
+            bucket,
+            key,
+            range,
+            if_match,
+            if_modified_since,
+            if_none_match,
+            if_unmodified_since,
+            ..
         } = req.input;
 
         let connection = self
@@ -747,6 +1018,15 @@ impl S3 for Sqlite {
             })
             .await
             .map_err(s3_error_from_sqlite)?;
+        validate_read_conditions(
+            &object.key_metadata,
+            &ObjectReadConditions {
+                etag_matches: if_match,
+                modified_since: if_modified_since.map(Into::into),
+                etag_none_matches: if_none_match,
+                unmodified_since: if_unmodified_since.map(Into::into),
+            },
+        )?;
 
         let object_size =
             u64::try_from(object.key_metadata.size).map_err(S3Error::internal_error)?;
@@ -841,7 +1121,15 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
-        let HeadObjectInput { bucket, key, .. } = req.input;
+        let HeadObjectInput {
+            bucket,
+            key,
+            if_match,
+            if_modified_since,
+            if_none_match,
+            if_unmodified_since,
+            ..
+        } = req.input;
 
         let connection = self
             .try_get_connection(&bucket)
@@ -855,6 +1143,15 @@ impl S3 for Sqlite {
             })
             .await
             .map_err(s3_error_from_sqlite)?;
+        validate_read_conditions(
+            &object,
+            &ObjectReadConditions {
+                etag_matches: if_match,
+                modified_since: if_modified_since.map(Into::into),
+                etag_none_matches: if_none_match,
+                unmodified_since: if_unmodified_since.map(Into::into),
+            },
+        )?;
 
         let content_type = object
             .content_type
@@ -1260,9 +1557,12 @@ impl S3 for Sqlite {
             content_md5,
             content_type,
             expires,
+            if_match,
+            if_none_match,
             storage_class,
             ..
         } = input;
+        let write_conditions = object_write_conditions(if_match, if_none_match);
 
         self.validate_mutable_bucket(&bucket)
             .map_err(s3_error_from_sqlite)?;
@@ -1307,6 +1607,7 @@ impl S3 for Sqlite {
         connection
             .write(move |connection| {
                 let transaction = connection.transaction()?;
+                Self::try_check_object_write_conditions(&transaction, &key, &write_conditions)?;
                 Self::try_put_object(
                     &transaction,
                     KeyValue {
@@ -1605,8 +1906,11 @@ impl S3 for Sqlite {
             bucket,
             key,
             upload_id,
+            if_match,
+            if_none_match,
             ..
         } = req.input;
+        let write_conditions = object_write_conditions(if_match, if_none_match);
 
         self.validate_mutable_bucket(&bucket)
             .map_err(s3_error_from_sqlite)?;
@@ -1658,6 +1962,7 @@ impl S3 for Sqlite {
                 upload_id,
                 requested_parts,
                 access_key,
+                write_conditions,
             )
             .await
             .map_err(s3_error_from_sqlite)?;

@@ -14,7 +14,7 @@ use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_sdk_s3::{
     Client,
     config::{Credentials, Region},
-    primitives::ByteStream,
+    primitives::{ByteStream, DateTime},
     types::{
         BucketLocationConstraint, CompletedMultipartUpload, CompletedPart,
         CreateBucketConfiguration, Delete, EncodingType, ObjectIdentifier,
@@ -151,6 +151,19 @@ async fn put_object(c: &Client, bucket: &str, key: &str, body: &'static [u8]) ->
         .send()
         .await?;
     Ok(())
+}
+
+async fn get_object_bytes(c: &Client, bucket: &str, key: &str) -> Result<Vec<u8>> {
+    Ok(c.get_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await?
+        .body
+        .collect()
+        .await?
+        .into_bytes()
+        .to_vec())
 }
 
 fn object_identifier(key: &str) -> Result<ObjectIdentifier> {
@@ -402,6 +415,394 @@ async fn test_get_object_ranges() -> Result<()> {
     delete_object(&context, &bucket, key).await?;
     delete_object(&context, &bucket, empty_key).await?;
     delete_bucket(&context, &bucket).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_get_and_head_object_conditionals() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+
+    let bucket = format!("test-read-conditions-{}", Uuid::new_v4());
+    let key = "conditional.txt";
+
+    create_bucket(&context, &bucket).await?;
+    put_object(&context, &bucket, key, b"conditional").await?;
+
+    let head = context
+        .head_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+    let etag = head
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("head object response missing ETag"))?
+        .to_string();
+    let last_modified = head
+        .last_modified()
+        .ok_or_else(|| anyhow::anyhow!("head object response missing Last-Modified"))?;
+    let before = DateTime::from_secs(last_modified.secs() - 1);
+    let after = DateTime::from_secs(last_modified.secs() + 1);
+
+    context
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match(&etag)
+        .if_unmodified_since(before)
+        .send()
+        .await?;
+
+    let Err(err) = context
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_none_match(&etag)
+        .send()
+        .await
+    else {
+        anyhow::bail!("matching If-None-Match should return NotModified");
+    };
+    assert_error_contains(err, "NotModified");
+
+    let Err(err) = context
+        .head_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match("\"00000000000000000000000000000000\"")
+        .send()
+        .await
+    else {
+        anyhow::bail!("mismatched If-Match should fail");
+    };
+    assert_error_contains(err, "PreconditionFailed");
+
+    let Err(err) = context
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_modified_since(after)
+        .send()
+        .await
+    else {
+        anyhow::bail!("unmodified object should return NotModified");
+    };
+    assert_error_contains(err, "NotModified");
+
+    let Err(err) = context
+        .head_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_unmodified_since(before)
+        .send()
+        .await
+    else {
+        anyhow::bail!("modified object should fail If-Unmodified-Since");
+    };
+    assert_error_contains(err, "PreconditionFailed");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_put_object_conditionals_are_transactional() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+
+    let bucket = format!("test-put-conditions-{}", Uuid::new_v4());
+    let key = "conditional-put.txt";
+
+    create_bucket(&context, &bucket).await?;
+    put_object(&context, &bucket, key, b"old").await?;
+
+    let etag = context
+        .head_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("head object response missing ETag"))?
+        .to_string();
+
+    let Err(err) = context
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_none_match("*")
+        .body(ByteStream::from_static(b"blocked"))
+        .send()
+        .await
+    else {
+        anyhow::bail!("If-None-Match should reject overwrite");
+    };
+    assert_error_contains(err, "PreconditionFailed");
+    assert_eq!(get_object_bytes(&context, &bucket, key).await?, b"old");
+
+    let Err(err) = context
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match("\"00000000000000000000000000000000\"")
+        .body(ByteStream::from_static(b"blocked"))
+        .send()
+        .await
+    else {
+        anyhow::bail!("mismatched If-Match should reject overwrite");
+    };
+    assert_error_contains(err, "PreconditionFailed");
+    assert_eq!(get_object_bytes(&context, &bucket, key).await?, b"old");
+
+    context
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match(etag)
+        .body(ByteStream::from_static(b"new"))
+        .send()
+        .await?;
+    assert_eq!(get_object_bytes(&context, &bucket, key).await?, b"new");
+
+    context
+        .put_object()
+        .bucket(&bucket)
+        .key("create-only.txt")
+        .if_none_match("*")
+        .body(ByteStream::from_static(b"created"))
+        .send()
+        .await?;
+    assert_eq!(
+        get_object_bytes(&context, &bucket, "create-only.txt").await?,
+        b"created"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_copy_source_conditionals() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+
+    let bucket = format!("test-copy-conditions-{}", Uuid::new_v4());
+    let source = "source.txt";
+    let target = "target.txt";
+
+    create_bucket(&context, &bucket).await?;
+    put_object(&context, &bucket, source, b"copy-me").await?;
+
+    let head = context
+        .head_object()
+        .bucket(&bucket)
+        .key(source)
+        .send()
+        .await?;
+    let etag = head
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("head object response missing ETag"))?
+        .to_string();
+    let last_modified = head
+        .last_modified()
+        .ok_or_else(|| anyhow::anyhow!("head object response missing Last-Modified"))?;
+    let before = DateTime::from_secs(last_modified.secs() - 1);
+    let after = DateTime::from_secs(last_modified.secs() + 1);
+    let copy_source = format!("{bucket}/{source}");
+
+    let Err(err) = context
+        .copy_object()
+        .bucket(&bucket)
+        .key(target)
+        .copy_source(&copy_source)
+        .copy_source_if_match("\"00000000000000000000000000000000\"")
+        .send()
+        .await
+    else {
+        anyhow::bail!("mismatched copy source If-Match should fail");
+    };
+    assert_error_contains(err, "PreconditionFailed");
+
+    let Err(err) = context
+        .copy_object()
+        .bucket(&bucket)
+        .key(target)
+        .copy_source(&copy_source)
+        .copy_source_if_none_match(&etag)
+        .send()
+        .await
+    else {
+        anyhow::bail!("matching copy source If-None-Match should fail");
+    };
+    assert_error_contains(err, "PreconditionFailed");
+
+    let Err(err) = context
+        .copy_object()
+        .bucket(&bucket)
+        .key(target)
+        .copy_source(&copy_source)
+        .copy_source_if_modified_since(after)
+        .send()
+        .await
+    else {
+        anyhow::bail!("unmodified copy source should fail If-Modified-Since");
+    };
+    assert_error_contains(err, "PreconditionFailed");
+
+    context
+        .copy_object()
+        .bucket(&bucket)
+        .key(target)
+        .copy_source(&copy_source)
+        .copy_source_if_match(etag)
+        .copy_source_if_unmodified_since(before)
+        .send()
+        .await?;
+    assert_eq!(
+        get_object_bytes(&context, &bucket, target).await?,
+        b"copy-me"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_delete_object_conditionals() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+
+    let bucket = format!("test-delete-conditions-{}", Uuid::new_v4());
+    let key = "delete.txt";
+
+    create_bucket(&context, &bucket).await?;
+    put_object(&context, &bucket, key, b"delete-me").await?;
+
+    let head = context
+        .head_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+    let etag = head
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("head object response missing ETag"))?
+        .to_string();
+    let last_modified = head
+        .last_modified()
+        .ok_or_else(|| anyhow::anyhow!("head object response missing Last-Modified"))?;
+
+    let Err(err) = context
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match("\"00000000000000000000000000000000\"")
+        .send()
+        .await
+    else {
+        anyhow::bail!("mismatched delete If-Match should fail");
+    };
+    assert_error_contains(err, "PreconditionFailed");
+    assert_eq!(
+        get_object_bytes(&context, &bucket, key).await?,
+        b"delete-me"
+    );
+
+    let Err(err) = context
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match_size(999)
+        .send()
+        .await
+    else {
+        anyhow::bail!("mismatched delete size should fail");
+    };
+    assert_error_contains(err, "PreconditionFailed");
+
+    context
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match(etag)
+        .if_match_last_modified_time(*last_modified)
+        .if_match_size(9)
+        .send()
+        .await?;
+
+    context
+        .delete_object()
+        .bucket(&bucket)
+        .key("missing.txt")
+        .if_match("\"00000000000000000000000000000000\"")
+        .send()
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_delete_objects_conditionals_report_per_key_errors() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+
+    let bucket = format!("test-del-conds-{}", Uuid::new_v4());
+    create_bucket(&context, &bucket).await?;
+    put_object(&context, &bucket, "keep.txt", b"keep").await?;
+    put_object(&context, &bucket, "delete.txt", b"delete").await?;
+
+    let delete_etag = context
+        .head_object()
+        .bucket(&bucket)
+        .key("delete.txt")
+        .send()
+        .await?
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("head object response missing ETag"))?
+        .to_string();
+
+    let delete = Delete::builder()
+        .objects(
+            ObjectIdentifier::builder()
+                .key("keep.txt")
+                .e_tag("\"00000000000000000000000000000000\"")
+                .build()?,
+        )
+        .objects(
+            ObjectIdentifier::builder()
+                .key("delete.txt")
+                .e_tag(delete_etag)
+                .build()?,
+        )
+        .build()?;
+
+    let output = context
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(delete)
+        .send()
+        .await?;
+    assert_eq!(output.deleted().len(), 1);
+    assert_eq!(output.errors().len(), 1);
+    assert_eq!(
+        get_object_bytes(&context, &bucket, "keep.txt").await?,
+        b"keep"
+    );
+
+    let Err(err) = context
+        .get_object()
+        .bucket(&bucket)
+        .key("delete.txt")
+        .send()
+        .await
+    else {
+        anyhow::bail!("conditionally deleted object should be gone");
+    };
+    assert_error_contains(err, "NoSuchKey");
 
     Ok(())
 }
@@ -1217,6 +1618,106 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
 
     delete_object(&context, &bucket, key).await?;
     delete_bucket(&context, &bucket).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_complete_multipart_upload_conditionals() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+
+    let bucket = format!("test-multipart-conditions-{}", Uuid::new_v4());
+    let key = "conditional-multipart.txt";
+
+    create_bucket(&context, &bucket).await?;
+    put_object(&context, &bucket, key, b"old").await?;
+    let old_etag = context
+        .head_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("head object response missing ETag"))?
+        .to_string();
+
+    let blocked_upload_id = context
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?
+        .upload_id
+        .ok_or_else(|| anyhow::anyhow!("create multipart response missing upload ID"))?;
+    let blocked_first = vec![b'a'; 5 * 1024 * 1024];
+    let blocked_part1 = upload_part_body(
+        &context,
+        &bucket,
+        key,
+        &blocked_upload_id,
+        1,
+        ByteStream::from(blocked_first),
+    )
+    .await?;
+    let blocked_part2 =
+        upload_part(&context, &bucket, key, &blocked_upload_id, 2, b"blocked").await?;
+    let blocked_upload = CompletedMultipartUpload::builder()
+        .set_parts(Some(vec![blocked_part1, blocked_part2]))
+        .build();
+    let Err(err) = context
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(&blocked_upload_id)
+        .multipart_upload(blocked_upload)
+        .if_none_match("*")
+        .send()
+        .await
+    else {
+        anyhow::bail!("If-None-Match should reject multipart overwrite");
+    };
+    assert_error_contains(err, "PreconditionFailed");
+    assert_eq!(get_object_bytes(&context, &bucket, key).await?, b"old");
+
+    let upload_id = context
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?
+        .upload_id
+        .ok_or_else(|| anyhow::anyhow!("create multipart response missing upload ID"))?;
+    let first_part = vec![b'b'; 5 * 1024 * 1024];
+    let mut expected = first_part.clone();
+    expected.extend_from_slice(b"new");
+    let part1 = upload_part_body(
+        &context,
+        &bucket,
+        key,
+        &upload_id,
+        1,
+        ByteStream::from(first_part),
+    )
+    .await?;
+    let part2 = upload_part(&context, &bucket, key, &upload_id, 2, b"new").await?;
+    let upload = CompletedMultipartUpload::builder()
+        .set_parts(Some(vec![part1, part2]))
+        .build();
+    context
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(upload)
+        .if_match(old_etag)
+        .send()
+        .await?;
+    assert_eq!(
+        get_object_bytes(&context, &bucket, key).await?,
+        expected.as_slice()
+    );
 
     Ok(())
 }
