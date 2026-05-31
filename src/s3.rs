@@ -7,7 +7,6 @@ use s3s::{
     S3, S3Error, S3ErrorCode,
     S3ErrorCode::InternalError,
     S3Request, S3Response, S3Result, StdError,
-    auth::Credentials,
     dto::{
         AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, CommonPrefix,
         CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput,
@@ -34,7 +33,8 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::sqlite::{
-    KeyMetadata, KeyValue, Multipart, MultipartUploadState, ObjectSummary, Sqlite, SqliteError,
+    KeyMetadata, KeyValue, Multipart, MultipartCompletionPart, MultipartUploadState, ObjectSummary,
+    Sqlite, SqliteError,
 };
 
 const LIST_BATCH_SIZE: i64 = 1024;
@@ -42,25 +42,24 @@ const CONTINUATION_TOKEN_PREFIX: &str = "s3ite:v1:";
 const OWNER_DISPLAY_NAME: &str = "s3ite";
 const OWNER_ID: &str = "s3ite";
 
-impl From<SqliteError> for S3Error {
-    fn from(error: SqliteError) -> Self {
-        match error {
-            SqliteError::BucketNotFound => Self::new(s3s::S3ErrorCode::NoSuchBucket),
-            SqliteError::BucketReadOnly => Self::with_message(
-                s3s::S3ErrorCode::MethodNotAllowed,
-                "database is in read-only mode",
-            ),
-            SqliteError::ObjectNotFound => Self::new(s3s::S3ErrorCode::NoSuchKey),
-            SqliteError::MultipartUploadNotFound => Self::new(s3s::S3ErrorCode::NoSuchUpload),
-            SqliteError::MultipartAccessDenied => Self::new(s3s::S3ErrorCode::AccessDenied),
-            SqliteError::InvalidMultipartPart => Self::new(s3s::S3ErrorCode::InvalidPart),
-            SqliteError::MultipartPartTooSmall => Self::new(s3s::S3ErrorCode::EntityTooSmall),
-            SqliteError::MultipartObjectTooLarge => {
-                Self::with_message(InternalError, "multipart object is too large")
-            }
-            SqliteError::Configuration(message) => Self::with_message(InternalError, message),
-            error => Self::internal_error(error),
+/// Maps storage-layer failures into S3 protocol errors at the service boundary.
+fn s3_error_from_sqlite(error: SqliteError) -> S3Error {
+    match error {
+        SqliteError::BucketNotFound => S3Error::new(S3ErrorCode::NoSuchBucket),
+        SqliteError::BucketReadOnly => S3Error::with_message(
+            S3ErrorCode::MethodNotAllowed,
+            "database is in read-only mode",
+        ),
+        SqliteError::ObjectNotFound => S3Error::new(S3ErrorCode::NoSuchKey),
+        SqliteError::MultipartUploadNotFound => S3Error::new(S3ErrorCode::NoSuchUpload),
+        SqliteError::MultipartAccessDenied => S3Error::new(S3ErrorCode::AccessDenied),
+        SqliteError::InvalidMultipartPart => S3Error::new(S3ErrorCode::InvalidPart),
+        SqliteError::MultipartPartTooSmall => S3Error::new(S3ErrorCode::EntityTooSmall),
+        SqliteError::MultipartObjectTooLarge => {
+            S3Error::with_message(InternalError, "multipart object is too large")
         }
+        SqliteError::Configuration(message) => S3Error::with_message(InternalError, message),
+        error => S3Error::internal_error(error),
     }
 }
 
@@ -310,26 +309,6 @@ fn output_delimiter(delimiter: Option<String>, encode: bool) -> Option<String> {
     })
 }
 
-/// Validates that multipart state belongs to the request credentials.
-fn validate_multipart_access(
-    stored_access_key: Option<&String>,
-    credentials: Option<&Credentials>,
-) -> Result<(), SqliteError> {
-    if stored_access_key == credentials.map(|credentials| &credentials.access_key) {
-        Ok(())
-    } else {
-        Err(SqliteError::MultipartAccessDenied)
-    }
-}
-
-/// Decodes a stored part MD5 value from lowercase hexadecimal text.
-fn decode_stored_md5_hex(value: &str) -> Result<[u8; 16], SqliteError> {
-    let decoded = decode_hex(value).ok_or(SqliteError::InvalidMultipartPart)?;
-    decoded
-        .try_into()
-        .map_err(|_| SqliteError::InvalidMultipartPart)
-}
-
 /// Converts a stored object summary into an S3 list object.
 fn object_from_summary(summary: ObjectSummary, encode_keys: bool, owner: Option<&Owner>) -> Object {
     Object {
@@ -381,7 +360,10 @@ impl Sqlite {
         mut after_key: Option<String>,
         max_keys: usize,
     ) -> S3Result<KeyListing> {
-        let connection = self.try_get_connection(bucket).await?;
+        let connection = self
+            .try_get_connection(bucket)
+            .await
+            .map_err(s3_error_from_sqlite)?;
         let mut keys = Vec::new();
         let mut common_prefixes = Vec::new();
         let mut seen_common_prefixes = HashSet::new();
@@ -405,7 +387,8 @@ impl Sqlite {
                             LIST_BATCH_SIZE,
                         )
                     })
-                    .await?;
+                    .await
+                    .map_err(s3_error_from_sqlite)?;
 
                 if summaries.is_empty() {
                     break;
@@ -487,7 +470,9 @@ impl S3 for Sqlite {
     ) -> S3Result<S3Response<CreateBucketOutput>> {
         let CreateBucketInput { bucket, .. } = req.input;
 
-        self.try_create_bucket(&bucket).await?;
+        self.try_create_bucket(&bucket)
+            .await
+            .map_err(s3_error_from_sqlite)?;
 
         let output = CreateBucketOutput {
             location: Some(format!("/{bucket}")),
@@ -513,7 +498,8 @@ impl S3 for Sqlite {
             ..
         } = req.input;
 
-        self.validate_mutable_bucket(&tgt_bucket)?;
+        self.validate_mutable_bucket(&tgt_bucket)
+            .map_err(s3_error_from_sqlite)?;
 
         let (src_bucket, src_key) = match copy_source {
             CopySource::AccessPoint { .. } => return Err(s3_error(S3ErrorCode::NotImplemented)),
@@ -533,14 +519,18 @@ impl S3 for Sqlite {
         }
 
         // verify source and target buckets exist
-        let connection = self.try_get_connection(&src_bucket).await?;
+        let connection = self
+            .try_get_connection(&src_bucket)
+            .await
+            .map_err(s3_error_from_sqlite)?;
 
         let mut object = connection
             .read(move |connection| {
                 let transaction = connection.transaction()?;
                 Self::try_get_object(&transaction, &src_key)?.ok_or(SqliteError::ObjectNotFound)
             })
-            .await?;
+            .await
+            .map_err(s3_error_from_sqlite)?;
 
         // replace key with target key
         object.key = tgt_key.clone();
@@ -557,14 +547,18 @@ impl S3 for Sqlite {
             ..Default::default()
         };
 
-        let connection = self.try_get_connection(&tgt_bucket).await?;
+        let connection = self
+            .try_get_connection(&tgt_bucket)
+            .await
+            .map_err(s3_error_from_sqlite)?;
         connection
             .write(move |connection| {
                 let transaction = connection.transaction()?;
                 Self::try_put_object(&transaction, object)?;
                 Ok(transaction.commit()?)
             })
-            .await?;
+            .await
+            .map_err(s3_error_from_sqlite)?;
 
         let output = CopyObjectOutput {
             copy_object_result: Some(copy_object_result),
@@ -581,15 +575,20 @@ impl S3 for Sqlite {
     ) -> S3Result<S3Response<DeleteBucketOutput>> {
         let DeleteBucketInput { bucket, .. } = req.input;
 
-        self.validate_mutable_bucket(&bucket)?;
+        self.validate_mutable_bucket(&bucket)
+            .map_err(s3_error_from_sqlite)?;
 
-        let connection = self.try_get_connection(&bucket).await?;
+        let connection = self
+            .try_get_connection(&bucket)
+            .await
+            .map_err(s3_error_from_sqlite)?;
         let has_objects = connection
             .read(|connection| {
                 let transaction = connection.transaction()?;
                 Self::try_has_objects(&transaction)
             })
-            .await?;
+            .await
+            .map_err(s3_error_from_sqlite)?;
         if has_objects {
             return Err(s3_error(S3ErrorCode::BucketNotEmpty));
         }
@@ -599,11 +598,14 @@ impl S3 for Sqlite {
             .write()
             .await
             .remove(&bucket)
-            .ok_or(SqliteError::BucketNotFound)?;
+            .ok_or(SqliteError::BucketNotFound)
+            .map_err(s3_error_from_sqlite)?;
 
-        connection.close().await?;
+        connection.close().await.map_err(s3_error_from_sqlite)?;
 
-        let bucket_path = self.get_bucket_path(&bucket)?;
+        let bucket_path = self
+            .get_bucket_path(&bucket)
+            .map_err(s3_error_from_sqlite)?;
         fs::remove_file(&bucket_path)
             .await
             .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
@@ -625,9 +627,13 @@ impl S3 for Sqlite {
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let DeleteObjectInput { bucket, key, .. } = req.input;
 
-        self.validate_mutable_bucket(&bucket)?;
+        self.validate_mutable_bucket(&bucket)
+            .map_err(s3_error_from_sqlite)?;
 
-        let connection = self.try_get_connection(&bucket).await?;
+        let connection = self
+            .try_get_connection(&bucket)
+            .await
+            .map_err(s3_error_from_sqlite)?;
 
         connection
             .write(move |connection| {
@@ -635,7 +641,8 @@ impl S3 for Sqlite {
                 Self::try_delete_object(&transaction, &key)?;
                 Ok(transaction.commit()?)
             })
-            .await?;
+            .await
+            .map_err(s3_error_from_sqlite)?;
 
         Ok(S3Response::new(DeleteObjectOutput::default()))
     }
@@ -648,7 +655,8 @@ impl S3 for Sqlite {
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
         let DeleteObjectsInput { bucket, delete, .. } = req.input;
 
-        self.validate_mutable_bucket(&bucket)?;
+        self.validate_mutable_bucket(&bucket)
+            .map_err(s3_error_from_sqlite)?;
 
         let quiet = delete.quiet.unwrap_or(false);
         let delete_keys = delete
@@ -663,7 +671,10 @@ impl S3 for Sqlite {
             ));
         }
 
-        let connection = self.try_get_connection(&bucket).await?;
+        let connection = self
+            .try_get_connection(&bucket)
+            .await
+            .map_err(s3_error_from_sqlite)?;
 
         let deleted_keys = delete_keys.clone();
         connection
@@ -673,7 +684,8 @@ impl S3 for Sqlite {
                 transaction.commit()?;
                 Ok(())
             })
-            .await?;
+            .await
+            .map_err(s3_error_from_sqlite)?;
 
         let output = DeleteObjectsOutput {
             deleted: quiet.not().then(|| {
@@ -702,7 +714,9 @@ impl S3 for Sqlite {
             return Err(s3_error(S3ErrorCode::NoSuchBucket));
         }
 
-        let file_path = self.get_bucket_path(&bucket)?;
+        let file_path = self
+            .get_bucket_path(&bucket)
+            .map_err(s3_error_from_sqlite)?;
         if file_path.exists().not() {
             return Err(s3_error(S3ErrorCode::NoSuchBucket));
         }
@@ -721,14 +735,18 @@ impl S3 for Sqlite {
             bucket, key, range, ..
         } = req.input;
 
-        let connection = self.try_get_connection(&bucket).await?;
+        let connection = self
+            .try_get_connection(&bucket)
+            .await
+            .map_err(s3_error_from_sqlite)?;
 
         let object = connection
             .read(move |connection| {
                 let transaction = connection.transaction()?;
                 Self::try_get_object(&transaction, &key)?.ok_or(SqliteError::ObjectNotFound)
             })
-            .await?;
+            .await
+            .map_err(s3_error_from_sqlite)?;
 
         let object_size =
             u64::try_from(object.key_metadata.size).map_err(S3Error::internal_error)?;
@@ -802,7 +820,9 @@ impl S3 for Sqlite {
             return Err(s3_error(S3ErrorCode::NoSuchBucket));
         }
 
-        let file_path = self.get_bucket_path(&bucket)?;
+        let file_path = self
+            .get_bucket_path(&bucket)
+            .map_err(s3_error_from_sqlite)?;
         if file_path.exists().not() {
             return Err(s3_error(S3ErrorCode::NoSuchBucket));
         }
@@ -823,14 +843,18 @@ impl S3 for Sqlite {
     ) -> S3Result<S3Response<HeadObjectOutput>> {
         let HeadObjectInput { bucket, key, .. } = req.input;
 
-        let connection = self.try_get_connection(&bucket).await?;
+        let connection = self
+            .try_get_connection(&bucket)
+            .await
+            .map_err(s3_error_from_sqlite)?;
 
         let object = connection
             .read(move |connection| {
                 let transaction = connection.transaction()?;
                 Self::try_get_metadata(&transaction, &key)?.ok_or(SqliteError::ObjectNotFound)
             })
-            .await?;
+            .await
+            .map_err(s3_error_from_sqlite)?;
 
         let content_type = object
             .content_type
@@ -858,14 +882,18 @@ impl S3 for Sqlite {
     ) -> S3Result<S3Response<GetObjectAclOutput>> {
         let GetObjectAclInput { bucket, key, .. } = req.input;
 
-        let connection = self.try_get_connection(&bucket).await?;
+        let connection = self
+            .try_get_connection(&bucket)
+            .await
+            .map_err(s3_error_from_sqlite)?;
         connection
             .read(move |connection| {
                 let transaction = connection.transaction()?;
                 Self::try_get_metadata(&transaction, &key)?.ok_or(SqliteError::ObjectNotFound)?;
                 Ok(())
             })
-            .await?;
+            .await
+            .map_err(s3_error_from_sqlite)?;
 
         let owner = owner();
         let output = GetObjectAclOutput {
@@ -902,7 +930,7 @@ impl S3 for Sqlite {
         let mut buckets: Vec<Bucket> = Vec::new();
 
         for name in self.buckets.read().await.keys() {
-            let file_path = self.get_bucket_path(name)?;
+            let file_path = self.get_bucket_path(name).map_err(s3_error_from_sqlite)?;
             let file_meta = fs::metadata(file_path)
                 .await
                 .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
@@ -1236,7 +1264,8 @@ impl S3 for Sqlite {
             ..
         } = input;
 
-        self.validate_mutable_bucket(&bucket)?;
+        self.validate_mutable_bucket(&bucket)
+            .map_err(s3_error_from_sqlite)?;
 
         if self.buckets.read().await.contains_key(&bucket).not() {
             return Err(s3_error(S3ErrorCode::NoSuchBucket));
@@ -1253,7 +1282,10 @@ impl S3 for Sqlite {
             return Err(s3_error(S3ErrorCode::IncompleteBody));
         };
 
-        let connection = self.try_get_connection(&bucket).await?;
+        let connection = self
+            .try_get_connection(&bucket)
+            .await
+            .map_err(s3_error_from_sqlite)?;
 
         let mut md5_hash = Md5::new();
         let stream = body.inspect_ok(|bytes| md5_hash.update(bytes.as_ref()));
@@ -1293,7 +1325,8 @@ impl S3 for Sqlite {
                 )?;
                 Ok(transaction.commit()?)
             })
-            .await?;
+            .await
+            .map_err(s3_error_from_sqlite)?;
 
         let output = PutObjectOutput {
             e_tag: Some(ETag::Strong(md5)),
@@ -1318,13 +1351,17 @@ impl S3 for Sqlite {
             ..
         } = req.input;
 
-        self.validate_mutable_bucket(&bucket)?;
+        self.validate_mutable_bucket(&bucket)
+            .map_err(s3_error_from_sqlite)?;
 
         let upload_id = Uuid::new_v4();
 
         let bucket_clone = bucket.clone();
         let key_clone = key.clone();
-        let connection = self.try_get_connection(&bucket).await?;
+        let connection = self
+            .try_get_connection(&bucket)
+            .await
+            .map_err(s3_error_from_sqlite)?;
         connection
             .write(move |connection| {
                 let transaction = connection.transaction()?;
@@ -1343,7 +1380,8 @@ impl S3 for Sqlite {
                 )?;
                 Ok(transaction.commit()?)
             })
-            .await?;
+            .await
+            .map_err(s3_error_from_sqlite)?;
 
         let output = CreateMultipartUploadOutput {
             bucket: Some(bucket),
@@ -1372,7 +1410,8 @@ impl S3 for Sqlite {
             ..
         } = input;
 
-        self.validate_mutable_bucket(&bucket)?;
+        self.validate_mutable_bucket(&bucket)
+            .map_err(s3_error_from_sqlite)?;
 
         let body = body.ok_or_else(|| s3_error(S3ErrorCode::IncompleteBody))?;
         let upload_id =
@@ -1393,7 +1432,10 @@ impl S3 for Sqlite {
         )?;
 
         let md5_clone = md5.clone();
-        let connection = self.try_get_connection(&bucket).await?;
+        let connection = self
+            .try_get_connection(&bucket)
+            .await
+            .map_err(s3_error_from_sqlite)?;
         connection
             .write(move |connection| {
                 let transaction = connection.transaction()?;
@@ -1401,9 +1443,11 @@ impl S3 for Sqlite {
                 let upload_state =
                     Self::try_get_multipart_upload_state(&transaction, upload_id, &bucket, &key)?
                         .ok_or(SqliteError::MultipartUploadNotFound)?;
-                validate_multipart_access(
+                Self::try_validate_multipart_access(
                     upload_state.access_key.as_ref(),
-                    req.credentials.as_ref(),
+                    req.credentials
+                        .as_ref()
+                        .map(|credentials| credentials.access_key.as_str()),
                 )?;
 
                 Self::try_touch_multipart_upload(&transaction, upload_id)?;
@@ -1421,7 +1465,8 @@ impl S3 for Sqlite {
 
                 Ok(transaction.commit()?)
             })
-            .await?;
+            .await
+            .map_err(s3_error_from_sqlite)?;
 
         let output = UploadPartOutput {
             e_tag: Some(ETag::Strong(md5)),
@@ -1448,7 +1493,10 @@ impl S3 for Sqlite {
 
         let bucket_clone = bucket.clone();
         let key_clone = key.clone();
-        let connection = self.try_get_connection(&bucket).await?;
+        let connection = self
+            .try_get_connection(&bucket)
+            .await
+            .map_err(s3_error_from_sqlite)?;
         let parts = connection
             .read(move |connection| {
                 let transaction = connection.transaction()?;
@@ -1460,9 +1508,11 @@ impl S3 for Sqlite {
                     &key_clone,
                 )?
                 .ok_or(SqliteError::MultipartUploadNotFound)?;
-                validate_multipart_access(
+                Self::try_validate_multipart_access(
                     upload_state.access_key.as_ref(),
-                    req.credentials.as_ref(),
+                    req.credentials
+                        .as_ref()
+                        .map(|credentials| credentials.access_key.as_str()),
                 )?;
 
                 let parts = Self::try_list_multipart(&transaction, upload_id)?;
@@ -1471,7 +1521,8 @@ impl S3 for Sqlite {
 
                 Ok(parts)
             })
-            .await?;
+            .await
+            .map_err(s3_error_from_sqlite)?;
 
         let parts = parts
             .into_iter()
@@ -1506,21 +1557,27 @@ impl S3 for Sqlite {
             ..
         } = req.input;
 
-        self.validate_mutable_bucket(&bucket)?;
+        self.validate_mutable_bucket(&bucket)
+            .map_err(s3_error_from_sqlite)?;
 
         let upload_id =
             Uuid::parse_str(&upload_id).map_err(|_| s3_error(S3ErrorCode::NoSuchUpload))?;
 
-        let connection = self.try_get_connection(&bucket).await?;
+        let connection = self
+            .try_get_connection(&bucket)
+            .await
+            .map_err(s3_error_from_sqlite)?;
         connection
             .write(move |connection| {
                 let transaction = connection.transaction()?;
                 let upload_state =
                     Self::try_get_multipart_upload_state(&transaction, upload_id, &bucket, &key)?
                         .ok_or(SqliteError::MultipartUploadNotFound)?;
-                validate_multipart_access(
+                Self::try_validate_multipart_access(
                     upload_state.access_key.as_ref(),
-                    req.credentials.as_ref(),
+                    req.credentials
+                        .as_ref()
+                        .map(|credentials| credentials.access_key.as_str()),
                 )?;
 
                 let deleted = Self::try_delete_multipart(&transaction, upload_id)?;
@@ -1531,7 +1588,8 @@ impl S3 for Sqlite {
                 transaction.commit()?;
                 Ok(())
             })
-            .await?;
+            .await
+            .map_err(s3_error_from_sqlite)?;
 
         Ok(S3Response::new(AbortMultipartUploadOutput::default()))
     }
@@ -1550,7 +1608,8 @@ impl S3 for Sqlite {
             ..
         } = req.input;
 
-        self.validate_mutable_bucket(&bucket)?;
+        self.validate_mutable_bucket(&bucket)
+            .map_err(s3_error_from_sqlite)?;
 
         let upload_id =
             Uuid::parse_str(&upload_id).map_err(|_| s3_error(S3ErrorCode::InvalidRequest))?;
@@ -1584,119 +1643,24 @@ impl S3 for Sqlite {
                     .and_then(ETag::into_strong)
                     .ok_or_else(|| s3_error(S3ErrorCode::InvalidPart))?;
 
-                Ok((part_number, e_tag))
+                Ok(MultipartCompletionPart {
+                    part_number,
+                    md5: e_tag,
+                })
             })
             .collect::<S3Result<Vec<_>>>()?;
 
-        let bucket_clone = bucket.clone();
-        let key_clone = key.clone();
-        let connection = self.try_get_connection(&bucket).await?;
-        let md5 = connection
-            .write(move |connection| {
-                let transaction = connection.transaction()?;
-
-                let Some(upload_state) = Self::try_get_multipart_upload_state(
-                    &transaction,
-                    upload_id,
-                    &bucket_clone,
-                    &key_clone,
-                )?
-                else {
-                    let completed = Self::try_get_completed_multipart_upload(
-                        &transaction,
-                        upload_id,
-                        &bucket_clone,
-                        &key_clone,
-                    )?
-                    .ok_or(SqliteError::MultipartUploadNotFound)?;
-                    validate_multipart_access(
-                        completed.access_key.as_ref(),
-                        req.credentials.as_ref(),
-                    )?;
-                    return Ok(completed.md5);
-                };
-                validate_multipart_access(
-                    upload_state.access_key.as_ref(),
-                    req.credentials.as_ref(),
-                )?;
-
-                let parts = Self::try_get_multiparts(&transaction, upload_id)?;
-
-                if parts.len() != requested_parts.len() {
-                    return Err(SqliteError::InvalidMultipartPart);
-                }
-
-                let total_size = parts.iter().try_fold(0usize, |total, part| {
-                    let part_size = usize::try_from(part.size)
-                        .map_err(|_| SqliteError::InvalidMultipartPart)?;
-                    total
-                        .checked_add(part_size)
-                        .ok_or(SqliteError::MultipartObjectTooLarge)
-                })?;
-
-                let mut value = Vec::with_capacity(total_size);
-                let mut part_md5s = Vec::with_capacity(parts.len() * 16);
-                let final_part_number = requested_parts.len();
-                for (index, ((requested_part_number, requested_etag), part)) in
-                    requested_parts.iter().zip(parts).enumerate()
-                {
-                    if part.part_number != *requested_part_number {
-                        return Err(SqliteError::InvalidMultipartPart);
-                    }
-
-                    if index + 1 != final_part_number && part.size < 5 * 1024 * 1024 {
-                        return Err(SqliteError::MultipartPartTooSmall);
-                    }
-
-                    let Some(stored_md5) = part.md5.as_deref() else {
-                        return Err(SqliteError::InvalidMultipartPart);
-                    };
-                    if requested_etag != stored_md5 {
-                        return Err(SqliteError::InvalidMultipartPart);
-                    }
-
-                    part_md5s.extend_from_slice(&decode_stored_md5_hex(stored_md5)?);
-                    value.extend_from_slice(&part.value);
-                }
-
-                let mut md5_hash = Md5::new();
-                md5_hash.update(&part_md5s);
-                let md5 = format!("{}-{}", hex(md5_hash.finalize()), requested_parts.len());
-                let size =
-                    i64::try_from(value.len()).map_err(|_| SqliteError::MultipartObjectTooLarge)?;
-
-                Self::try_put_object(
-                    &transaction,
-                    KeyValue {
-                        key: key_clone.clone(),
-                        value: Some(value),
-                        key_metadata: KeyMetadata {
-                            size,
-                            metadata: upload_state.metadata,
-                            content_type: upload_state.content_type,
-                            cache_control: upload_state.cache_control,
-                            expires: upload_state.expires,
-                            last_modified: OffsetDateTime::now_utc(),
-                            md5: Some(md5.clone()),
-                        },
-                    },
-                )?;
-
-                Self::try_delete_multipart(&transaction, upload_id)?;
-                Self::try_put_completed_multipart_upload(
-                    &transaction,
-                    upload_id,
-                    &bucket_clone,
-                    &key_clone,
-                    req.credentials.map(|credentials| credentials.access_key),
-                    &md5,
-                )?;
-
-                transaction.commit()?;
-
-                Ok(md5)
-            })
-            .await?;
+        let access_key = req.credentials.map(|credentials| credentials.access_key);
+        let md5 = self
+            .try_complete_multipart_upload(
+                bucket.clone(),
+                key.clone(),
+                upload_id,
+                requested_parts,
+                access_key,
+            )
+            .await
+            .map_err(s3_error_from_sqlite)?;
 
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket),

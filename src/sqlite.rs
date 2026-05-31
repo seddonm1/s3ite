@@ -6,6 +6,7 @@ use std::{
     sync::Arc,
 };
 
+use md5::{Digest, Md5};
 use path_absolutize::Absolutize;
 use rusqlite::{Error::ToSqlConversionFailure, OptionalExtension, Transaction};
 use time::{Duration, OffsetDateTime};
@@ -115,6 +116,42 @@ fn repeat_vars(count: usize) -> String {
     vars
 }
 
+fn encode_hex(input: impl AsRef<[u8]>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let input = input.as_ref();
+    let mut encoded = String::with_capacity(input.len() * 2);
+    for byte in input {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn decode_md5_hex(value: &str) -> SqliteResult<[u8; 16]> {
+    fn nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = value.as_bytes();
+    if bytes.len() != 32 {
+        return Err(SqliteError::InvalidMultipartPart);
+    }
+
+    let mut decoded = [0; 16];
+    for (idx, pair) in bytes.chunks_exact(2).enumerate() {
+        let upper = nibble(pair[0]).ok_or(SqliteError::InvalidMultipartPart)?;
+        let lower = nibble(pair[1]).ok_or(SqliteError::InvalidMultipartPart)?;
+        decoded[idx] = (upper << 4) | lower;
+    }
+    Ok(decoded)
+}
+
 /// SQLite-backed storage state and open bucket connections.
 #[derive(Debug)]
 pub struct Sqlite {
@@ -169,6 +206,13 @@ pub(crate) struct MultipartMetadata {
     pub(crate) part_number: i32,
     pub(crate) last_modified: OffsetDateTime,
     pub(crate) size: i64,
+}
+
+/// Client-requested multipart part checksum used during completion.
+#[derive(Debug)]
+pub(crate) struct MultipartCompletionPart {
+    pub(crate) part_number: i32,
+    pub(crate) md5: String,
 }
 
 /// Initiated multipart upload state shared by all uploaded parts.
@@ -428,6 +472,140 @@ impl Sqlite {
         }
 
         Ok(())
+    }
+
+    /// Completes a multipart upload and records the completed object.
+    pub(crate) async fn try_complete_multipart_upload(
+        &self,
+        bucket: String,
+        key: String,
+        upload_id: Uuid,
+        requested_parts: Vec<MultipartCompletionPart>,
+        access_key: Option<String>,
+    ) -> SqliteResult<String> {
+        self.validate_mutable_bucket(&bucket)?;
+
+        let connection = self.try_get_connection(&bucket).await?;
+        connection
+            .write(move |connection| {
+                let transaction = connection.transaction()?;
+                let md5 = Self::try_complete_multipart_upload_transaction(
+                    &transaction,
+                    &bucket,
+                    &key,
+                    upload_id,
+                    &requested_parts,
+                    access_key,
+                )?;
+                transaction.commit()?;
+                Ok(md5)
+            })
+            .await
+    }
+
+    /// Validates and materializes multipart completion inside one transaction.
+    fn try_complete_multipart_upload_transaction(
+        transaction: &Transaction,
+        bucket: &str,
+        key: &str,
+        upload_id: Uuid,
+        requested_parts: &[MultipartCompletionPart],
+        access_key: Option<String>,
+    ) -> SqliteResult<String> {
+        if requested_parts.is_empty() {
+            return Err(SqliteError::InvalidMultipartPart);
+        }
+
+        let Some(upload_state) =
+            Self::try_get_multipart_upload_state(transaction, upload_id, bucket, key)?
+        else {
+            let completed =
+                Self::try_get_completed_multipart_upload(transaction, upload_id, bucket, key)?
+                    .ok_or(SqliteError::MultipartUploadNotFound)?;
+            Self::try_validate_multipart_access(
+                completed.access_key.as_ref(),
+                access_key.as_deref(),
+            )?;
+            return Ok(completed.md5);
+        };
+        Self::try_validate_multipart_access(
+            upload_state.access_key.as_ref(),
+            access_key.as_deref(),
+        )?;
+
+        let parts = Self::try_get_multiparts(transaction, upload_id)?;
+        if parts.len() != requested_parts.len() {
+            return Err(SqliteError::InvalidMultipartPart);
+        }
+
+        let total_size = parts.iter().try_fold(0usize, |total, part| {
+            let part_size =
+                usize::try_from(part.size).map_err(|_| SqliteError::InvalidMultipartPart)?;
+            total
+                .checked_add(part_size)
+                .ok_or(SqliteError::MultipartObjectTooLarge)
+        })?;
+
+        let mut value = Vec::with_capacity(total_size);
+        let mut part_md5s = Vec::with_capacity(parts.len() * 16);
+        let final_part_number = requested_parts.len();
+        for (index, (requested_part, part)) in requested_parts.iter().zip(parts).enumerate() {
+            if part.part_number != requested_part.part_number {
+                return Err(SqliteError::InvalidMultipartPart);
+            }
+
+            if index + 1 != final_part_number && part.size < 5 * 1024 * 1024 {
+                return Err(SqliteError::MultipartPartTooSmall);
+            }
+
+            let Some(stored_md5) = part.md5.as_deref() else {
+                return Err(SqliteError::InvalidMultipartPart);
+            };
+            if requested_part.md5 != stored_md5 {
+                return Err(SqliteError::InvalidMultipartPart);
+            }
+
+            part_md5s.extend_from_slice(&decode_md5_hex(stored_md5)?);
+            value.extend_from_slice(&part.value);
+        }
+
+        let mut md5_hash = Md5::new();
+        md5_hash.update(&part_md5s);
+        let md5 = format!(
+            "{}-{}",
+            encode_hex(md5_hash.finalize()),
+            requested_parts.len()
+        );
+        let size = i64::try_from(value.len()).map_err(|_| SqliteError::MultipartObjectTooLarge)?;
+
+        Self::try_put_object(
+            transaction,
+            KeyValue {
+                key: key.to_string(),
+                value: Some(value),
+                key_metadata: KeyMetadata {
+                    size,
+                    metadata: upload_state.metadata,
+                    content_type: upload_state.content_type,
+                    cache_control: upload_state.cache_control,
+                    expires: upload_state.expires,
+                    last_modified: OffsetDateTime::now_utc(),
+                    md5: Some(md5.clone()),
+                },
+            },
+        )?;
+
+        Self::try_delete_multipart(transaction, upload_id)?;
+        Self::try_put_completed_multipart_upload(
+            transaction,
+            upload_id,
+            bucket,
+            key,
+            access_key,
+            &md5,
+        )?;
+
+        Ok(md5)
     }
 
     /// Ensures the bucket database schema exists and applies additive migrations.
@@ -1037,6 +1215,18 @@ impl Sqlite {
             return Err(SqliteError::BucketReadOnly);
         }
         Ok(())
+    }
+
+    /// Validates that stored multipart state belongs to a request access key.
+    pub(crate) fn try_validate_multipart_access(
+        stored_access_key: Option<&String>,
+        request_access_key: Option<&str>,
+    ) -> SqliteResult<()> {
+        if stored_access_key.map(String::as_str) == request_access_key {
+            Ok(())
+        } else {
+            Err(SqliteError::MultipartAccessDenied)
+        }
     }
 }
 
