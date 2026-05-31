@@ -237,12 +237,12 @@ fi
 if [[ -n "${S3ITE_BIN:-}" ]]; then
   s3ite_bin="$S3ITE_BIN"
 else
-  CARGO_TARGET_DIR="$cargo_target_dir" cargo build --manifest-path "$repo_root/Cargo.toml" --features binary --bin s3ite
+  CARGO_TARGET_DIR="$cargo_target_dir" cargo build --release --manifest-path "$repo_root/Cargo.toml" --features binary --bin s3ite
   target_dir="$(
     CARGO_TARGET_DIR="$cargo_target_dir" cargo metadata --manifest-path "$repo_root/Cargo.toml" --no-deps --format-version 1 |
       "$venv_dir/bin/python" -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
   )"
-  s3ite_bin="$target_dir/debug/s3ite"
+  s3ite_bin="$target_dir/release/s3ite"
 fi
 
 if [[ ! -x "$s3ite_bin" ]]; then

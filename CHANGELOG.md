@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add unversioned `ListObjectVersions` support that reports current objects as `VersionId = null`.
 - Add minimal object ACL reads for conformance tests, returning the stable local owner with full control.
 - Add `AbortMultipartUpload` support.
+- Add multipart upload listing, multipart copy, completed-object part reads, and completed part boundary tracking.
 
 ### Changed
 
@@ -29,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replace process-global listing continuation snapshots with keyset pagination over ordered keys.
 - Reduce the direct dependency surface by removing unused dependencies, feature-gating binary-only crates, and replacing `crossbeam-channel` worker queues with `std::sync::mpsc::sync_channel`.
 - Ignore local reference clones and local `s3-tests` runtime artifacts.
+- Run the local `s3-tests` helper against a release `s3ite` build by default.
 
 ### Fixed
 
@@ -46,6 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Allow resent multipart parts to replace the previous stored part.
 - Make repeated multipart completion idempotently return the completed multipart ETag.
 - Refresh incomplete multipart upload activity when parts are uploaded, so cleanup is based on inactivity rather than creation time.
+- Complete `ListParts` pagination and `ETag` behavior, and normalize invalid multipart upload IDs to `NoSuchUpload`.
 - Return `InvalidDigest` for malformed `Content-MD5` values while preserving `BadDigest` for valid digests that do not match the request body.
 - Remove stray stdout from bucket creation.
 

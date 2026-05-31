@@ -43,6 +43,9 @@ pub enum SqliteError {
     /// A requested object does not exist.
     #[error("object does not exist")]
     ObjectNotFound,
+    /// A requested object byte range is not satisfiable.
+    #[error("object range is invalid")]
+    InvalidObjectRange,
     /// Object write preconditions did not match current stored metadata.
     #[error("object precondition failed")]
     PreconditionFailed,
@@ -202,6 +205,16 @@ pub(crate) struct MultipartMetadata {
     pub(crate) part_number: i32,
     pub(crate) last_modified: OffsetDateTime,
     pub(crate) size: i64,
+    pub(crate) md5: Option<String>,
+}
+
+/// Stored part boundary for a completed multipart object.
+#[derive(Debug)]
+pub(crate) struct CompletedObjectPart {
+    pub(crate) part_number: i32,
+    pub(crate) start: i64,
+    pub(crate) size: i64,
+    pub(crate) md5: Option<String>,
 }
 
 /// Client-requested multipart part checksum used during completion.
@@ -234,6 +247,14 @@ pub(crate) struct MultipartUploadState {
     pub(crate) content_type: Option<String>,
     pub(crate) cache_control: Option<String>,
     pub(crate) expires: Option<OffsetDateTime>,
+}
+
+/// Active multipart upload row returned by multipart upload listing.
+#[derive(Debug)]
+pub(crate) struct MultipartUploadSummary {
+    pub(crate) key: String,
+    pub(crate) upload_id: Uuid,
+    pub(crate) initiated: OffsetDateTime,
 }
 
 /// Completion ledger entry used to make multipart completion idempotent.
@@ -561,9 +582,12 @@ impl Sqlite {
         })?;
 
         let mut value = Vec::with_capacity(total_size);
+        let mut completed_parts = Vec::with_capacity(parts.len());
         let mut part_md5s = Vec::with_capacity(parts.len() * 16);
         let final_part_number = requested_parts.len();
-        for (index, (requested_part, part)) in requested_parts.iter().zip(parts).enumerate() {
+        let mut offset = 0;
+        for (index, (requested_part, part)) in requested_parts.iter().zip(parts.iter()).enumerate()
+        {
             if part.part_number != requested_part.part_number {
                 return Err(SqliteError::InvalidMultipartPart);
             }
@@ -580,6 +604,15 @@ impl Sqlite {
             }
 
             part_md5s.extend_from_slice(&decode_md5_hex(stored_md5)?);
+            completed_parts.push(CompletedObjectPart {
+                part_number: part.part_number,
+                start: offset,
+                size: part.size,
+                md5: Some(stored_md5.to_string()),
+            });
+            offset = offset
+                .checked_add(part.size)
+                .ok_or(SqliteError::MultipartObjectTooLarge)?;
             value.extend_from_slice(&part.value);
         }
 
@@ -609,6 +642,7 @@ impl Sqlite {
                 },
             },
         )?;
+        Self::try_put_completed_object_parts(transaction, key, &completed_parts)?;
 
         Self::try_delete_multipart(transaction, upload_id)?;
         Self::try_put_completed_multipart_upload(
@@ -694,6 +728,7 @@ impl Sqlite {
                     upload_id BLOB NOT NULL PRIMARY KEY,
                     bucket TEXT NOT NULL,
                     key TEXT NOT NULL,
+                    initiated TEXT NOT NULL,
                     last_modified TEXT NOT NULL,
                     access_key TEXT,
                     metadata TEXT,
@@ -702,6 +737,18 @@ impl Sqlite {
                     expires TEXT,
                     UNIQUE(upload_id, bucket, key)
                 );",
+            (),
+        )?;
+        transaction.execute(
+            "CREATE TABLE IF NOT EXISTS completed_object_part (
+                    key TEXT NOT NULL,
+                    part_number INTEGER NOT NULL,
+                    start INTEGER NOT NULL,
+                    size INTEGER NOT NULL,
+                    md5 TEXT,
+                    PRIMARY KEY (key, part_number),
+                    FOREIGN KEY (key) REFERENCES data (key) ON DELETE CASCADE
+                ) WITHOUT ROWID;",
             (),
         )?;
         transaction.execute(
@@ -738,6 +785,7 @@ impl Sqlite {
             ("metadata", "content_type", "content_type TEXT"),
             ("metadata", "cache_control", "cache_control TEXT"),
             ("metadata", "expires", "expires TEXT"),
+            ("multipart_upload", "initiated", "initiated TEXT"),
             ("multipart_upload", "metadata", "metadata TEXT"),
             ("multipart_upload", "content_type", "content_type TEXT"),
             ("multipart_upload", "cache_control", "cache_control TEXT"),
@@ -748,6 +796,10 @@ impl Sqlite {
                     .execute(&format!("ALTER TABLE {table} ADD COLUMN {definition};"), ())?;
             }
         }
+        transaction.execute(
+            "UPDATE multipart_upload SET initiated = last_modified WHERE initiated IS NULL;",
+            (),
+        )?;
 
         Ok(())
     }
@@ -932,6 +984,13 @@ impl Sqlite {
         )?;
 
         stmt.execute((&key, value))?;
+        transaction
+            .prepare_cached(
+                "
+                DELETE FROM completed_object_part
+                WHERE key = ?1;",
+            )?
+            .execute([&key])?;
 
         let mut stmt = transaction.prepare_cached(
             "
@@ -978,13 +1037,14 @@ impl Sqlite {
     ) -> SqliteResult<usize> {
         let mut stmt = transaction.prepare_cached(
             "
-            INSERT INTO multipart_upload (upload_id, last_modified, bucket, key, access_key, metadata, content_type, cache_control, expires)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);",
+            INSERT INTO multipart_upload (upload_id, initiated, last_modified, bucket, key, access_key, metadata, content_type, cache_control, expires)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10);",
         )?;
 
         let now = OffsetDateTime::now_utc();
         Ok(stmt.execute((
             upload_id,
+            now,
             now,
             bucket,
             key,
@@ -1130,30 +1190,170 @@ impl Sqlite {
     pub(crate) fn try_list_multipart(
         transaction: &Transaction,
         upload_id: Uuid,
+        after_part_number: i32,
+        limit: i64,
     ) -> SqliteResult<Vec<MultipartMetadata>> {
+        let limit = sql_limit(limit)?;
         let mut stmt = transaction.prepare_cached(
             "
             SELECT
                 last_modified,
                 part_number,
-                size
+                size,
+                md5
             FROM multipart_upload_part
             WHERE upload_id = ?1
-            ORDER BY part_number;",
+                AND part_number > ?2
+            ORDER BY part_number
+            LIMIT ?3;",
         )?;
 
         #[allow(clippy::let_and_return)]
         let objects = stmt
-            .query_map([upload_id], |row| {
+            .query_map((upload_id, after_part_number, limit), |row| {
                 Ok(MultipartMetadata {
                     last_modified: row.get(0)?,
                     part_number: row.get(1)?,
                     size: row_size(row, 2)?,
+                    md5: row.get(3)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         Ok(objects)
+    }
+
+    /// Lists active multipart uploads ordered by key and upload ID.
+    pub(crate) fn try_list_multipart_uploads(
+        transaction: &Transaction,
+        prefix: Option<&str>,
+        after_key: Option<&str>,
+        after_upload_id: Option<Uuid>,
+        limit: i64,
+    ) -> SqliteResult<Vec<MultipartUploadSummary>> {
+        let limit = sql_limit(limit)?;
+        let prefix = prefix.and_then(|prefix| prefix.is_empty().not().then_some(prefix));
+        let map_upload = |row: &rusqlite::Row<'_>| {
+            Ok(MultipartUploadSummary {
+                key: row.get(0)?,
+                upload_id: row.get(1)?,
+                initiated: row.get(2)?,
+            })
+        };
+
+        let uploads = match (prefix, after_key, after_upload_id) {
+            (Some(prefix), Some(after_key), Some(after_upload_id)) => {
+                let mut stmt = transaction.prepare_cached(
+                    "SELECT key, upload_id, initiated FROM multipart_upload WHERE key >= ?1 AND (key > ?2 OR (key = ?2 AND upload_id > ?3)) ORDER BY key, upload_id LIMIT ?4;",
+                )?;
+                stmt.query_map(
+                    rusqlite::params![prefix, after_key, after_upload_id, limit],
+                    map_upload,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            (Some(prefix), Some(after_key), None) => {
+                let mut stmt = transaction.prepare_cached(
+                    "SELECT key, upload_id, initiated FROM multipart_upload WHERE key >= ?1 AND key > ?2 ORDER BY key, upload_id LIMIT ?3;",
+                )?;
+                stmt.query_map(rusqlite::params![prefix, after_key, limit], map_upload)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            (Some(prefix), None, _) => {
+                let mut stmt = transaction.prepare_cached(
+                    "SELECT key, upload_id, initiated FROM multipart_upload WHERE key >= ?1 ORDER BY key, upload_id LIMIT ?2;",
+                )?;
+                stmt.query_map(rusqlite::params![prefix, limit], map_upload)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            (None, Some(after_key), Some(after_upload_id)) => {
+                let mut stmt = transaction.prepare_cached(
+                    "SELECT key, upload_id, initiated FROM multipart_upload WHERE key > ?1 OR (key = ?1 AND upload_id > ?2) ORDER BY key, upload_id LIMIT ?3;",
+                )?;
+                stmt.query_map(
+                    rusqlite::params![after_key, after_upload_id, limit],
+                    map_upload,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            (None, Some(after_key), None) => {
+                let mut stmt = transaction.prepare_cached(
+                    "SELECT key, upload_id, initiated FROM multipart_upload WHERE key > ?1 ORDER BY key, upload_id LIMIT ?2;",
+                )?;
+                stmt.query_map(rusqlite::params![after_key, limit], map_upload)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            (None, None, _) => {
+                let mut stmt = transaction.prepare_cached(
+                    "SELECT key, upload_id, initiated FROM multipart_upload ORDER BY key, upload_id LIMIT ?1;",
+                )?;
+                stmt.query_map([limit], map_upload)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+        };
+
+        Ok(uploads)
+    }
+
+    /// Fetches one completed multipart object part boundary.
+    pub(crate) fn try_get_completed_object_part(
+        transaction: &Transaction,
+        key: &str,
+        part_number: i32,
+    ) -> SqliteResult<Option<CompletedObjectPart>> {
+        let mut stmt = transaction.prepare_cached(
+            "
+            SELECT part_number, start, size, md5
+            FROM completed_object_part
+            WHERE key = ?1 AND part_number = ?2;",
+        )?;
+
+        Ok(stmt
+            .query_row((key, part_number), |row| {
+                Ok(CompletedObjectPart {
+                    part_number: row.get(0)?,
+                    start: row_size(row, 1)?,
+                    size: row_size(row, 2)?,
+                    md5: row.get(3)?,
+                })
+            })
+            .optional()?)
+    }
+
+    /// Counts recorded completed multipart object part boundaries.
+    pub(crate) fn try_count_completed_object_parts(
+        transaction: &Transaction,
+        key: &str,
+    ) -> SqliteResult<i32> {
+        let mut stmt = transaction
+            .prepare_cached("SELECT COUNT(*) FROM completed_object_part WHERE key = ?1;")?;
+        let count = stmt.query_row([key], |row| row_size(row, 0))?;
+        i32::try_from(count).map_err(|_| SqliteError::MultipartObjectTooLarge)
+    }
+
+    /// Inserts completed multipart object part boundaries.
+    fn try_put_completed_object_parts(
+        transaction: &Transaction,
+        key: &str,
+        parts: &[CompletedObjectPart],
+    ) -> SqliteResult<()> {
+        let mut stmt = transaction.prepare_cached(
+            "
+            INSERT INTO completed_object_part (key, part_number, start, size, md5)
+            VALUES (?1, ?2, ?3, ?4, ?5);",
+        )?;
+
+        for part in parts {
+            stmt.execute((
+                key,
+                part.part_number,
+                sql_size(part.start)?,
+                sql_size(part.size)?,
+                &part.md5,
+            ))?;
+        }
+
+        Ok(())
     }
 
     /// Fetches multipart upload parts with bodies ordered by part number.

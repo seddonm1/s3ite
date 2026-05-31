@@ -1,4 +1,8 @@
-use std::{collections::HashSet, fmt::Write as _, ops::Not};
+use std::{
+    collections::HashSet,
+    fmt::Write as _,
+    ops::{Not, Range as ByteRange},
+};
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
@@ -10,18 +14,20 @@ use s3s::{
     dto::{
         AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, CommonPrefix,
         CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput,
-        CopyObjectOutput, CopyObjectResult, CopySource, CreateBucketInput, CreateBucketOutput,
-        CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketInput,
-        DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput,
-        DeleteObjectsOutput, DeletedObject, ETag, ETagCondition, EncodingType,
+        CopyObjectOutput, CopyObjectResult, CopyPartResult, CopySource, CreateBucketInput,
+        CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
+        DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput,
+        DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag, ETagCondition, EncodingType,
         Error as DeleteError, GetBucketLocationInput, GetBucketLocationOutput, GetObjectAclInput,
         GetObjectAclOutput, GetObjectInput, GetObjectOutput, Grant, Grantee, HeadBucketInput,
-        HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput,
+        HeadBucketOutput, HeadObjectInput, HeadObjectOutput, Initiator, ListBucketsInput,
+        ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput,
         ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput,
         ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput,
-        MetadataDirective, Object, ObjectVersion, ObjectVersionStorageClass, Owner, Part,
-        Permission, PutObjectInput, PutObjectOutput, StreamingBlob, Timestamp, Type,
-        UploadPartInput, UploadPartOutput,
+        MetadataDirective, MultipartUpload, Object, ObjectVersion, ObjectVersionStorageClass,
+        Owner, Part, Permission, PutObjectInput, PutObjectOutput, Range as S3Range, StorageClass,
+        StreamingBlob, Timestamp, Type, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput,
+        UploadPartOutput,
     },
     header::CONTENT_MD5,
 };
@@ -34,8 +40,9 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::sqlite::{
-    KeyMetadata, KeyValue, Multipart, MultipartCompletionPart, MultipartUploadState, ObjectSummary,
-    ObjectTagCondition, ObjectWriteConditions, Sqlite, SqliteError,
+    CompletedObjectPart, KeyMetadata, KeyValue, Multipart, MultipartCompletionPart,
+    MultipartUploadState, MultipartUploadSummary, ObjectSummary, ObjectTagCondition,
+    ObjectWriteConditions, Sqlite, SqliteError,
 };
 
 const LIST_BATCH_SIZE: i64 = 1024;
@@ -52,6 +59,7 @@ fn s3_error_from_sqlite(error: SqliteError) -> S3Error {
             "database is in read-only mode",
         ),
         SqliteError::ObjectNotFound => S3Error::new(S3ErrorCode::NoSuchKey),
+        SqliteError::InvalidObjectRange => S3Error::new(S3ErrorCode::InvalidRange),
         SqliteError::PreconditionFailed => S3Error::new(S3ErrorCode::PreconditionFailed),
         SqliteError::MultipartUploadNotFound => S3Error::new(S3ErrorCode::NoSuchUpload),
         SqliteError::MultipartAccessDenied => S3Error::new(S3ErrorCode::AccessDenied),
@@ -311,6 +319,122 @@ fn output_delimiter(delimiter: Option<String>, encode: bool) -> Option<String> {
     })
 }
 
+/// Parses a multipart upload ID into the internal UUID representation.
+fn parse_upload_id(upload_id: &str) -> S3Result<Uuid> {
+    Uuid::parse_str(upload_id).map_err(|_| s3_error(S3ErrorCode::NoSuchUpload))
+}
+
+/// Validates an S3 multipart part number.
+fn validate_part_number(part_number: i32) -> S3Result<()> {
+    if (1..=10_000).contains(&part_number) {
+        Ok(())
+    } else {
+        Err(s3_error_with_message(
+            S3ErrorCode::InvalidArgument,
+            "partNumber must be between 1 and 10000",
+        ))
+    }
+}
+
+/// Returns a bounded S3 listing limit.
+fn list_limit(limit: Option<i32>, default: i32, max: i32) -> S3Result<i32> {
+    let limit = limit.unwrap_or(default);
+    if limit <= 0 {
+        return Err(s3_error_with_message(
+            S3ErrorCode::InvalidArgument,
+            "listing limit must be greater than zero",
+        ));
+    }
+    Ok(limit.min(max))
+}
+
+/// Parses an upload-copy source byte range.
+fn parse_copy_source_range(range: Option<String>) -> S3Result<Option<S3Range>> {
+    range
+        .map(|range| {
+            S3Range::parse(&range)
+                .map_err(|_| s3_error_with_message(S3ErrorCode::InvalidArgument, "invalid range"))
+        })
+        .transpose()
+}
+
+/// Normalizes an optional source range against object size.
+fn checked_copy_source_range(
+    range: Option<S3Range>,
+    object_size: u64,
+) -> Result<ByteRange<u64>, SqliteError> {
+    match range {
+        Some(range) => {
+            if let S3Range::Int {
+                last: Some(last), ..
+            } = range
+                && last >= object_size
+            {
+                return Err(SqliteError::InvalidObjectRange);
+            }
+            let range = range
+                .check(object_size)
+                .map_err(|_| SqliteError::InvalidObjectRange)?;
+            if range.is_empty() {
+                return Err(SqliteError::InvalidObjectRange);
+            }
+            Ok(range)
+        }
+        None => Ok(0..object_size),
+    }
+}
+
+/// Returns an object byte slice for upload-copy storage.
+fn copied_part_bytes(object: &KeyValue, range: ByteRange<u64>) -> Result<Vec<u8>, SqliteError> {
+    let value = match object.value.as_ref() {
+        Some(value) => value,
+        None if object.key_metadata.size == 0 => return Ok(Vec::new()),
+        None => {
+            return Err(SqliteError::Configuration(
+                "object metadata has nonzero size but no value".to_string(),
+            ));
+        }
+    };
+
+    let start = usize::try_from(range.start).map_err(|_| SqliteError::InvalidObjectRange)?;
+    let end = usize::try_from(range.end).map_err(|_| SqliteError::InvalidObjectRange)?;
+    value
+        .get(start..end)
+        .map(<[u8]>::to_vec)
+        .ok_or(SqliteError::InvalidObjectRange)
+}
+
+/// Computes the MD5 `ETag` for part bytes.
+fn part_md5(value: &[u8]) -> String {
+    let mut md5_hash = Md5::new();
+    md5_hash.update(value);
+    hex(md5_hash.finalize())
+}
+
+/// Converts a stored completed part boundary into an object byte range.
+fn completed_part_range(part: &CompletedObjectPart) -> S3Result<ByteRange<u64>> {
+    let start = u64::try_from(part.start).map_err(S3Error::internal_error)?;
+    let size = u64::try_from(part.size).map_err(S3Error::internal_error)?;
+    let end = start
+        .checked_add(size)
+        .ok_or_else(|| S3Error::with_message(InternalError, "completed part boundary overflows"))?;
+    Ok(start..end)
+}
+
+/// Resolves `partNumber` against recorded completed multipart boundaries.
+fn requested_part_range(
+    part_number: i32,
+    completed_part: Option<&CompletedObjectPart>,
+    completed_part_count: i32,
+    object_size: u64,
+) -> S3Result<ByteRange<u64>> {
+    match completed_part {
+        Some(part) => completed_part_range(part),
+        None if completed_part_count == 0 && part_number == 1 => Ok(0..object_size),
+        None => Err(s3_error(S3ErrorCode::InvalidPart)),
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ObjectReadConditions {
     etag_matches: Option<ETagCondition>,
@@ -324,6 +448,13 @@ struct ObjectDeleteConditions {
     etag_matches: Option<ETagCondition>,
     last_modified_time: Option<OffsetDateTime>,
     size: Option<i64>,
+}
+
+#[derive(Debug)]
+struct CopiedPart {
+    value: Vec<u8>,
+    size: i64,
+    md5: String,
 }
 
 /// Converts S3 write condition headers into storage-neutral object conditions.
@@ -520,6 +651,14 @@ struct KeyListing {
     is_truncated: bool,
 }
 
+struct MultipartUploadListing {
+    uploads: Vec<MultipartUploadSummary>,
+    common_prefixes: Vec<CommonPrefix>,
+    next_key_marker: Option<String>,
+    next_upload_id_marker: Option<String>,
+    is_truncated: bool,
+}
+
 impl Sqlite {
     /// Lists keys and common prefixes using S3 prefix, delimiter, and marker semantics.
     async fn list_keys(
@@ -625,6 +764,124 @@ impl Sqlite {
             common_prefixes,
             key_count,
             next_marker,
+            is_truncated,
+        })
+    }
+
+    /// Lists active multipart uploads with S3 prefix, delimiter, and marker semantics.
+    async fn list_active_multipart_uploads(
+        &self,
+        bucket: &str,
+        prefix_filter: &str,
+        delimiter_filter: Option<&str>,
+        mut after_key: Option<String>,
+        mut after_upload_id: Option<Uuid>,
+        max_uploads: usize,
+    ) -> S3Result<MultipartUploadListing> {
+        let connection = self
+            .try_get_connection(bucket)
+            .await
+            .map_err(s3_error_from_sqlite)?;
+        let mut uploads = Vec::new();
+        let mut common_prefixes = Vec::new();
+        let mut seen_common_prefixes = HashSet::new();
+        let marker_filter = after_key.clone();
+        let mut next_key_marker = None;
+        let mut next_upload_id_marker = None;
+        let mut count = 0usize;
+        let mut is_truncated = false;
+        let list_batch_len = usize::try_from(LIST_BATCH_SIZE).map_err(S3Error::internal_error)?;
+
+        if max_uploads > 0 {
+            'pages: loop {
+                let prefix = prefix_filter.to_string();
+                let after_key_query = after_key.clone();
+                let after_upload_id_query = after_upload_id;
+                let summaries = connection
+                    .read(move |connection| {
+                        let transaction = connection.transaction()?;
+                        Self::try_list_multipart_uploads(
+                            &transaction,
+                            Some(&prefix),
+                            after_key_query.as_deref(),
+                            after_upload_id_query,
+                            LIST_BATCH_SIZE,
+                        )
+                    })
+                    .await
+                    .map_err(s3_error_from_sqlite)?;
+
+                if summaries.is_empty() {
+                    break;
+                }
+
+                let summary_count = summaries.len();
+                for summary in summaries {
+                    if prefix_filter.is_empty().not()
+                        && summary.key.starts_with(prefix_filter).not()
+                    {
+                        break 'pages;
+                    }
+
+                    if let Some(common_prefix) =
+                        common_prefix_for_key(&summary.key, prefix_filter, delimiter_filter)
+                    {
+                        if marker_filter
+                            .as_ref()
+                            .is_some_and(|marker| common_prefix.as_str() <= marker.as_str())
+                        {
+                            after_key = Some(summary.key);
+                            after_upload_id = Some(summary.upload_id);
+                            continue;
+                        }
+
+                        if seen_common_prefixes.contains(&common_prefix) {
+                            after_key = Some(summary.key);
+                            after_upload_id = Some(summary.upload_id);
+                            continue;
+                        }
+
+                        if count == max_uploads {
+                            is_truncated = true;
+                            break 'pages;
+                        }
+
+                        seen_common_prefixes.insert(common_prefix.clone());
+                        next_key_marker = Some(common_prefix.clone());
+                        next_upload_id_marker = None;
+                        common_prefixes.push(CommonPrefix {
+                            prefix: Some(common_prefix),
+                        });
+                        count += 1;
+                        after_key = Some(summary.key);
+                        after_upload_id = Some(summary.upload_id);
+                        continue;
+                    }
+
+                    if count == max_uploads {
+                        is_truncated = true;
+                        break 'pages;
+                    }
+
+                    next_key_marker = Some(summary.key.clone());
+                    next_upload_id_marker = Some(summary.upload_id.to_string());
+                    after_key = Some(summary.key.clone());
+                    after_upload_id = Some(summary.upload_id);
+                    uploads.push(summary);
+                    count += 1;
+                }
+
+                if summary_count < list_batch_len {
+                    break;
+                }
+            }
+        }
+
+        Ok(MultipartUploadListing {
+            uploads,
+            common_prefixes,
+            next_key_marker,
+            next_upload_id_marker,
             is_truncated,
         })
     }
@@ -999,22 +1256,41 @@ impl S3 for Sqlite {
             bucket,
             key,
             range,
+            part_number,
             if_match,
             if_modified_since,
             if_none_match,
             if_unmodified_since,
             ..
         } = req.input;
+        if range.is_some() && part_number.is_some() {
+            return Err(s3_error_with_message(
+                S3ErrorCode::InvalidRequest,
+                "Range and partNumber cannot both be specified",
+            ));
+        }
+        if let Some(part_number) = part_number {
+            validate_part_number(part_number)?;
+        }
 
         let connection = self
             .try_get_connection(&bucket)
             .await
             .map_err(s3_error_from_sqlite)?;
 
-        let object = connection
+        let (object, completed_part, completed_part_count) = connection
             .read(move |connection| {
                 let transaction = connection.transaction()?;
-                Self::try_get_object(&transaction, &key)?.ok_or(SqliteError::ObjectNotFound)
+                let object =
+                    Self::try_get_object(&transaction, &key)?.ok_or(SqliteError::ObjectNotFound)?;
+                let (completed_part, completed_part_count) = match part_number {
+                    Some(part_number) => (
+                        Self::try_get_completed_object_part(&transaction, &key, part_number)?,
+                        Self::try_count_completed_object_parts(&transaction, &key)?,
+                    ),
+                    None => (None, 0),
+                };
+                Ok((object, completed_part, completed_part_count))
             })
             .await
             .map_err(s3_error_from_sqlite)?;
@@ -1030,9 +1306,15 @@ impl S3 for Sqlite {
 
         let object_size =
             u64::try_from(object.key_metadata.size).map_err(S3Error::internal_error)?;
-        let object_range = match range.as_ref() {
-            None => 0..object_size,
-            Some(range) => {
+        let object_range = match (part_number, range.as_ref()) {
+            (Some(part_number), _) => requested_part_range(
+                part_number,
+                completed_part.as_ref(),
+                completed_part_count,
+                object_size,
+            )?,
+            (None, None) => 0..object_size,
+            (None, Some(range)) => {
                 let object_range = range.check(object_size)?;
                 if object_range.is_empty() {
                     return Err(s3_error(S3ErrorCode::InvalidRange));
@@ -1069,20 +1351,21 @@ impl S3 for Sqlite {
             body: Some(StreamingBlob::wrap::<_, S3Error>(body)),
             accept_ranges: Some("bytes".to_string()),
             cache_control: object.key_metadata.cache_control,
-            content_range: range.is_some().then(|| {
-                format!(
-                    "bytes {}-{}/{}",
-                    object_range.start,
-                    object_range.end - 1,
-                    object_size
-                )
-            }),
+            content_range: (range.is_some() || part_number.is_some())
+                .then(|| {
+                    object_range
+                        .end
+                        .checked_sub(1)
+                        .map(|end| format!("bytes {}-{}/{}", object_range.start, end, object_size))
+                })
+                .flatten(),
             content_length: Some(content_length_i64),
             content_type: object.key_metadata.content_type,
             expires: object.key_metadata.expires.map(Into::into),
             last_modified: Some(object.key_metadata.last_modified.into()),
             metadata: object.key_metadata.metadata,
             e_tag: object.key_metadata.md5.map(ETag::Strong),
+            parts_count: (completed_part_count > 0).then_some(completed_part_count),
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -1124,22 +1407,42 @@ impl S3 for Sqlite {
         let HeadObjectInput {
             bucket,
             key,
+            range,
+            part_number,
             if_match,
             if_modified_since,
             if_none_match,
             if_unmodified_since,
             ..
         } = req.input;
+        if range.is_some() && part_number.is_some() {
+            return Err(s3_error_with_message(
+                S3ErrorCode::InvalidRequest,
+                "Range and partNumber cannot both be specified",
+            ));
+        }
+        if let Some(part_number) = part_number {
+            validate_part_number(part_number)?;
+        }
 
         let connection = self
             .try_get_connection(&bucket)
             .await
             .map_err(s3_error_from_sqlite)?;
 
-        let object = connection
+        let (object, completed_part, completed_part_count) = connection
             .read(move |connection| {
                 let transaction = connection.transaction()?;
-                Self::try_get_metadata(&transaction, &key)?.ok_or(SqliteError::ObjectNotFound)
+                let object = Self::try_get_metadata(&transaction, &key)?
+                    .ok_or(SqliteError::ObjectNotFound)?;
+                let (completed_part, completed_part_count) = match part_number {
+                    Some(part_number) => (
+                        Self::try_get_completed_object_part(&transaction, &key, part_number)?,
+                        Self::try_count_completed_object_parts(&transaction, &key)?,
+                    ),
+                    None => (None, 0),
+                };
+                Ok((object, completed_part, completed_part_count))
             })
             .await
             .map_err(s3_error_from_sqlite)?;
@@ -1156,16 +1459,44 @@ impl S3 for Sqlite {
         let content_type = object
             .content_type
             .unwrap_or_else(|| mime::APPLICATION_OCTET_STREAM.to_string());
+        let object_size = u64::try_from(object.size).map_err(S3Error::internal_error)?;
+        let object_range = match (part_number, range.as_ref()) {
+            (Some(part_number), _) => requested_part_range(
+                part_number,
+                completed_part.as_ref(),
+                completed_part_count,
+                object_size,
+            )?,
+            (None, None) => 0..object_size,
+            (None, Some(range)) => {
+                let object_range = range.check(object_size)?;
+                if object_range.is_empty() {
+                    return Err(s3_error(S3ErrorCode::InvalidRange));
+                }
+                object_range
+            }
+        };
+        let content_length = i64::try_from(object_range.end - object_range.start)
+            .map_err(S3Error::internal_error)?;
 
         let output = HeadObjectOutput {
             accept_ranges: Some("bytes".to_string()),
             cache_control: object.cache_control,
-            content_length: Some(object.size),
+            content_length: Some(content_length),
+            content_range: (range.is_some() || part_number.is_some())
+                .then(|| {
+                    object_range
+                        .end
+                        .checked_sub(1)
+                        .map(|end| format!("bytes {}-{}/{}", object_range.start, end, object_size))
+                })
+                .flatten(),
             content_type: Some(content_type),
             e_tag: object.md5.map(ETag::Strong),
             expires: object.expires.map(Into::into),
             last_modified: Some(object.last_modified.into()),
             metadata: object.metadata,
+            parts_count: (completed_part_count > 0).then_some(completed_part_count),
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -1540,6 +1871,105 @@ impl S3 for Sqlite {
         Ok(S3Response::new(output))
     }
 
+    /// Lists active multipart uploads in a bucket.
+    #[tracing::instrument]
+    async fn list_multipart_uploads(
+        &self,
+        req: S3Request<ListMultipartUploadsInput>,
+    ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
+        let ListMultipartUploadsInput {
+            bucket,
+            mut prefix,
+            mut delimiter,
+            mut key_marker,
+            upload_id_marker,
+            max_uploads,
+            encoding_type,
+            ..
+        } = req.input;
+
+        prefix = prefix.map(decode_list_input_value);
+        delimiter = delimiter.map(decode_list_input_value);
+        key_marker = key_marker.map(decode_list_input_value);
+
+        let max_uploads = list_limit(max_uploads, 1000, 1000)?;
+        let max_uploads_usize = usize::try_from(max_uploads).map_err(S3Error::internal_error)?;
+        let prefix_filter = prefix.clone().unwrap_or_default();
+        let encode_keys = is_url_encoding(encoding_type.as_ref());
+        let delimiter_filter = delimiter
+            .as_deref()
+            .filter(|delimiter| delimiter.is_empty().not())
+            .map(str::to_string);
+        let delimiter = output_delimiter(delimiter, encode_keys);
+        let after_upload_id = if key_marker.is_some() {
+            upload_id_marker
+                .as_deref()
+                .map(parse_upload_id)
+                .transpose()?
+        } else {
+            None
+        };
+
+        let listing = self
+            .list_active_multipart_uploads(
+                &bucket,
+                &prefix_filter,
+                delimiter_filter.as_deref(),
+                key_marker.clone(),
+                after_upload_id,
+                max_uploads_usize,
+            )
+            .await?;
+        let owner = owner();
+        let initiator = Initiator {
+            display_name: owner.display_name.clone(),
+            id: owner.id.clone(),
+        };
+        let uploads = listing
+            .uploads
+            .into_iter()
+            .map(|summary| MultipartUpload {
+                initiated: Some(summary.initiated.into()),
+                initiator: Some(initiator.clone()),
+                key: Some(encode_list_value(summary.key, encode_keys)),
+                owner: Some(owner.clone()),
+                storage_class: Some(StorageClass::from_static(StorageClass::STANDARD)),
+                upload_id: Some(summary.upload_id.to_string()),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+
+        let output = ListMultipartUploadsOutput {
+            bucket: Some(bucket),
+            common_prefixes: delimiter.as_ref().map(|_| {
+                listing
+                    .common_prefixes
+                    .into_iter()
+                    .map(|common_prefix| CommonPrefix {
+                        prefix: common_prefix
+                            .prefix
+                            .map(|prefix| encode_list_value(prefix, encode_keys)),
+                    })
+                    .collect::<Vec<_>>()
+            }),
+            delimiter,
+            encoding_type,
+            is_truncated: Some(listing.is_truncated),
+            key_marker: key_marker.map(|marker| encode_list_value(marker, encode_keys)),
+            max_uploads: Some(max_uploads),
+            next_key_marker: listing
+                .next_key_marker
+                .map(|marker| encode_list_value(marker, encode_keys)),
+            next_upload_id_marker: listing.next_upload_id_marker,
+            prefix: prefix.map(|prefix| encode_list_value(prefix, encode_keys)),
+            upload_id_marker,
+            uploads: Some(uploads),
+            ..Default::default()
+        };
+
+        Ok(S3Response::new(output))
+    }
+
     /// Stores an object body and metadata.
     #[tracing::instrument]
     async fn put_object(
@@ -1715,8 +2145,8 @@ impl S3 for Sqlite {
             .map_err(s3_error_from_sqlite)?;
 
         let body = body.ok_or_else(|| s3_error(S3ErrorCode::IncompleteBody))?;
-        let upload_id =
-            Uuid::parse_str(&upload_id).map_err(|_| s3_error(S3ErrorCode::InvalidRequest))?;
+        let upload_id = parse_upload_id(&upload_id)?;
+        validate_part_number(part_number)?;
 
         let mut md5_hash = Md5::new();
         let stream = body.inspect_ok(|bytes| md5_hash.update(bytes.as_ref()));
@@ -1776,6 +2206,178 @@ impl S3 for Sqlite {
         Ok(S3Response::new(output))
     }
 
+    /// Copies an existing object byte range into a multipart upload part.
+    #[tracing::instrument]
+    async fn upload_part_copy(
+        &self,
+        req: S3Request<UploadPartCopyInput>,
+    ) -> S3Result<S3Response<UploadPartCopyOutput>> {
+        let S3Request {
+            input, credentials, ..
+        } = req;
+        let UploadPartCopyInput {
+            bucket,
+            key,
+            upload_id,
+            part_number,
+            copy_source,
+            copy_source_if_match,
+            copy_source_if_modified_since,
+            copy_source_if_none_match,
+            copy_source_if_unmodified_since,
+            copy_source_range,
+            ..
+        } = input;
+
+        self.validate_mutable_bucket(&bucket)
+            .map_err(s3_error_from_sqlite)?;
+        let upload_id = parse_upload_id(&upload_id)?;
+        validate_part_number(part_number)?;
+        let copy_source_range = parse_copy_source_range(copy_source_range)?;
+        let access_key = credentials.map(|credentials| credentials.access_key);
+
+        let (src_bucket, src_key) = match copy_source {
+            CopySource::AccessPoint { .. } => return Err(s3_error(S3ErrorCode::NotImplemented)),
+            CopySource::Bucket { bucket, key, .. } => (bucket, key),
+        };
+        let source_conditions = ObjectReadConditions {
+            etag_matches: copy_source_if_match,
+            modified_since: copy_source_if_modified_since.map(Into::into),
+            etag_none_matches: copy_source_if_none_match,
+            unmodified_since: copy_source_if_unmodified_since.map(Into::into),
+        };
+
+        if src_bucket.as_ref() == bucket.as_str() {
+            let connection = self
+                .try_get_connection(&bucket)
+                .await
+                .map_err(s3_error_from_sqlite)?;
+            let copy_part_result = connection
+                .write(move |connection| {
+                    let transaction = connection.transaction()?;
+                    let object = Self::try_get_object(&transaction, &src_key)?
+                        .ok_or(SqliteError::ObjectNotFound)?;
+                    validate_copy_source_conditions(&object.key_metadata, &source_conditions)?;
+                    let object_size = u64::try_from(object.key_metadata.size)
+                        .map_err(|_| SqliteError::InvalidObjectRange)?;
+                    let byte_range = checked_copy_source_range(copy_source_range, object_size)?;
+                    let value = copied_part_bytes(&object, byte_range)?;
+                    let size = i64::try_from(value.len())
+                        .map_err(|_| SqliteError::MultipartObjectTooLarge)?;
+                    let md5 = part_md5(&value);
+                    let now = OffsetDateTime::now_utc();
+
+                    let upload_state = Self::try_get_multipart_upload_state(
+                        &transaction,
+                        upload_id,
+                        &bucket,
+                        &key,
+                    )?
+                    .ok_or(SqliteError::MultipartUploadNotFound)?;
+                    Self::try_validate_multipart_access(
+                        upload_state.access_key.as_ref(),
+                        access_key.as_deref(),
+                    )?;
+
+                    Self::try_touch_multipart_upload(&transaction, upload_id)?;
+                    Self::try_put_multipart(
+                        &transaction,
+                        Multipart {
+                            upload_id,
+                            part_number,
+                            last_modified: now,
+                            value,
+                            size,
+                            md5: Some(md5.clone()),
+                        },
+                    )?;
+
+                    transaction.commit()?;
+                    Ok(CopyPartResult {
+                        e_tag: Some(ETag::Strong(md5)),
+                        last_modified: Some(now.into()),
+                        ..Default::default()
+                    })
+                })
+                .await
+                .map_err(s3_error_from_sqlite)?;
+
+            let output = UploadPartCopyOutput {
+                copy_part_result: Some(copy_part_result),
+                ..Default::default()
+            };
+            return Ok(S3Response::new(output));
+        }
+
+        let source_connection = self
+            .try_get_connection(&src_bucket)
+            .await
+            .map_err(s3_error_from_sqlite)?;
+        let copied_part = source_connection
+            .read(move |connection| {
+                let transaction = connection.transaction()?;
+                let object = Self::try_get_object(&transaction, &src_key)?
+                    .ok_or(SqliteError::ObjectNotFound)?;
+                validate_copy_source_conditions(&object.key_metadata, &source_conditions)?;
+                let object_size = u64::try_from(object.key_metadata.size)
+                    .map_err(|_| SqliteError::InvalidObjectRange)?;
+                let byte_range = checked_copy_source_range(copy_source_range, object_size)?;
+                let value = copied_part_bytes(&object, byte_range)?;
+                let size =
+                    i64::try_from(value.len()).map_err(|_| SqliteError::MultipartObjectTooLarge)?;
+                let md5 = part_md5(&value);
+                Ok(CopiedPart { value, size, md5 })
+            })
+            .await
+            .map_err(s3_error_from_sqlite)?;
+
+        let connection = self
+            .try_get_connection(&bucket)
+            .await
+            .map_err(s3_error_from_sqlite)?;
+        let copy_part_result = connection
+            .write(move |connection| {
+                let transaction = connection.transaction()?;
+                let upload_state =
+                    Self::try_get_multipart_upload_state(&transaction, upload_id, &bucket, &key)?
+                        .ok_or(SqliteError::MultipartUploadNotFound)?;
+                Self::try_validate_multipart_access(
+                    upload_state.access_key.as_ref(),
+                    access_key.as_deref(),
+                )?;
+
+                let now = OffsetDateTime::now_utc();
+                let md5 = copied_part.md5;
+                Self::try_touch_multipart_upload(&transaction, upload_id)?;
+                Self::try_put_multipart(
+                    &transaction,
+                    Multipart {
+                        upload_id,
+                        part_number,
+                        last_modified: now,
+                        value: copied_part.value,
+                        size: copied_part.size,
+                        md5: Some(md5.clone()),
+                    },
+                )?;
+
+                transaction.commit()?;
+                Ok(CopyPartResult {
+                    e_tag: Some(ETag::Strong(md5)),
+                    last_modified: Some(now.into()),
+                    ..Default::default()
+                })
+            })
+            .await
+            .map_err(s3_error_from_sqlite)?;
+
+        let output = UploadPartCopyOutput {
+            copy_part_result: Some(copy_part_result),
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
+    }
+
     /// Lists parts uploaded for an active multipart upload.
     #[tracing::instrument]
     async fn list_parts(
@@ -1786,11 +2388,20 @@ impl S3 for Sqlite {
             bucket,
             key,
             upload_id,
+            max_parts,
+            part_number_marker,
             ..
         } = req.input;
 
-        let upload_id =
-            Uuid::parse_str(&upload_id).map_err(|_| s3_error(S3ErrorCode::InvalidRequest))?;
+        let upload_id = parse_upload_id(&upload_id)?;
+        let max_parts = list_limit(max_parts, 1000, 1000)?;
+        let part_number_marker = part_number_marker.unwrap_or(0);
+        if part_number_marker < 0 {
+            return Err(s3_error_with_message(
+                S3ErrorCode::InvalidArgument,
+                "part-number-marker must be nonnegative",
+            ));
+        }
 
         let bucket_clone = bucket.clone();
         let key_clone = key.clone();
@@ -1816,18 +2427,31 @@ impl S3 for Sqlite {
                         .map(|credentials| credentials.access_key.as_str()),
                 )?;
 
-                let parts = Self::try_list_multipart(&transaction, upload_id)?;
-
-                drop(transaction);
+                let parts = Self::try_list_multipart(
+                    &transaction,
+                    upload_id,
+                    part_number_marker,
+                    i64::from(max_parts) + 1,
+                )?;
 
                 Ok(parts)
             })
             .await
             .map_err(s3_error_from_sqlite)?;
 
+        let max_parts_usize = usize::try_from(max_parts).map_err(S3Error::internal_error)?;
+        let is_truncated = parts.len() > max_parts_usize;
+        let mut parts = parts;
+        if is_truncated {
+            parts.truncate(max_parts_usize);
+        }
+        let next_part_number_marker = is_truncated
+            .then(|| parts.last().map(|part| part.part_number))
+            .flatten();
         let parts = parts
             .into_iter()
             .map(|part| Part {
+                e_tag: part.md5.map(ETag::Strong),
                 last_modified: Some(part.last_modified.into()),
                 part_number: Some(part.part_number),
                 size: Some(part.size),
@@ -1837,7 +2461,11 @@ impl S3 for Sqlite {
 
         let output = ListPartsOutput {
             bucket: Some(bucket),
+            is_truncated: Some(is_truncated),
             key: Some(key),
+            max_parts: Some(max_parts),
+            next_part_number_marker,
+            part_number_marker: Some(part_number_marker),
             upload_id: Some(upload_id.to_string()),
             parts: Some(parts),
             ..Default::default()
@@ -1915,8 +2543,7 @@ impl S3 for Sqlite {
         self.validate_mutable_bucket(&bucket)
             .map_err(s3_error_from_sqlite)?;
 
-        let upload_id =
-            Uuid::parse_str(&upload_id).map_err(|_| s3_error(S3ErrorCode::InvalidRequest))?;
+        let upload_id = parse_upload_id(&upload_id)?;
 
         let Some(multipart_upload) = multipart_upload else {
             return Err(s3_error(S3ErrorCode::InvalidPart));
@@ -1937,6 +2564,7 @@ impl S3 for Sqlite {
                 let part_number = part
                     .part_number
                     .ok_or_else(|| s3_error(S3ErrorCode::InvalidPart))?;
+                validate_part_number(part_number)?;
                 if part_number <= previous_part_number {
                     return Err(s3_error(S3ErrorCode::InvalidPartOrder));
                 }

@@ -166,6 +166,35 @@ async fn get_object_bytes(c: &Client, bucket: &str, key: &str) -> Result<Vec<u8>
         .to_vec())
 }
 
+async fn get_object_part_bytes(
+    c: &Client,
+    bucket: &str,
+    key: &str,
+    part_number: i32,
+) -> Result<Vec<u8>> {
+    Ok(c.get_object()
+        .bucket(bucket)
+        .key(key)
+        .part_number(part_number)
+        .send()
+        .await?
+        .body
+        .collect()
+        .await?
+        .into_bytes()
+        .to_vec())
+}
+
+async fn create_multipart_upload_id(c: &Client, bucket: &str, key: &str) -> Result<String> {
+    c.create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await?
+        .upload_id
+        .ok_or_else(|| anyhow::anyhow!("create multipart response missing upload ID"))
+}
+
 fn object_identifier(key: &str) -> Result<ObjectIdentifier> {
     Ok(ObjectIdentifier::builder().key(key).build()?)
 }
@@ -1718,6 +1747,503 @@ async fn test_complete_multipart_upload_conditionals() -> Result<()> {
         get_object_bytes(&context, &bucket, key).await?,
         expected.as_slice()
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_list_parts_pagination_etags_and_upload_id_errors() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+
+    let bucket = format!("test-list-parts-{}", Uuid::new_v4());
+    let key = "parts.txt";
+    create_bucket(&context, &bucket).await?;
+
+    let upload_id = create_multipart_upload_id(&context, &bucket, key).await?;
+    let part1 = upload_part(&context, &bucket, key, &upload_id, 1, b"one").await?;
+    let part2 = upload_part(&context, &bucket, key, &upload_id, 2, b"two").await?;
+    let part3 = upload_part(&context, &bucket, key, &upload_id, 3, b"three").await?;
+
+    let first = context
+        .list_parts()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .max_parts(2)
+        .send()
+        .await?;
+    assert_eq!(first.parts().len(), 2);
+    assert_eq!(first.is_truncated(), Some(true));
+    assert_eq!(first.next_part_number_marker(), Some("2"));
+    assert_eq!(first.parts()[0].part_number(), Some(1));
+    assert_eq!(first.parts()[0].e_tag(), part1.e_tag());
+    assert_eq!(first.parts()[1].part_number(), Some(2));
+    assert_eq!(first.parts()[1].e_tag(), part2.e_tag());
+
+    let second = context
+        .list_parts()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .part_number_marker("2")
+        .send()
+        .await?;
+    assert_eq!(second.parts().len(), 1);
+    assert_eq!(second.is_truncated(), Some(false));
+    assert_eq!(second.parts()[0].part_number(), Some(3));
+    assert_eq!(second.parts()[0].e_tag(), part3.e_tag());
+
+    let Err(err) = context
+        .list_parts()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id("not-a-uuid")
+        .send()
+        .await
+    else {
+        anyhow::bail!("malformed upload ID should fail");
+    };
+    assert_error_contains(err, "NoSuchUpload");
+
+    let Err(err) = context
+        .list_parts()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(Uuid::new_v4().to_string())
+        .send()
+        .await
+    else {
+        anyhow::bail!("missing upload ID should fail");
+    };
+    assert_error_contains(err, "NoSuchUpload");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_list_multipart_uploads_prefix_delimiter_and_pagination() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+
+    let bucket = format!("test-list-uploads-{}", Uuid::new_v4());
+    create_bucket(&context, &bucket).await?;
+
+    let page_a = create_multipart_upload_id(&context, &bucket, "page/a").await?;
+    let _page_b = create_multipart_upload_id(&context, &bucket, "page/b").await?;
+    let aborted = create_multipart_upload_id(&context, &bucket, "page/aborted").await?;
+    context
+        .abort_multipart_upload()
+        .bucket(&bucket)
+        .key("page/aborted")
+        .upload_id(aborted)
+        .send()
+        .await?;
+
+    let completed = create_multipart_upload_id(&context, &bucket, "page/completed").await?;
+    let completed_part =
+        upload_part(&context, &bucket, "page/completed", &completed, 1, b"done").await?;
+    let completed_upload = CompletedMultipartUpload::builder()
+        .set_parts(Some(vec![completed_part]))
+        .build();
+    context
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key("page/completed")
+        .upload_id(&completed)
+        .multipart_upload(completed_upload)
+        .send()
+        .await?;
+
+    let first = context
+        .list_multipart_uploads()
+        .bucket(&bucket)
+        .prefix("page/")
+        .max_uploads(1)
+        .send()
+        .await?;
+    assert_eq!(first.uploads().len(), 1);
+    assert_eq!(first.uploads()[0].key(), Some("page/a"));
+    assert_eq!(first.uploads()[0].upload_id(), Some(page_a.as_str()));
+    assert_eq!(first.is_truncated(), Some(true));
+
+    let second = context
+        .list_multipart_uploads()
+        .bucket(&bucket)
+        .prefix("page/")
+        .key_marker(
+            first
+                .next_key_marker()
+                .ok_or_else(|| anyhow::anyhow!("first upload page missing key marker"))?,
+        )
+        .upload_id_marker(
+            first
+                .next_upload_id_marker()
+                .ok_or_else(|| anyhow::anyhow!("first upload page missing upload ID marker"))?,
+        )
+        .send()
+        .await?;
+    let second_keys = second
+        .uploads()
+        .iter()
+        .filter_map(|upload| upload.key())
+        .collect::<Vec<_>>();
+    assert_eq!(second_keys, vec!["page/b"]);
+    assert_eq!(second.is_truncated(), Some(false));
+
+    create_multipart_upload_id(&context, &bucket, "group/a/one").await?;
+    create_multipart_upload_id(&context, &bucket, "group/b/two").await?;
+    create_multipart_upload_id(&context, &bucket, "group/root").await?;
+    let grouped = context
+        .list_multipart_uploads()
+        .bucket(&bucket)
+        .prefix("group/")
+        .delimiter("/")
+        .send()
+        .await?;
+    let grouped_prefixes = grouped
+        .common_prefixes()
+        .iter()
+        .filter_map(|common_prefix| common_prefix.prefix())
+        .collect::<Vec<_>>();
+    let grouped_uploads = grouped
+        .uploads()
+        .iter()
+        .filter_map(|upload| upload.key())
+        .collect::<Vec<_>>();
+    assert_eq!(grouped_prefixes, vec!["group/a/", "group/b/"]);
+    assert_eq!(grouped_uploads, vec!["group/root"]);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_upload_part_copy_full_range_conditions_and_missing_upload() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+
+    let source_bucket = format!("test-copy-part-src-{}", Uuid::new_v4());
+    let target_bucket = format!("test-copy-part-dst-{}", Uuid::new_v4());
+    let source = "source.txt";
+    create_bucket(&context, &source_bucket).await?;
+    create_bucket(&context, &target_bucket).await?;
+    put_object(&context, &source_bucket, source, b"0123456789abcdef").await?;
+    let source_etag = context
+        .head_object()
+        .bucket(&source_bucket)
+        .key(source)
+        .send()
+        .await?
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("head object response missing ETag"))?
+        .to_string();
+    let copy_source = format!("{source_bucket}/{source}");
+
+    let full_key = "full-copy.txt";
+    let full_upload = create_multipart_upload_id(&context, &target_bucket, full_key).await?;
+    let full_copy = context
+        .upload_part_copy()
+        .bucket(&target_bucket)
+        .key(full_key)
+        .upload_id(&full_upload)
+        .part_number(1)
+        .copy_source(&copy_source)
+        .send()
+        .await?;
+    let full_part = CompletedPart::builder()
+        .part_number(1)
+        .e_tag(
+            full_copy
+                .copy_part_result()
+                .and_then(|result| result.e_tag())
+                .ok_or_else(|| anyhow::anyhow!("upload part copy response missing ETag"))?,
+        )
+        .build();
+    let full_complete = CompletedMultipartUpload::builder()
+        .set_parts(Some(vec![full_part]))
+        .build();
+    context
+        .complete_multipart_upload()
+        .bucket(&target_bucket)
+        .key(full_key)
+        .upload_id(&full_upload)
+        .multipart_upload(full_complete)
+        .send()
+        .await?;
+    assert_eq!(
+        get_object_bytes(&context, &target_bucket, full_key).await?,
+        b"0123456789abcdef"
+    );
+
+    let range_key = "range-copy.txt";
+    let range_upload = create_multipart_upload_id(&context, &target_bucket, range_key).await?;
+    let range_copy = context
+        .upload_part_copy()
+        .bucket(&target_bucket)
+        .key(range_key)
+        .upload_id(&range_upload)
+        .part_number(1)
+        .copy_source(&copy_source)
+        .copy_source_range("bytes=2-5")
+        .copy_source_if_match(source_etag.clone())
+        .send()
+        .await?;
+    let range_part = CompletedPart::builder()
+        .part_number(1)
+        .e_tag(
+            range_copy
+                .copy_part_result()
+                .and_then(|result| result.e_tag())
+                .ok_or_else(|| anyhow::anyhow!("upload part copy response missing ETag"))?,
+        )
+        .build();
+    let range_complete = CompletedMultipartUpload::builder()
+        .set_parts(Some(vec![range_part]))
+        .build();
+    context
+        .complete_multipart_upload()
+        .bucket(&target_bucket)
+        .key(range_key)
+        .upload_id(&range_upload)
+        .multipart_upload(range_complete)
+        .send()
+        .await?;
+    assert_eq!(
+        get_object_bytes(&context, &target_bucket, range_key).await?,
+        b"2345"
+    );
+
+    let invalid_range_upload =
+        create_multipart_upload_id(&context, &target_bucket, "invalid-range.txt").await?;
+    let Err(err) = context
+        .upload_part_copy()
+        .bucket(&target_bucket)
+        .key("invalid-range.txt")
+        .upload_id(&invalid_range_upload)
+        .part_number(1)
+        .copy_source(&copy_source)
+        .copy_source_range("bytes=0-99")
+        .send()
+        .await
+    else {
+        anyhow::bail!("copy source range beyond the source object should fail");
+    };
+    assert_error_contains(err, "InvalidRange");
+
+    let blocked_upload =
+        create_multipart_upload_id(&context, &target_bucket, "blocked.txt").await?;
+    let Err(err) = context
+        .upload_part_copy()
+        .bucket(&target_bucket)
+        .key("blocked.txt")
+        .upload_id(&blocked_upload)
+        .part_number(1)
+        .copy_source(&copy_source)
+        .copy_source_if_none_match(source_etag)
+        .send()
+        .await
+    else {
+        anyhow::bail!("matching copy source If-None-Match should fail");
+    };
+    assert_error_contains(err, "PreconditionFailed");
+
+    let Err(err) = context
+        .upload_part_copy()
+        .bucket(&target_bucket)
+        .key("missing-upload.txt")
+        .upload_id(Uuid::new_v4().to_string())
+        .part_number(1)
+        .copy_source(&copy_source)
+        .send()
+        .await
+    else {
+        anyhow::bail!("copying into a missing upload should fail");
+    };
+    assert_error_contains(err, "NoSuchUpload");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_get_object_part_number_and_boundary_cleanup() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+
+    let bucket = format!("test-get-object-part-{}", Uuid::new_v4());
+    let key = "multipart-object.txt";
+    create_bucket(&context, &bucket).await?;
+
+    let upload_id = create_multipart_upload_id(&context, &bucket, key).await?;
+    let first_part = vec![b'a'; 5 * 1024 * 1024];
+    let part1 = upload_part_body(
+        &context,
+        &bucket,
+        key,
+        &upload_id,
+        1,
+        ByteStream::from(first_part.clone()),
+    )
+    .await?;
+    let part2 = upload_part(&context, &bucket, key, &upload_id, 2, b"tail").await?;
+    let upload = CompletedMultipartUpload::builder()
+        .set_parts(Some(vec![part1, part2]))
+        .build();
+    context
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(upload)
+        .send()
+        .await?;
+
+    assert_eq!(
+        get_object_part_bytes(&context, &bucket, key, 1).await?,
+        first_part
+    );
+    let head_first_part = context
+        .head_object()
+        .bucket(&bucket)
+        .key(key)
+        .part_number(1)
+        .send()
+        .await?;
+    assert_eq!(head_first_part.parts_count(), Some(2));
+    assert_eq!(
+        head_first_part.content_length(),
+        Some(i64::try_from(first_part.len())?)
+    );
+    let get_first_part = context
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .part_number(1)
+        .send()
+        .await?;
+    assert_eq!(get_first_part.parts_count(), Some(2));
+    assert_eq!(
+        get_object_part_bytes(&context, &bucket, key, 2).await?,
+        b"tail"
+    );
+    let Err(err) = context
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .part_number(3)
+        .send()
+        .await
+    else {
+        anyhow::bail!("missing completed part should fail");
+    };
+    assert_error_contains(err, "InvalidPart");
+
+    put_object(&context, &bucket, key, b"plain").await?;
+    assert_eq!(
+        get_object_part_bytes(&context, &bucket, key, 1).await?,
+        b"plain"
+    );
+    let Err(err) = context
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .part_number(2)
+        .send()
+        .await
+    else {
+        anyhow::bail!("PutObject should clear completed part boundaries");
+    };
+    assert_error_contains(err, "InvalidPart");
+
+    put_object(&context, &bucket, "copy-source.txt", b"copied").await?;
+    context
+        .copy_object()
+        .bucket(&bucket)
+        .key(key)
+        .copy_source(format!("{bucket}/copy-source.txt"))
+        .send()
+        .await?;
+    assert_eq!(
+        get_object_part_bytes(&context, &bucket, key, 1).await?,
+        b"copied"
+    );
+    let Err(err) = context
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .range("bytes=0-0")
+        .part_number(1)
+        .send()
+        .await
+    else {
+        anyhow::bail!("Range and partNumber together should fail");
+    };
+    assert_error_contains(err, "InvalidRequest");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_invalid_upload_ids_are_no_such_upload() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+
+    let bucket = format!("test-upload-id-errors-{}", Uuid::new_v4());
+    create_bucket(&context, &bucket).await?;
+    put_object(&context, &bucket, "source.txt", b"source").await?;
+
+    let Err(err) = context
+        .upload_part()
+        .bucket(&bucket)
+        .key("invalid-upload-part.txt")
+        .upload_id("not-a-uuid")
+        .part_number(1)
+        .body(ByteStream::from_static(b"body"))
+        .send()
+        .await
+    else {
+        anyhow::bail!("uploading with malformed upload ID should fail");
+    };
+    assert_error_contains(err, "NoSuchUpload");
+
+    let invalid_complete = CompletedMultipartUpload::builder()
+        .parts(
+            CompletedPart::builder()
+                .part_number(1)
+                .e_tag("00000000000000000000000000000000")
+                .build(),
+        )
+        .build();
+    let Err(err) = context
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key("invalid-complete.txt")
+        .upload_id("not-a-uuid")
+        .multipart_upload(invalid_complete)
+        .send()
+        .await
+    else {
+        anyhow::bail!("completing with malformed upload ID should fail");
+    };
+    assert_error_contains(err, "NoSuchUpload");
+
+    let Err(err) = context
+        .upload_part_copy()
+        .bucket(&bucket)
+        .key("invalid-copy.txt")
+        .upload_id("not-a-uuid")
+        .part_number(1)
+        .copy_source(format!("{bucket}/source.txt"))
+        .send()
+        .await
+    else {
+        anyhow::bail!("copying with malformed upload ID should fail");
+    };
+    assert_error_contains(err, "NoSuchUpload");
 
     Ok(())
 }
