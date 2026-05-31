@@ -11,25 +11,28 @@ use s3s::{
     S3, S3Error, S3ErrorCode,
     S3ErrorCode::InternalError,
     S3Request, S3Response, S3Result, StdError,
+    crypto::{Checksum as CryptoChecksum, Crc32, Crc32c, Crc64Nvme, Sha1, Sha256},
     dto::{
         AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketVersioningStatus,
-        CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CompletedPart,
+        Checksum as S3Checksum, ChecksumAlgorithm, ChecksumMode, ChecksumType, CommonPrefix,
+        CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CompletedPart,
         CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopyPartResult, CopySource,
         CreateBucketInput, CreateBucketOutput, CreateMultipartUploadInput,
         CreateMultipartUploadOutput, DeleteBucketInput, DeleteBucketOutput, DeleteMarkerEntry,
         DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput,
         DeletedObject, ETag, ETagCondition, EncodingType, Error as DeleteError,
         GetBucketLocationInput, GetBucketLocationOutput, GetBucketVersioningInput,
-        GetBucketVersioningOutput, GetObjectAclInput, GetObjectAclOutput, GetObjectInput,
-        GetObjectOutput, Grant, Grantee, HeadBucketInput, HeadBucketOutput, HeadObjectInput,
-        HeadObjectOutput, Initiator, ListBucketsInput, ListBucketsOutput,
-        ListMultipartUploadsInput, ListMultipartUploadsOutput, ListObjectVersionsInput,
-        ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
-        ListObjectsV2Output, ListPartsInput, ListPartsOutput, MFADelete, MetadataDirective,
-        MultipartUpload, Object, ObjectVersion, ObjectVersionStorageClass, Owner, Part, Permission,
-        PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectInput, PutObjectOutput,
-        Range as S3Range, StorageClass, StreamingBlob, Timestamp, Type, UploadPartCopyInput,
-        UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
+        GetBucketVersioningOutput, GetObjectAclInput, GetObjectAclOutput, GetObjectAttributesInput,
+        GetObjectAttributesOutput, GetObjectAttributesParts, GetObjectInput, GetObjectOutput,
+        Grant, Grantee, HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput,
+        Initiator, ListBucketsInput, ListBucketsOutput, ListMultipartUploadsInput,
+        ListMultipartUploadsOutput, ListObjectVersionsInput, ListObjectVersionsOutput,
+        ListObjectsInput, ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output,
+        ListPartsInput, ListPartsOutput, MFADelete, MetadataDirective, MultipartUpload, Object,
+        ObjectAttributes, ObjectPart, ObjectVersion, ObjectVersionStorageClass, Owner, Part,
+        Permission, PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectInput,
+        PutObjectOutput, Range as S3Range, StorageClass, StreamingBlob, Timestamp, Type,
+        UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
     },
     header::{CONTENT_MD5, CONTENT_TYPE, ETAG, X_AMZ_DELETE_MARKER, X_AMZ_REQUEST_ID},
 };
@@ -43,15 +46,52 @@ use uuid::Uuid;
 
 use crate::database::BucketConnection;
 use crate::sqlite::{
-    BucketVersioningState, CompletedObjectPart, KeyMetadata, KeyValue, Multipart,
-    MultipartCompletionPart, MultipartUploadState, MultipartUploadSummary, ObjectDeleteOutcome,
-    ObjectSummary, ObjectTagCondition, ObjectWriteConditions, Sqlite, SqliteError,
+    BucketVersioningState, ChecksumMetadata, CompletedObjectPart, KeyMetadata, KeyValue, Multipart,
+    MultipartCompletionPart, MultipartCompletionRequest, MultipartUploadState,
+    MultipartUploadSummary, ObjectDeleteOutcome, ObjectSummary, ObjectTagCondition,
+    ObjectWriteConditions, Sqlite, SqliteError,
 };
 
 const LIST_BATCH_SIZE: i64 = 1024;
 const CONTINUATION_TOKEN_PREFIX: &str = "s3ite:v1:";
 const OWNER_DISPLAY_NAME: &str = "s3ite";
 const OWNER_ID: &str = "s3ite";
+
+/// Returns whether a bucket name satisfies S3 DNS-compatible naming rules.
+fn is_valid_bucket_name(bucket: &str) -> bool {
+    let bytes = bucket.as_bytes();
+    if !(3..=63).contains(&bytes.len()) {
+        return false;
+    }
+    if looks_like_ipv4_address(bucket) {
+        return false;
+    }
+    if matches!(bytes.first(), Some(b'.' | b'-')) || matches!(bytes.last(), Some(b'.' | b'-')) {
+        return false;
+    }
+
+    for pair in bytes.windows(2) {
+        if matches!(pair, b".." | b".-" | b"-.") {
+            return false;
+        }
+    }
+
+    bytes
+        .iter()
+        .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-'))
+}
+
+/// Returns whether a bucket name has an IPv4-address shape.
+fn looks_like_ipv4_address(bucket: &str) -> bool {
+    let mut parts = bucket.split('.');
+    if parts.clone().count() != 4 {
+        return false;
+    }
+    parts.all(|part| {
+        part.parse::<u8>()
+            .is_ok_and(|value| part == value.to_string())
+    })
+}
 
 /// Maps storage-layer failures into S3 protocol errors at the service boundary.
 fn s3_error_from_sqlite(error: SqliteError) -> S3Error {
@@ -65,6 +105,7 @@ fn s3_error_from_sqlite(error: SqliteError) -> S3Error {
         SqliteError::ObjectVersionNotFound => S3Error::new(S3ErrorCode::NoSuchVersion),
         SqliteError::InvalidObjectRange => S3Error::new(S3ErrorCode::InvalidRange),
         SqliteError::PreconditionFailed => S3Error::new(S3ErrorCode::PreconditionFailed),
+        SqliteError::ChecksumMismatch => S3Error::new(S3ErrorCode::BadDigest),
         SqliteError::MultipartUploadNotFound => S3Error::new(S3ErrorCode::NoSuchUpload),
         SqliteError::MultipartAccessDenied => S3Error::new(S3ErrorCode::AccessDenied),
         SqliteError::InvalidMultipartPart => S3Error::new(S3ErrorCode::InvalidPart),
@@ -263,6 +304,260 @@ fn validate_content_md5(
     Ok(())
 }
 
+/// Encodes bytes as standard padded base64 text.
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        output.push(char::from(TABLE[usize::from(first >> 2)]));
+        output.push(char::from(
+            TABLE[usize::from(((first & 0b0000_0011) << 4) | (second >> 4))],
+        ));
+        if chunk.len() > 1 {
+            output.push(char::from(
+                TABLE[usize::from(((second & 0b0000_1111) << 2) | (third >> 6))],
+            ));
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(char::from(TABLE[usize::from(third & 0b0011_1111)]));
+        } else {
+            output.push('=');
+        }
+    }
+    output
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChecksumAlgorithmKind {
+    Crc32,
+    Crc32c,
+    Crc64Nvme,
+    Sha1,
+    Sha256,
+}
+
+impl ChecksumAlgorithmKind {
+    fn from_algorithm(algorithm: Option<ChecksumAlgorithm>) -> S3Result<Option<Self>> {
+        let Some(algorithm) = algorithm else {
+            return Ok(None);
+        };
+        let kind = match algorithm.as_str() {
+            ChecksumAlgorithm::CRC32 => Self::Crc32,
+            ChecksumAlgorithm::CRC32C => Self::Crc32c,
+            ChecksumAlgorithm::CRC64NVME => Self::Crc64Nvme,
+            ChecksumAlgorithm::SHA1 => Self::Sha1,
+            ChecksumAlgorithm::SHA256 => Self::Sha256,
+            _ => {
+                return Err(s3_error_with_message(
+                    S3ErrorCode::InvalidArgument,
+                    "unsupported checksum algorithm",
+                ));
+            }
+        };
+        Ok(Some(kind))
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Crc32 => ChecksumAlgorithm::CRC32,
+            Self::Crc32c => ChecksumAlgorithm::CRC32C,
+            Self::Crc64Nvme => ChecksumAlgorithm::CRC64NVME,
+            Self::Sha1 => ChecksumAlgorithm::SHA1,
+            Self::Sha256 => ChecksumAlgorithm::SHA256,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ChecksumInput {
+    algorithm: Option<ChecksumAlgorithm>,
+    checksum_type: Option<ChecksumType>,
+    crc32: Option<String>,
+    crc32c: Option<String>,
+    crc64nvme: Option<String>,
+    sha1: Option<String>,
+    sha256: Option<String>,
+}
+
+impl ChecksumInput {
+    fn algorithm_kind(&self) -> S3Result<Option<ChecksumAlgorithmKind>> {
+        if self.algorithm.is_some() {
+            return ChecksumAlgorithmKind::from_algorithm(self.algorithm.clone());
+        }
+
+        let mut inferred = [
+            self.crc32.as_ref().map(|_| ChecksumAlgorithmKind::Crc32),
+            self.crc32c.as_ref().map(|_| ChecksumAlgorithmKind::Crc32c),
+            self.crc64nvme
+                .as_ref()
+                .map(|_| ChecksumAlgorithmKind::Crc64Nvme),
+            self.sha1.as_ref().map(|_| ChecksumAlgorithmKind::Sha1),
+            self.sha256.as_ref().map(|_| ChecksumAlgorithmKind::Sha256),
+        ]
+        .into_iter()
+        .flatten();
+
+        let first = inferred.next();
+        if inferred.next().is_some() {
+            return Err(s3_error_with_message(
+                S3ErrorCode::InvalidArgument,
+                "multiple checksum values were supplied",
+            ));
+        }
+        Ok(first)
+    }
+
+    fn requested_for(&self, kind: ChecksumAlgorithmKind) -> Option<&str> {
+        match kind {
+            ChecksumAlgorithmKind::Crc32 => self.crc32.as_deref(),
+            ChecksumAlgorithmKind::Crc32c => self.crc32c.as_deref(),
+            ChecksumAlgorithmKind::Crc64Nvme => self.crc64nvme.as_deref(),
+            ChecksumAlgorithmKind::Sha1 => self.sha1.as_deref(),
+            ChecksumAlgorithmKind::Sha256 => self.sha256.as_deref(),
+        }
+    }
+
+    fn into_requested_metadata(self) -> S3Result<ChecksumMetadata> {
+        let checksum_type = checksum_type_name(self.checksum_type)?;
+        Ok(ChecksumMetadata {
+            checksum_type,
+            crc32: self.crc32,
+            crc32c: self.crc32c,
+            crc64nvme: self.crc64nvme,
+            sha1: self.sha1,
+            sha256: self.sha256,
+            ..ChecksumMetadata::default()
+        })
+    }
+}
+
+fn checksum_type_name(checksum_type: Option<ChecksumType>) -> S3Result<Option<String>> {
+    let Some(checksum_type) = checksum_type else {
+        return Ok(None);
+    };
+    match checksum_type.as_str() {
+        ChecksumType::COMPOSITE | ChecksumType::FULL_OBJECT => {
+            Ok(Some(checksum_type.as_str().to_string()))
+        }
+        _ => Err(s3_error_with_message(
+            S3ErrorCode::InvalidArgument,
+            "unsupported checksum type",
+        )),
+    }
+}
+
+fn compute_checksum(kind: ChecksumAlgorithmKind, value: &[u8]) -> String {
+    match kind {
+        ChecksumAlgorithmKind::Crc32 => {
+            base64_encode(<Crc32 as CryptoChecksum>::checksum(value).as_ref())
+        }
+        ChecksumAlgorithmKind::Crc32c => {
+            base64_encode(<Crc32c as CryptoChecksum>::checksum(value).as_ref())
+        }
+        ChecksumAlgorithmKind::Crc64Nvme => {
+            base64_encode(<Crc64Nvme as CryptoChecksum>::checksum(value).as_ref())
+        }
+        ChecksumAlgorithmKind::Sha1 => {
+            base64_encode(<Sha1 as CryptoChecksum>::checksum(value).as_ref())
+        }
+        ChecksumAlgorithmKind::Sha256 => {
+            base64_encode(<Sha256 as CryptoChecksum>::checksum(value).as_ref())
+        }
+    }
+}
+
+fn validate_payload_checksum(
+    input: &ChecksumInput,
+    value: &[u8],
+    checksum_type: Option<&str>,
+) -> S3Result<ChecksumMetadata> {
+    let Some(kind) = input.algorithm_kind()? else {
+        return Ok(ChecksumMetadata::default());
+    };
+
+    let computed = compute_checksum(kind, value);
+    if let Some(requested) = input.requested_for(kind)
+        && requested != computed
+    {
+        return Err(s3_error(S3ErrorCode::BadDigest));
+    }
+
+    let mut checksum = ChecksumMetadata {
+        algorithm: Some(kind.as_str().to_string()),
+        checksum_type: checksum_type.map(str::to_string),
+        ..ChecksumMetadata::default()
+    };
+    checksum
+        .set_value(kind.as_str(), computed)
+        .map_err(s3_error_from_sqlite)?;
+    Ok(checksum)
+}
+
+fn checksum_algorithm_output(checksum: &ChecksumMetadata) -> Option<ChecksumAlgorithm> {
+    checksum
+        .algorithm
+        .as_deref()
+        .map(|algorithm| ChecksumAlgorithm::from(algorithm.to_string()))
+}
+
+fn checksum_type_output(checksum: &ChecksumMetadata) -> Option<ChecksumType> {
+    checksum
+        .checksum_type
+        .as_deref()
+        .map(|checksum_type| ChecksumType::from(checksum_type.to_string()))
+}
+
+fn checksum_struct(checksum: &ChecksumMetadata) -> Option<S3Checksum> {
+    checksum.has_value().then(|| S3Checksum {
+        checksum_crc32: checksum.crc32.clone(),
+        checksum_crc32c: checksum.crc32c.clone(),
+        checksum_crc64nvme: checksum.crc64nvme.clone(),
+        checksum_sha1: checksum.sha1.clone(),
+        checksum_sha256: checksum.sha256.clone(),
+        checksum_type: checksum_type_output(checksum),
+    })
+}
+
+fn object_checksum_for_part(
+    object_checksum: &ChecksumMetadata,
+    part: Option<&CompletedObjectPart>,
+) -> ChecksumMetadata {
+    let Some(part) = part else {
+        return object_checksum.clone();
+    };
+    ChecksumMetadata {
+        algorithm: object_checksum.algorithm.clone(),
+        checksum_type: object_checksum.checksum_type.clone(),
+        crc32: part.checksum.crc32.clone(),
+        crc32c: part.checksum.crc32c.clone(),
+        crc64nvme: part.checksum.crc64nvme.clone(),
+        sha1: part.checksum.sha1.clone(),
+        sha256: part.checksum.sha256.clone(),
+    }
+}
+
+fn checksum_mode_enabled(checksum_mode: Option<&ChecksumMode>) -> bool {
+    checksum_mode.is_some_and(|mode| mode.as_str() == ChecksumMode::ENABLED)
+}
+
+fn visible_version_id(version_id: String) -> Option<String> {
+    (version_id != "null").then_some(version_id)
+}
+
+fn has_object_attribute(attributes: &[ObjectAttributes], name: &str) -> bool {
+    attributes.iter().any(|attribute| {
+        attribute
+            .as_str()
+            .split(',')
+            .any(|part| part.trim() == name)
+    })
+}
+
 /// Stores HTTP content encodings while hiding S3's transport-only aws-chunked marker.
 fn normalize_content_encoding(content_encoding: Option<String>) -> Option<String> {
     let content_encoding = content_encoding?;
@@ -419,6 +714,14 @@ fn normalize_completion_parts(parts: Vec<CompletedPart>) -> S3Result<Vec<Multipa
             && previous.part_number == part_number
         {
             previous.md5 = e_tag;
+            previous.checksum = ChecksumMetadata {
+                crc32: part.checksum_crc32,
+                crc32c: part.checksum_crc32c,
+                crc64nvme: part.checksum_crc64nvme,
+                sha1: part.checksum_sha1,
+                sha256: part.checksum_sha256,
+                ..ChecksumMetadata::default()
+            };
             continue;
         }
 
@@ -430,6 +733,14 @@ fn normalize_completion_parts(parts: Vec<CompletedPart>) -> S3Result<Vec<Multipa
         normalized.push(MultipartCompletionPart {
             part_number,
             md5: e_tag,
+            checksum: ChecksumMetadata {
+                crc32: part.checksum_crc32,
+                crc32c: part.checksum_crc32c,
+                crc64nvme: part.checksum_crc64nvme,
+                sha1: part.checksum_sha1,
+                sha256: part.checksum_sha256,
+                ..ChecksumMetadata::default()
+            },
         });
     }
 
@@ -1191,6 +1502,10 @@ impl S3 for Sqlite {
     ) -> S3Result<S3Response<CreateBucketOutput>> {
         let CreateBucketInput { bucket, .. } = req.input;
 
+        if is_valid_bucket_name(&bucket).not() {
+            return Err(s3_error(S3ErrorCode::InvalidBucketName));
+        }
+
         self.try_create_bucket(&bucket)
             .await
             .map_err(s3_error_from_sqlite)?;
@@ -1702,6 +2017,7 @@ impl S3 for Sqlite {
             if_modified_since,
             if_none_match,
             if_unmodified_since,
+            checksum_mode,
             ..
         } = req.input;
         if range.is_some() && part_number.is_some() {
@@ -1822,11 +2138,25 @@ impl S3 for Sqlite {
         }
         let value = Bytes::from(value).slice(start..end);
         let body = stream::once(async { Ok(value) });
+        let response_checksum = if part_number.is_some()
+            || (checksum_mode_enabled(checksum_mode.as_ref()) && range.is_none())
+        {
+            object_checksum_for_part(&object.key_metadata.checksum, completed_part.as_ref())
+        } else {
+            ChecksumMetadata::default()
+        };
+        let checksum_type = checksum_type_output(&response_checksum);
 
         let output = GetObjectOutput {
             body: Some(StreamingBlob::wrap::<_, S3Error>(body)),
             accept_ranges: Some("bytes".to_string()),
             cache_control: object.key_metadata.cache_control,
+            checksum_crc32: response_checksum.crc32,
+            checksum_crc32c: response_checksum.crc32c,
+            checksum_crc64nvme: response_checksum.crc64nvme,
+            checksum_sha1: response_checksum.sha1,
+            checksum_sha256: response_checksum.sha256,
+            checksum_type,
             content_encoding: object.key_metadata.content_encoding,
             content_range: (range.is_some() || part_number.is_some())
                 .then(|| {
@@ -1892,6 +2222,7 @@ impl S3 for Sqlite {
             if_modified_since,
             if_none_match,
             if_unmodified_since,
+            checksum_mode,
             ..
         } = req.input;
         if range.is_some() && part_number.is_some() {
@@ -1993,10 +2324,24 @@ impl S3 for Sqlite {
         };
         let content_length = i64::try_from(object_range.end - object_range.start)
             .map_err(S3Error::internal_error)?;
+        let response_checksum = if part_number.is_some()
+            || (checksum_mode_enabled(checksum_mode.as_ref()) && range.is_none())
+        {
+            object_checksum_for_part(&object.checksum, completed_part.as_ref())
+        } else {
+            ChecksumMetadata::default()
+        };
+        let checksum_type = checksum_type_output(&response_checksum);
 
         let output = HeadObjectOutput {
             accept_ranges: Some("bytes".to_string()),
             cache_control: object.cache_control,
+            checksum_crc32: response_checksum.crc32,
+            checksum_crc32c: response_checksum.crc32c,
+            checksum_crc64nvme: response_checksum.crc64nvme,
+            checksum_sha1: response_checksum.sha1,
+            checksum_sha256: response_checksum.sha256,
+            checksum_type,
             content_encoding: object.content_encoding,
             content_length: Some(content_length),
             content_range: (range.is_some() || part_number.is_some())
@@ -2014,6 +2359,137 @@ impl S3 for Sqlite {
             metadata: object.metadata,
             parts_count: (completed_part_count > 0).then_some(completed_part_count),
             version_id: Some(object.version_id),
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
+    }
+
+    /// Returns selected object attributes without returning the object body.
+    #[tracing::instrument]
+    async fn get_object_attributes(
+        &self,
+        req: S3Request<GetObjectAttributesInput>,
+    ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
+        let GetObjectAttributesInput {
+            bucket,
+            key,
+            version_id,
+            object_attributes,
+            max_parts,
+            part_number_marker,
+            ..
+        } = req.input;
+
+        let max_parts = list_limit(max_parts, 1000, 1000)?;
+        let part_number_marker = part_number_marker.unwrap_or(0);
+        if part_number_marker < 0 {
+            return Err(s3_error_with_message(
+                S3ErrorCode::InvalidArgument,
+                "part-number-marker must be nonnegative",
+            ));
+        }
+
+        let wants_checksum = has_object_attribute(&object_attributes, ObjectAttributes::CHECKSUM);
+        let wants_etag = has_object_attribute(&object_attributes, ObjectAttributes::ETAG);
+        let wants_object_parts =
+            has_object_attribute(&object_attributes, ObjectAttributes::OBJECT_PARTS);
+        let wants_object_size =
+            has_object_attribute(&object_attributes, ObjectAttributes::OBJECT_SIZE);
+        let wants_storage_class =
+            has_object_attribute(&object_attributes, ObjectAttributes::STORAGE_CLASS);
+
+        let connection = self
+            .try_get_connection(&bucket)
+            .await
+            .map_err(s3_error_from_sqlite)?;
+        let (object, parts, total_parts_count) = connection
+            .read(move |connection| {
+                let transaction = connection.transaction()?;
+                let object = match version_id.as_deref() {
+                    Some(version_id) => Some(
+                        Self::try_get_version_metadata(&transaction, &key, version_id)?
+                            .filter(|metadata| metadata.is_delete_marker.not())
+                            .ok_or(SqliteError::ObjectVersionNotFound)?,
+                    ),
+                    None => Self::try_get_current_metadata(&transaction, &key)?,
+                };
+                let Some(object) = object else {
+                    return Ok((None, Vec::new(), 0));
+                };
+                if object.is_delete_marker {
+                    return Ok((Some(object), Vec::new(), 0));
+                }
+
+                let total_parts_count =
+                    Self::try_count_completed_object_parts(&transaction, &key, &object.version_id)?;
+                let parts = if wants_object_parts && total_parts_count > 0 {
+                    Self::try_list_completed_object_parts(
+                        &transaction,
+                        &key,
+                        &object.version_id,
+                        part_number_marker,
+                        i64::from(max_parts) + 1,
+                    )?
+                } else {
+                    Vec::new()
+                };
+                Ok((Some(object), parts, total_parts_count))
+            })
+            .await
+            .map_err(s3_error_from_sqlite)?;
+
+        let Some(object) = object else {
+            return Err(not_found_delete_marker_error(false));
+        };
+        if object.is_delete_marker {
+            return Err(not_found_delete_marker_error(true));
+        }
+
+        let max_parts_usize = usize::try_from(max_parts).map_err(S3Error::internal_error)?;
+        let is_truncated = parts.len() > max_parts_usize;
+        let mut parts = parts;
+        if is_truncated {
+            parts.truncate(max_parts_usize);
+        }
+        let next_part_number_marker = is_truncated
+            .then(|| parts.last().map(|part| part.part_number))
+            .flatten();
+        let object_parts = if wants_object_parts && total_parts_count > 0 {
+            let parts = parts
+                .into_iter()
+                .map(|part| ObjectPart {
+                    checksum_crc32: part.checksum.crc32,
+                    checksum_crc32c: part.checksum.crc32c,
+                    checksum_crc64nvme: part.checksum.crc64nvme,
+                    checksum_sha1: part.checksum.sha1,
+                    checksum_sha256: part.checksum.sha256,
+                    part_number: Some(part.part_number),
+                    size: Some(part.size),
+                })
+                .collect::<Vec<_>>();
+            Some(GetObjectAttributesParts {
+                is_truncated: Some(is_truncated),
+                max_parts: Some(max_parts),
+                next_part_number_marker,
+                part_number_marker: Some(part_number_marker),
+                parts: Some(parts),
+                total_parts_count: Some(total_parts_count),
+            })
+        } else {
+            None
+        };
+
+        let output = GetObjectAttributesOutput {
+            checksum: wants_checksum
+                .then(|| checksum_struct(&object.checksum))
+                .flatten(),
+            e_tag: wants_etag.then(|| object.md5.map(ETag::Strong)).flatten(),
+            last_modified: Some(object.last_modified.into()),
+            object_parts,
+            object_size: wants_object_size.then_some(object.size),
+            storage_class: wants_storage_class
+                .then(|| StorageClass::from_static(StorageClass::STANDARD)),
+            version_id: visible_version_id(object.version_id),
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -2494,13 +2970,14 @@ impl S3 for Sqlite {
             .uploads
             .into_iter()
             .map(|summary| MultipartUpload {
+                checksum_algorithm: checksum_algorithm_output(&summary.checksum),
+                checksum_type: checksum_type_output(&summary.checksum),
                 initiated: Some(summary.initiated.into()),
                 initiator: Some(initiator.clone()),
                 key: Some(encode_list_value(summary.key, encode_keys)),
                 owner: Some(owner.clone()),
                 storage_class: Some(StorageClass::from_static(StorageClass::STANDARD)),
                 upload_id: Some(summary.upload_id.to_string()),
-                ..Default::default()
             })
             .collect::<Vec<_>>();
 
@@ -2552,6 +3029,12 @@ impl S3 for Sqlite {
             content_length: _,
             content_md5,
             content_type,
+            checksum_algorithm,
+            checksum_crc32,
+            checksum_crc32c,
+            checksum_crc64nvme,
+            checksum_sha1,
+            checksum_sha256,
             expires,
             if_match,
             if_none_match,
@@ -2598,9 +3081,24 @@ impl S3 for Sqlite {
             md5_bytes.as_ref(),
         )?;
 
+        let checksum = validate_payload_checksum(
+            &ChecksumInput {
+                algorithm: checksum_algorithm,
+                crc32: checksum_crc32,
+                crc32c: checksum_crc32c,
+                crc64nvme: checksum_crc64nvme,
+                sha1: checksum_sha1,
+                sha256: checksum_sha256,
+                ..ChecksumInput::default()
+            },
+            &value,
+            Some(ChecksumType::FULL_OBJECT),
+        )?;
+
         debug!(path = %key, ?size, %md5, "write file");
 
         let md5_clone = md5.clone();
+        let checksum_clone = checksum.clone();
         let write_outcome = connection
             .write(move |connection| {
                 let transaction = connection.transaction()?;
@@ -2621,6 +3119,7 @@ impl S3 for Sqlite {
                             expires: expires.map(Into::into),
                             last_modified: OffsetDateTime::now_utc(),
                             md5: Some(md5_clone),
+                            checksum: checksum_clone,
                             is_latest: true,
                             is_delete_marker: false,
                         },
@@ -2632,9 +3131,16 @@ impl S3 for Sqlite {
             .await
             .map_err(s3_error_from_sqlite)?;
 
+        let checksum_type = checksum_type_output(&checksum);
         let output = PutObjectOutput {
             e_tag: Some(ETag::Strong(md5)),
             version_id: write_outcome.returned_version_id,
+            checksum_crc32: checksum.crc32,
+            checksum_crc32c: checksum.crc32c,
+            checksum_crc64nvme: checksum.crc64nvme,
+            checksum_sha1: checksum.sha1,
+            checksum_sha256: checksum.sha256,
+            checksum_type,
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -2652,6 +3158,8 @@ impl S3 for Sqlite {
             cache_control,
             content_encoding,
             content_type,
+            checksum_algorithm,
+            checksum_type,
             expires,
             metadata,
             ..
@@ -2661,6 +3169,14 @@ impl S3 for Sqlite {
             .map_err(s3_error_from_sqlite)?;
 
         let upload_id = Uuid::new_v4();
+        let checksum_kind = ChecksumAlgorithmKind::from_algorithm(checksum_algorithm.clone())?;
+        let checksum_type = checksum_type_name(checksum_type)?
+            .or_else(|| checksum_kind.map(|_| ChecksumType::COMPOSITE.to_string()));
+        let checksum = ChecksumMetadata {
+            algorithm: checksum_kind.map(|kind| kind.as_str().to_string()),
+            checksum_type: checksum_type.clone(),
+            ..ChecksumMetadata::default()
+        };
 
         let bucket_clone = bucket.clone();
         let key_clone = key.clone();
@@ -2683,6 +3199,7 @@ impl S3 for Sqlite {
                         content_encoding: normalize_content_encoding(content_encoding),
                         cache_control,
                         expires: expires.map(Into::into),
+                        checksum,
                     },
                 )?;
                 Ok(transaction.commit()?)
@@ -2694,6 +3211,8 @@ impl S3 for Sqlite {
             bucket: Some(bucket),
             key: Some(key),
             upload_id: Some(upload_id.to_string()),
+            checksum_algorithm,
+            checksum_type: checksum_type.map(ChecksumType::from),
             ..Default::default()
         };
 
@@ -2714,6 +3233,12 @@ impl S3 for Sqlite {
             upload_id,
             part_number,
             content_md5,
+            checksum_algorithm,
+            checksum_crc32,
+            checksum_crc32c,
+            checksum_crc64nvme,
+            checksum_sha1,
+            checksum_sha256,
             ..
         } = input;
 
@@ -2737,8 +3262,22 @@ impl S3 for Sqlite {
             content_md5.as_deref(),
             md5_bytes.as_ref(),
         )?;
+        let checksum = validate_payload_checksum(
+            &ChecksumInput {
+                algorithm: checksum_algorithm,
+                crc32: checksum_crc32,
+                crc32c: checksum_crc32c,
+                crc64nvme: checksum_crc64nvme,
+                sha1: checksum_sha1,
+                sha256: checksum_sha256,
+                ..ChecksumInput::default()
+            },
+            &value,
+            None,
+        )?;
 
         let md5_clone = md5.clone();
+        let checksum_clone = checksum.clone();
         let connection = self
             .try_get_connection(&bucket)
             .await
@@ -2767,6 +3306,7 @@ impl S3 for Sqlite {
                         value,
                         size,
                         md5: Some(md5_clone),
+                        checksum: checksum_clone,
                     },
                 )?;
 
@@ -2777,6 +3317,11 @@ impl S3 for Sqlite {
 
         let output = UploadPartOutput {
             e_tag: Some(ETag::Strong(md5)),
+            checksum_crc32: checksum.crc32,
+            checksum_crc32c: checksum.crc32c,
+            checksum_crc64nvme: checksum.crc64nvme,
+            checksum_sha1: checksum.sha1,
+            checksum_sha256: checksum.sha256,
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -2880,6 +3425,7 @@ impl S3 for Sqlite {
                             value,
                             size,
                             md5: Some(md5.clone()),
+                            checksum: ChecksumMetadata::default(),
                         },
                     )?;
 
@@ -2956,6 +3502,7 @@ impl S3 for Sqlite {
                         value: copied_part.value,
                         size: copied_part.size,
                         md5: Some(md5.clone()),
+                        checksum: ChecksumMetadata::default(),
                     },
                 )?;
 
@@ -3007,7 +3554,7 @@ impl S3 for Sqlite {
             .try_get_connection(&bucket)
             .await
             .map_err(s3_error_from_sqlite)?;
-        let parts = connection
+        let (upload_checksum, parts) = connection
             .read(move |connection| {
                 let transaction = connection.transaction()?;
 
@@ -3032,7 +3579,7 @@ impl S3 for Sqlite {
                     i64::from(max_parts) + 1,
                 )?;
 
-                Ok(parts)
+                Ok((upload_state.checksum, parts))
             })
             .await
             .map_err(s3_error_from_sqlite)?;
@@ -3049,16 +3596,22 @@ impl S3 for Sqlite {
         let parts = parts
             .into_iter()
             .map(|part| Part {
+                checksum_crc32: part.checksum.crc32,
+                checksum_crc32c: part.checksum.crc32c,
+                checksum_crc64nvme: part.checksum.crc64nvme,
+                checksum_sha1: part.checksum.sha1,
+                checksum_sha256: part.checksum.sha256,
                 e_tag: part.md5.map(ETag::Strong),
                 last_modified: Some(part.last_modified.into()),
                 part_number: Some(part.part_number),
                 size: Some(part.size),
-                ..Default::default()
             })
             .collect::<Vec<_>>();
 
         let output = ListPartsOutput {
             bucket: Some(bucket),
+            checksum_algorithm: checksum_algorithm_output(&upload_checksum),
+            checksum_type: checksum_type_output(&upload_checksum),
             is_truncated: Some(is_truncated),
             key: Some(key),
             max_parts: Some(max_parts),
@@ -3134,6 +3687,12 @@ impl S3 for Sqlite {
             upload_id,
             if_match,
             if_none_match,
+            checksum_crc32,
+            checksum_crc32c,
+            checksum_crc64nvme,
+            checksum_sha1,
+            checksum_sha256,
+            checksum_type,
             ..
         } = req.input;
         let write_conditions = object_write_conditions(if_match, if_none_match);
@@ -3156,26 +3715,44 @@ impl S3 for Sqlite {
         }
 
         let requested_parts = normalize_completion_parts(requested_parts)?;
+        let requested_checksum = ChecksumInput {
+            checksum_type,
+            crc32: checksum_crc32,
+            crc32c: checksum_crc32c,
+            crc64nvme: checksum_crc64nvme,
+            sha1: checksum_sha1,
+            sha256: checksum_sha256,
+            ..ChecksumInput::default()
+        }
+        .into_requested_metadata()?;
 
         let access_key = req.credentials.map(|credentials| credentials.access_key);
         let completed = self
-            .try_complete_multipart_upload(
-                bucket.clone(),
-                key.clone(),
+            .try_complete_multipart_upload(MultipartCompletionRequest {
+                bucket: bucket.clone(),
+                key: key.clone(),
                 upload_id,
                 requested_parts,
+                requested_checksum,
                 access_key,
                 write_conditions,
-            )
+            })
             .await
             .map_err(s3_error_from_sqlite)?;
         debug!(version_id = %completed.version_id, "completed multipart upload");
 
+        let completed_checksum_type = checksum_type_output(&completed.checksum);
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket),
             key: Some(key),
             e_tag: Some(ETag::Strong(completed.md5)),
             version_id: completed.returned_version_id,
+            checksum_crc32: completed.checksum.crc32,
+            checksum_crc32c: completed.checksum.crc32c,
+            checksum_crc64nvme: completed.checksum.crc64nvme,
+            checksum_sha1: completed.checksum.sha1,
+            checksum_sha256: completed.checksum.sha256,
+            checksum_type: completed_checksum_type,
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -3186,7 +3763,7 @@ impl S3 for Sqlite {
 mod tests {
     use s3s::S3ErrorCode;
 
-    use super::{decode_base64, validate_content_md5};
+    use super::{decode_base64, is_valid_bucket_name, validate_content_md5};
 
     fn assert_error_code(result: s3s::S3Result<()>, code: &S3ErrorCode) {
         match result {
@@ -3231,5 +3808,29 @@ mod tests {
             validate_content_md5(true, Some("rL0Y20xC+Fzt72VPzMSk2A=="), &[0; 16]),
             &S3ErrorCode::BadDigest,
         );
+    }
+
+    #[test]
+    fn validates_dns_bucket_names() {
+        for bucket in [
+            "abc",
+            "a.b-c",
+            "a234567890123456789012345678901234567890123456789012345678901",
+        ] {
+            assert!(is_valid_bucket_name(bucket), "{bucket}");
+        }
+
+        for bucket in [
+            "ab",
+            "foo_bar",
+            "foo-",
+            "foo.",
+            "foo..bar",
+            "foo.-bar",
+            "foo-.bar",
+            "192.168.5.123",
+        ] {
+            assert!(!is_valid_bucket_name(bucket), "{bucket}");
+        }
     }
 }

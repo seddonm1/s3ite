@@ -162,13 +162,81 @@ where
     }
 
     fn call(&mut self, mut req: Request<B>) -> Self::Future {
+        if let Some(response) = presigned_expiry_compat(&req) {
+            return Box::pin(async move { Ok(response) });
+        }
+
+        let rewrite_object_attributes = is_get_object_attributes(&req);
         if let Some(response) = sig_v2_header_compat(&mut req, self.secret_key.as_deref()) {
             return Box::pin(async move { Ok(response) });
         }
 
         let future = self.inner.call(req);
-        Box::pin(future)
+        Box::pin(async move {
+            let response = future.await?;
+            if rewrite_object_attributes {
+                rewrite_get_object_attributes_etag(response).await
+            } else {
+                Ok(response)
+            }
+        })
     }
+}
+
+fn is_get_object_attributes<B>(req: &Request<B>) -> bool {
+    req.method() == Method::GET && req.headers().contains_key("x-amz-object-attributes")
+}
+
+async fn rewrite_get_object_attributes_etag(
+    response: HttpResponse,
+) -> Result<HttpResponse, HttpError> {
+    if !response.status().is_success() {
+        return Ok(response);
+    }
+
+    let (mut parts, body) = response.into_parts();
+    let bytes = body.collect().await.map_err(HttpError::new)?.to_bytes();
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return Ok(HttpResponse::from_parts(parts, Body::from(bytes)));
+    };
+    let text = text
+        .replace("<ETag>\"", "<ETag>")
+        .replace("\"</ETag>", "</ETag>");
+    let content_length = text
+        .len()
+        .to_string()
+        .parse()
+        .map_err(|err| HttpError::new(Box::new(err)))?;
+    parts.headers.insert(CONTENT_LENGTH, content_length);
+    Ok(HttpResponse::from_parts(parts, Body::from(text)))
+}
+
+fn presigned_expiry_compat<B>(req: &Request<B>) -> Option<HttpResponse> {
+    let query = req.uri().query()?;
+    let expires = query_value(query, "X-Amz-Expires")?;
+    if req.method() == Method::OPTIONS {
+        return Some(s3_error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+        ));
+    }
+
+    let Ok(expires) = expires.parse::<i64>() else {
+        return Some(s3_error_response(StatusCode::FORBIDDEN, "AccessDenied"));
+    };
+
+    if !(1..=604_800).contains(&expires) {
+        return Some(s3_error_response(StatusCode::FORBIDDEN, "AccessDenied"));
+    }
+
+    None
+}
+
+fn query_value<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == name).then_some(value)
+    })
 }
 
 #[derive(Debug)]

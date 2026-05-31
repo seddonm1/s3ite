@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add minimal object ACL reads for conformance tests, returning the stable local owner with full control.
 - Add `AbortMultipartUpload` support.
 - Add multipart upload listing, multipart copy, completed-object part reads, and completed part boundary tracking.
+- Add `GetObjectAttributes` support for `ETag`, object size, storage class, multipart object parts, and checksum attributes.
+- Add checksum validation, persistence, and response fields for single-part and multipart uploads, including `CRC32`, `CRC32C`, `CRC64NVME`, `SHA1`, and `SHA256`.
 
 ### Changed
 
@@ -31,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reduce the direct dependency surface by removing unused dependencies, feature-gating binary-only crates, and replacing `crossbeam-channel` worker queues with `std::sync::mpsc::sync_channel`.
 - Ignore local reference clones and local `s3-tests` runtime artifacts.
 - Run the local `s3-tests` helper against a release `s3ite` build and exclude `fails_on_rgw` tests by default.
+- Generate conformance-test server config with permissive `CORS` disabled so presigned request validation reaches the S3 auth layer.
 
 ### Fixed
 
@@ -50,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Refresh incomplete multipart upload activity when parts are uploaded, so cleanup is based on inactivity rather than creation time.
 - Complete `ListParts` pagination and `ETag` behavior, and normalize invalid multipart upload IDs to `NoSuchUpload`.
 - Return `InvalidDigest` for malformed `Content-MD5` values while preserving `BadDigest` for valid digests that do not match the request body.
+- Reject DNS-incompatible bucket names such as `foo-.bar`, `foo.-bar`, and IPv4-address-shaped names.
+- Enforce S3 presigned URL expiry bounds and return expected errors for invalid expiry values and `OPTIONS` probes.
 - Remove stray stdout from bucket creation.
 
 ## [0.6.0] - 2025-06-13

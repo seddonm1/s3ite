@@ -88,6 +88,7 @@ host: $s3ite_host
 port: $s3ite_port
 access_key: $s3ite_access_key
 secret_key: $s3ite_secret_key
+permissive_cors: false
 EOF
 }
 
@@ -120,8 +121,7 @@ EOF
   append_auth_section "s3 main" \
     "display_name = s3ite" \
     "user_id = s3ite-main" \
-    "email = s3ite-main@example.com" \
-    "api_name = default"
+    "email = s3ite-main@example.com"
 
   append_auth_section "s3 alt" \
     "display_name = s3ite-alt" \
