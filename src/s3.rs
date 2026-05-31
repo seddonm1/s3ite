@@ -13,22 +13,23 @@ use s3s::{
     S3Request, S3Response, S3Result, StdError,
     dto::{
         AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketVersioningStatus,
-        CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput,
-        CopyObjectOutput, CopyObjectResult, CopyPartResult, CopySource, CreateBucketInput,
-        CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
-        DeleteBucketInput, DeleteBucketOutput, DeleteMarkerEntry, DeleteObjectInput,
-        DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
-        ETagCondition, EncodingType, Error as DeleteError, GetBucketLocationInput,
-        GetBucketLocationOutput, GetBucketVersioningInput, GetBucketVersioningOutput,
-        GetObjectAclInput, GetObjectAclOutput, GetObjectInput, GetObjectOutput, Grant, Grantee,
-        HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, Initiator,
-        ListBucketsInput, ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput,
-        ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput,
-        ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput, MFADelete,
-        MetadataDirective, MultipartUpload, Object, ObjectVersion, ObjectVersionStorageClass,
-        Owner, Part, Permission, PutBucketVersioningInput, PutBucketVersioningOutput,
-        PutObjectInput, PutObjectOutput, Range as S3Range, StorageClass, StreamingBlob, Timestamp,
-        Type, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
+        CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CompletedPart,
+        CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopyPartResult, CopySource,
+        CreateBucketInput, CreateBucketOutput, CreateMultipartUploadInput,
+        CreateMultipartUploadOutput, DeleteBucketInput, DeleteBucketOutput, DeleteMarkerEntry,
+        DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput,
+        DeletedObject, ETag, ETagCondition, EncodingType, Error as DeleteError,
+        GetBucketLocationInput, GetBucketLocationOutput, GetBucketVersioningInput,
+        GetBucketVersioningOutput, GetObjectAclInput, GetObjectAclOutput, GetObjectInput,
+        GetObjectOutput, Grant, Grantee, HeadBucketInput, HeadBucketOutput, HeadObjectInput,
+        HeadObjectOutput, Initiator, ListBucketsInput, ListBucketsOutput,
+        ListMultipartUploadsInput, ListMultipartUploadsOutput, ListObjectVersionsInput,
+        ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
+        ListObjectsV2Output, ListPartsInput, ListPartsOutput, MFADelete, MetadataDirective,
+        MultipartUpload, Object, ObjectVersion, ObjectVersionStorageClass, Owner, Part, Permission,
+        PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectInput, PutObjectOutput,
+        Range as S3Range, StorageClass, StreamingBlob, Timestamp, Type, UploadPartCopyInput,
+        UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
     },
     header::{CONTENT_MD5, CONTENT_TYPE, ETAG},
 };
@@ -344,14 +345,46 @@ fn has_query_value(query: Option<&str>, name: &str, value: &str) -> bool {
     })
 }
 
-/// Normalizes a delimiter for list output.
-fn output_delimiter(delimiter: Option<String>, encode: bool) -> Option<String> {
-    delimiter.and_then(|delimiter| {
-        delimiter
-            .is_empty()
-            .not()
-            .then(|| encode_list_value(delimiter, encode))
-    })
+/// Normalizes a delimiter echo for list output.
+fn output_delimiter(delimiter: Option<String>) -> Option<String> {
+    delimiter.and_then(|delimiter| delimiter.is_empty().not().then_some(delimiter))
+}
+
+/// Normalizes a completed multipart part list while preserving S3 ordering rules.
+fn normalize_completion_parts(parts: Vec<CompletedPart>) -> S3Result<Vec<MultipartCompletionPart>> {
+    let mut previous_distinct_part_number = 0;
+    let mut normalized = Vec::<MultipartCompletionPart>::with_capacity(parts.len());
+
+    for part in parts {
+        let part_number = part
+            .part_number
+            .ok_or_else(|| s3_error(S3ErrorCode::InvalidPart))?;
+        validate_part_number(part_number)?;
+
+        let e_tag = part
+            .e_tag
+            .and_then(ETag::into_strong)
+            .ok_or_else(|| s3_error(S3ErrorCode::InvalidPart))?;
+
+        if let Some(previous) = normalized.last_mut()
+            && previous.part_number == part_number
+        {
+            previous.md5 = e_tag;
+            continue;
+        }
+
+        if part_number <= previous_distinct_part_number {
+            return Err(s3_error(S3ErrorCode::InvalidPartOrder));
+        }
+        previous_distinct_part_number = part_number;
+
+        normalized.push(MultipartCompletionPart {
+            part_number,
+            md5: e_tag,
+        });
+    }
+
+    Ok(normalized)
 }
 
 /// Parses a multipart upload ID into the internal UUID representation.
@@ -2042,7 +2075,7 @@ impl S3 for Sqlite {
                 "allow-unordered cannot be used with delimiter",
             ));
         }
-        let delimiter = output_delimiter(delimiter, encode_keys);
+        let delimiter = output_delimiter(delimiter);
         let owner = owner();
 
         let listing = self
@@ -2085,7 +2118,7 @@ impl S3 for Sqlite {
             delimiter,
             encoding_type,
             name: Some(bucket),
-            prefix: prefix.map(|prefix| encode_list_value(prefix, encode_keys)),
+            prefix,
             max_keys: Some(max_keys),
             is_truncated: Some(next_marker.is_some()),
             marker: marker_output,
@@ -2127,7 +2160,7 @@ impl S3 for Sqlite {
             .as_deref()
             .filter(|delimiter| delimiter.is_empty().not())
             .map(str::to_string);
-        let delimiter = output_delimiter(delimiter, encode_keys);
+        let delimiter = output_delimiter(delimiter);
         let owner = owner();
 
         let listing = self
@@ -2180,7 +2213,7 @@ impl S3 for Sqlite {
             name: Some(bucket),
             next_key_marker,
             next_version_id_marker,
-            prefix: prefix.map(|prefix| encode_list_value(prefix, encode_keys)),
+            prefix,
             version_id_marker: version_id_marker_clone,
             versions: Some(versions),
             ..Default::default()
@@ -2227,7 +2260,7 @@ impl S3 for Sqlite {
                 "allow-unordered cannot be used with delimiter",
             ));
         }
-        let delimiter = output_delimiter(delimiter, encode_keys);
+        let delimiter = output_delimiter(delimiter);
         let owner = owner();
         let owner = fetch_owner.unwrap_or(false).then_some(owner);
         let after_key = match continuation_token
@@ -2285,8 +2318,8 @@ impl S3 for Sqlite {
             delimiter,
             encoding_type,
             name: Some(bucket),
-            prefix: prefix.map(|prefix| encode_list_value(prefix, encode_keys)),
-            start_after: start_after.map(|start_after| encode_list_value(start_after, encode_keys)),
+            prefix,
+            start_after,
             next_continuation_token,
             ..Default::default()
         };
@@ -2323,7 +2356,7 @@ impl S3 for Sqlite {
             .as_deref()
             .filter(|delimiter| delimiter.is_empty().not())
             .map(str::to_string);
-        let delimiter = output_delimiter(delimiter, encode_keys);
+        let delimiter = output_delimiter(delimiter);
         let after_upload_id = if key_marker.is_some() {
             upload_id_marker
                 .as_deref()
@@ -2378,13 +2411,13 @@ impl S3 for Sqlite {
             delimiter,
             encoding_type,
             is_truncated: Some(listing.is_truncated),
-            key_marker: key_marker.map(|marker| encode_list_value(marker, encode_keys)),
+            key_marker,
             max_uploads: Some(max_uploads),
             next_key_marker: listing
                 .next_key_marker
                 .map(|marker| encode_list_value(marker, encode_keys)),
             next_upload_id_marker: listing.next_upload_id_marker,
-            prefix: prefix.map(|prefix| encode_list_value(prefix, encode_keys)),
+            prefix,
             upload_id_marker,
             uploads: Some(uploads),
             ..Default::default()
@@ -3008,30 +3041,7 @@ impl S3 for Sqlite {
             ));
         }
 
-        let mut previous_part_number = 0;
-        let requested_parts = requested_parts
-            .into_iter()
-            .map(|part| {
-                let part_number = part
-                    .part_number
-                    .ok_or_else(|| s3_error(S3ErrorCode::InvalidPart))?;
-                validate_part_number(part_number)?;
-                if part_number <= previous_part_number {
-                    return Err(s3_error(S3ErrorCode::InvalidPartOrder));
-                }
-                previous_part_number = part_number;
-
-                let e_tag = part
-                    .e_tag
-                    .and_then(ETag::into_strong)
-                    .ok_or_else(|| s3_error(S3ErrorCode::InvalidPart))?;
-
-                Ok(MultipartCompletionPart {
-                    part_number,
-                    md5: e_tag,
-                })
-            })
-            .collect::<S3Result<Vec<_>>>()?;
+        let requested_parts = normalize_completion_parts(requested_parts)?;
 
         let access_key = req.credentials.map(|credentials| credentials.access_key);
         let completed = self

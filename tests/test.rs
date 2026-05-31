@@ -1155,6 +1155,33 @@ async fn test_list_objects_ceph_edge_semantics() -> Result<()> {
     assert_eq!(encoded_v1_keys, vec!["asdf%2Bb"]);
     assert_eq!(encoded_v1_prefixes, vec!["foo%2B1/", "foo/", "quux%20ab/"]);
 
+    let unreadable_prefix = context
+        .list_objects()
+        .bucket(&bucket)
+        .prefix("\n")
+        .encoding_type(EncodingType::Url)
+        .send()
+        .await?;
+    assert_eq!(unreadable_prefix.prefix(), Some("\n"));
+    assert_eq!(unreadable_prefix.encoding_type(), Some(&EncodingType::Url));
+    assert!(unreadable_prefix.contents().is_empty());
+    assert!(unreadable_prefix.common_prefixes().is_empty());
+
+    let unreadable_v2_prefix = context
+        .list_objects_v2()
+        .bucket(&bucket)
+        .prefix("\n")
+        .encoding_type(EncodingType::Url)
+        .send()
+        .await?;
+    assert_eq!(unreadable_v2_prefix.prefix(), Some("\n"));
+    assert_eq!(
+        unreadable_v2_prefix.encoding_type(),
+        Some(&EncodingType::Url)
+    );
+    assert!(unreadable_v2_prefix.contents().is_empty());
+    assert!(unreadable_v2_prefix.common_prefixes().is_empty());
+
     for key in ["foo+1/bar", "foo/bar/xyzzy", "quux ab/thud", "asdf+b"] {
         delete_object(&context, &bucket, key).await?;
     }
@@ -1287,6 +1314,81 @@ async fn test_list_objects_ceph_edge_semantics() -> Result<()> {
     ] {
         delete_object(&context, &bucket, key).await?;
     }
+    delete_bucket(&context, &bucket).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_list_object_versions_deleted_marker_continues_listing() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+
+    let bucket = format!("test-lov-marker-{}", Uuid::new_v4());
+    create_bucket(&context, &bucket).await?;
+    put_bucket_versioning(&context, &bucket, BucketVersioningStatus::Enabled).await?;
+
+    for _ in 0..5 {
+        put_object(&context, &bucket, "version/a", b"x").await?;
+    }
+    put_object(&context, &bucket, "version/b", b"x").await?;
+
+    let first_page = context
+        .list_object_versions()
+        .bucket(&bucket)
+        .prefix("version/")
+        .max_keys(2)
+        .send()
+        .await?;
+    let next_key_marker = first_page
+        .next_key_marker()
+        .ok_or_else(|| anyhow::anyhow!("first version page missing next key marker"))?
+        .to_string();
+    let next_version_id_marker = first_page
+        .next_version_id_marker()
+        .ok_or_else(|| anyhow::anyhow!("first version page missing next version ID marker"))?
+        .to_string();
+    let first_page_versions = first_page
+        .versions()
+        .iter()
+        .map(|version| {
+            let key = version
+                .key()
+                .ok_or_else(|| anyhow::anyhow!("listed version missing key"))?
+                .to_string();
+            let version_id = version
+                .version_id()
+                .ok_or_else(|| anyhow::anyhow!("listed version missing version ID"))?
+                .to_string();
+            Ok((key, version_id))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(first_page_versions.len(), 2);
+
+    for (key, version_id) in &first_page_versions {
+        context
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(version_id)
+            .send()
+            .await?;
+    }
+
+    let second_page = context
+        .list_object_versions()
+        .bucket(&bucket)
+        .prefix("version/")
+        .key_marker(next_key_marker)
+        .version_id_marker(next_version_id_marker)
+        .send()
+        .await?;
+    assert!(second_page.versions().iter().any(|version| {
+        version.key() == Some("version/a") || version.key() == Some("version/b")
+    }));
+
+    delete_all_object_versions(&context, &bucket).await?;
     delete_bucket(&context, &bucket).await?;
 
     Ok(())
@@ -2007,6 +2109,49 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
         expected.as_slice()
     );
 
+    let duplicate_key = "duplicate-part.txt";
+    let duplicate_upload_id = context
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key(duplicate_key)
+        .send()
+        .await?
+        .upload_id
+        .ok_or_else(|| anyhow::anyhow!("create multipart response missing upload ID"))?;
+    let stale_part = upload_part(
+        &context,
+        &bucket,
+        duplicate_key,
+        &duplicate_upload_id,
+        1,
+        b"first",
+    )
+    .await?;
+    let final_part = upload_part(
+        &context,
+        &bucket,
+        duplicate_key,
+        &duplicate_upload_id,
+        1,
+        b"second",
+    )
+    .await?;
+    let duplicate_upload = CompletedMultipartUpload::builder()
+        .set_parts(Some(vec![stale_part, final_part]))
+        .build();
+    context
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key(duplicate_key)
+        .upload_id(&duplicate_upload_id)
+        .multipart_upload(duplicate_upload)
+        .send()
+        .await?;
+    assert_eq!(
+        get_object_bytes(&context, &bucket, duplicate_key).await?,
+        b"second"
+    );
+
     let missing_key = "missing.txt";
     let missing_upload_id = context
         .create_multipart_upload()
@@ -2133,6 +2278,7 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
         .await?;
 
     delete_object(&context, &bucket, key).await?;
+    delete_object(&context, &bucket, duplicate_key).await?;
     delete_bucket(&context, &bucket).await?;
 
     Ok(())

@@ -362,6 +362,12 @@ pub(crate) struct ObjectSummary {
     pub(crate) is_delete_marker: bool,
 }
 
+#[derive(Debug)]
+enum VersionMarker {
+    Existing(i64),
+    Deleted,
+}
+
 /// Object metadata loaded without the object body.
 #[derive(Debug)]
 pub(crate) struct KeyMetadata {
@@ -1091,16 +1097,17 @@ impl Sqlite {
         after_version_id: Option<&str>,
         limit: i64,
     ) -> SqliteResult<Vec<ObjectSummary>> {
-        let limit = sql_limit(limit)?;
-        let prefix = prefix.and_then(|prefix| prefix.is_empty().not().then_some(prefix));
-        let after_sequence = match (after_key, after_version_id) {
-            (Some(key), Some(version_id)) => Some(Self::try_get_version_sequence(
-                transaction,
-                key,
-                version_id,
-            )?),
+        let after_marker = match (after_key, after_version_id) {
+            (Some(key), Some(version_id)) => Some(
+                match Self::try_find_version_sequence(transaction, key, version_id)? {
+                    Some(sequence) => VersionMarker::Existing(sequence),
+                    None => VersionMarker::Deleted,
+                },
+            ),
             _ => None,
         };
+        let limit = sql_limit(limit)?;
+        let prefix = prefix.and_then(|prefix| prefix.is_empty().not().then_some(prefix));
         let map_summary = |row: &rusqlite::Row<'_>| {
             Ok(ObjectSummary {
                 key: row.get(0)?,
@@ -1113,12 +1120,19 @@ impl Sqlite {
             })
         };
 
-        let versions = match (prefix, after_key, after_sequence) {
-            (Some(prefix), Some(after_key), Some(after_sequence)) => {
+        let versions = match (prefix, after_key, after_marker) {
+            (Some(prefix), Some(after_key), Some(VersionMarker::Existing(after_sequence))) => {
                 let mut stmt = transaction.prepare_cached(
                     "SELECT key, version_id, size, last_modified, md5, is_latest, is_delete_marker FROM object_version WHERE key >= ?1 AND (key > ?2 OR (key = ?2 AND sequence < ?3)) ORDER BY key, sequence DESC LIMIT ?4;",
                 )?;
                 stmt.query_map((prefix, after_key, after_sequence, limit), map_summary)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            (Some(prefix), Some(after_key), Some(VersionMarker::Deleted)) => {
+                let mut stmt = transaction.prepare_cached(
+                    "SELECT key, version_id, size, last_modified, md5, is_latest, is_delete_marker FROM object_version WHERE key >= ?1 AND key >= ?2 ORDER BY key, sequence DESC LIMIT ?3;",
+                )?;
+                stmt.query_map((prefix, after_key, limit), map_summary)?
                     .collect::<rusqlite::Result<Vec<_>>>()?
             }
             (Some(prefix), Some(after_key), None) => {
@@ -1135,11 +1149,18 @@ impl Sqlite {
                 stmt.query_map((prefix, limit), map_summary)?
                     .collect::<rusqlite::Result<Vec<_>>>()?
             }
-            (None, Some(after_key), Some(after_sequence)) => {
+            (None, Some(after_key), Some(VersionMarker::Existing(after_sequence))) => {
                 let mut stmt = transaction.prepare_cached(
                     "SELECT key, version_id, size, last_modified, md5, is_latest, is_delete_marker FROM object_version WHERE key > ?1 OR (key = ?1 AND sequence < ?2) ORDER BY key, sequence DESC LIMIT ?3;",
                 )?;
                 stmt.query_map((after_key, after_sequence, limit), map_summary)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            (None, Some(after_key), Some(VersionMarker::Deleted)) => {
+                let mut stmt = transaction.prepare_cached(
+                    "SELECT key, version_id, size, last_modified, md5, is_latest, is_delete_marker FROM object_version WHERE key >= ?1 ORDER BY key, sequence DESC LIMIT ?2;",
+                )?;
+                stmt.query_map((after_key, limit), map_summary)?
                     .collect::<rusqlite::Result<Vec<_>>>()?
             }
             (None, Some(after_key), None) => {
@@ -1524,21 +1545,21 @@ impl Sqlite {
         Ok(stmt.execute([state.as_sql()])?)
     }
 
-    /// Returns the storage sequence for an exact object version.
-    fn try_get_version_sequence(
+    /// Returns the storage sequence for an exact object version when present.
+    fn try_find_version_sequence(
         transaction: &Transaction,
         key: &str,
         version_id: &str,
-    ) -> SqliteResult<i64> {
+    ) -> SqliteResult<Option<i64>> {
         let mut stmt = transaction.prepare_cached(
             "
             SELECT sequence
             FROM object_version
             WHERE key = ?1 AND version_id = ?2;",
         )?;
-        stmt.query_row((key, version_id), |row| row.get(0))
-            .optional()?
-            .ok_or(SqliteError::ObjectVersionNotFound)
+        Ok(stmt
+            .query_row((key, version_id), |row| row.get(0))
+            .optional()?)
     }
 
     /// Generates an unused opaque version ID for a key.
