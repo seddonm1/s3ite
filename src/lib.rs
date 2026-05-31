@@ -6,6 +6,7 @@
     clippy::unwrap_used
 )]
 
+mod checksum;
 mod config;
 mod database;
 mod s3;

@@ -1,17 +1,17 @@
 use std::collections::HashSet;
 
 use super::{
-    AbortMultipartUploadInput, AbortMultipartUploadOutput, ByteRange, CONTENT_MD5,
-    ChecksumAlgorithmKind, ChecksumInput, ChecksumMetadata, ChecksumPolicy, ChecksumType,
-    CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CompletedObjectPart,
-    CompletedPart, CopyPartResult, CopySource, CreateMultipartUploadInput,
-    CreateMultipartUploadOutput, Digest, ETag, Initiator, InternalError, KeyValue, LIST_BATCH_SIZE,
-    ListMultipartUploadsInput, ListMultipartUploadsOutput, ListPartsInput, ListPartsOutput, Md5,
-    Multipart, MultipartCompletionPart, MultipartCompletionRequest, MultipartUpload,
-    MultipartUploadState, MultipartUploadSummary, Not, ObjectReadConditions, OffsetDateTime, Part,
-    S3Error, S3ErrorCode, S3Range, S3Request, S3Response, S3Result, Sqlite, SqliteError,
-    SqliteResult, StorageClass, TryStreamExt, UploadPartCopyInput, UploadPartCopyOutput,
-    UploadPartInput, UploadPartOutput, Uuid, checksum_algorithm_output, checksum_type_name,
+    AbortMultipartUploadInput, AbortMultipartUploadOutput, ByteRange, CONTENT_MD5, ChecksumInput,
+    ChecksumMetadata, ChecksumPolicy, ChecksumType, CommonPrefix, CompleteMultipartUploadInput,
+    CompleteMultipartUploadOutput, CompletedObjectPart, CompletedPart, CopyPartResult, CopySource,
+    CreateMultipartUploadInput, CreateMultipartUploadOutput, Digest, ETag, Initiator,
+    InternalError, KeyValue, LIST_BATCH_SIZE, ListMultipartUploadsInput,
+    ListMultipartUploadsOutput, ListPartsInput, ListPartsOutput, Md5, Multipart,
+    MultipartCompletionPart, MultipartCompletionRequest, MultipartUpload, MultipartUploadState,
+    MultipartUploadSummary, Not, ObjectReadConditions, OffsetDateTime, Part, S3Error, S3ErrorCode,
+    S3Range, S3Request, S3Response, S3Result, Sqlite, SqliteError, SqliteResult, StorageClass,
+    TryStreamExt, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
+    Uuid, checksum_algorithm_from_request, checksum_algorithm_output, checksum_type_name,
     checksum_type_output, common_prefix_for_key, copied_part_checksum, copy_bytes, debug,
     decode_list_input_value, default_crc64nvme_full_object_checksum, encode_list_value, hex,
     is_url_encoding, multipart_checksum_type, normalize_content_encoding, object_write_conditions,
@@ -648,7 +648,7 @@ pub(super) async fn create_multipart_upload(
         .map_err(s3_error_from_sqlite)?;
 
     let upload_id = Uuid::new_v4();
-    let checksum_kind = ChecksumAlgorithmKind::from_algorithm(checksum_algorithm.clone())?;
+    let checksum_kind = checksum_algorithm_from_request(checksum_algorithm.clone())?;
     let checksum_type = checksum_type_name(checksum_type)?
         .or_else(|| checksum_kind.map(|kind| multipart_checksum_type(kind).to_string()));
     let checksum = ChecksumMetadata {

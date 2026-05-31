@@ -10,13 +10,13 @@ use super::{
     MetadataDirective, Not, ObjectAttributes, ObjectDeleteConditions, ObjectDeleteOutcome,
     ObjectPart, ObjectReadConditionFailure, ObjectReadConditions, OffsetDateTime, PutObjectInput,
     PutObjectOutput, S3Error, S3ErrorCode, S3Range, S3Request, S3Response, S3Result, Sqlite,
-    SqliteError, SqliteResult, StorageClass, StreamingBlob, TryStreamExt, checksum_mode_enabled,
-    checksum_struct, checksum_type_output, copy_bytes, debug, hex, list_limit,
-    not_found_delete_marker_error, not_modified_error, object_checksum_for_part,
-    object_write_checksum_from_value, object_write_conditions, requested_part_range, s3_error,
-    s3_error_from_sqlite, s3_error_with_message, stream, validate_content_md5,
-    validate_copy_source_conditions, validate_delete_conditions, validate_part_number,
-    validate_payload_checksum, validate_read_conditions,
+    SqliteError, SqliteResult, StorageClass, StreamingBlob, TryStreamExt,
+    checksum_algorithm_from_request, checksum_mode_enabled, checksum_struct, checksum_type_output,
+    copy_bytes, debug, hex, list_limit, not_found_delete_marker_error, not_modified_error,
+    object_checksum_for_part, object_write_checksum_from_value, object_write_conditions,
+    requested_part_range, s3_error, s3_error_from_sqlite, s3_error_with_message, stream,
+    validate_content_md5, validate_copy_source_conditions, validate_delete_conditions,
+    validate_part_number, validate_payload_checksum, validate_read_conditions,
 };
 
 use crate::database::BucketConnection;
@@ -99,7 +99,7 @@ fn parse_copy_object_request(input: CopyObjectInput) -> S3Result<CopyObjectReque
     let replace_metadata = metadata_directive
         .as_ref()
         .is_some_and(|directive| directive.as_str() == MetadataDirective::REPLACE);
-    let target_checksum_kind = ChecksumAlgorithmKind::from_algorithm(checksum_algorithm)?
+    let target_checksum_kind = checksum_algorithm_from_request(checksum_algorithm)?
         .unwrap_or(ChecksumAlgorithmKind::Crc64Nvme);
 
     Ok(CopyObjectRequest {

@@ -1,51 +1,17 @@
-use std::ops::Not;
-
-use s3s::crypto::{Checksum as _, Crc32, Crc32c, Crc64Nvme, Sha1, Sha256};
+use crate::checksum::{
+    CHECKSUM_CRC32, CHECKSUM_CRC32C, CHECKSUM_CRC64NVME, CHECKSUM_SHA1, CHECKSUM_SHA256,
+    ChecksumAlgorithmKind, checksum_value as storage_checksum_value,
+    decode_md5_hex as decode_storage_md5_hex,
+};
 
 use super::{SqliteError, SqliteResult};
 
-pub(super) const CHECKSUM_CRC32: &str = "CRC32";
-pub(super) const CHECKSUM_CRC32C: &str = "CRC32C";
-pub(super) const CHECKSUM_CRC64NVME: &str = "CRC64NVME";
-pub(super) const CHECKSUM_SHA1: &str = "SHA1";
-pub(super) const CHECKSUM_SHA256: &str = "SHA256";
-pub(super) const CHECKSUM_TYPE_COMPOSITE: &str = "COMPOSITE";
-pub(super) const CHECKSUM_TYPE_FULL_OBJECT: &str = "FULL_OBJECT";
-
-pub(super) fn encode_hex(input: impl AsRef<[u8]>) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-
-    let input = input.as_ref();
-    let mut encoded = String::with_capacity(input.len() * 2);
-    for byte in input {
-        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    encoded
-}
+pub(super) use crate::checksum::{
+    CHECKSUM_TYPE_COMPOSITE, CHECKSUM_TYPE_FULL_OBJECT, decode_base64, encode_hex,
+};
 
 pub(super) fn decode_md5_hex(value: &str) -> SqliteResult<[u8; 16]> {
-    fn nibble(byte: u8) -> Option<u8> {
-        match byte {
-            b'0'..=b'9' => Some(byte - b'0'),
-            b'a'..=b'f' => Some(byte - b'a' + 10),
-            b'A'..=b'F' => Some(byte - b'A' + 10),
-            _ => None,
-        }
-    }
-
-    let bytes = value.as_bytes();
-    if bytes.len() != 32 {
-        return Err(SqliteError::InvalidMultipartPart);
-    }
-
-    let mut decoded = [0; 16];
-    for (idx, pair) in bytes.chunks_exact(2).enumerate() {
-        let upper = nibble(pair[0]).ok_or(SqliteError::InvalidMultipartPart)?;
-        let lower = nibble(pair[1]).ok_or(SqliteError::InvalidMultipartPart)?;
-        decoded[idx] = (upper << 4) | lower;
-    }
-    Ok(decoded)
+    decode_storage_md5_hex(value).ok_or(SqliteError::InvalidMultipartPart)
 }
 
 pub(super) fn row_checksum(
@@ -76,96 +42,9 @@ pub(super) fn row_checksum(
     })
 }
 
-fn base64_encode(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let first = chunk[0];
-        let second = chunk.get(1).copied().unwrap_or(0);
-        let third = chunk.get(2).copied().unwrap_or(0);
-        output.push(char::from(TABLE[usize::from(first >> 2)]));
-        output.push(char::from(
-            TABLE[usize::from(((first & 0b0000_0011) << 4) | (second >> 4))],
-        ));
-        if chunk.len() > 1 {
-            output.push(char::from(
-                TABLE[usize::from(((second & 0b0000_1111) << 2) | (third >> 6))],
-            ));
-        } else {
-            output.push('=');
-        }
-        if chunk.len() > 2 {
-            output.push(char::from(TABLE[usize::from(third & 0b0011_1111)]));
-        } else {
-            output.push('=');
-        }
-    }
-    output
-}
-
-pub(super) fn decode_base64(value: &str) -> Option<Vec<u8>> {
-    fn sextet(byte: u8) -> Option<u8> {
-        match byte {
-            b'A'..=b'Z' => Some(byte - b'A'),
-            b'a'..=b'z' => Some(byte - b'a' + 26),
-            b'0'..=b'9' => Some(byte - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-
-    let bytes = value.as_bytes();
-    if bytes.is_empty() || bytes.len().is_multiple_of(4).not() {
-        return None;
-    }
-
-    let chunk_count = bytes.len() / 4;
-    let mut decoded = Vec::with_capacity(chunk_count * 3);
-    for (index, chunk) in bytes.chunks_exact(4).enumerate() {
-        let is_last = index + 1 == chunk_count;
-        let padding = match (chunk[2], chunk[3]) {
-            (b'=', b'=') => 2,
-            (b'=', _) => return None,
-            (_, b'=') => 1,
-            _ => 0,
-        };
-
-        if padding > 0 && is_last.not() {
-            return None;
-        }
-
-        let b0 = sextet(chunk[0])?;
-        let b1 = sextet(chunk[1])?;
-        let b2 = if padding == 2 { 0 } else { sextet(chunk[2])? };
-        let b3 = if padding > 0 { 0 } else { sextet(chunk[3])? };
-
-        if (padding == 2 && (b1 & 0x0f) != 0) || (padding == 1 && (b2 & 0x03) != 0) {
-            return None;
-        }
-
-        decoded.push((b0 << 2) | (b1 >> 4));
-        if padding < 2 {
-            decoded.push((b1 << 4) | (b2 >> 2));
-        }
-        if padding == 0 {
-            decoded.push((b2 << 6) | b3);
-        }
-    }
-
-    Some(decoded)
-}
-
 pub(super) fn checksum_value(algorithm: &str, value: &[u8]) -> SqliteResult<String> {
-    let checksum = match algorithm {
-        CHECKSUM_CRC32 => base64_encode(Crc32::checksum(value).as_ref()),
-        CHECKSUM_CRC32C => base64_encode(Crc32c::checksum(value).as_ref()),
-        CHECKSUM_CRC64NVME => base64_encode(Crc64Nvme::checksum(value).as_ref()),
-        CHECKSUM_SHA1 => base64_encode(Sha1::checksum(value).as_ref()),
-        CHECKSUM_SHA256 => base64_encode(Sha256::checksum(value).as_ref()),
-        _ => return Err(SqliteError::ChecksumMismatch),
-    };
-    Ok(checksum)
+    let kind = ChecksumAlgorithmKind::from_name(algorithm).ok_or(SqliteError::ChecksumMismatch)?;
+    Ok(storage_checksum_value(kind, value))
 }
 
 /// Stored checksum values for an object, multipart upload, or part.

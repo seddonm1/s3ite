@@ -61,11 +61,11 @@ mod object;
 use self::{
     bucket::owner,
     checksum::{
-        ChecksumAlgorithmKind, ChecksumInput, ChecksumPolicy, checksum_algorithm_output,
-        checksum_mode_enabled, checksum_struct, checksum_type_name, checksum_type_output,
-        copied_part_checksum, default_crc64nvme_full_object_checksum, hex, multipart_checksum_type,
-        object_checksum_for_part, object_write_checksum_from_value, validate_content_md5,
-        validate_payload_checksum,
+        ChecksumAlgorithmKind, ChecksumInput, ChecksumPolicy, checksum_algorithm_from_request,
+        checksum_algorithm_output, checksum_mode_enabled, checksum_struct, checksum_type_name,
+        checksum_type_output, copied_part_checksum, default_crc64nvme_full_object_checksum, hex,
+        multipart_checksum_type, object_checksum_for_part, object_write_checksum_from_value,
+        validate_content_md5, validate_payload_checksum,
     },
     conditions::{
         ObjectDeleteConditions, ObjectReadConditionFailure, ObjectReadConditions,
