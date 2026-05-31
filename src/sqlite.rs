@@ -666,6 +666,7 @@ pub(crate) struct MultipartCompletionRequest {
     pub(crate) upload_id: Uuid,
     pub(crate) requested_parts: Vec<MultipartCompletionPart>,
     pub(crate) requested_checksum: ChecksumMetadata,
+    pub(crate) default_checksum: Option<ChecksumMetadata>,
     pub(crate) access_key: Option<String>,
     pub(crate) write_conditions: ObjectWriteConditions,
 }
@@ -1054,6 +1055,7 @@ impl Sqlite {
             &request.requested_parts,
             &upload_state.checksum,
             &request.requested_checksum,
+            request.default_checksum.as_ref(),
         )?;
 
         Self::try_check_object_write_conditions(
@@ -1120,6 +1122,7 @@ impl Sqlite {
         requested_parts: &[MultipartCompletionPart],
         upload_checksum: &ChecksumMetadata,
         requested_checksum: &ChecksumMetadata,
+        default_checksum: Option<&ChecksumMetadata>,
     ) -> SqliteResult<CompletedMultipartObject> {
         let parts = Self::try_get_multiparts(transaction, upload_id)?;
         if parts.len() != requested_parts.len() {
@@ -1172,6 +1175,7 @@ impl Sqlite {
         let checksum = Self::try_completed_multipart_checksum(
             upload_checksum,
             requested_checksum,
+            default_checksum,
             &value,
             &completed_parts,
         )?;
@@ -1229,21 +1233,39 @@ impl Sqlite {
     fn try_completed_multipart_checksum(
         upload_checksum: &ChecksumMetadata,
         requested_checksum: &ChecksumMetadata,
+        default_checksum: Option<&ChecksumMetadata>,
         value: &[u8],
         parts: &[CompletedObjectPart],
     ) -> SqliteResult<ChecksumMetadata> {
-        let Some(algorithm) = upload_checksum.algorithm.as_deref() else {
+        let empty_default_checksum = ChecksumMetadata::default();
+        let default_checksum = default_checksum.unwrap_or(&empty_default_checksum);
+        let algorithm = upload_checksum
+            .algorithm
+            .as_deref()
+            .or(requested_checksum.algorithm.as_deref())
+            .or(default_checksum.algorithm.as_deref());
+        let Some(algorithm) = algorithm else {
             if requested_checksum.has_value() {
                 return Err(SqliteError::ChecksumMismatch);
             }
             return Ok(ChecksumMetadata::default());
         };
 
-        let checksum_type = requested_checksum
-            .checksum_type
-            .as_deref()
-            .or(upload_checksum.checksum_type.as_deref())
-            .unwrap_or(CHECKSUM_TYPE_COMPOSITE);
+        let checksum_type =
+            if upload_checksum.algorithm.is_some() || requested_checksum.algorithm.is_some() {
+                requested_checksum
+                    .checksum_type
+                    .as_deref()
+                    .or(upload_checksum.checksum_type.as_deref())
+                    .or(default_checksum.checksum_type.as_deref())
+                    .unwrap_or(CHECKSUM_TYPE_COMPOSITE)
+            } else {
+                default_checksum
+                    .checksum_type
+                    .as_deref()
+                    .or(requested_checksum.checksum_type.as_deref())
+                    .unwrap_or(CHECKSUM_TYPE_COMPOSITE)
+            };
         let computed = match checksum_type {
             CHECKSUM_TYPE_FULL_OBJECT => checksum_value(algorithm, value)?,
             CHECKSUM_TYPE_COMPOSITE => {

@@ -49,7 +49,7 @@ use crate::sqlite::{
     BucketVersioningState, ChecksumMetadata, CompletedObjectPart, KeyMetadata, KeyValue, Multipart,
     MultipartCompletionPart, MultipartCompletionRequest, MultipartUploadState,
     MultipartUploadSummary, ObjectDeleteOutcome, ObjectSummary, ObjectTagCondition,
-    ObjectWriteConditions, Sqlite, SqliteError,
+    ObjectWriteConditions, Sqlite, SqliteError, SqliteResult,
 };
 
 const LIST_BATCH_SIZE: i64 = 1024;
@@ -346,20 +346,25 @@ impl ChecksumAlgorithmKind {
         let Some(algorithm) = algorithm else {
             return Ok(None);
         };
-        let kind = match algorithm.as_str() {
+        let kind = Self::from_name(algorithm.as_str()).map_err(|_| {
+            s3_error_with_message(
+                S3ErrorCode::InvalidArgument,
+                "unsupported checksum algorithm",
+            )
+        })?;
+        Ok(Some(kind))
+    }
+
+    fn from_name(algorithm: &str) -> SqliteResult<Self> {
+        let kind = match algorithm {
             ChecksumAlgorithm::CRC32 => Self::Crc32,
             ChecksumAlgorithm::CRC32C => Self::Crc32c,
             ChecksumAlgorithm::CRC64NVME => Self::Crc64Nvme,
             ChecksumAlgorithm::SHA1 => Self::Sha1,
             ChecksumAlgorithm::SHA256 => Self::Sha256,
-            _ => {
-                return Err(s3_error_with_message(
-                    S3ErrorCode::InvalidArgument,
-                    "unsupported checksum algorithm",
-                ));
-            }
+            _ => return Err(SqliteError::ChecksumMismatch),
         };
-        Ok(Some(kind))
+        Ok(kind)
     }
 
     fn as_str(self) -> &'static str {
@@ -369,6 +374,28 @@ impl ChecksumAlgorithmKind {
             Self::Crc64Nvme => ChecksumAlgorithm::CRC64NVME,
             Self::Sha1 => ChecksumAlgorithm::SHA1,
             Self::Sha256 => ChecksumAlgorithm::SHA256,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChecksumPolicy {
+    ExplicitOnly,
+    DefaultCrc64NvmeFullObject,
+}
+
+impl ChecksumPolicy {
+    fn default_kind(self) -> Option<ChecksumAlgorithmKind> {
+        match self {
+            Self::ExplicitOnly => None,
+            Self::DefaultCrc64NvmeFullObject => Some(ChecksumAlgorithmKind::Crc64Nvme),
+        }
+    }
+
+    fn default_type(self) -> Option<&'static str> {
+        match self {
+            Self::ExplicitOnly => None,
+            Self::DefaultCrc64NvmeFullObject => Some(ChecksumType::FULL_OBJECT),
         }
     }
 }
@@ -423,16 +450,27 @@ impl ChecksumInput {
     }
 
     fn into_requested_metadata(self) -> S3Result<ChecksumMetadata> {
+        let algorithm = self.algorithm_kind()?.map(|kind| kind.as_str().to_string());
         let checksum_type = checksum_type_name(self.checksum_type)?;
         Ok(ChecksumMetadata {
+            algorithm,
             checksum_type,
             crc32: self.crc32,
             crc32c: self.crc32c,
             crc64nvme: self.crc64nvme,
             sha1: self.sha1,
             sha256: self.sha256,
-            ..ChecksumMetadata::default()
         })
+    }
+}
+
+fn multipart_checksum_type(kind: ChecksumAlgorithmKind) -> &'static str {
+    match kind {
+        ChecksumAlgorithmKind::Crc64Nvme => ChecksumType::FULL_OBJECT,
+        ChecksumAlgorithmKind::Crc32
+        | ChecksumAlgorithmKind::Crc32c
+        | ChecksumAlgorithmKind::Sha1
+        | ChecksumAlgorithmKind::Sha256 => ChecksumType::COMPOSITE,
     }
 }
 
@@ -471,31 +509,75 @@ fn compute_checksum(kind: ChecksumAlgorithmKind, value: &[u8]) -> String {
     }
 }
 
-fn validate_payload_checksum(
-    input: &ChecksumInput,
+fn checksum_metadata(
+    kind: ChecksumAlgorithmKind,
     value: &[u8],
     checksum_type: Option<&str>,
-) -> S3Result<ChecksumMetadata> {
-    let Some(kind) = input.algorithm_kind()? else {
-        return Ok(ChecksumMetadata::default());
-    };
-
+) -> SqliteResult<ChecksumMetadata> {
     let computed = compute_checksum(kind, value);
-    if let Some(requested) = input.requested_for(kind)
-        && requested != computed
-    {
-        return Err(s3_error(S3ErrorCode::BadDigest));
-    }
-
     let mut checksum = ChecksumMetadata {
         algorithm: Some(kind.as_str().to_string()),
         checksum_type: checksum_type.map(str::to_string),
         ..ChecksumMetadata::default()
     };
-    checksum
-        .set_value(kind.as_str(), computed)
-        .map_err(s3_error_from_sqlite)?;
+    checksum.set_value(kind.as_str(), computed)?;
     Ok(checksum)
+}
+
+fn validate_payload_checksum(
+    input: &ChecksumInput,
+    value: &[u8],
+    policy: ChecksumPolicy,
+    checksum_type: Option<&str>,
+) -> S3Result<ChecksumMetadata> {
+    let explicit_kind = input.algorithm_kind()?;
+    let Some(kind) = explicit_kind.or_else(|| policy.default_kind()) else {
+        return Ok(ChecksumMetadata::default());
+    };
+    let checksum_type = checksum_type.or_else(|| {
+        explicit_kind
+            .is_none()
+            .then(|| policy.default_type())
+            .flatten()
+    });
+
+    let checksum = checksum_metadata(kind, value, checksum_type).map_err(s3_error_from_sqlite)?;
+    if let Some(requested) = input.requested_for(kind)
+        && checksum.value_for(kind.as_str()) != Some(requested)
+    {
+        return Err(s3_error(S3ErrorCode::BadDigest));
+    }
+
+    Ok(checksum)
+}
+
+fn default_crc64nvme_full_object_checksum() -> ChecksumMetadata {
+    ChecksumMetadata {
+        algorithm: Some(ChecksumAlgorithm::CRC64NVME.to_string()),
+        checksum_type: Some(ChecksumType::FULL_OBJECT.to_string()),
+        ..ChecksumMetadata::default()
+    }
+}
+
+fn object_write_checksum_from_value(
+    kind: ChecksumAlgorithmKind,
+    object: &KeyValue,
+) -> SqliteResult<ChecksumMetadata> {
+    let value = object.value.as_deref().ok_or_else(|| {
+        SqliteError::Configuration("object metadata has no stored value".to_string())
+    })?;
+    checksum_metadata(kind, value, Some(ChecksumType::FULL_OBJECT))
+}
+
+fn copied_part_checksum(
+    upload_checksum: &ChecksumMetadata,
+    value: &[u8],
+) -> SqliteResult<ChecksumMetadata> {
+    let Some(algorithm) = upload_checksum.algorithm.as_deref() else {
+        return Ok(ChecksumMetadata::default());
+    };
+    let kind = ChecksumAlgorithmKind::from_name(algorithm)?;
+    checksum_metadata(kind, value, None)
 }
 
 fn checksum_algorithm_output(checksum: &ChecksumMetadata) -> Option<ChecksumAlgorithm> {
@@ -530,6 +612,9 @@ fn object_checksum_for_part(
     let Some(part) = part else {
         return object_checksum.clone();
     };
+    if part.checksum.has_value().not() {
+        return ChecksumMetadata::default();
+    }
     ChecksumMetadata {
         algorithm: object_checksum.algorithm.clone(),
         checksum_type: object_checksum.checksum_type.clone(),
@@ -1533,6 +1618,7 @@ impl S3 for Sqlite {
             copy_source_if_modified_since,
             copy_source_if_none_match,
             copy_source_if_unmodified_since,
+            checksum_algorithm,
             expires,
             metadata,
             metadata_directive,
@@ -1573,6 +1659,8 @@ impl S3 for Sqlite {
             etag_none_matches: copy_source_if_none_match,
             unmodified_since: copy_source_if_unmodified_since.map(Into::into),
         };
+        let target_checksum_kind = ChecksumAlgorithmKind::from_algorithm(checksum_algorithm)?
+            .unwrap_or(ChecksumAlgorithmKind::Crc64Nvme);
 
         if src_bucket.as_ref() == tgt_bucket.as_str() {
             let connection = self
@@ -1602,12 +1690,20 @@ impl S3 for Sqlite {
                         object.key_metadata.cache_control = cache_control;
                         object.key_metadata.expires = expires.map(Into::into);
                     }
+                    let checksum = object_write_checksum_from_value(target_checksum_kind, &object)?;
+                    object.key_metadata.checksum = checksum.clone();
 
                     let write_outcome = Self::try_put_object(&transaction, object)?;
+                    let checksum_type = checksum_type_output(&checksum);
                     let copy_object_result = CopyObjectResult {
+                        checksum_crc32: checksum.crc32,
+                        checksum_crc32c: checksum.crc32c,
+                        checksum_crc64nvme: checksum.crc64nvme,
+                        checksum_sha1: checksum.sha1,
+                        checksum_sha256: checksum.sha256,
+                        checksum_type,
                         e_tag: write_outcome.md5.clone().map(ETag::Strong),
                         last_modified: Some(write_outcome.last_modified.into()),
-                        ..Default::default()
                     };
                     transaction.commit()?;
                     Ok((copy_object_result, write_outcome.returned_version_id))
@@ -1658,6 +1754,9 @@ impl S3 for Sqlite {
             object.key_metadata.cache_control = cache_control;
             object.key_metadata.expires = expires.map(Into::into);
         }
+        let checksum = object_write_checksum_from_value(target_checksum_kind, &object)
+            .map_err(s3_error_from_sqlite)?;
+        object.key_metadata.checksum = checksum.clone();
 
         let connection = self
             .try_get_connection(&tgt_bucket)
@@ -1667,10 +1766,16 @@ impl S3 for Sqlite {
             .write(move |connection| {
                 let transaction = connection.transaction()?;
                 let write_outcome = Self::try_put_object(&transaction, object)?;
+                let checksum_type = checksum_type_output(&checksum);
                 let copy_object_result = CopyObjectResult {
+                    checksum_crc32: checksum.crc32,
+                    checksum_crc32c: checksum.crc32c,
+                    checksum_crc64nvme: checksum.crc64nvme,
+                    checksum_sha1: checksum.sha1,
+                    checksum_sha256: checksum.sha256,
+                    checksum_type,
                     e_tag: write_outcome.md5.clone().map(ETag::Strong),
                     last_modified: Some(write_outcome.last_modified.into()),
-                    ..Default::default()
                 };
                 transaction.commit()?;
                 Ok((copy_object_result, write_outcome.returned_version_id))
@@ -3092,6 +3197,7 @@ impl S3 for Sqlite {
                 ..ChecksumInput::default()
             },
             &value,
+            ChecksumPolicy::DefaultCrc64NvmeFullObject,
             Some(ChecksumType::FULL_OBJECT),
         )?;
 
@@ -3171,7 +3277,7 @@ impl S3 for Sqlite {
         let upload_id = Uuid::new_v4();
         let checksum_kind = ChecksumAlgorithmKind::from_algorithm(checksum_algorithm.clone())?;
         let checksum_type = checksum_type_name(checksum_type)?
-            .or_else(|| checksum_kind.map(|_| ChecksumType::COMPOSITE.to_string()));
+            .or_else(|| checksum_kind.map(|kind| multipart_checksum_type(kind).to_string()));
         let checksum = ChecksumMetadata {
             algorithm: checksum_kind.map(|kind| kind.as_str().to_string()),
             checksum_type: checksum_type.clone(),
@@ -3273,6 +3379,7 @@ impl S3 for Sqlite {
                 ..ChecksumInput::default()
             },
             &value,
+            ChecksumPolicy::ExplicitOnly,
             None,
         )?;
 
@@ -3414,6 +3521,7 @@ impl S3 for Sqlite {
                         upload_state.access_key.as_ref(),
                         access_key.as_deref(),
                     )?;
+                    let checksum = copied_part_checksum(&upload_state.checksum, &value)?;
 
                     Self::try_touch_multipart_upload(&transaction, upload_id)?;
                     Self::try_put_multipart(
@@ -3425,15 +3533,19 @@ impl S3 for Sqlite {
                             value,
                             size,
                             md5: Some(md5.clone()),
-                            checksum: ChecksumMetadata::default(),
+                            checksum: checksum.clone(),
                         },
                     )?;
 
                     transaction.commit()?;
                     Ok(CopyPartResult {
+                        checksum_crc32: checksum.crc32,
+                        checksum_crc32c: checksum.crc32c,
+                        checksum_crc64nvme: checksum.crc64nvme,
+                        checksum_sha1: checksum.sha1,
+                        checksum_sha256: checksum.sha256,
                         e_tag: Some(ETag::Strong(md5)),
                         last_modified: Some(now.into()),
-                        ..Default::default()
                     })
                 })
                 .await
@@ -3492,6 +3604,7 @@ impl S3 for Sqlite {
 
                 let now = OffsetDateTime::now_utc();
                 let md5 = copied_part.md5;
+                let checksum = copied_part_checksum(&upload_state.checksum, &copied_part.value)?;
                 Self::try_touch_multipart_upload(&transaction, upload_id)?;
                 Self::try_put_multipart(
                     &transaction,
@@ -3502,15 +3615,19 @@ impl S3 for Sqlite {
                         value: copied_part.value,
                         size: copied_part.size,
                         md5: Some(md5.clone()),
-                        checksum: ChecksumMetadata::default(),
+                        checksum: checksum.clone(),
                     },
                 )?;
 
                 transaction.commit()?;
                 Ok(CopyPartResult {
+                    checksum_crc32: checksum.crc32,
+                    checksum_crc32c: checksum.crc32c,
+                    checksum_crc64nvme: checksum.crc64nvme,
+                    checksum_sha1: checksum.sha1,
+                    checksum_sha256: checksum.sha256,
                     e_tag: Some(ETag::Strong(md5)),
                     last_modified: Some(now.into()),
-                    ..Default::default()
                 })
             })
             .await
@@ -3734,6 +3851,7 @@ impl S3 for Sqlite {
                 upload_id,
                 requested_parts,
                 requested_checksum,
+                default_checksum: Some(default_crc64nvme_full_object_checksum()),
                 access_key,
                 write_conditions,
             })

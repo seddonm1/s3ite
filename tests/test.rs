@@ -11,13 +11,15 @@ use std::{collections::HashMap, fs, ops::Deref, path::PathBuf, sync::LazyLock};
 use anyhow::Result;
 use aws_config::SdkConfig;
 use aws_credential_types::provider::SharedCredentialsProvider;
+use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode, ChecksumType};
 use aws_sdk_s3::{
     Client,
-    config::{Credentials, Region},
+    config::{Credentials, Region, RequestChecksumCalculation},
     primitives::{ByteStream, DateTime},
     types::{
         BucketLocationConstraint, BucketVersioningStatus, CompletedMultipartUpload, CompletedPart,
-        CreateBucketConfiguration, Delete, EncodingType, ObjectIdentifier, VersioningConfiguration,
+        CreateBucketConfiguration, Delete, EncodingType, ObjectAttributes, ObjectIdentifier,
+        VersioningConfiguration,
     },
 };
 use s3ite::{Bucket, Config, Sqlite};
@@ -29,6 +31,9 @@ use uuid::Uuid;
 const FS_ROOT: &str = concat!(env!("CARGO_TARGET_TMPDIR"), "/s3s-sqlite-tests-aws");
 const DOMAIN_NAME: &str = "localhost:8014";
 const REGION: &str = "us-west-2";
+const SHA256_1024_A: &str = "arcu6553sHVAiX4MjW0j7I7vD4w6R+Gz9Ok0Q9lTa+0=";
+const SHA256_5_MIB_A: &str = "275VF5loJr1YYawit0XSHREhkFXYkkPKGuoK0x9VKxI=";
+const SHA256_TAIL: &str = "DGL4du8d6oMN6fMsL0tG3W101Q0ViW4J71ovzUrH4dc=";
 
 static TRACING: LazyLock<()> = LazyLock::new(|| {
     use tracing_subscriber::EnvFilter;
@@ -91,6 +96,7 @@ impl TestContext {
             .http_client(client)
             .region(Region::new(REGION))
             .endpoint_url(format!("http://{DOMAIN_NAME}"))
+            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
             .build();
 
         Ok(Self {
@@ -2780,6 +2786,307 @@ async fn test_upload_part_copy_full_range_conditions_and_missing_upload() -> Res
         anyhow::bail!("copying into a missing upload should fail");
     };
     assert_error_contains(err, "NoSuchUpload");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_default_crc64nvme_for_put_object() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+
+    let bucket = format!("test-put-default-checksum-{}", Uuid::new_v4());
+    let key = "default.txt";
+    create_bucket(&context, &bucket).await?;
+
+    let put = context
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"default checksum"))
+        .send()
+        .await?;
+    let checksum = put
+        .checksum_crc64_nvme()
+        .ok_or_else(|| anyhow::anyhow!("PutObject response missing CRC64NVME"))?;
+    assert_eq!(put.checksum_type(), Some(&ChecksumType::FullObject));
+    assert!(put.checksum_sha256().is_none());
+
+    let head = context
+        .head_object()
+        .bucket(&bucket)
+        .key(key)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(head.checksum_crc64_nvme(), Some(checksum));
+    assert_eq!(head.checksum_type(), Some(&ChecksumType::FullObject));
+
+    let attrs = context
+        .get_object_attributes()
+        .bucket(&bucket)
+        .key(key)
+        .object_attributes(ObjectAttributes::Checksum)
+        .send()
+        .await?;
+    let attrs_checksum = attrs
+        .checksum()
+        .ok_or_else(|| anyhow::anyhow!("GetObjectAttributes response missing checksum"))?;
+    assert_eq!(attrs_checksum.checksum_crc64_nvme(), Some(checksum));
+    assert_eq!(
+        attrs_checksum.checksum_type(),
+        Some(&ChecksumType::FullObject)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_explicit_sha256_suppresses_default_crc64nvme() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+
+    let bucket = format!("test-explicit-sha256-{}", Uuid::new_v4());
+    let key = "sha256.txt";
+    create_bucket(&context, &bucket).await?;
+
+    let put = context
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .checksum_algorithm(ChecksumAlgorithm::Sha256)
+        .checksum_sha256(SHA256_1024_A)
+        .body(ByteStream::from(vec![b'A'; 1024]))
+        .send()
+        .await?;
+    assert_eq!(put.checksum_sha256(), Some(SHA256_1024_A));
+    assert!(put.checksum_crc64_nvme().is_none());
+    assert_eq!(put.checksum_type(), Some(&ChecksumType::FullObject));
+
+    let head = context
+        .head_object()
+        .bucket(&bucket)
+        .key(key)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(head.checksum_sha256(), Some(SHA256_1024_A));
+    assert!(head.checksum_crc64_nvme().is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_default_crc64nvme_for_copy_object() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+
+    let bucket = format!("test-copy-default-checksum-{}", Uuid::new_v4());
+    let source = "source.txt";
+    let target = "target.txt";
+    create_bucket(&context, &bucket).await?;
+    put_object(&context, &bucket, source, b"copy checksum").await?;
+
+    let copy = context
+        .copy_object()
+        .bucket(&bucket)
+        .key(target)
+        .copy_source(format!("{bucket}/{source}"))
+        .send()
+        .await?;
+    let copy_result = copy
+        .copy_object_result()
+        .ok_or_else(|| anyhow::anyhow!("CopyObject response missing result"))?;
+    let checksum = copy_result
+        .checksum_crc64_nvme()
+        .ok_or_else(|| anyhow::anyhow!("CopyObject response missing CRC64NVME"))?;
+    assert_eq!(copy_result.checksum_type(), Some(&ChecksumType::FullObject));
+
+    let head = context
+        .head_object()
+        .bucket(&bucket)
+        .key(target)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(head.checksum_crc64_nvme(), Some(checksum));
+    assert_eq!(
+        get_object_bytes(&context, &bucket, target).await?,
+        b"copy checksum"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_default_crc64nvme_for_multipart_completion() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+
+    let bucket = format!("test-mpu-default-{}", Uuid::new_v4());
+    let key = "multipart-default.txt";
+    create_bucket(&context, &bucket).await?;
+
+    let upload_id = create_multipart_upload_id(&context, &bucket, key).await?;
+    let first_part = vec![b'A'; 5 * 1024 * 1024];
+    let part1 = upload_part_body(
+        &context,
+        &bucket,
+        key,
+        &upload_id,
+        1,
+        ByteStream::from(first_part),
+    )
+    .await?;
+    let part2 = upload_part(&context, &bucket, key, &upload_id, 2, b"tail").await?;
+    let upload = CompletedMultipartUpload::builder()
+        .set_parts(Some(vec![part1, part2]))
+        .build();
+
+    let completed = context
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(upload)
+        .send()
+        .await?;
+    let checksum = completed
+        .checksum_crc64_nvme()
+        .ok_or_else(|| anyhow::anyhow!("CompleteMultipartUpload missing CRC64NVME"))?;
+    assert_eq!(completed.checksum_type(), Some(&ChecksumType::FullObject));
+    assert!(completed.checksum_sha256().is_none());
+
+    let head = context
+        .head_object()
+        .bucket(&bucket)
+        .key(key)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(head.checksum_crc64_nvme(), Some(checksum));
+    assert_eq!(head.checksum_type(), Some(&ChecksumType::FullObject));
+
+    let attrs = context
+        .get_object_attributes()
+        .bucket(&bucket)
+        .key(key)
+        .object_attributes(ObjectAttributes::Checksum)
+        .send()
+        .await?;
+    assert_eq!(
+        attrs
+            .checksum()
+            .and_then(|value| value.checksum_crc64_nvme()),
+        Some(checksum)
+    );
+
+    let part = context
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .part_number(1)
+        .send()
+        .await?;
+    assert!(part.checksum_crc64_nvme().is_none());
+    assert!(part.checksum_type().is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_explicit_sha256_multipart_keeps_composite_checksum() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+
+    let bucket = format!("test-multipart-sha256-{}", Uuid::new_v4());
+    let key = "multipart-sha256.txt";
+    create_bucket(&context, &bucket).await?;
+
+    let upload_id = context
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .checksum_algorithm(ChecksumAlgorithm::Sha256)
+        .send()
+        .await?
+        .upload_id
+        .ok_or_else(|| anyhow::anyhow!("create multipart response missing upload ID"))?;
+
+    let first_part = vec![b'A'; 5 * 1024 * 1024];
+    let part1_output = context
+        .upload_part()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .part_number(1)
+        .checksum_algorithm(ChecksumAlgorithm::Sha256)
+        .checksum_sha256(SHA256_5_MIB_A)
+        .body(ByteStream::from(first_part))
+        .send()
+        .await?;
+    let part1 = CompletedPart::builder()
+        .e_tag(
+            part1_output
+                .e_tag()
+                .ok_or_else(|| anyhow::anyhow!("upload part response missing ETag"))?,
+        )
+        .part_number(1)
+        .build();
+
+    let part2_output = context
+        .upload_part()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .part_number(2)
+        .checksum_algorithm(ChecksumAlgorithm::Sha256)
+        .checksum_sha256(SHA256_TAIL)
+        .body(ByteStream::from_static(b"tail"))
+        .send()
+        .await?;
+    let part2 = CompletedPart::builder()
+        .e_tag(
+            part2_output
+                .e_tag()
+                .ok_or_else(|| anyhow::anyhow!("upload part response missing ETag"))?,
+        )
+        .part_number(2)
+        .build();
+
+    let upload = CompletedMultipartUpload::builder()
+        .set_parts(Some(vec![part1, part2]))
+        .build();
+    let completed = context
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(upload)
+        .send()
+        .await?;
+    let checksum = completed
+        .checksum_sha256()
+        .ok_or_else(|| anyhow::anyhow!("CompleteMultipartUpload missing SHA256 checksum"))?;
+    assert!(checksum.ends_with("-2"));
+    assert!(completed.checksum_crc64_nvme().is_none());
+    assert_eq!(completed.checksum_type(), Some(&ChecksumType::Composite));
+
+    let head = context
+        .head_object()
+        .bucket(&bucket)
+        .key(key)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(head.checksum_sha256(), Some(checksum));
+    assert!(head.checksum_crc64_nvme().is_none());
+    assert_eq!(head.checksum_type(), Some(&ChecksumType::Composite));
 
     Ok(())
 }
