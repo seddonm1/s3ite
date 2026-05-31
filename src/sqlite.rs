@@ -16,6 +16,115 @@ use uuid::Uuid;
 
 use crate::database::BucketConnection;
 
+const BUCKET_SCHEMA_VERSION: i32 = 1;
+const NULL_VERSION_ID: &str = "null";
+const VERSION_ID_LEN: usize = 31;
+const VERSION_ID_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-.";
+const BUCKET_SCHEMA_SQL: &str = "
+CREATE TABLE bucket_state (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    versioning_state TEXT NOT NULL CHECK(versioning_state IN ('never_configured', 'enabled', 'suspended'))
+) STRICT;
+
+CREATE TABLE object_version (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    key TEXT NOT NULL,
+    version_id TEXT NOT NULL,
+    is_latest INTEGER NOT NULL CHECK(is_latest IN (0, 1)),
+    is_delete_marker INTEGER NOT NULL CHECK(is_delete_marker IN (0, 1)),
+    body BLOB,
+    size INTEGER NOT NULL CHECK(size >= 0),
+    metadata TEXT,
+    content_type TEXT,
+    cache_control TEXT,
+    expires TEXT,
+    last_modified TEXT NOT NULL,
+    md5 TEXT,
+    UNIQUE(key, version_id),
+    CHECK (
+        (
+            is_delete_marker = 0
+            AND body IS NOT NULL
+            AND md5 IS NOT NULL
+        )
+        OR
+        (
+            is_delete_marker = 1
+            AND body IS NULL
+            AND size = 0
+            AND metadata IS NULL
+            AND content_type IS NULL
+            AND cache_control IS NULL
+            AND expires IS NULL
+            AND md5 IS NULL
+        )
+    )
+) STRICT;
+
+CREATE UNIQUE INDEX object_version_latest_one
+    ON object_version(key)
+    WHERE is_latest = 1;
+CREATE INDEX object_version_current_list
+    ON object_version(key)
+    WHERE is_latest = 1 AND is_delete_marker = 0;
+CREATE INDEX object_version_list
+    ON object_version(key, sequence DESC);
+
+CREATE TABLE completed_object_part (
+    key TEXT NOT NULL,
+    version_id TEXT NOT NULL,
+    part_number INTEGER NOT NULL CHECK(part_number BETWEEN 1 AND 10000),
+    start INTEGER NOT NULL CHECK(start >= 0),
+    size INTEGER NOT NULL CHECK(size >= 0),
+    md5 TEXT,
+    PRIMARY KEY (key, version_id, part_number),
+    FOREIGN KEY (key, version_id) REFERENCES object_version (key, version_id) ON DELETE CASCADE
+) WITHOUT ROWID, STRICT;
+
+CREATE TABLE multipart_upload (
+    upload_id BLOB NOT NULL PRIMARY KEY,
+    bucket TEXT NOT NULL,
+    key TEXT NOT NULL,
+    initiated TEXT NOT NULL,
+    last_modified TEXT NOT NULL,
+    access_key TEXT,
+    metadata TEXT,
+    content_type TEXT,
+    cache_control TEXT,
+    expires TEXT,
+    UNIQUE(upload_id, bucket, key)
+) STRICT;
+
+CREATE TABLE multipart_upload_part (
+    upload_id BLOB NOT NULL,
+    last_modified TEXT NOT NULL,
+    part_number INTEGER NOT NULL CHECK(part_number BETWEEN 1 AND 10000),
+    value BLOB NOT NULL,
+    size INTEGER NOT NULL CHECK(size >= 0),
+    md5 TEXT,
+    PRIMARY KEY (upload_id, part_number),
+    FOREIGN KEY (upload_id) REFERENCES multipart_upload (upload_id) ON DELETE CASCADE
+) WITHOUT ROWID, STRICT;
+
+CREATE TABLE completed_multipart_upload (
+    upload_id BLOB NOT NULL PRIMARY KEY,
+    bucket TEXT NOT NULL,
+    key TEXT NOT NULL,
+    access_key TEXT,
+    md5 TEXT NOT NULL,
+    version_id TEXT NOT NULL,
+    returned_version_id TEXT,
+    last_modified TEXT NOT NULL,
+    UNIQUE(upload_id, bucket, key)
+) STRICT;
+
+INSERT INTO bucket_state (id, versioning_state)
+VALUES (1, 'never_configured');
+
+PRAGMA user_version = 1;
+";
+
 /// Result type returned by `SQLite` storage operations.
 pub type SqliteResult<T> = std::result::Result<T, SqliteError>;
 
@@ -43,6 +152,9 @@ pub enum SqliteError {
     /// A requested object does not exist.
     #[error("object does not exist")]
     ObjectNotFound,
+    /// A requested object version does not exist.
+    #[error("object version does not exist")]
+    ObjectVersionNotFound,
     /// A requested object byte range is not satisfiable.
     #[error("object range is invalid")]
     InvalidObjectRange,
@@ -52,6 +164,17 @@ pub enum SqliteError {
     /// Storage configuration is invalid.
     #[error("configuration error: {0}")]
     Configuration(String),
+    /// A bucket database schema is not supported by this binary.
+    #[error("unsupported bucket schema version {found}; expected {expected}")]
+    UnsupportedSchemaVersion {
+        /// Version found in `PRAGMA user_version`.
+        found: i32,
+        /// Version expected by this binary.
+        expected: i32,
+    },
+    /// Random bytes could not be generated for an opaque version ID.
+    #[error("random version id generation failed: {0}")]
+    Random(String),
     /// A database worker thread panicked or could not be joined.
     #[error("database worker thread panicked")]
     ThreadJoin,
@@ -151,6 +274,26 @@ fn decode_md5_hex(value: &str) -> SqliteResult<[u8; 16]> {
     Ok(decoded)
 }
 
+fn row_bool(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<bool> {
+    Ok(row.get::<_, i32>(idx)? != 0)
+}
+
+fn generate_version_id() -> SqliteResult<String> {
+    let mut bytes = [0; VERSION_ID_LEN];
+    getrandom::fill(&mut bytes).map_err(|err| SqliteError::Random(err.to_string()))?;
+
+    let mut version_id = String::with_capacity(VERSION_ID_LEN);
+    for byte in bytes {
+        version_id.push(char::from(VERSION_ID_ALPHABET[usize::from(byte & 0x3f)]));
+    }
+
+    if version_id == NULL_VERSION_ID {
+        generate_version_id()
+    } else {
+        Ok(version_id)
+    }
+}
+
 /// SQLite-backed storage state and open bucket connections.
 #[derive(Debug)]
 pub struct Sqlite {
@@ -159,10 +302,50 @@ pub struct Sqlite {
     pub(crate) buckets: Arc<RwLock<HashMap<String, Arc<BucketConnection>>>>,
 }
 
+/// Bucket-level S3 object versioning state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BucketVersioningState {
+    /// Versioning has never been configured on this bucket.
+    NeverConfigured,
+    /// New object writes create generated version IDs.
+    Enabled,
+    /// New object writes replace the special `null` version.
+    Suspended,
+}
+
+impl BucketVersioningState {
+    /// Returns the serialized database representation.
+    #[must_use]
+    fn as_sql(self) -> &'static str {
+        match self {
+            Self::NeverConfigured => "never_configured",
+            Self::Enabled => "enabled",
+            Self::Suspended => "suspended",
+        }
+    }
+
+    /// Parses a database representation.
+    fn from_sql(value: &str) -> rusqlite::Result<Self> {
+        match value {
+            "never_configured" => Ok(Self::NeverConfigured),
+            "enabled" => Ok(Self::Enabled),
+            "suspended" => Ok(Self::Suspended),
+            _ => Err(rusqlite::Error::InvalidQuery),
+        }
+    }
+
+    /// Returns whether write responses expose the stored version ID.
+    #[must_use]
+    fn returns_write_version_id(self) -> bool {
+        self == Self::Enabled
+    }
+}
+
 /// Object body and metadata loaded from the bucket database.
 #[derive(Debug)]
 pub(crate) struct KeyValue {
     pub(crate) key: String,
+    pub(crate) version_id: String,
     pub(crate) value: Option<Vec<u8>>,
     pub(crate) key_metadata: KeyMetadata,
 }
@@ -171,14 +354,18 @@ pub(crate) struct KeyValue {
 #[derive(Debug)]
 pub(crate) struct ObjectSummary {
     pub(crate) key: String,
+    pub(crate) version_id: String,
     pub(crate) size: i64,
     pub(crate) last_modified: OffsetDateTime,
     pub(crate) md5: Option<String>,
+    pub(crate) is_latest: bool,
+    pub(crate) is_delete_marker: bool,
 }
 
 /// Object metadata loaded without the object body.
 #[derive(Debug)]
 pub(crate) struct KeyMetadata {
+    pub(crate) version_id: String,
     pub(crate) size: i64,
     pub(crate) metadata: Option<HashMap<String, String>>,
     pub(crate) content_type: Option<String>,
@@ -186,6 +373,25 @@ pub(crate) struct KeyMetadata {
     pub(crate) expires: Option<OffsetDateTime>,
     pub(crate) last_modified: OffsetDateTime,
     pub(crate) md5: Option<String>,
+    pub(crate) is_latest: bool,
+    pub(crate) is_delete_marker: bool,
+}
+
+/// Result of storing an object version.
+#[derive(Debug)]
+pub(crate) struct ObjectWriteOutcome {
+    pub(crate) version_id: String,
+    pub(crate) returned_version_id: Option<String>,
+    pub(crate) md5: Option<String>,
+    pub(crate) last_modified: OffsetDateTime,
+}
+
+/// Result of deleting an object or object version.
+#[derive(Debug)]
+pub(crate) struct ObjectDeleteOutcome {
+    pub(crate) version_id: Option<String>,
+    pub(crate) is_delete_marker: bool,
+    pub(crate) delete_marker_version_id: Option<String>,
 }
 
 /// Stored multipart upload part with its body and checksum metadata.
@@ -262,6 +468,37 @@ pub(crate) struct MultipartUploadSummary {
 pub(crate) struct CompletedMultipartUploadState {
     pub(crate) access_key: Option<String>,
     pub(crate) md5: String,
+    pub(crate) version_id: String,
+    pub(crate) returned_version_id: Option<String>,
+}
+
+/// Values inserted into the multipart completion ledger.
+#[derive(Debug)]
+pub(crate) struct CompletedMultipartUploadRecord<'a> {
+    pub(crate) upload_id: Uuid,
+    pub(crate) bucket: &'a str,
+    pub(crate) key: &'a str,
+    pub(crate) access_key: Option<String>,
+    pub(crate) md5: &'a str,
+    pub(crate) version_id: &'a str,
+    pub(crate) returned_version_id: Option<&'a str>,
+}
+
+/// Result of materializing multipart upload parts into an object version.
+#[derive(Debug)]
+pub(crate) struct CompletedMultipartUploadOutcome {
+    pub(crate) md5: String,
+    pub(crate) version_id: String,
+    pub(crate) returned_version_id: Option<String>,
+}
+
+/// Buffered completed multipart object and its persisted part boundaries.
+#[derive(Debug)]
+struct CompletedMultipartObject {
+    value: Vec<u8>,
+    size: i64,
+    md5: String,
+    parts: Vec<CompletedObjectPart>,
 }
 
 impl Sqlite {
@@ -515,14 +752,14 @@ impl Sqlite {
         requested_parts: Vec<MultipartCompletionPart>,
         access_key: Option<String>,
         write_conditions: ObjectWriteConditions,
-    ) -> SqliteResult<String> {
+    ) -> SqliteResult<CompletedMultipartUploadOutcome> {
         self.validate_mutable_bucket(&bucket)?;
 
         let connection = self.try_get_connection(&bucket).await?;
         connection
             .write(move |connection| {
                 let transaction = connection.transaction()?;
-                let md5 = Self::try_complete_multipart_upload_transaction(
+                let outcome = Self::try_complete_multipart_upload_transaction(
                     &transaction,
                     &bucket,
                     &key,
@@ -532,7 +769,7 @@ impl Sqlite {
                     &write_conditions,
                 )?;
                 transaction.commit()?;
-                Ok(md5)
+                Ok(outcome)
             })
             .await
     }
@@ -546,7 +783,7 @@ impl Sqlite {
         requested_parts: &[MultipartCompletionPart],
         access_key: Option<String>,
         write_conditions: &ObjectWriteConditions,
-    ) -> SqliteResult<String> {
+    ) -> SqliteResult<CompletedMultipartUploadOutcome> {
         if requested_parts.is_empty() {
             return Err(SqliteError::InvalidMultipartPart);
         }
@@ -561,48 +798,92 @@ impl Sqlite {
                 completed.access_key.as_ref(),
                 access_key.as_deref(),
             )?;
-            return Ok(completed.md5);
+            return Ok(CompletedMultipartUploadOutcome {
+                md5: completed.md5,
+                version_id: completed.version_id,
+                returned_version_id: completed.returned_version_id,
+            });
         };
         Self::try_validate_multipart_access(
             upload_state.access_key.as_ref(),
             access_key.as_deref(),
         )?;
 
+        let completed_object =
+            Self::try_materialize_multipart_object(transaction, upload_id, requested_parts)?;
+
+        Self::try_check_object_write_conditions(transaction, key, write_conditions)?;
+        let write_outcome = Self::try_put_object(
+            transaction,
+            KeyValue {
+                key: key.to_string(),
+                version_id: String::new(),
+                value: Some(completed_object.value),
+                key_metadata: KeyMetadata {
+                    version_id: String::new(),
+                    size: completed_object.size,
+                    metadata: upload_state.metadata,
+                    content_type: upload_state.content_type,
+                    cache_control: upload_state.cache_control,
+                    expires: upload_state.expires,
+                    last_modified: OffsetDateTime::now_utc(),
+                    md5: Some(completed_object.md5.clone()),
+                    is_latest: true,
+                    is_delete_marker: false,
+                },
+            },
+        )?;
+        Self::try_put_completed_object_parts(
+            transaction,
+            key,
+            &write_outcome.version_id,
+            &completed_object.parts,
+        )?;
+
+        Self::try_delete_multipart(transaction, upload_id)?;
+        Self::try_put_completed_multipart_upload(
+            transaction,
+            CompletedMultipartUploadRecord {
+                upload_id,
+                bucket,
+                key,
+                access_key,
+                md5: &completed_object.md5,
+                version_id: &write_outcome.version_id,
+                returned_version_id: write_outcome.returned_version_id.as_deref(),
+            },
+        )?;
+
+        Ok(CompletedMultipartUploadOutcome {
+            md5: completed_object.md5,
+            version_id: write_outcome.version_id,
+            returned_version_id: write_outcome.returned_version_id,
+        })
+    }
+
+    /// Validates requested multipart parts and concatenates their bytes.
+    fn try_materialize_multipart_object(
+        transaction: &Transaction,
+        upload_id: Uuid,
+        requested_parts: &[MultipartCompletionPart],
+    ) -> SqliteResult<CompletedMultipartObject> {
         let parts = Self::try_get_multiparts(transaction, upload_id)?;
         if parts.len() != requested_parts.len() {
             return Err(SqliteError::InvalidMultipartPart);
         }
 
-        let total_size = parts.iter().try_fold(0usize, |total, part| {
-            let part_size =
-                usize::try_from(part.size).map_err(|_| SqliteError::InvalidMultipartPart)?;
-            total
-                .checked_add(part_size)
-                .ok_or(SqliteError::MultipartObjectTooLarge)
-        })?;
-
-        let mut value = Vec::with_capacity(total_size);
+        let mut value = Vec::with_capacity(Self::try_total_multipart_size(&parts)?);
         let mut completed_parts = Vec::with_capacity(parts.len());
         let mut part_md5s = Vec::with_capacity(parts.len() * 16);
         let final_part_number = requested_parts.len();
         let mut offset = 0;
         for (index, (requested_part, part)) in requested_parts.iter().zip(parts.iter()).enumerate()
         {
-            if part.part_number != requested_part.part_number {
-                return Err(SqliteError::InvalidMultipartPart);
-            }
-
-            if index + 1 != final_part_number && part.size < 5 * 1024 * 1024 {
-                return Err(SqliteError::MultipartPartTooSmall);
-            }
-
-            let Some(stored_md5) = part.md5.as_deref() else {
-                return Err(SqliteError::InvalidMultipartPart);
-            };
-            if requested_part.md5 != stored_md5 {
-                return Err(SqliteError::InvalidMultipartPart);
-            }
-
+            Self::try_validate_completion_part(index, final_part_number, requested_part, part)?;
+            let stored_md5 = part
+                .md5
+                .as_deref()
+                .ok_or(SqliteError::InvalidMultipartPart)?;
             part_md5s.extend_from_slice(&decode_md5_hex(stored_md5)?);
             completed_parts.push(CompletedObjectPart {
                 part_number: part.part_number,
@@ -624,37 +905,42 @@ impl Sqlite {
             requested_parts.len()
         );
         let size = i64::try_from(value.len()).map_err(|_| SqliteError::MultipartObjectTooLarge)?;
+        Ok(CompletedMultipartObject {
+            value,
+            size,
+            md5,
+            parts: completed_parts,
+        })
+    }
 
-        Self::try_check_object_write_conditions(transaction, key, write_conditions)?;
-        Self::try_put_object(
-            transaction,
-            KeyValue {
-                key: key.to_string(),
-                value: Some(value),
-                key_metadata: KeyMetadata {
-                    size,
-                    metadata: upload_state.metadata,
-                    content_type: upload_state.content_type,
-                    cache_control: upload_state.cache_control,
-                    expires: upload_state.expires,
-                    last_modified: OffsetDateTime::now_utc(),
-                    md5: Some(md5.clone()),
-                },
-            },
-        )?;
-        Self::try_put_completed_object_parts(transaction, key, &completed_parts)?;
+    /// Returns the total body size for uploaded multipart parts.
+    fn try_total_multipart_size(parts: &[Multipart]) -> SqliteResult<usize> {
+        parts.iter().try_fold(0usize, |total, part| {
+            let part_size =
+                usize::try_from(part.size).map_err(|_| SqliteError::InvalidMultipartPart)?;
+            total
+                .checked_add(part_size)
+                .ok_or(SqliteError::MultipartObjectTooLarge)
+        })
+    }
 
-        Self::try_delete_multipart(transaction, upload_id)?;
-        Self::try_put_completed_multipart_upload(
-            transaction,
-            upload_id,
-            bucket,
-            key,
-            access_key,
-            &md5,
-        )?;
-
-        Ok(md5)
+    /// Validates one requested completion part against the stored part row.
+    fn try_validate_completion_part(
+        index: usize,
+        final_part_number: usize,
+        requested_part: &MultipartCompletionPart,
+        part: &Multipart,
+    ) -> SqliteResult<()> {
+        if part.part_number != requested_part.part_number {
+            return Err(SqliteError::InvalidMultipartPart);
+        }
+        if index + 1 != final_part_number && part.size < 5 * 1024 * 1024 {
+            return Err(SqliteError::MultipartPartTooSmall);
+        }
+        if part.md5.as_deref() != Some(requested_part.md5.as_str()) {
+            return Err(SqliteError::InvalidMultipartPart);
+        }
+        Ok(())
     }
 
     /// Checks object write preconditions against current metadata in the transaction.
@@ -705,118 +991,41 @@ impl Sqlite {
         }
     }
 
-    /// Ensures the bucket database schema exists and applies additive migrations.
-    pub(crate) fn try_create_tables(transaction: &Transaction) -> SqliteResult<()> {
-        transaction.execute(
-            "CREATE TABLE IF NOT EXISTS data (
-                    key TEXT PRIMARY KEY,
-                    value BLOB
-                );",
-            (),
-        )?;
-        transaction.execute(
-            "CREATE TABLE IF NOT EXISTS metadata (
-                    key TEXT PRIMARY KEY,
-                    size INTEGER NOT NULL,
-                    metadata TEXT,
-                    content_type TEXT,
-                    cache_control TEXT,
-                    expires TEXT,
-                    last_modified TEXT NOT NULL,
-                    md5 TEXT,
-                    FOREIGN KEY (key) REFERENCES data (key) ON DELETE CASCADE
-                ) WITHOUT ROWID;",
-            (),
-        )?;
-        transaction.execute(
-            "CREATE TABLE IF NOT EXISTS multipart_upload (
-                    upload_id BLOB NOT NULL PRIMARY KEY,
-                    bucket TEXT NOT NULL,
-                    key TEXT NOT NULL,
-                    initiated TEXT NOT NULL,
-                    last_modified TEXT NOT NULL,
-                    access_key TEXT,
-                    metadata TEXT,
-                    content_type TEXT,
-                    cache_control TEXT,
-                    expires TEXT,
-                    UNIQUE(upload_id, bucket, key)
-                );",
-            (),
-        )?;
-        transaction.execute(
-            "CREATE TABLE IF NOT EXISTS completed_object_part (
-                    key TEXT NOT NULL,
-                    part_number INTEGER NOT NULL,
-                    start INTEGER NOT NULL,
-                    size INTEGER NOT NULL,
-                    md5 TEXT,
-                    PRIMARY KEY (key, part_number),
-                    FOREIGN KEY (key) REFERENCES data (key) ON DELETE CASCADE
-                ) WITHOUT ROWID;",
-            (),
-        )?;
-        transaction.execute(
-            "CREATE TABLE IF NOT EXISTS completed_multipart_upload (
-                    upload_id BLOB NOT NULL PRIMARY KEY,
-                    bucket TEXT NOT NULL,
-                    key TEXT NOT NULL,
-                    access_key TEXT,
-                    md5 TEXT NOT NULL,
-                    last_modified TEXT NOT NULL,
-                    UNIQUE(upload_id, bucket, key)
-                );",
-            (),
-        )?;
-        transaction.execute(
-            "CREATE TABLE IF NOT EXISTS multipart_upload_part (
-                    upload_id BLOB NOT NULL,
-                    last_modified TEXT NOT NULL,
-                    part_number INTEGER NOT NULL,
-                    value BLOB NOT NULL,
-                    size INTEGER NOT NULL,
-                    md5 TEXT,
-                    PRIMARY KEY (upload_id, part_number),
-                    FOREIGN KEY (upload_id) REFERENCES multipart_upload (upload_id) ON DELETE CASCADE
-                );",
-            (),
-        )?;
-
-        // s3ite 0.7.0 started persisting HTTP metadata on objects and multipart
-        // uploads. `CREATE TABLE IF NOT EXISTS` leaves pre-0.7.0 bucket databases
-        // unchanged, so keep these additive compatibility changes here until a
-        // formal migration system exists.
-        for (table, column, definition) in [
-            ("metadata", "content_type", "content_type TEXT"),
-            ("metadata", "cache_control", "cache_control TEXT"),
-            ("metadata", "expires", "expires TEXT"),
-            ("multipart_upload", "initiated", "initiated TEXT"),
-            ("multipart_upload", "metadata", "metadata TEXT"),
-            ("multipart_upload", "content_type", "content_type TEXT"),
-            ("multipart_upload", "cache_control", "cache_control TEXT"),
-            ("multipart_upload", "expires", "expires TEXT"),
-        ] {
-            if Self::try_has_column(transaction, table, column)?.not() {
-                transaction
-                    .execute(&format!("ALTER TABLE {table} ADD COLUMN {definition};"), ())?;
-            }
-        }
-        transaction.execute(
-            "UPDATE multipart_upload SET initiated = last_modified WHERE initiated IS NULL;",
-            (),
-        )?;
-
-        Ok(())
+    /// Reads the bucket schema version from `PRAGMA user_version`.
+    fn try_schema_version(transaction: &Transaction) -> SqliteResult<i32> {
+        let mut stmt = transaction.prepare_cached("PRAGMA user_version;")?;
+        Ok(stmt.query_row((), |row| row.get(0))?)
     }
 
-    /// Returns whether a table already contains a column.
-    fn try_has_column(transaction: &Transaction, table: &str, column: &str) -> SqliteResult<bool> {
-        let mut stmt = transaction.prepare(&format!("PRAGMA table_info({table});"))?;
-        let columns = stmt
-            .query_map((), |row| row.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+    /// Counts user-created schema objects in a bucket database.
+    fn try_user_table_count(transaction: &Transaction) -> SqliteResult<i64> {
+        let mut stmt = transaction.prepare_cached(
+            "
+            SELECT COUNT(*)
+            FROM sqlite_schema
+            WHERE type = 'table'
+                AND name NOT LIKE 'sqlite_%';",
+        )?;
+        Ok(stmt.query_row((), |row| row.get(0))?)
+    }
 
-        Ok(columns.iter().any(|name| name == column))
+    /// Ensures the bucket database schema exists at the supported version.
+    pub(crate) fn try_create_tables(transaction: &Transaction) -> SqliteResult<()> {
+        let version = Self::try_schema_version(transaction)?;
+        if version == BUCKET_SCHEMA_VERSION {
+            return Ok(());
+        }
+
+        if version != 0 || Self::try_user_table_count(transaction)? > 0 {
+            return Err(SqliteError::UnsupportedSchemaVersion {
+                found: version,
+                expected: BUCKET_SCHEMA_VERSION,
+            });
+        }
+
+        transaction.execute_batch(BUCKET_SCHEMA_SQL)?;
+
+        Ok(())
     }
 
     /// Lists object metadata ordered by key for keyset pagination.
@@ -831,37 +1040,40 @@ impl Sqlite {
         let map_summary = |row: &rusqlite::Row<'_>| {
             Ok(ObjectSummary {
                 key: row.get(0)?,
-                size: row_size(row, 1)?,
-                last_modified: row.get(2)?,
-                md5: row.get(3)?,
+                version_id: row.get(1)?,
+                size: row_size(row, 2)?,
+                last_modified: row.get(3)?,
+                md5: row.get(4)?,
+                is_latest: true,
+                is_delete_marker: false,
             })
         };
 
         let objects = match (prefix, after_key) {
             (Some(prefix), Some(after_key)) => {
                 let mut stmt = transaction.prepare_cached(
-                    "SELECT key, size, last_modified, md5 FROM metadata WHERE key >= ?1 AND key > ?2 ORDER BY key LIMIT ?3;",
+                    "SELECT key, version_id, size, last_modified, md5 FROM object_version WHERE is_latest = 1 AND is_delete_marker = 0 AND key >= ?1 AND key > ?2 ORDER BY key LIMIT ?3;",
                 )?;
                 stmt.query_map((prefix, after_key, limit), map_summary)?
                     .collect::<rusqlite::Result<Vec<_>>>()?
             }
             (Some(prefix), None) => {
                 let mut stmt = transaction.prepare_cached(
-                    "SELECT key, size, last_modified, md5 FROM metadata WHERE key >= ?1 ORDER BY key LIMIT ?2;",
+                    "SELECT key, version_id, size, last_modified, md5 FROM object_version WHERE is_latest = 1 AND is_delete_marker = 0 AND key >= ?1 ORDER BY key LIMIT ?2;",
                 )?;
                 stmt.query_map((prefix, limit), map_summary)?
                     .collect::<rusqlite::Result<Vec<_>>>()?
             }
             (None, Some(after_key)) => {
                 let mut stmt = transaction.prepare_cached(
-                    "SELECT key, size, last_modified, md5 FROM metadata WHERE key > ?1 ORDER BY key LIMIT ?2;",
+                    "SELECT key, version_id, size, last_modified, md5 FROM object_version WHERE is_latest = 1 AND is_delete_marker = 0 AND key > ?1 ORDER BY key LIMIT ?2;",
                 )?;
                 stmt.query_map((after_key, limit), map_summary)?
                     .collect::<rusqlite::Result<Vec<_>>>()?
             }
             (None, None) => {
                 let mut stmt = transaction.prepare_cached(
-                    "SELECT key, size, last_modified, md5 FROM metadata ORDER BY key LIMIT ?1;",
+                    "SELECT key, version_id, size, last_modified, md5 FROM object_version WHERE is_latest = 1 AND is_delete_marker = 0 ORDER BY key LIMIT ?1;",
                 )?;
                 stmt.query_map([limit], map_summary)?
                     .collect::<rusqlite::Result<Vec<_>>>()?
@@ -871,71 +1083,329 @@ impl Sqlite {
         Ok(objects)
     }
 
+    /// Lists object versions ordered by key and newest version first.
+    pub(crate) fn try_list_object_versions(
+        transaction: &Transaction,
+        prefix: Option<&str>,
+        after_key: Option<&str>,
+        after_version_id: Option<&str>,
+        limit: i64,
+    ) -> SqliteResult<Vec<ObjectSummary>> {
+        let limit = sql_limit(limit)?;
+        let prefix = prefix.and_then(|prefix| prefix.is_empty().not().then_some(prefix));
+        let after_sequence = match (after_key, after_version_id) {
+            (Some(key), Some(version_id)) => Some(Self::try_get_version_sequence(
+                transaction,
+                key,
+                version_id,
+            )?),
+            _ => None,
+        };
+        let map_summary = |row: &rusqlite::Row<'_>| {
+            Ok(ObjectSummary {
+                key: row.get(0)?,
+                version_id: row.get(1)?,
+                size: row_size(row, 2)?,
+                last_modified: row.get(3)?,
+                md5: row.get(4)?,
+                is_latest: row_bool(row, 5)?,
+                is_delete_marker: row_bool(row, 6)?,
+            })
+        };
+
+        let versions = match (prefix, after_key, after_sequence) {
+            (Some(prefix), Some(after_key), Some(after_sequence)) => {
+                let mut stmt = transaction.prepare_cached(
+                    "SELECT key, version_id, size, last_modified, md5, is_latest, is_delete_marker FROM object_version WHERE key >= ?1 AND (key > ?2 OR (key = ?2 AND sequence < ?3)) ORDER BY key, sequence DESC LIMIT ?4;",
+                )?;
+                stmt.query_map((prefix, after_key, after_sequence, limit), map_summary)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            (Some(prefix), Some(after_key), None) => {
+                let mut stmt = transaction.prepare_cached(
+                    "SELECT key, version_id, size, last_modified, md5, is_latest, is_delete_marker FROM object_version WHERE key >= ?1 AND key > ?2 ORDER BY key, sequence DESC LIMIT ?3;",
+                )?;
+                stmt.query_map((prefix, after_key, limit), map_summary)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            (Some(prefix), None, _) => {
+                let mut stmt = transaction.prepare_cached(
+                    "SELECT key, version_id, size, last_modified, md5, is_latest, is_delete_marker FROM object_version WHERE key >= ?1 ORDER BY key, sequence DESC LIMIT ?2;",
+                )?;
+                stmt.query_map((prefix, limit), map_summary)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            (None, Some(after_key), Some(after_sequence)) => {
+                let mut stmt = transaction.prepare_cached(
+                    "SELECT key, version_id, size, last_modified, md5, is_latest, is_delete_marker FROM object_version WHERE key > ?1 OR (key = ?1 AND sequence < ?2) ORDER BY key, sequence DESC LIMIT ?3;",
+                )?;
+                stmt.query_map((after_key, after_sequence, limit), map_summary)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            (None, Some(after_key), None) => {
+                let mut stmt = transaction.prepare_cached(
+                    "SELECT key, version_id, size, last_modified, md5, is_latest, is_delete_marker FROM object_version WHERE key > ?1 ORDER BY key, sequence DESC LIMIT ?2;",
+                )?;
+                stmt.query_map((after_key, limit), map_summary)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            (None, None, _) => {
+                let mut stmt = transaction.prepare_cached(
+                    "SELECT key, version_id, size, last_modified, md5, is_latest, is_delete_marker FROM object_version ORDER BY key, sequence DESC LIMIT ?1;",
+                )?;
+                stmt.query_map([limit], map_summary)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+        };
+
+        Ok(versions)
+    }
+
     /// Returns whether the bucket contains any objects.
     pub(crate) fn try_has_objects(transaction: &Transaction) -> SqliteResult<bool> {
-        let mut stmt = transaction.prepare_cached("SELECT EXISTS(SELECT 1 FROM metadata);")?;
+        let mut stmt =
+            transaction.prepare_cached("SELECT EXISTS(SELECT 1 FROM object_version);")?;
         Ok(stmt.query_row((), |row| row.get(0))?)
     }
 
-    /// Fetches an object body and metadata by key.
+    /// Fetches the current visible object body and metadata by key.
     pub(crate) fn try_get_object(
         transaction: &Transaction,
         key: &str,
     ) -> SqliteResult<Option<KeyValue>> {
+        Self::try_get_object_internal(transaction, key, None, false)
+    }
+
+    /// Fetches an exact visible object body and metadata by key and version ID.
+    pub(crate) fn try_get_object_version(
+        transaction: &Transaction,
+        key: &str,
+        version_id: &str,
+    ) -> SqliteResult<Option<KeyValue>> {
+        Self::try_get_object_internal(transaction, key, Some(version_id), false)
+    }
+
+    /// Fetches an object body and metadata by current or exact version selector.
+    fn try_get_object_internal(
+        transaction: &Transaction,
+        key: &str,
+        version_id: Option<&str>,
+        include_delete_markers: bool,
+    ) -> SqliteResult<Option<KeyValue>> {
         let mut stmt = transaction.prepare_cached(
             "
             SELECT
-                metadata.key,
-                data.value,
-                metadata.size,
-                metadata.metadata,
-                metadata.content_type,
-                metadata.cache_control,
-                metadata.expires,
-                metadata.last_modified,
-                metadata.md5
-            FROM metadata
-            INNER JOIN data ON metadata.key = data.key
-            WHERE metadata.key = ?;",
+                key,
+                version_id,
+                body,
+                size,
+                metadata,
+                content_type,
+                cache_control,
+                expires,
+                last_modified,
+                md5,
+                is_latest,
+                is_delete_marker
+            FROM object_version
+            WHERE key = ?1
+                AND (?2 IS NULL OR version_id = ?2)
+                AND (?2 IS NOT NULL OR is_latest = 1)
+                AND (?3 OR is_delete_marker = 0);",
         )?;
 
         Ok(stmt
-            .query_row([key], |row| {
+            .query_row((key, version_id, include_delete_markers), |row| {
                 Ok(KeyValue {
                     key: row.get(0)?,
-                    value: row.get(1)?,
+                    version_id: row.get(1)?,
+                    value: row.get(2)?,
                     key_metadata: KeyMetadata {
-                        size: row_size(row, 2)?,
+                        version_id: row.get(1)?,
+                        size: row_size(row, 3)?,
                         metadata: row
-                            .get::<_, Option<String>>(3)?
+                            .get::<_, Option<String>>(4)?
                             .map(|metadata| serde_json::from_str(&metadata))
                             .transpose()
                             .map_err(|err| {
                                 rusqlite::Error::FromSqlConversionFailure(
-                                    3,
+                                    4,
                                     rusqlite::types::Type::Text,
                                     Box::new(err),
                                 )
                             })?,
-                        content_type: row.get(4)?,
-                        cache_control: row.get(5)?,
-                        expires: row.get(6)?,
-                        last_modified: row.get(7)?,
-                        md5: row.get(8)?,
+                        content_type: row.get(5)?,
+                        cache_control: row.get(6)?,
+                        expires: row.get(7)?,
+                        last_modified: row.get(8)?,
+                        md5: row.get(9)?,
+                        is_latest: row_bool(row, 10)?,
+                        is_delete_marker: row_bool(row, 11)?,
                     },
                 })
             })
             .optional()?)
     }
 
-    /// Fetches object metadata by key without reading the body.
+    /// Fetches current visible object metadata by key without reading the body.
     pub(crate) fn try_get_metadata(
+        transaction: &Transaction,
+        key: &str,
+    ) -> SqliteResult<Option<KeyMetadata>> {
+        Self::try_get_metadata_internal(transaction, key, None, false)
+    }
+
+    /// Fetches the newest non-delete-marker metadata for conditional deletes.
+    pub(crate) fn try_get_latest_object_metadata(
         transaction: &Transaction,
         key: &str,
     ) -> SqliteResult<Option<KeyMetadata>> {
         let mut stmt = transaction.prepare_cached(
             "
             SELECT
+                version_id,
+                size,
+                metadata,
+                content_type,
+                cache_control,
+                expires,
+                last_modified,
+                md5,
+                is_latest,
+                is_delete_marker
+            FROM object_version
+            WHERE key = ?1 AND is_delete_marker = 0
+            ORDER BY sequence DESC
+            LIMIT 1;",
+        )?;
+
+        Ok(stmt
+            .query_row([key], |row| {
+                Ok(KeyMetadata {
+                    version_id: row.get(0)?,
+                    size: row_size(row, 1)?,
+                    metadata: row
+                        .get::<_, Option<String>>(2)?
+                        .map(|metadata| serde_json::from_str(&metadata))
+                        .transpose()
+                        .map_err(|err| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                2,
+                                rusqlite::types::Type::Text,
+                                Box::new(err),
+                            )
+                        })?,
+                    content_type: row.get(3)?,
+                    cache_control: row.get(4)?,
+                    expires: row.get(5)?,
+                    last_modified: row.get(6)?,
+                    md5: row.get(7)?,
+                    is_latest: row_bool(row, 8)?,
+                    is_delete_marker: row_bool(row, 9)?,
+                })
+            })
+            .optional()?)
+    }
+
+    /// Fetches exact object metadata, including delete markers, by key and version ID.
+    pub(crate) fn try_get_version_metadata(
+        transaction: &Transaction,
+        key: &str,
+        version_id: &str,
+    ) -> SqliteResult<Option<KeyMetadata>> {
+        Self::try_get_metadata_internal(transaction, key, Some(version_id), true)
+    }
+
+    /// Fetches metadata by current or exact version selector.
+    fn try_get_metadata_internal(
+        transaction: &Transaction,
+        key: &str,
+        version_id: Option<&str>,
+        include_delete_markers: bool,
+    ) -> SqliteResult<Option<KeyMetadata>> {
+        let mut stmt = transaction.prepare_cached(
+            "
+            SELECT
+                version_id,
+                size,
+                metadata,
+                content_type,
+                cache_control,
+                expires,
+                last_modified,
+                md5,
+                is_latest,
+                is_delete_marker
+            FROM object_version
+            WHERE key = ?1
+                AND (?2 IS NULL OR version_id = ?2)
+                AND (?2 IS NOT NULL OR is_latest = 1)
+                AND (?3 OR is_delete_marker = 0);",
+        )?;
+
+        Ok(stmt
+            .query_row((key, version_id, include_delete_markers), |row| {
+                Ok(KeyMetadata {
+                    version_id: row.get(0)?,
+                    size: row_size(row, 1)?,
+                    metadata: row
+                        .get::<_, Option<String>>(2)?
+                        .map(|metadata| serde_json::from_str(&metadata))
+                        .transpose()
+                        .map_err(|err| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                2,
+                                rusqlite::types::Type::Text,
+                                Box::new(err),
+                            )
+                        })?,
+                    content_type: row.get(3)?,
+                    cache_control: row.get(4)?,
+                    expires: row.get(5)?,
+                    last_modified: row.get(6)?,
+                    md5: row.get(7)?,
+                    is_latest: row_bool(row, 8)?,
+                    is_delete_marker: row_bool(row, 9)?,
+                })
+            })
+            .optional()?)
+    }
+
+    /// Inserts an object version or replaces the `null` version.
+    pub(crate) fn try_put_object(
+        transaction: &Transaction,
+        kv: KeyValue,
+    ) -> SqliteResult<ObjectWriteOutcome> {
+        let KeyValue {
+            key,
+            value,
+            key_metadata,
+            ..
+        } = kv;
+        let state = Self::try_get_bucket_versioning_state(transaction)?;
+        let version_id = match state {
+            BucketVersioningState::Enabled => {
+                Self::try_generate_unique_version_id(transaction, &key)?
+            }
+            BucketVersioningState::NeverConfigured | BucketVersioningState::Suspended => {
+                NULL_VERSION_ID.to_string()
+            }
+        };
+        let returned_version_id = state.returns_write_version_id().then(|| version_id.clone());
+
+        if state.returns_write_version_id().not() {
+            Self::try_delete_version_row(transaction, &key, NULL_VERSION_ID)?;
+        }
+        Self::try_clear_latest(transaction, &key)?;
+
+        let mut stmt = transaction.prepare_cached(
+            "
+            INSERT INTO object_version (
+                key,
+                version_id,
+                is_latest,
+                is_delete_marker,
+                body,
                 size,
                 metadata,
                 content_type,
@@ -943,71 +1413,15 @@ impl Sqlite {
                 expires,
                 last_modified,
                 md5
-            FROM metadata
-            WHERE key = ?;",
-        )?;
-
-        Ok(stmt
-            .query_row([key], |row| {
-                Ok(KeyMetadata {
-                    size: row_size(row, 0)?,
-                    metadata: row
-                        .get::<_, Option<String>>(1)?
-                        .map(|metadata| serde_json::from_str(&metadata))
-                        .transpose()
-                        .map_err(|err| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                1,
-                                rusqlite::types::Type::Text,
-                                Box::new(err),
-                            )
-                        })?,
-                    content_type: row.get(2)?,
-                    cache_control: row.get(3)?,
-                    expires: row.get(4)?,
-                    last_modified: row.get(5)?,
-                    md5: row.get(6)?,
-                })
-            })
-            .optional()?)
-    }
-
-    /// Inserts or replaces an object body and metadata.
-    pub(crate) fn try_put_object(transaction: &Transaction, kv: KeyValue) -> SqliteResult<usize> {
-        let KeyValue {
-            key,
-            value,
-            key_metadata,
-        } = kv;
-
-        let mut stmt = transaction.prepare_cached(
-            "
-            INSERT INTO data (key, value)
-            VALUES (?1, ?2)
-            ON CONFLICT(key) DO UPDATE
-            SET value=excluded.value;",
-        )?;
-
-        stmt.execute((&key, value))?;
-        transaction
-            .prepare_cached(
-                "
-                DELETE FROM completed_object_part
-                WHERE key = ?1;",
-            )?
-            .execute([&key])?;
-
-        let mut stmt = transaction.prepare_cached(
-            "
-            INSERT INTO metadata (key, size, metadata, content_type, cache_control, expires, last_modified, md5)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-            ON CONFLICT(key) DO UPDATE
-            SET size=excluded.size, metadata=excluded.metadata, content_type=excluded.content_type, cache_control=excluded.cache_control, expires=excluded.expires, last_modified=excluded.last_modified, md5=excluded.md5;",
+            )
+            VALUES (?1, ?2, 1, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10);",
         )?;
 
         let size = sql_size(key_metadata.size)?;
-        Ok(stmt.execute((
-            key,
+        stmt.execute((
+            &key,
+            &version_id,
+            value,
             size,
             key_metadata
                 .metadata
@@ -1018,18 +1432,213 @@ impl Sqlite {
             key_metadata.cache_control,
             key_metadata.expires,
             key_metadata.last_modified,
-            key_metadata.md5,
-        ))?)
+            key_metadata.md5.as_deref(),
+        ))?;
+
+        Ok(ObjectWriteOutcome {
+            version_id,
+            returned_version_id,
+            md5: key_metadata.md5,
+            last_modified: key_metadata.last_modified,
+        })
     }
 
-    /// Deletes an object by key.
-    pub(crate) fn try_delete_object(transaction: &Transaction, key: &str) -> SqliteResult<usize> {
+    /// Deletes an object by key or permanently deletes an exact version.
+    pub(crate) fn try_delete_object(
+        transaction: &Transaction,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> SqliteResult<ObjectDeleteOutcome> {
+        if let Some(version_id) = version_id {
+            let deleted = Self::try_get_version_metadata(transaction, key, version_id)?;
+            let is_latest = deleted.as_ref().is_some_and(|metadata| metadata.is_latest);
+            let is_delete_marker = deleted
+                .as_ref()
+                .is_some_and(|metadata| metadata.is_delete_marker);
+            Self::try_delete_version_row(transaction, key, version_id)?;
+            if is_latest {
+                Self::try_promote_latest_version(transaction, key)?;
+            }
+            return Ok(ObjectDeleteOutcome {
+                version_id: Some(version_id.to_string()),
+                is_delete_marker,
+                delete_marker_version_id: is_delete_marker.then(|| version_id.to_string()),
+            });
+        }
+
+        let state = Self::try_get_bucket_versioning_state(transaction)?;
+        match state {
+            BucketVersioningState::NeverConfigured => {
+                Self::try_delete_version_row(transaction, key, NULL_VERSION_ID)?;
+                Ok(ObjectDeleteOutcome {
+                    version_id: None,
+                    is_delete_marker: false,
+                    delete_marker_version_id: None,
+                })
+            }
+            BucketVersioningState::Enabled => {
+                let version_id = Self::try_generate_unique_version_id(transaction, key)?;
+                Self::try_insert_delete_marker(transaction, key, &version_id)?;
+                Ok(ObjectDeleteOutcome {
+                    version_id: Some(version_id.clone()),
+                    is_delete_marker: true,
+                    delete_marker_version_id: Some(version_id),
+                })
+            }
+            BucketVersioningState::Suspended => {
+                Self::try_delete_version_row(transaction, key, NULL_VERSION_ID)?;
+                Self::try_insert_delete_marker(transaction, key, NULL_VERSION_ID)?;
+                Ok(ObjectDeleteOutcome {
+                    version_id: Some(NULL_VERSION_ID.to_string()),
+                    is_delete_marker: true,
+                    delete_marker_version_id: Some(NULL_VERSION_ID.to_string()),
+                })
+            }
+        }
+    }
+
+    /// Returns the current bucket versioning state.
+    pub(crate) fn try_get_bucket_versioning_state(
+        transaction: &Transaction,
+    ) -> SqliteResult<BucketVersioningState> {
+        let mut stmt = transaction
+            .prepare_cached("SELECT versioning_state FROM bucket_state WHERE id = 1;")?;
+        let state = stmt.query_row((), |row| {
+            let value = row.get::<_, String>(0)?;
+            BucketVersioningState::from_sql(&value)
+        })?;
+        Ok(state)
+    }
+
+    /// Updates the bucket versioning state.
+    pub(crate) fn try_put_bucket_versioning_state(
+        transaction: &Transaction,
+        state: BucketVersioningState,
+    ) -> SqliteResult<usize> {
         let mut stmt = transaction.prepare_cached(
             "
-            DELETE FROM data
+            UPDATE bucket_state
+            SET versioning_state = ?1
+            WHERE id = 1;",
+        )?;
+        Ok(stmt.execute([state.as_sql()])?)
+    }
+
+    /// Returns the storage sequence for an exact object version.
+    fn try_get_version_sequence(
+        transaction: &Transaction,
+        key: &str,
+        version_id: &str,
+    ) -> SqliteResult<i64> {
+        let mut stmt = transaction.prepare_cached(
+            "
+            SELECT sequence
+            FROM object_version
+            WHERE key = ?1 AND version_id = ?2;",
+        )?;
+        stmt.query_row((key, version_id), |row| row.get(0))
+            .optional()?
+            .ok_or(SqliteError::ObjectVersionNotFound)
+    }
+
+    /// Generates an unused opaque version ID for a key.
+    fn try_generate_unique_version_id(
+        transaction: &Transaction,
+        key: &str,
+    ) -> SqliteResult<String> {
+        loop {
+            let version_id = generate_version_id()?;
+            if Self::try_version_exists(transaction, key, &version_id)?.not() {
+                return Ok(version_id);
+            }
+        }
+    }
+
+    /// Returns whether an exact object version row exists.
+    fn try_version_exists(
+        transaction: &Transaction,
+        key: &str,
+        version_id: &str,
+    ) -> SqliteResult<bool> {
+        let mut stmt = transaction.prepare_cached(
+            "
+            SELECT EXISTS(
+                SELECT 1
+                FROM object_version
+                WHERE key = ?1 AND version_id = ?2
+            );",
+        )?;
+        Ok(stmt.query_row((key, version_id), |row| row.get(0))?)
+    }
+
+    /// Clears the latest pointer for all versions of a key.
+    fn try_clear_latest(transaction: &Transaction, key: &str) -> SqliteResult<usize> {
+        let mut stmt = transaction.prepare_cached(
+            "
+            UPDATE object_version
+            SET is_latest = 0
             WHERE key = ?1;",
         )?;
         Ok(stmt.execute([key])?)
+    }
+
+    /// Deletes one exact object version row.
+    fn try_delete_version_row(
+        transaction: &Transaction,
+        key: &str,
+        version_id: &str,
+    ) -> SqliteResult<usize> {
+        let mut stmt = transaction.prepare_cached(
+            "
+            DELETE FROM object_version
+            WHERE key = ?1 AND version_id = ?2;",
+        )?;
+        Ok(stmt.execute((key, version_id))?)
+    }
+
+    /// Promotes the newest remaining version for a key to latest.
+    fn try_promote_latest_version(transaction: &Transaction, key: &str) -> SqliteResult<usize> {
+        let mut stmt = transaction.prepare_cached(
+            "
+            UPDATE object_version
+            SET is_latest = 1
+            WHERE sequence = (
+                SELECT sequence
+                FROM object_version
+                WHERE key = ?1
+                ORDER BY sequence DESC
+                LIMIT 1
+            );",
+        )?;
+        Ok(stmt.execute([key])?)
+    }
+
+    /// Creates a delete marker as the current latest version.
+    fn try_insert_delete_marker(
+        transaction: &Transaction,
+        key: &str,
+        version_id: &str,
+    ) -> SqliteResult<usize> {
+        Self::try_clear_latest(transaction, key)?;
+        let mut stmt = transaction.prepare_cached(
+            "
+            INSERT INTO object_version (
+                key,
+                version_id,
+                is_latest,
+                is_delete_marker,
+                body,
+                size,
+                metadata,
+                content_type,
+                cache_control,
+                expires,
+                last_modified,
+                md5
+            )
+            VALUES (?1, ?2, 1, 1, NULL, 0, NULL, NULL, NULL, NULL, ?3, NULL);",
+        )?;
+        Ok(stmt.execute((key, version_id, OffsetDateTime::now_utc()))?)
     }
 
     /// Creates multipart upload state for an upload ID.
@@ -1119,26 +1728,24 @@ impl Sqlite {
     /// Records a completed multipart upload for idempotent retries.
     pub(crate) fn try_put_completed_multipart_upload(
         transaction: &Transaction,
-        upload_id: Uuid,
-        bucket: &str,
-        key: &str,
-        access_key: Option<String>,
-        md5: &str,
+        record: CompletedMultipartUploadRecord<'_>,
     ) -> SqliteResult<usize> {
         let mut stmt = transaction.prepare_cached(
             "
-            INSERT INTO completed_multipart_upload (upload_id, bucket, key, access_key, md5, last_modified)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            INSERT INTO completed_multipart_upload (upload_id, bucket, key, access_key, md5, version_id, returned_version_id, last_modified)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             ON CONFLICT(upload_id) DO UPDATE
-            SET bucket=excluded.bucket, key=excluded.key, access_key=excluded.access_key, md5=excluded.md5, last_modified=excluded.last_modified;",
+            SET bucket=excluded.bucket, key=excluded.key, access_key=excluded.access_key, md5=excluded.md5, version_id=excluded.version_id, returned_version_id=excluded.returned_version_id, last_modified=excluded.last_modified;",
         )?;
 
         Ok(stmt.execute((
-            upload_id,
-            bucket,
-            key,
-            access_key,
-            md5,
+            record.upload_id,
+            record.bucket,
+            record.key,
+            record.access_key,
+            record.md5,
+            record.version_id,
+            record.returned_version_id,
             OffsetDateTime::now_utc(),
         ))?)
     }
@@ -1152,7 +1759,7 @@ impl Sqlite {
     ) -> SqliteResult<Option<CompletedMultipartUploadState>> {
         let mut stmt = transaction.prepare_cached(
             "
-            SELECT access_key, md5
+            SELECT access_key, md5, version_id, returned_version_id
             FROM completed_multipart_upload
             WHERE upload_id = ?1 AND bucket = ?2 AND key = ?3;",
         )?;
@@ -1162,6 +1769,8 @@ impl Sqlite {
                 Ok(CompletedMultipartUploadState {
                     access_key: row.get(0)?,
                     md5: row.get(1)?,
+                    version_id: row.get(2)?,
+                    returned_version_id: row.get(3)?,
                 })
             })
             .optional()?)
@@ -1304,17 +1913,18 @@ impl Sqlite {
     pub(crate) fn try_get_completed_object_part(
         transaction: &Transaction,
         key: &str,
+        version_id: &str,
         part_number: i32,
     ) -> SqliteResult<Option<CompletedObjectPart>> {
         let mut stmt = transaction.prepare_cached(
             "
             SELECT part_number, start, size, md5
             FROM completed_object_part
-            WHERE key = ?1 AND part_number = ?2;",
+            WHERE key = ?1 AND version_id = ?2 AND part_number = ?3;",
         )?;
 
         Ok(stmt
-            .query_row((key, part_number), |row| {
+            .query_row((key, version_id, part_number), |row| {
                 Ok(CompletedObjectPart {
                     part_number: row.get(0)?,
                     start: row_size(row, 1)?,
@@ -1329,10 +1939,12 @@ impl Sqlite {
     pub(crate) fn try_count_completed_object_parts(
         transaction: &Transaction,
         key: &str,
+        version_id: &str,
     ) -> SqliteResult<i32> {
-        let mut stmt = transaction
-            .prepare_cached("SELECT COUNT(*) FROM completed_object_part WHERE key = ?1;")?;
-        let count = stmt.query_row([key], |row| row_size(row, 0))?;
+        let mut stmt = transaction.prepare_cached(
+            "SELECT COUNT(*) FROM completed_object_part WHERE key = ?1 AND version_id = ?2;",
+        )?;
+        let count = stmt.query_row((key, version_id), |row| row_size(row, 0))?;
         i32::try_from(count).map_err(|_| SqliteError::MultipartObjectTooLarge)
     }
 
@@ -1340,17 +1952,19 @@ impl Sqlite {
     fn try_put_completed_object_parts(
         transaction: &Transaction,
         key: &str,
+        version_id: &str,
         parts: &[CompletedObjectPart],
     ) -> SqliteResult<()> {
         let mut stmt = transaction.prepare_cached(
             "
-            INSERT INTO completed_object_part (key, part_number, start, size, md5)
-            VALUES (?1, ?2, ?3, ?4, ?5);",
+            INSERT INTO completed_object_part (key, version_id, part_number, start, size, md5)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6);",
         )?;
 
         for part in parts {
             stmt.execute((
                 key,
+                version_id,
                 part.part_number,
                 sql_size(part.start)?,
                 sql_size(part.size)?,
@@ -1567,11 +2181,15 @@ mod tests {
         let completed_upload_id = Uuid::new_v4();
         Sqlite::try_put_completed_multipart_upload(
             &transaction,
-            completed_upload_id,
-            "bucket",
-            "completed-key",
-            None,
-            "etag",
+            CompletedMultipartUploadRecord {
+                upload_id: completed_upload_id,
+                bucket: "bucket",
+                key: "completed-key",
+                access_key: None,
+                md5: "etag",
+                version_id: NULL_VERSION_ID,
+                returned_version_id: None,
+            },
         )?;
         transaction.execute(
             "UPDATE completed_multipart_upload SET last_modified = ?2 WHERE upload_id = ?1;",

@@ -12,22 +12,23 @@ use s3s::{
     S3ErrorCode::InternalError,
     S3Request, S3Response, S3Result, StdError,
     dto::{
-        AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, CommonPrefix,
-        CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput,
+        AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketVersioningStatus,
+        CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput,
         CopyObjectOutput, CopyObjectResult, CopyPartResult, CopySource, CreateBucketInput,
         CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
-        DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput,
-        DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag, ETagCondition, EncodingType,
-        Error as DeleteError, GetBucketLocationInput, GetBucketLocationOutput, GetObjectAclInput,
-        GetObjectAclOutput, GetObjectInput, GetObjectOutput, Grant, Grantee, HeadBucketInput,
-        HeadBucketOutput, HeadObjectInput, HeadObjectOutput, Initiator, ListBucketsInput,
-        ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput,
+        DeleteBucketInput, DeleteBucketOutput, DeleteMarkerEntry, DeleteObjectInput,
+        DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
+        ETagCondition, EncodingType, Error as DeleteError, GetBucketLocationInput,
+        GetBucketLocationOutput, GetBucketVersioningInput, GetBucketVersioningOutput,
+        GetObjectAclInput, GetObjectAclOutput, GetObjectInput, GetObjectOutput, Grant, Grantee,
+        HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, Initiator,
+        ListBucketsInput, ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput,
         ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput,
-        ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput,
+        ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput, MFADelete,
         MetadataDirective, MultipartUpload, Object, ObjectVersion, ObjectVersionStorageClass,
-        Owner, Part, Permission, PutObjectInput, PutObjectOutput, Range as S3Range, StorageClass,
-        StreamingBlob, Timestamp, Type, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput,
-        UploadPartOutput,
+        Owner, Part, Permission, PutBucketVersioningInput, PutBucketVersioningOutput,
+        PutObjectInput, PutObjectOutput, Range as S3Range, StorageClass, StreamingBlob, Timestamp,
+        Type, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
     },
     header::{CONTENT_MD5, CONTENT_TYPE, ETAG},
 };
@@ -39,10 +40,11 @@ use tokio::{
 use tracing::debug;
 use uuid::Uuid;
 
+use crate::database::BucketConnection;
 use crate::sqlite::{
-    CompletedObjectPart, KeyMetadata, KeyValue, Multipart, MultipartCompletionPart,
-    MultipartUploadState, MultipartUploadSummary, ObjectSummary, ObjectTagCondition,
-    ObjectWriteConditions, Sqlite, SqliteError,
+    BucketVersioningState, CompletedObjectPart, KeyMetadata, KeyValue, Multipart,
+    MultipartCompletionPart, MultipartUploadState, MultipartUploadSummary, ObjectDeleteOutcome,
+    ObjectSummary, ObjectTagCondition, ObjectWriteConditions, Sqlite, SqliteError,
 };
 
 const LIST_BATCH_SIZE: i64 = 1024;
@@ -59,6 +61,7 @@ fn s3_error_from_sqlite(error: SqliteError) -> S3Error {
             "database is in read-only mode",
         ),
         SqliteError::ObjectNotFound => S3Error::new(S3ErrorCode::NoSuchKey),
+        SqliteError::ObjectVersionNotFound => S3Error::new(S3ErrorCode::NoSuchVersion),
         SqliteError::InvalidObjectRange => S3Error::new(S3ErrorCode::InvalidRange),
         SqliteError::PreconditionFailed => S3Error::new(S3ErrorCode::PreconditionFailed),
         SqliteError::MultipartUploadNotFound => S3Error::new(S3ErrorCode::NoSuchUpload),
@@ -628,7 +631,12 @@ fn validate_delete_conditions(
     };
 
     if let Some(condition) = conditions.etag_matches.as_ref()
-        && strong_etag_condition_matches(condition, metadata.md5.as_deref()).not()
+        && match condition {
+            ETagCondition::Any => false,
+            ETagCondition::ETag(_) => {
+                strong_etag_condition_matches(condition, metadata.md5.as_deref()).not()
+            }
+        }
     {
         return Err(SqliteError::PreconditionFailed);
     }
@@ -668,7 +676,7 @@ fn object_version_from_summary(
 ) -> ObjectVersion {
     ObjectVersion {
         e_tag: summary.md5.map(ETag::Strong),
-        is_latest: Some(true),
+        is_latest: Some(summary.is_latest),
         key: Some(encode_list_value(summary.key, encode_keys)),
         last_modified: Some(summary.last_modified.into()),
         owner: owner.cloned(),
@@ -676,8 +684,23 @@ fn object_version_from_summary(
         storage_class: Some(ObjectVersionStorageClass::from_static(
             ObjectVersionStorageClass::STANDARD,
         )),
-        version_id: Some("null".to_string()),
+        version_id: Some(summary.version_id),
         ..Default::default()
+    }
+}
+
+/// Converts a stored delete-marker summary into an S3 version-list entry.
+fn delete_marker_from_summary(
+    summary: ObjectSummary,
+    encode_keys: bool,
+    owner: Option<&Owner>,
+) -> DeleteMarkerEntry {
+    DeleteMarkerEntry {
+        is_latest: Some(summary.is_latest),
+        key: Some(encode_list_value(summary.key, encode_keys)),
+        last_modified: Some(summary.last_modified.into()),
+        owner: owner.cloned(),
+        version_id: Some(summary.version_id),
     }
 }
 
@@ -686,6 +709,15 @@ struct KeyListing {
     common_prefixes: Vec<CommonPrefix>,
     key_count: usize,
     next_marker: Option<String>,
+    is_truncated: bool,
+}
+
+struct ObjectVersionListing {
+    versions: Vec<ObjectSummary>,
+    delete_markers: Vec<ObjectSummary>,
+    common_prefixes: Vec<CommonPrefix>,
+    next_key_marker: Option<String>,
+    next_version_id_marker: Option<String>,
     is_truncated: bool,
 }
 
@@ -804,6 +836,148 @@ impl Sqlite {
             next_marker,
             is_truncated,
         })
+    }
+
+    /// Lists object versions and common prefixes using S3 version marker semantics.
+    async fn list_versions(
+        &self,
+        bucket: &str,
+        prefix_filter: &str,
+        delimiter_filter: Option<&str>,
+        mut after_key: Option<String>,
+        mut after_version_id: Option<String>,
+        max_keys: usize,
+    ) -> S3Result<ObjectVersionListing> {
+        let connection = self
+            .try_get_connection(bucket)
+            .await
+            .map_err(s3_error_from_sqlite)?;
+        let mut versions = Vec::new();
+        let mut delete_markers = Vec::new();
+        let mut common_prefixes = Vec::new();
+        let mut seen_common_prefixes = HashSet::new();
+        let marker_filter = after_key.clone();
+        let mut next_key_marker = None;
+        let mut next_version_id_marker = None;
+        let mut count = 0usize;
+        let mut is_truncated = false;
+        let list_batch_len = usize::try_from(LIST_BATCH_SIZE).map_err(S3Error::internal_error)?;
+
+        if max_keys > 0 {
+            'pages: loop {
+                let prefix = prefix_filter.to_string();
+                let after_key_query = after_key.clone();
+                let after_version_id_query = after_version_id.clone();
+                let summaries = Self::list_version_page(
+                    &connection,
+                    prefix,
+                    after_key_query,
+                    after_version_id_query,
+                )
+                .await?;
+
+                if summaries.is_empty() {
+                    break;
+                }
+
+                let summary_count = summaries.len();
+                for summary in summaries {
+                    if prefix_filter.is_empty().not()
+                        && summary.key.starts_with(prefix_filter).not()
+                    {
+                        break 'pages;
+                    }
+
+                    let scanned_key = summary.key.clone();
+                    let scanned_version_id = summary.version_id.clone();
+                    if let Some(common_prefix) =
+                        common_prefix_for_key(&summary.key, prefix_filter, delimiter_filter)
+                    {
+                        if marker_filter
+                            .as_ref()
+                            .is_some_and(|marker| common_prefix.as_str() <= marker.as_str())
+                        {
+                            after_key = Some(scanned_key);
+                            after_version_id = Some(scanned_version_id);
+                            continue;
+                        }
+
+                        if seen_common_prefixes.contains(&common_prefix) {
+                            after_key = Some(scanned_key);
+                            after_version_id = Some(scanned_version_id);
+                            continue;
+                        }
+
+                        if count == max_keys {
+                            is_truncated = true;
+                            break 'pages;
+                        }
+
+                        seen_common_prefixes.insert(common_prefix.clone());
+                        common_prefixes.push(CommonPrefix {
+                            prefix: Some(common_prefix),
+                        });
+                        next_key_marker = Some(scanned_key.clone());
+                        next_version_id_marker = Some(scanned_version_id.clone());
+                        count += 1;
+                        after_key = Some(scanned_key);
+                        after_version_id = Some(scanned_version_id);
+                        continue;
+                    }
+
+                    if count == max_keys {
+                        is_truncated = true;
+                        break 'pages;
+                    }
+
+                    next_key_marker = Some(scanned_key.clone());
+                    next_version_id_marker = Some(scanned_version_id.clone());
+                    after_key = Some(scanned_key);
+                    after_version_id = Some(scanned_version_id);
+                    if summary.is_delete_marker {
+                        delete_markers.push(summary);
+                    } else {
+                        versions.push(summary);
+                    }
+                    count += 1;
+                }
+
+                if summary_count < list_batch_len {
+                    break;
+                }
+            }
+        }
+
+        Ok(ObjectVersionListing {
+            versions,
+            delete_markers,
+            common_prefixes,
+            next_key_marker,
+            next_version_id_marker,
+            is_truncated,
+        })
+    }
+
+    /// Reads one storage page for `ListObjectVersions`.
+    async fn list_version_page(
+        connection: &BucketConnection,
+        prefix: String,
+        after_key: Option<String>,
+        after_version_id: Option<String>,
+    ) -> S3Result<Vec<ObjectSummary>> {
+        connection
+            .read(move |connection| {
+                let transaction = connection.transaction()?;
+                Self::try_list_object_versions(
+                    &transaction,
+                    Some(&prefix),
+                    after_key.as_deref(),
+                    after_version_id.as_deref(),
+                    LIST_BATCH_SIZE,
+                )
+            })
+            .await
+            .map_err(s3_error_from_sqlite)
     }
 
     /// Lists active multipart uploads with S3 prefix, delimiter, and marker semantics.
@@ -970,9 +1144,17 @@ impl S3 for Sqlite {
         self.validate_mutable_bucket(&tgt_bucket)
             .map_err(s3_error_from_sqlite)?;
 
-        let (src_bucket, src_key) = match copy_source {
+        let (src_bucket, src_key, src_version_id) = match copy_source {
             CopySource::AccessPoint { .. } => return Err(s3_error(S3ErrorCode::NotImplemented)),
-            CopySource::Bucket { bucket, key, .. } => (bucket, key),
+            CopySource::Bucket {
+                bucket,
+                key,
+                version_id,
+            } => (
+                bucket,
+                key,
+                version_id.map(|version_id| version_id.to_string()),
+            ),
         };
         let replace_metadata = metadata_directive
             .as_ref()
@@ -998,14 +1180,22 @@ impl S3 for Sqlite {
                 .try_get_connection(&tgt_bucket)
                 .await
                 .map_err(s3_error_from_sqlite)?;
+            let src_version_id_for_read = src_version_id.clone();
             let copy_object_result = connection
                 .write(move |connection| {
                     let transaction = connection.transaction()?;
-                    let mut object = Self::try_get_object(&transaction, &src_key)?
-                        .ok_or(SqliteError::ObjectNotFound)?;
+                    let mut object = match src_version_id_for_read.as_deref() {
+                        Some(version_id) => {
+                            Self::try_get_object_version(&transaction, &src_key, version_id)?
+                                .ok_or(SqliteError::ObjectVersionNotFound)?
+                        }
+                        None => Self::try_get_object(&transaction, &src_key)?
+                            .ok_or(SqliteError::ObjectNotFound)?,
+                    };
                     validate_copy_source_conditions(&object.key_metadata, &source_conditions)?;
 
                     object.key = tgt_key;
+                    object.key_metadata.last_modified = OffsetDateTime::now_utc();
                     if replace_metadata {
                         object.key_metadata.metadata = metadata;
                         object.key_metadata.content_type = content_type;
@@ -1013,21 +1203,22 @@ impl S3 for Sqlite {
                         object.key_metadata.expires = expires.map(Into::into);
                     }
 
+                    let write_outcome = Self::try_put_object(&transaction, object)?;
                     let copy_object_result = CopyObjectResult {
-                        e_tag: object.key_metadata.md5.clone().map(ETag::Strong),
-                        last_modified: Some(object.key_metadata.last_modified.into()),
+                        e_tag: write_outcome.md5.clone().map(ETag::Strong),
+                        last_modified: Some(write_outcome.last_modified.into()),
                         ..Default::default()
                     };
-
-                    Self::try_put_object(&transaction, object)?;
                     transaction.commit()?;
-                    Ok(copy_object_result)
+                    Ok((copy_object_result, write_outcome.returned_version_id))
                 })
                 .await
                 .map_err(s3_error_from_sqlite)?;
 
             let output = CopyObjectOutput {
-                copy_object_result: Some(copy_object_result),
+                copy_object_result: Some(copy_object_result.0),
+                copy_source_version_id: src_version_id,
+                version_id: copy_object_result.1,
                 ..Default::default()
             };
             return Ok(S3Response::new(output));
@@ -1039,10 +1230,18 @@ impl S3 for Sqlite {
             .await
             .map_err(s3_error_from_sqlite)?;
 
+        let src_version_id_clone = src_version_id.clone();
         let mut object = connection
             .read(move |connection| {
                 let transaction = connection.transaction()?;
-                Self::try_get_object(&transaction, &src_key)?.ok_or(SqliteError::ObjectNotFound)
+                match src_version_id_clone.as_deref() {
+                    Some(version_id) => {
+                        Self::try_get_object_version(&transaction, &src_key, version_id)?
+                            .ok_or(SqliteError::ObjectVersionNotFound)
+                    }
+                    None => Self::try_get_object(&transaction, &src_key)?
+                        .ok_or(SqliteError::ObjectNotFound),
+                }
             })
             .await
             .map_err(s3_error_from_sqlite)?;
@@ -1051,6 +1250,7 @@ impl S3 for Sqlite {
 
         // replace key with target key
         object.key = tgt_key.clone();
+        object.key_metadata.last_modified = OffsetDateTime::now_utc();
         if replace_metadata {
             object.key_metadata.metadata = metadata;
             object.key_metadata.content_type = content_type;
@@ -1058,27 +1258,29 @@ impl S3 for Sqlite {
             object.key_metadata.expires = expires.map(Into::into);
         }
 
-        let copy_object_result = CopyObjectResult {
-            e_tag: object.key_metadata.md5.clone().map(ETag::Strong),
-            last_modified: Some(object.key_metadata.last_modified.into()),
-            ..Default::default()
-        };
-
         let connection = self
             .try_get_connection(&tgt_bucket)
             .await
             .map_err(s3_error_from_sqlite)?;
-        connection
+        let (copy_object_result, returned_version_id) = connection
             .write(move |connection| {
                 let transaction = connection.transaction()?;
-                Self::try_put_object(&transaction, object)?;
-                Ok(transaction.commit()?)
+                let write_outcome = Self::try_put_object(&transaction, object)?;
+                let copy_object_result = CopyObjectResult {
+                    e_tag: write_outcome.md5.clone().map(ETag::Strong),
+                    last_modified: Some(write_outcome.last_modified.into()),
+                    ..Default::default()
+                };
+                transaction.commit()?;
+                Ok((copy_object_result, write_outcome.returned_version_id))
             })
             .await
             .map_err(s3_error_from_sqlite)?;
 
         let output = CopyObjectOutput {
             copy_object_result: Some(copy_object_result),
+            copy_source_version_id: src_version_id,
+            version_id: returned_version_id,
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -1145,6 +1347,7 @@ impl S3 for Sqlite {
         let DeleteObjectInput {
             bucket,
             key,
+            version_id,
             if_match,
             if_match_last_modified_time,
             if_match_size,
@@ -1164,18 +1367,28 @@ impl S3 for Sqlite {
             .await
             .map_err(s3_error_from_sqlite)?;
 
-        connection
+        let outcome = connection
             .write(move |connection| {
                 let transaction = connection.transaction()?;
-                let metadata = Self::try_get_metadata(&transaction, &key)?;
+                let metadata = match version_id.as_deref() {
+                    Some(version_id) => {
+                        Self::try_get_version_metadata(&transaction, &key, version_id)?
+                    }
+                    None => Self::try_get_latest_object_metadata(&transaction, &key)?,
+                };
                 validate_delete_conditions(metadata.as_ref(), &conditions)?;
-                Self::try_delete_object(&transaction, &key)?;
-                Ok(transaction.commit()?)
+                let outcome = Self::try_delete_object(&transaction, &key, version_id.as_deref())?;
+                transaction.commit()?;
+                Ok(outcome)
             })
             .await
             .map_err(s3_error_from_sqlite)?;
 
-        Ok(S3Response::new(DeleteObjectOutput::default()))
+        Ok(S3Response::new(DeleteObjectOutput {
+            delete_marker: outcome.is_delete_marker.then_some(true),
+            version_id: outcome.version_id,
+            ..Default::default()
+        }))
     }
 
     /// Deletes a batch of objects and returns S3 multi-delete results.
@@ -1196,6 +1409,7 @@ impl S3 for Sqlite {
             .map(|object| {
                 (
                     object.key,
+                    object.version_id,
                     ObjectDeleteConditions {
                         etag_matches: object.e_tag.map(ETagCondition::ETag),
                         last_modified_time: object.last_modified_time.map(Into::into),
@@ -1216,18 +1430,24 @@ impl S3 for Sqlite {
             .await
             .map_err(s3_error_from_sqlite)?;
 
-        let (deleted_keys, errors) = connection
+        let (deleted_objects, errors) = connection
             .write(move |connection| {
                 let transaction = connection.transaction()?;
-                let mut deleted_keys = Vec::new();
+                let mut deleted_objects = Vec::new();
                 let mut errors = Vec::new();
 
-                for (key, conditions) in delete_objects {
-                    let metadata = Self::try_get_metadata(&transaction, &key)?;
+                for (key, version_id, conditions) in delete_objects {
+                    let metadata = match version_id.as_deref() {
+                        Some(version_id) => {
+                            Self::try_get_version_metadata(&transaction, &key, version_id)?
+                        }
+                        None => Self::try_get_latest_object_metadata(&transaction, &key)?,
+                    };
                     match validate_delete_conditions(metadata.as_ref(), &conditions) {
                         Ok(()) => {
-                            Self::try_delete_object(&transaction, &key)?;
-                            deleted_keys.push(key);
+                            let outcome =
+                                Self::try_delete_object(&transaction, &key, version_id.as_deref())?;
+                            deleted_objects.push((key, outcome));
                         }
                         Err(SqliteError::PreconditionFailed) => errors.push(DeleteError {
                             key: Some(key),
@@ -1240,19 +1460,23 @@ impl S3 for Sqlite {
                 }
 
                 transaction.commit()?;
-                Ok((deleted_keys, errors))
+                Ok((deleted_objects, errors))
             })
             .await
             .map_err(s3_error_from_sqlite)?;
 
         let output = DeleteObjectsOutput {
             deleted: quiet.not().then(|| {
-                deleted_keys
+                deleted_objects
                     .into_iter()
-                    .map(|key| DeletedObject {
-                        key: Some(key),
-                        ..Default::default()
-                    })
+                    .map(
+                        |(key, outcome): (String, ObjectDeleteOutcome)| DeletedObject {
+                            key: Some(key),
+                            version_id: outcome.version_id,
+                            delete_marker: outcome.is_delete_marker.then_some(true),
+                            delete_marker_version_id: outcome.delete_marker_version_id,
+                        },
+                    )
                     .collect::<Vec<_>>()
             }),
             errors: errors.is_empty().not().then_some(errors),
@@ -1284,6 +1508,98 @@ impl S3 for Sqlite {
         Ok(S3Response::new(output))
     }
 
+    /// Returns the bucket versioning state.
+    #[tracing::instrument]
+    async fn get_bucket_versioning(
+        &self,
+        req: S3Request<GetBucketVersioningInput>,
+    ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+        let GetBucketVersioningInput { bucket, .. } = req.input;
+        let connection = self
+            .try_get_connection(&bucket)
+            .await
+            .map_err(s3_error_from_sqlite)?;
+        let state = connection
+            .read(|connection| {
+                let transaction = connection.transaction()?;
+                Self::try_get_bucket_versioning_state(&transaction)
+            })
+            .await
+            .map_err(s3_error_from_sqlite)?;
+
+        let status = match state {
+            BucketVersioningState::NeverConfigured => None,
+            BucketVersioningState::Enabled => Some(BucketVersioningStatus::from_static(
+                BucketVersioningStatus::ENABLED,
+            )),
+            BucketVersioningState::Suspended => Some(BucketVersioningStatus::from_static(
+                BucketVersioningStatus::SUSPENDED,
+            )),
+        };
+
+        Ok(S3Response::new(GetBucketVersioningOutput {
+            status,
+            ..Default::default()
+        }))
+    }
+
+    /// Updates the bucket versioning state.
+    #[tracing::instrument]
+    async fn put_bucket_versioning(
+        &self,
+        req: S3Request<PutBucketVersioningInput>,
+    ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        let PutBucketVersioningInput {
+            bucket,
+            versioning_configuration,
+            ..
+        } = req.input;
+
+        self.validate_mutable_bucket(&bucket)
+            .map_err(s3_error_from_sqlite)?;
+
+        if versioning_configuration
+            .mfa_delete
+            .as_ref()
+            .is_some_and(|mfa_delete| mfa_delete.as_str() == MFADelete::ENABLED)
+        {
+            return Err(s3_error_with_message(
+                S3ErrorCode::InvalidRequest,
+                "MFA Delete is not supported",
+            ));
+        }
+
+        let state = match versioning_configuration
+            .status
+            .as_ref()
+            .map(BucketVersioningStatus::as_str)
+        {
+            Some(BucketVersioningStatus::ENABLED) => BucketVersioningState::Enabled,
+            Some(BucketVersioningStatus::SUSPENDED) => BucketVersioningState::Suspended,
+            _ => {
+                return Err(s3_error_with_message(
+                    S3ErrorCode::InvalidArgument,
+                    "versioning status must be Enabled or Suspended",
+                ));
+            }
+        };
+
+        let connection = self
+            .try_get_connection(&bucket)
+            .await
+            .map_err(s3_error_from_sqlite)?;
+        connection
+            .write(move |connection| {
+                let transaction = connection.transaction()?;
+                Self::try_put_bucket_versioning_state(&transaction, state)?;
+                Ok(transaction.commit()?)
+            })
+            .await
+            .map_err(s3_error_from_sqlite)?;
+
+        Ok(S3Response::new(PutBucketVersioningOutput::default()))
+    }
+
     /// Returns an object body and metadata, applying byte-range requests when present.
     #[tracing::instrument]
     async fn get_object(
@@ -1295,6 +1611,7 @@ impl S3 for Sqlite {
             key,
             range,
             part_number,
+            version_id,
             if_match,
             if_modified_since,
             if_none_match,
@@ -1319,12 +1636,27 @@ impl S3 for Sqlite {
         let (object, completed_part, completed_part_count) = connection
             .read(move |connection| {
                 let transaction = connection.transaction()?;
-                let object =
-                    Self::try_get_object(&transaction, &key)?.ok_or(SqliteError::ObjectNotFound)?;
+                let object = match version_id.as_deref() {
+                    Some(version_id) => {
+                        Self::try_get_object_version(&transaction, &key, version_id)?
+                            .ok_or(SqliteError::ObjectVersionNotFound)?
+                    }
+                    None => Self::try_get_object(&transaction, &key)?
+                        .ok_or(SqliteError::ObjectNotFound)?,
+                };
                 let (completed_part, completed_part_count) = match part_number {
                     Some(part_number) => (
-                        Self::try_get_completed_object_part(&transaction, &key, part_number)?,
-                        Self::try_count_completed_object_parts(&transaction, &key)?,
+                        Self::try_get_completed_object_part(
+                            &transaction,
+                            &key,
+                            &object.version_id,
+                            part_number,
+                        )?,
+                        Self::try_count_completed_object_parts(
+                            &transaction,
+                            &key,
+                            &object.version_id,
+                        )?,
                     ),
                     None => (None, 0),
                 };
@@ -1413,6 +1745,7 @@ impl S3 for Sqlite {
             metadata: object.key_metadata.metadata,
             e_tag: object.key_metadata.md5.map(ETag::Strong),
             parts_count: (completed_part_count > 0).then_some(completed_part_count),
+            version_id: Some(object.version_id),
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -1456,6 +1789,7 @@ impl S3 for Sqlite {
             key,
             range,
             part_number,
+            version_id,
             if_match,
             if_modified_since,
             if_none_match,
@@ -1480,12 +1814,28 @@ impl S3 for Sqlite {
         let (object, completed_part, completed_part_count) = connection
             .read(move |connection| {
                 let transaction = connection.transaction()?;
-                let object = Self::try_get_metadata(&transaction, &key)?
-                    .ok_or(SqliteError::ObjectNotFound)?;
+                let object = match version_id.as_deref() {
+                    Some(version_id) => {
+                        Self::try_get_version_metadata(&transaction, &key, version_id)?
+                            .filter(|metadata| metadata.is_delete_marker.not())
+                            .ok_or(SqliteError::ObjectVersionNotFound)?
+                    }
+                    None => Self::try_get_metadata(&transaction, &key)?
+                        .ok_or(SqliteError::ObjectNotFound)?,
+                };
                 let (completed_part, completed_part_count) = match part_number {
                     Some(part_number) => (
-                        Self::try_get_completed_object_part(&transaction, &key, part_number)?,
-                        Self::try_count_completed_object_parts(&transaction, &key)?,
+                        Self::try_get_completed_object_part(
+                            &transaction,
+                            &key,
+                            &object.version_id,
+                            part_number,
+                        )?,
+                        Self::try_count_completed_object_parts(
+                            &transaction,
+                            &key,
+                            &object.version_id,
+                        )?,
                     ),
                     None => (None, 0),
                 };
@@ -1553,6 +1903,7 @@ impl S3 for Sqlite {
             last_modified: Some(object.last_modified.into()),
             metadata: object.metadata,
             parts_count: (completed_part_count > 0).then_some(completed_part_count),
+            version_id: Some(object.version_id),
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -1564,7 +1915,12 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<GetObjectAclInput>,
     ) -> S3Result<S3Response<GetObjectAclOutput>> {
-        let GetObjectAclInput { bucket, key, .. } = req.input;
+        let GetObjectAclInput {
+            bucket,
+            key,
+            version_id,
+            ..
+        } = req.input;
 
         let connection = self
             .try_get_connection(&bucket)
@@ -1573,7 +1929,15 @@ impl S3 for Sqlite {
         connection
             .read(move |connection| {
                 let transaction = connection.transaction()?;
-                Self::try_get_metadata(&transaction, &key)?.ok_or(SqliteError::ObjectNotFound)?;
+                match version_id.as_deref() {
+                    Some(version_id) => {
+                        Self::try_get_version_metadata(&transaction, &key, version_id)?
+                            .filter(|metadata| metadata.is_delete_marker.not())
+                            .ok_or(SqliteError::ObjectVersionNotFound)?
+                    }
+                    None => Self::try_get_metadata(&transaction, &key)?
+                        .ok_or(SqliteError::ObjectNotFound)?,
+                };
                 Ok(())
             })
             .await
@@ -1732,7 +2096,7 @@ impl S3 for Sqlite {
         Ok(S3Response::new(output))
     }
 
-    /// Lists unversioned objects using the `ListObjectVersions` response shape.
+    /// Lists all object versions and delete markers.
     #[tracing::instrument]
     async fn list_object_versions(
         &self,
@@ -1767,30 +2131,33 @@ impl S3 for Sqlite {
         let owner = owner();
 
         let listing = self
-            .list_keys(
+            .list_versions(
                 &bucket,
                 &prefix_filter,
                 delimiter_filter.as_deref(),
                 key_marker.clone(),
+                version_id_marker.clone(),
                 max_keys_usize,
             )
             .await?;
         let versions = listing
-            .keys
+            .versions
             .into_iter()
             .map(|summary| object_version_from_summary(summary, encode_keys, Some(&owner)))
             .collect::<Vec<_>>();
+        let delete_markers = listing
+            .delete_markers
+            .into_iter()
+            .map(|summary| delete_marker_from_summary(summary, encode_keys, Some(&owner)))
+            .collect::<Vec<_>>();
 
         let next_key_marker = listing
-            .is_truncated
-            .then(|| {
-                listing
-                    .next_marker
-                    .clone()
-                    .map(|marker| encode_list_value(marker, encode_keys))
-            })
-            .flatten();
-        let next_version_id_marker = next_key_marker.as_ref().map(|_| "null".to_string());
+            .next_key_marker
+            .filter(|_| listing.is_truncated)
+            .map(|marker| encode_list_value(marker, encode_keys));
+        let next_version_id_marker = listing
+            .next_version_id_marker
+            .filter(|_| listing.is_truncated);
 
         let output = ListObjectVersionsOutput {
             common_prefixes: delimiter.as_ref().map(|_| {
@@ -1804,7 +2171,7 @@ impl S3 for Sqlite {
                     })
                     .collect::<Vec<_>>()
             }),
-            delete_markers: Some(Vec::new()),
+            delete_markers: Some(delete_markers),
             delimiter,
             encoding_type,
             is_truncated: Some(next_key_marker.is_some()),
@@ -2090,16 +2457,18 @@ impl S3 for Sqlite {
         debug!(path = %key, ?size, %md5, "write file");
 
         let md5_clone = md5.clone();
-        connection
+        let write_outcome = connection
             .write(move |connection| {
                 let transaction = connection.transaction()?;
                 Self::try_check_object_write_conditions(&transaction, &key, &write_conditions)?;
-                Self::try_put_object(
+                let outcome = Self::try_put_object(
                     &transaction,
                     KeyValue {
                         key,
+                        version_id: String::new(),
                         value: Some(value),
                         key_metadata: KeyMetadata {
+                            version_id: String::new(),
                             size,
                             metadata,
                             content_type,
@@ -2107,16 +2476,20 @@ impl S3 for Sqlite {
                             expires: expires.map(Into::into),
                             last_modified: OffsetDateTime::now_utc(),
                             md5: Some(md5_clone),
+                            is_latest: true,
+                            is_delete_marker: false,
                         },
                     },
                 )?;
-                Ok(transaction.commit()?)
+                transaction.commit()?;
+                Ok(outcome)
             })
             .await
             .map_err(s3_error_from_sqlite)?;
 
         let output = PutObjectOutput {
             e_tag: Some(ETag::Strong(md5)),
+            version_id: write_outcome.returned_version_id,
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -2292,9 +2665,17 @@ impl S3 for Sqlite {
         let copy_source_range = parse_copy_source_range(copy_source_range)?;
         let access_key = credentials.map(|credentials| credentials.access_key);
 
-        let (src_bucket, src_key) = match copy_source {
+        let (src_bucket, src_key, src_version_id) = match copy_source {
             CopySource::AccessPoint { .. } => return Err(s3_error(S3ErrorCode::NotImplemented)),
-            CopySource::Bucket { bucket, key, .. } => (bucket, key),
+            CopySource::Bucket {
+                bucket,
+                key,
+                version_id,
+            } => (
+                bucket,
+                key,
+                version_id.map(|version_id| version_id.to_string()),
+            ),
         };
         let source_conditions = ObjectReadConditions {
             etag_matches: copy_source_if_match,
@@ -2308,11 +2689,18 @@ impl S3 for Sqlite {
                 .try_get_connection(&bucket)
                 .await
                 .map_err(s3_error_from_sqlite)?;
+            let src_version_id_for_read = src_version_id.clone();
             let copy_part_result = connection
                 .write(move |connection| {
                     let transaction = connection.transaction()?;
-                    let object = Self::try_get_object(&transaction, &src_key)?
-                        .ok_or(SqliteError::ObjectNotFound)?;
+                    let object = match src_version_id_for_read.as_deref() {
+                        Some(version_id) => {
+                            Self::try_get_object_version(&transaction, &src_key, version_id)?
+                                .ok_or(SqliteError::ObjectVersionNotFound)?
+                        }
+                        None => Self::try_get_object(&transaction, &src_key)?
+                            .ok_or(SqliteError::ObjectNotFound)?,
+                    };
                     validate_copy_source_conditions(&object.key_metadata, &source_conditions)?;
                     let object_size = u64::try_from(object.key_metadata.size)
                         .map_err(|_| SqliteError::InvalidObjectRange)?;
@@ -2369,11 +2757,18 @@ impl S3 for Sqlite {
             .try_get_connection(&src_bucket)
             .await
             .map_err(s3_error_from_sqlite)?;
+        let src_version_id_for_read = src_version_id.clone();
         let copied_part = source_connection
             .read(move |connection| {
                 let transaction = connection.transaction()?;
-                let object = Self::try_get_object(&transaction, &src_key)?
-                    .ok_or(SqliteError::ObjectNotFound)?;
+                let object = match src_version_id_for_read.as_deref() {
+                    Some(version_id) => {
+                        Self::try_get_object_version(&transaction, &src_key, version_id)?
+                            .ok_or(SqliteError::ObjectVersionNotFound)?
+                    }
+                    None => Self::try_get_object(&transaction, &src_key)?
+                        .ok_or(SqliteError::ObjectNotFound)?,
+                };
                 validate_copy_source_conditions(&object.key_metadata, &source_conditions)?;
                 let object_size = u64::try_from(object.key_metadata.size)
                     .map_err(|_| SqliteError::InvalidObjectRange)?;
@@ -2639,7 +3034,7 @@ impl S3 for Sqlite {
             .collect::<S3Result<Vec<_>>>()?;
 
         let access_key = req.credentials.map(|credentials| credentials.access_key);
-        let md5 = self
+        let completed = self
             .try_complete_multipart_upload(
                 bucket.clone(),
                 key.clone(),
@@ -2650,11 +3045,13 @@ impl S3 for Sqlite {
             )
             .await
             .map_err(s3_error_from_sqlite)?;
+        debug!(version_id = %completed.version_id, "completed multipart upload");
 
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket),
             key: Some(key),
-            e_tag: Some(ETag::Strong(md5)),
+            e_tag: Some(ETag::Strong(completed.md5)),
+            version_id: completed.returned_version_id,
             ..Default::default()
         };
         Ok(S3Response::new(output))

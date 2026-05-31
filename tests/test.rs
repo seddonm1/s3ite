@@ -16,8 +16,8 @@ use aws_sdk_s3::{
     config::{Credentials, Region},
     primitives::{ByteStream, DateTime},
     types::{
-        BucketLocationConstraint, CompletedMultipartUpload, CompletedPart,
-        CreateBucketConfiguration, Delete, EncodingType, ObjectIdentifier,
+        BucketLocationConstraint, BucketVersioningStatus, CompletedMultipartUpload, CompletedPart,
+        CreateBucketConfiguration, Delete, EncodingType, ObjectIdentifier, VersioningConfiguration,
     },
 };
 use s3ite::{Bucket, Config, Sqlite};
@@ -153,6 +153,20 @@ async fn put_object(c: &Client, bucket: &str, key: &str, body: &'static [u8]) ->
     Ok(())
 }
 
+async fn put_bucket_versioning(
+    c: &Client,
+    bucket: &str,
+    status: BucketVersioningStatus,
+) -> Result<()> {
+    let versioning = VersioningConfiguration::builder().status(status).build();
+    c.put_bucket_versioning()
+        .bucket(bucket)
+        .versioning_configuration(versioning)
+        .send()
+        .await?;
+    Ok(())
+}
+
 async fn get_object_bytes(c: &Client, bucket: &str, key: &str) -> Result<Vec<u8>> {
     Ok(c.get_object()
         .bucket(bucket)
@@ -243,6 +257,60 @@ async fn upload_part_body(
         )
         .part_number(part_number)
         .build())
+}
+
+fn assert_ceph_shaped_version_id(version_id: &str) {
+    assert_eq!(version_id.len(), 31);
+    assert!(
+        version_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
+    );
+}
+
+async fn delete_all_object_versions(c: &Client, bucket: &str) -> Result<()> {
+    loop {
+        let page = c.list_object_versions().bucket(bucket).send().await?;
+        let mut deleted_any = false;
+
+        for version in page.versions() {
+            let Some(key) = version.key() else {
+                continue;
+            };
+            let Some(version_id) = version.version_id() else {
+                continue;
+            };
+            c.delete_object()
+                .bucket(bucket)
+                .key(key)
+                .version_id(version_id)
+                .send()
+                .await?;
+            deleted_any = true;
+        }
+
+        for marker in page.delete_markers() {
+            let Some(key) = marker.key() else {
+                continue;
+            };
+            let Some(version_id) = marker.version_id() else {
+                continue;
+            };
+            c.delete_object()
+                .bucket(bucket)
+                .key(key)
+                .version_id(version_id)
+                .send()
+                .await?;
+            deleted_any = true;
+        }
+
+        if !deleted_any {
+            break;
+        }
+    }
+
+    Ok(())
 }
 
 async fn delete_bucket(c: &Client, bucket: &str) -> Result<()> {
@@ -1320,6 +1388,363 @@ async fn test_list_object_versions_for_unversioned_bucket() -> Result<()> {
 
 #[tokio::test]
 #[tracing::instrument]
+async fn test_bucket_versioning_state_and_enabled_versions() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+
+    let bucket = format!("test-versioning-enabled-{}", Uuid::new_v4());
+    let key = "versioned.txt";
+    create_bucket(&context, &bucket).await?;
+
+    let default_state = context
+        .get_bucket_versioning()
+        .bucket(&bucket)
+        .send()
+        .await?;
+    assert_eq!(default_state.status(), None);
+
+    put_bucket_versioning(&context, &bucket, BucketVersioningStatus::Suspended).await?;
+    let suspended_state = context
+        .get_bucket_versioning()
+        .bucket(&bucket)
+        .send()
+        .await?;
+    assert_eq!(
+        suspended_state.status(),
+        Some(&BucketVersioningStatus::Suspended)
+    );
+    let null_put = context
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"null"))
+        .send()
+        .await?;
+    assert_eq!(null_put.version_id(), None);
+
+    put_bucket_versioning(&context, &bucket, BucketVersioningStatus::Enabled).await?;
+    let enabled_state = context
+        .get_bucket_versioning()
+        .bucket(&bucket)
+        .send()
+        .await?;
+    assert_eq!(
+        enabled_state.status(),
+        Some(&BucketVersioningStatus::Enabled)
+    );
+
+    let first = context
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"first"))
+        .send()
+        .await?
+        .version_id()
+        .ok_or_else(|| anyhow::anyhow!("enabled PutObject missing version ID"))?
+        .to_string();
+    let second = context
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"second"))
+        .send()
+        .await?
+        .version_id()
+        .ok_or_else(|| anyhow::anyhow!("enabled PutObject missing version ID"))?
+        .to_string();
+    assert_ne!(first, second);
+    assert_ceph_shaped_version_id(&first);
+    assert_ceph_shaped_version_id(&second);
+
+    assert_eq!(get_object_bytes(&context, &bucket, key).await?, b"second");
+    let first_body = context
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .version_id(&first)
+        .send()
+        .await?
+        .body
+        .collect()
+        .await?
+        .into_bytes();
+    assert_eq!(first_body.as_ref(), b"first");
+
+    let delete_marker = context
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+    assert_eq!(delete_marker.delete_marker(), Some(true));
+    let delete_marker_version = delete_marker
+        .version_id()
+        .ok_or_else(|| anyhow::anyhow!("delete marker response missing version ID"))?
+        .to_string();
+    assert_ceph_shaped_version_id(&delete_marker_version);
+
+    let Err(err) = context.get_object().bucket(&bucket).key(key).send().await else {
+        anyhow::bail!("current delete marker should hide object");
+    };
+    assert_error_contains(err, "NoSuchKey");
+    let second_body = context
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .version_id(&second)
+        .send()
+        .await?
+        .body
+        .collect()
+        .await?
+        .into_bytes();
+    assert_eq!(second_body.as_ref(), b"second");
+
+    let versions = context
+        .list_object_versions()
+        .bucket(&bucket)
+        .send()
+        .await?;
+    assert_eq!(versions.delete_markers().len(), 1);
+    assert_eq!(versions.versions().len(), 3);
+    assert_eq!(
+        versions
+            .delete_markers()
+            .first()
+            .and_then(|marker| marker.version_id()),
+        Some(delete_marker_version.as_str())
+    );
+    assert!(
+        versions
+            .delete_markers()
+            .first()
+            .and_then(|marker| marker.is_latest())
+            .unwrap_or(false)
+    );
+
+    context
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .version_id(&delete_marker_version)
+        .send()
+        .await?;
+    assert_eq!(get_object_bytes(&context, &bucket, key).await?, b"second");
+
+    delete_all_object_versions(&context, &bucket).await?;
+    delete_bucket(&context, &bucket).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_suspended_versioning_replaces_null_version() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+
+    let bucket = format!("test-versioning-suspended-{}", Uuid::new_v4());
+    let key = "suspended.txt";
+    create_bucket(&context, &bucket).await?;
+
+    put_bucket_versioning(&context, &bucket, BucketVersioningStatus::Enabled).await?;
+    let generated = context
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"generated"))
+        .send()
+        .await?
+        .version_id()
+        .ok_or_else(|| anyhow::anyhow!("enabled PutObject missing version ID"))?
+        .to_string();
+
+    put_bucket_versioning(&context, &bucket, BucketVersioningStatus::Suspended).await?;
+    let null_put = context
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"null-one"))
+        .send()
+        .await?;
+    assert_eq!(null_put.version_id(), None);
+    context
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"null-two"))
+        .send()
+        .await?;
+    assert_eq!(get_object_bytes(&context, &bucket, key).await?, b"null-two");
+
+    let listed = context
+        .list_object_versions()
+        .bucket(&bucket)
+        .send()
+        .await?;
+    let null_versions = listed
+        .versions()
+        .iter()
+        .filter(|version| version.version_id() == Some("null"))
+        .count();
+    assert_eq!(null_versions, 1);
+    assert!(listed.versions().iter().any(|version| {
+        version.version_id() == Some(generated.as_str()) && !version.is_latest().unwrap_or(true)
+    }));
+
+    let delete_marker = context
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+    assert_eq!(delete_marker.delete_marker(), Some(true));
+    assert_eq!(delete_marker.version_id(), Some("null"));
+    let Err(err) = context.get_object().bucket(&bucket).key(key).send().await else {
+        anyhow::bail!("suspended null delete marker should hide object");
+    };
+    assert_error_contains(err, "NoSuchKey");
+
+    let generated_body = context
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .version_id(&generated)
+        .send()
+        .await?
+        .body
+        .collect()
+        .await?
+        .into_bytes();
+    assert_eq!(generated_body.as_ref(), b"generated");
+
+    delete_all_object_versions(&context, &bucket).await?;
+    delete_bucket(&context, &bucket).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_versioned_copy_and_multipart_completion() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+
+    let bucket = format!("test-ver-cp-mp-{}", Uuid::new_v4());
+    create_bucket(&context, &bucket).await?;
+    put_bucket_versioning(&context, &bucket, BucketVersioningStatus::Enabled).await?;
+
+    let source_first = context
+        .put_object()
+        .bucket(&bucket)
+        .key("source.txt")
+        .body(ByteStream::from_static(b"source-one"))
+        .send()
+        .await?
+        .version_id()
+        .ok_or_else(|| anyhow::anyhow!("enabled PutObject missing version ID"))?
+        .to_string();
+    context
+        .put_object()
+        .bucket(&bucket)
+        .key("source.txt")
+        .body(ByteStream::from_static(b"source-two"))
+        .send()
+        .await?;
+
+    let copy = context
+        .copy_object()
+        .bucket(&bucket)
+        .key("copied.txt")
+        .copy_source(format!("{bucket}/source.txt?versionId={source_first}"))
+        .send()
+        .await?;
+    let copy_version = copy
+        .version_id()
+        .ok_or_else(|| anyhow::anyhow!("versioned CopyObject missing version ID"))?
+        .to_string();
+    assert_ceph_shaped_version_id(&copy_version);
+    assert_eq!(
+        get_object_bytes(&context, &bucket, "copied.txt").await?,
+        b"source-one"
+    );
+
+    let key = "multipart-version.txt";
+    let upload_id = create_multipart_upload_id(&context, &bucket, key).await?;
+    let first_part = vec![b'a'; 5 * 1024 * 1024];
+    let part1 = upload_part_body(
+        &context,
+        &bucket,
+        key,
+        &upload_id,
+        1,
+        ByteStream::from(first_part.clone()),
+    )
+    .await?;
+    let part2 = upload_part(&context, &bucket, key, &upload_id, 2, b"tail").await?;
+    let upload = CompletedMultipartUpload::builder()
+        .set_parts(Some(vec![part1, part2]))
+        .build();
+    let complete = context
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(upload)
+        .send()
+        .await?;
+    let multipart_version = complete
+        .version_id()
+        .ok_or_else(|| anyhow::anyhow!("versioned CompleteMultipartUpload missing version ID"))?
+        .to_string();
+    assert_ceph_shaped_version_id(&multipart_version);
+    let first_part_body = context
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .version_id(&multipart_version)
+        .part_number(1)
+        .send()
+        .await?
+        .body
+        .collect()
+        .await?
+        .into_bytes();
+    assert_eq!(first_part_body.as_ref(), first_part.as_slice());
+
+    delete_all_object_versions(&context, &bucket).await?;
+    delete_bucket(&context, &bucket).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_old_bucket_schema_is_rejected() -> Result<()> {
+    let _guard = serial().await;
+    let root = PathBuf::from(FS_ROOT).join(format!("old-schema-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+    let connection = rusqlite::Connection::open(root.join("old.sqlite3"))?;
+    connection.execute("CREATE TABLE data (key TEXT PRIMARY KEY, value BLOB);", ())?;
+
+    let config = Config {
+        root: root.clone(),
+        ..Default::default()
+    };
+    let err = Sqlite::new(&config)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("old bucket schema should fail startup"))?;
+    assert_error_contains(err, "UnsupportedSchemaVersion");
+
+    fs::remove_dir_all(root)?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
 async fn test_delete_and_trailing_slash_conformance() -> Result<()> {
     let _guard = serial().await;
     let context = TestContext::new(None).await?;
@@ -1530,6 +1955,13 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
         anyhow::bail!("small multipart completion should fail");
     };
     assert_error_contains(err, "EntityTooSmall");
+    context
+        .abort_multipart_upload()
+        .bucket(&bucket)
+        .key(small_key)
+        .upload_id(&small_upload_id)
+        .send()
+        .await?;
 
     let key = "valid.txt";
     let upload_id = context
@@ -1617,6 +2049,13 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
         anyhow::bail!("completion with missing part should fail");
     };
     assert_error_contains(err, "InvalidPart");
+    context
+        .abort_multipart_upload()
+        .bucket(&bucket)
+        .key(missing_key)
+        .upload_id(&missing_upload_id)
+        .send()
+        .await?;
 
     let wrong_key = "wrong-etag.txt";
     let wrong_upload_id = context
@@ -1649,6 +2088,13 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
         anyhow::bail!("completion with wrong ETag should fail");
     };
     assert_error_contains(err, "InvalidPart");
+    context
+        .abort_multipart_upload()
+        .bucket(&bucket)
+        .key(wrong_key)
+        .upload_id(&wrong_upload_id)
+        .send()
+        .await?;
 
     let order_key = "out-of-order.txt";
     let order_upload_id = context
@@ -1678,6 +2124,13 @@ async fn test_multipart_completion_validation_and_etag() -> Result<()> {
         anyhow::bail!("out-of-order multipart completion should fail");
     };
     assert_error_contains(err, "InvalidPartOrder");
+    context
+        .abort_multipart_upload()
+        .bucket(&bucket)
+        .key(order_key)
+        .upload_id(&order_upload_id)
+        .send()
+        .await?;
 
     delete_object(&context, &bucket, key).await?;
     delete_bucket(&context, &bucket).await?;
