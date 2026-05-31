@@ -607,6 +607,19 @@ async fn test_put_object_conditionals_are_transactional() -> Result<()> {
     };
     assert_error_contains(err, "NoSuchKey");
 
+    let Err(err) = context
+        .put_object()
+        .bucket(&bucket)
+        .key("missing-if-match-etag.txt")
+        .if_match("\"00000000000000000000000000000000\"")
+        .body(ByteStream::from_static(b"blocked"))
+        .send()
+        .await
+    else {
+        anyhow::bail!("concrete If-Match should reject writes to missing objects");
+    };
+    assert_error_contains(err, "NoSuchKey");
+
     context
         .put_object()
         .bucket(&bucket)
@@ -1730,6 +1743,51 @@ async fn test_complete_multipart_upload_conditionals() -> Result<()> {
     };
     assert_error_contains(err, "PreconditionFailed");
     assert_eq!(get_object_bytes(&context, &bucket, key).await?, b"old");
+
+    let missing_key = "missing-conditional-multipart.txt";
+    let missing_upload_id = context
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key(missing_key)
+        .send()
+        .await?
+        .upload_id
+        .ok_or_else(|| anyhow::anyhow!("create multipart response missing upload ID"))?;
+    let missing_first = vec![b'm'; 5 * 1024 * 1024];
+    let missing_part1 = upload_part_body(
+        &context,
+        &bucket,
+        missing_key,
+        &missing_upload_id,
+        1,
+        ByteStream::from(missing_first),
+    )
+    .await?;
+    let missing_part2 = upload_part(
+        &context,
+        &bucket,
+        missing_key,
+        &missing_upload_id,
+        2,
+        b"blocked",
+    )
+    .await?;
+    let missing_upload = CompletedMultipartUpload::builder()
+        .set_parts(Some(vec![missing_part1, missing_part2]))
+        .build();
+    let Err(err) = context
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key(missing_key)
+        .upload_id(&missing_upload_id)
+        .multipart_upload(missing_upload)
+        .if_match("\"00000000000000000000000000000000\"")
+        .send()
+        .await
+    else {
+        anyhow::bail!("concrete If-Match should reject multipart writes to missing objects");
+    };
+    assert_error_contains(err, "NoSuchKey");
 
     let upload_id = context
         .create_multipart_upload()

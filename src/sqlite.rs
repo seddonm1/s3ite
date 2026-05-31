@@ -668,9 +668,8 @@ impl Sqlite {
         }
 
         let current = Self::try_get_metadata(transaction, key)?;
-        if current.is_none()
-            && matches!(conditions.if_match.as_ref(), Some(ObjectTagCondition::Any))
-        {
+        // S3 reports a missing object before evaluating any If-Match tag.
+        if current.is_none() && conditions.if_match.is_some() {
             return Err(SqliteError::ObjectNotFound);
         }
 
