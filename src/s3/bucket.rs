@@ -1,0 +1,380 @@
+use super::{
+    Bucket, BucketVersioningState, BucketVersioningStatus, CreateBucketInput, CreateBucketOutput,
+    DeleteBucketInput, DeleteBucketOutput, GetBucketLocationInput, GetBucketLocationOutput,
+    GetBucketVersioningInput, GetBucketVersioningOutput, HeadBucketInput, HeadBucketOutput,
+    InternalError, ListBucketsInput, ListBucketsOutput, MFADelete, Not, OWNER_DISPLAY_NAME,
+    OWNER_ID, Owner, PutBucketVersioningInput, PutBucketVersioningOutput, S3Error, S3ErrorCode,
+    S3Request, S3Response, S3Result, Sqlite, SqliteError, Timestamp, decode_continuation_token,
+    encode_continuation_token, fs, list_limit, s3_error, s3_error_from_sqlite,
+    s3_error_with_message,
+};
+
+/// Returns whether a bucket name satisfies S3 DNS-compatible naming rules.
+pub(super) fn is_valid_bucket_name(bucket: &str) -> bool {
+    let bytes = bucket.as_bytes();
+    if !(3..=63).contains(&bytes.len()) {
+        return false;
+    }
+    if looks_like_ipv4_address(bucket) {
+        return false;
+    }
+    if matches!(bytes.first(), Some(b'.' | b'-')) || matches!(bytes.last(), Some(b'.' | b'-')) {
+        return false;
+    }
+
+    for pair in bytes.windows(2) {
+        if matches!(pair, b".." | b".-" | b"-.") {
+            return false;
+        }
+    }
+
+    bytes
+        .iter()
+        .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-'))
+}
+
+/// Returns whether a bucket name has an IPv4-address shape.
+fn looks_like_ipv4_address(bucket: &str) -> bool {
+    let mut parts = bucket.split('.');
+    if parts.clone().count() != 4 {
+        return false;
+    }
+    parts.all(|part| {
+        part.parse::<u8>()
+            .is_ok_and(|value| part == value.to_string())
+    })
+}
+
+/// Returns the canonical owner used by s3ite ACL and listing responses.
+pub(super) fn owner() -> Owner {
+    Owner {
+        display_name: Some(OWNER_DISPLAY_NAME.to_string()),
+        id: Some(OWNER_ID.to_string()),
+    }
+}
+
+/// Creates a bucket database if it does not already exist.
+#[tracing::instrument]
+pub(super) async fn create_bucket(
+    sqlite: &Sqlite,
+    req: S3Request<CreateBucketInput>,
+) -> S3Result<S3Response<CreateBucketOutput>> {
+    let CreateBucketInput { bucket, .. } = req.input;
+
+    if is_valid_bucket_name(&bucket).not() {
+        return Err(s3_error(S3ErrorCode::InvalidBucketName));
+    }
+
+    sqlite
+        .try_create_bucket(&bucket)
+        .await
+        .map_err(s3_error_from_sqlite)?;
+
+    let output = CreateBucketOutput {
+        location: Some(format!("/{bucket}")),
+    };
+    Ok(S3Response::new(output))
+}
+
+/// Deletes an empty bucket database and its `SQLite` sidecar files.
+#[tracing::instrument]
+pub(super) async fn delete_bucket(
+    sqlite: &Sqlite,
+    req: S3Request<DeleteBucketInput>,
+) -> S3Result<S3Response<DeleteBucketOutput>> {
+    let DeleteBucketInput { bucket, .. } = req.input;
+
+    sqlite
+        .validate_mutable_bucket(&bucket)
+        .map_err(s3_error_from_sqlite)?;
+
+    let connection = sqlite
+        .try_get_connection(&bucket)
+        .await
+        .map_err(s3_error_from_sqlite)?;
+    let has_objects = connection
+        .read(|connection| {
+            let transaction = connection.transaction()?;
+            Sqlite::try_has_objects(&transaction)
+        })
+        .await
+        .map_err(s3_error_from_sqlite)?;
+    if has_objects {
+        return Err(s3_error(S3ErrorCode::BucketNotEmpty));
+    }
+
+    let connection = sqlite
+        .buckets
+        .write()
+        .await
+        .remove(&bucket)
+        .ok_or(SqliteError::BucketNotFound)
+        .map_err(s3_error_from_sqlite)?;
+
+    connection.close().await.map_err(s3_error_from_sqlite)?;
+
+    let bucket_path = sqlite
+        .get_bucket_path(&bucket)
+        .map_err(s3_error_from_sqlite)?;
+    fs::remove_file(&bucket_path)
+        .await
+        .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
+    fs::remove_file(format!("{}-wal", bucket_path.to_string_lossy()))
+        .await
+        .ok();
+    fs::remove_file(format!("{}-shm", bucket_path.to_string_lossy()))
+        .await
+        .ok();
+
+    Ok(S3Response::new(DeleteBucketOutput {}))
+}
+
+/// Returns the default bucket location for an existing bucket.
+#[tracing::instrument]
+pub(super) async fn get_bucket_location(
+    sqlite: &Sqlite,
+    req: S3Request<GetBucketLocationInput>,
+) -> S3Result<S3Response<GetBucketLocationOutput>> {
+    let GetBucketLocationInput { bucket, .. } = req.input;
+
+    if sqlite.buckets.read().await.contains_key(&bucket).not() {
+        return Err(s3_error(S3ErrorCode::NoSuchBucket));
+    }
+
+    let file_path = sqlite
+        .get_bucket_path(&bucket)
+        .map_err(s3_error_from_sqlite)?;
+    if file_path.exists().not() {
+        return Err(s3_error(S3ErrorCode::NoSuchBucket));
+    }
+
+    let output = GetBucketLocationOutput::default();
+    Ok(S3Response::new(output))
+}
+
+/// Returns the bucket versioning state.
+#[tracing::instrument]
+pub(super) async fn get_bucket_versioning(
+    sqlite: &Sqlite,
+    req: S3Request<GetBucketVersioningInput>,
+) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+    let GetBucketVersioningInput { bucket, .. } = req.input;
+    let connection = sqlite
+        .try_get_connection(&bucket)
+        .await
+        .map_err(s3_error_from_sqlite)?;
+    let state = connection
+        .read(|connection| {
+            let transaction = connection.transaction()?;
+            Sqlite::try_get_bucket_versioning_state(&transaction)
+        })
+        .await
+        .map_err(s3_error_from_sqlite)?;
+
+    let status = match state {
+        BucketVersioningState::NeverConfigured => None,
+        BucketVersioningState::Enabled => Some(BucketVersioningStatus::from_static(
+            BucketVersioningStatus::ENABLED,
+        )),
+        BucketVersioningState::Suspended => Some(BucketVersioningStatus::from_static(
+            BucketVersioningStatus::SUSPENDED,
+        )),
+    };
+
+    Ok(S3Response::new(GetBucketVersioningOutput {
+        status,
+        ..Default::default()
+    }))
+}
+
+/// Updates the bucket versioning state.
+#[tracing::instrument]
+pub(super) async fn put_bucket_versioning(
+    sqlite: &Sqlite,
+    req: S3Request<PutBucketVersioningInput>,
+) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+    let PutBucketVersioningInput {
+        bucket,
+        versioning_configuration,
+        ..
+    } = req.input;
+
+    sqlite
+        .validate_mutable_bucket(&bucket)
+        .map_err(s3_error_from_sqlite)?;
+
+    if versioning_configuration
+        .mfa_delete
+        .as_ref()
+        .is_some_and(|mfa_delete| mfa_delete.as_str() == MFADelete::ENABLED)
+    {
+        return Err(s3_error_with_message(
+            S3ErrorCode::InvalidRequest,
+            "MFA Delete is not supported",
+        ));
+    }
+
+    let state = match versioning_configuration
+        .status
+        .as_ref()
+        .map(BucketVersioningStatus::as_str)
+    {
+        Some(BucketVersioningStatus::ENABLED) => BucketVersioningState::Enabled,
+        Some(BucketVersioningStatus::SUSPENDED) => BucketVersioningState::Suspended,
+        _ => {
+            return Err(s3_error_with_message(
+                S3ErrorCode::InvalidArgument,
+                "versioning status must be Enabled or Suspended",
+            ));
+        }
+    };
+
+    let connection = sqlite
+        .try_get_connection(&bucket)
+        .await
+        .map_err(s3_error_from_sqlite)?;
+    connection
+        .write(move |connection| {
+            let transaction = connection.transaction()?;
+            Sqlite::try_put_bucket_versioning_state(&transaction, state)?;
+            Ok(transaction.commit()?)
+        })
+        .await
+        .map_err(s3_error_from_sqlite)?;
+
+    Ok(S3Response::new(PutBucketVersioningOutput::default()))
+}
+
+/// Checks whether a bucket exists.
+#[tracing::instrument]
+pub(super) async fn head_bucket(
+    sqlite: &Sqlite,
+    req: S3Request<HeadBucketInput>,
+) -> S3Result<S3Response<HeadBucketOutput>> {
+    let HeadBucketInput { bucket, .. } = req.input;
+
+    if sqlite.buckets.read().await.contains_key(&bucket).not() {
+        return Err(s3_error(S3ErrorCode::NoSuchBucket));
+    }
+
+    let file_path = sqlite
+        .get_bucket_path(&bucket)
+        .map_err(s3_error_from_sqlite)?;
+    if file_path.exists().not() {
+        return Err(s3_error(S3ErrorCode::NoSuchBucket));
+    }
+
+    Ok(S3Response::new(HeadBucketOutput {
+        access_point_alias: None,
+        bucket_location_name: None,
+        bucket_location_type: None,
+        bucket_region: None,
+    }))
+}
+
+/// Lists all open bucket databases.
+#[tracing::instrument]
+pub(super) async fn list_buckets(
+    sqlite: &Sqlite,
+    req: S3Request<ListBucketsInput>,
+) -> S3Result<S3Response<ListBucketsOutput>> {
+    let ListBucketsInput {
+        bucket_region: _,
+        continuation_token,
+        max_buckets,
+        prefix,
+    } = req.input;
+
+    let limit = usize::try_from(list_limit(max_buckets, 10_000, 10_000)?)
+        .map_err(S3Error::internal_error)?;
+    let after_bucket = continuation_token
+        .as_deref()
+        .map(decode_continuation_token)
+        .transpose()?;
+    let prefix_filter = prefix
+        .as_deref()
+        .and_then(|prefix| prefix.is_empty().not().then_some(prefix));
+    let mut names = sqlite
+        .buckets
+        .read()
+        .await
+        .keys()
+        .filter(|name| prefix_filter.is_none_or(|prefix| name.starts_with(prefix)))
+        .cloned()
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+
+    let start = after_bucket.as_ref().map_or(0, |after_bucket| {
+        names.partition_point(|name| name.as_str() <= after_bucket.as_str())
+    });
+    let page_names = names
+        .into_iter()
+        .skip(start)
+        .take(limit.saturating_add(1))
+        .collect::<Vec<_>>();
+    let is_truncated = page_names.len() > limit;
+    let mut buckets: Vec<Bucket> = Vec::with_capacity(page_names.len().min(limit));
+    let mut last_bucket_name = None;
+
+    for name in page_names.into_iter().take(limit) {
+        let file_path = sqlite
+            .get_bucket_path(&name)
+            .map_err(s3_error_from_sqlite)?;
+        let file_meta = fs::metadata(file_path)
+            .await
+            .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
+        let created_or_modified_date = Timestamp::from(
+            file_meta
+                .created()
+                .or_else(|_| file_meta.modified())
+                .map_err(S3Error::internal_error)?,
+        );
+
+        let bucket = Bucket {
+            bucket_region: None,
+            creation_date: Some(created_or_modified_date),
+            name: Some(name.clone()),
+        };
+        buckets.push(bucket);
+        last_bucket_name = Some(name);
+    }
+
+    let output = ListBucketsOutput {
+        continuation_token: is_truncated
+            .then(|| last_bucket_name.as_deref().map(encode_continuation_token))
+            .flatten(),
+        buckets: Some(buckets),
+        owner: None,
+        prefix,
+    };
+    Ok(S3Response::new(output))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_valid_bucket_name;
+
+    #[test]
+    fn validates_dns_bucket_names() {
+        for bucket in [
+            "abc",
+            "a.b-c",
+            "a234567890123456789012345678901234567890123456789012345678901",
+        ] {
+            assert!(is_valid_bucket_name(bucket), "{bucket}");
+        }
+
+        for bucket in [
+            "ab",
+            "foo_bar",
+            "foo-",
+            "foo.",
+            "foo..bar",
+            "foo.-bar",
+            "foo-.bar",
+            "192.168.5.123",
+        ] {
+            assert!(!is_valid_bucket_name(bucket), "{bucket}");
+        }
+    }
+}
