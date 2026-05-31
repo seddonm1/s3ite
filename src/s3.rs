@@ -1814,13 +1814,13 @@ impl S3 for Sqlite {
 
         let start = usize::try_from(object_range.start).map_err(S3Error::internal_error)?;
         let end = usize::try_from(object_range.end).map_err(S3Error::internal_error)?;
-        let Some(value) = value.get(start..end) else {
+        if start > end || end > value.len() {
             return Err(S3Error::with_message(
                 InternalError,
                 "object metadata size exceeds stored value length",
             ));
-        };
-        let value = Bytes::copy_from_slice(value);
+        }
+        let value = Bytes::from(value).slice(start..end);
         let body = stream::once(async { Ok(value) });
 
         let output = GetObjectOutput {
