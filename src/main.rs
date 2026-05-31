@@ -21,6 +21,10 @@ use tower_http::cors::CorsLayer;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+mod header_auth;
+
+use self::header_auth::HeaderAuthCompatLayer;
+
 type MainResult<T> = std::result::Result<T, MainError>;
 
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +46,7 @@ async fn main() -> MainResult<()> {
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     let config = Config::from_args()?;
+    let auth_compat = HeaderAuthCompatLayer::new(config.secret_key.clone());
 
     // Setup S3 provider
     let sqlite = Sqlite::new(&config).await?;
@@ -101,6 +106,7 @@ async fn main() -> MainResult<()> {
                 TowerToHyperService::new(
                     tower::ServiceBuilder::new()
                         .layer(CorsLayer::very_permissive())
+                        .layer(auth_compat.clone())
                         .layer(ConcurrencyLimitLayer::new(config.concurrency_limit.into()))
                         .service(svc.clone()),
                 ),
@@ -114,6 +120,7 @@ async fn main() -> MainResult<()> {
                 io,
                 TowerToHyperService::new(
                     tower::ServiceBuilder::new()
+                        .layer(auth_compat.clone())
                         .layer(ConcurrencyLimitLayer::new(config.concurrency_limit.into()))
                         .service(svc.clone()),
                 ),

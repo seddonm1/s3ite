@@ -30,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replace process-global listing continuation snapshots with keyset pagination over ordered keys.
 - Reduce the direct dependency surface by removing unused dependencies, feature-gating binary-only crates, and replacing `crossbeam-channel` worker queues with `std::sync::mpsc::sync_channel`.
 - Ignore local reference clones and local `s3-tests` runtime artifacts.
-- Run the local `s3-tests` helper against a release `s3ite` build by default.
+- Run the local `s3-tests` helper against a release `s3ite` build and exclude `fails_on_rgw` tests by default.
 
 ### Fixed
 

@@ -24,6 +24,19 @@ if [[ "${#pytest_args[@]}" -eq 0 ]]; then
   pytest_args=("s3tests/functional")
 fi
 
+has_mark_expression=false
+for arg in "${pytest_args[@]}"; do
+  case "$arg" in
+    -m|--markexpr|--markexpr=*)
+      has_mark_expression=true
+      ;;
+  esac
+done
+
+if [[ "$has_mark_expression" == false ]]; then
+  pytest_args=(-m "not fails_on_rgw" "${pytest_args[@]}")
+fi
+
 find_uv() {
   if [[ -n "${UV:-}" && -x "${UV:-}" ]]; then
     printf '%s\n' "$UV"
