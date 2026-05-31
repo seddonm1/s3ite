@@ -31,7 +31,7 @@ use s3s::{
         Range as S3Range, StorageClass, StreamingBlob, Timestamp, Type, UploadPartCopyInput,
         UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
     },
-    header::{CONTENT_MD5, CONTENT_TYPE, ETAG},
+    header::{CONTENT_MD5, CONTENT_TYPE, ETAG, X_AMZ_DELETE_MARKER, X_AMZ_REQUEST_ID},
 };
 use time::OffsetDateTime;
 use tokio::{
@@ -55,7 +55,7 @@ const OWNER_ID: &str = "s3ite";
 
 /// Maps storage-layer failures into S3 protocol errors at the service boundary.
 fn s3_error_from_sqlite(error: SqliteError) -> S3Error {
-    match error {
+    with_request_id(match error {
         SqliteError::BucketNotFound => S3Error::new(S3ErrorCode::NoSuchBucket),
         SqliteError::BucketReadOnly => S3Error::with_message(
             S3ErrorCode::MethodNotAllowed,
@@ -74,17 +74,48 @@ fn s3_error_from_sqlite(error: SqliteError) -> S3Error {
         }
         SqliteError::Configuration(message) => S3Error::with_message(InternalError, message),
         error => S3Error::internal_error(error),
-    }
+    })
 }
 
 /// Builds an S3 protocol error with no custom message.
 fn s3_error(code: S3ErrorCode) -> S3Error {
-    S3Error::new(code)
+    with_request_id(S3Error::new(code))
 }
 
 /// Builds an S3 protocol error with a custom message.
 fn s3_error_with_message(code: S3ErrorCode, message: &'static str) -> S3Error {
-    S3Error::with_message(code, message)
+    with_request_id(S3Error::with_message(code, message))
+}
+
+/// Adds a request ID to an error body and response headers.
+fn with_request_id(mut error: S3Error) -> S3Error {
+    let request_id = Uuid::new_v4().simple().to_string();
+    error.set_request_id(request_id.clone());
+
+    let mut headers = error
+        .headers()
+        .cloned()
+        .unwrap_or_else(|| S3Response::new(()).headers);
+    if let Ok(request_id) = request_id.parse() {
+        headers.insert(X_AMZ_REQUEST_ID, request_id);
+    }
+    error.set_headers(headers);
+    error
+}
+
+/// Builds a missing-object error with the S3 delete-marker header.
+fn not_found_delete_marker_error(is_delete_marker: bool) -> S3Error {
+    let mut error = s3_error(S3ErrorCode::NoSuchKey);
+    let mut headers = error
+        .headers()
+        .cloned()
+        .unwrap_or_else(|| S3Response::new(()).headers);
+    let delete_marker = if is_delete_marker { "true" } else { "false" };
+    if let Ok(value) = delete_marker.parse() {
+        headers.insert(X_AMZ_DELETE_MARKER, value);
+    }
+    error.set_headers(headers);
+    error
 }
 
 /// Builds a 304 response error with object headers required by S3 clients.
@@ -94,7 +125,10 @@ fn not_modified_error(md5: Option<&str>) -> S3Result<S3Error> {
         return Ok(error);
     };
 
-    let mut headers = S3Response::new(()).headers;
+    let mut headers = error
+        .headers()
+        .cloned()
+        .unwrap_or_else(|| S3Response::new(()).headers);
     headers.insert(
         ETAG,
         ETag::Strong(md5.to_string())
@@ -227,6 +261,21 @@ fn validate_content_md5(
     }
 
     Ok(())
+}
+
+/// Stores HTTP content encodings while hiding S3's transport-only aws-chunked marker.
+fn normalize_content_encoding(content_encoding: Option<String>) -> Option<String> {
+    let content_encoding = content_encoding?;
+    let values = content_encoding
+        .split(',')
+        .filter_map(|value| {
+            let value = value.trim();
+            (value.is_empty().not() && value.eq_ignore_ascii_case("aws-chunked").not())
+                .then(|| value.to_string())
+        })
+        .collect::<Vec<_>>();
+
+    values.is_empty().not().then(|| values.join(", "))
 }
 
 /// Returns the common prefix produced by applying an S3 delimiter to a key.
@@ -1162,6 +1211,7 @@ impl S3 for Sqlite {
             bucket: tgt_bucket,
             key: tgt_key,
             cache_control,
+            content_encoding,
             content_type,
             copy_source,
             copy_source_if_match,
@@ -1192,6 +1242,7 @@ impl S3 for Sqlite {
         let replace_metadata = metadata_directive
             .as_ref()
             .is_some_and(|directive| directive.as_str() == MetadataDirective::REPLACE);
+        let content_encoding = normalize_content_encoding(content_encoding);
         if src_bucket.as_ref() == tgt_bucket.as_str()
             && src_key.as_ref() == tgt_key.as_str()
             && replace_metadata.not()
@@ -1232,6 +1283,7 @@ impl S3 for Sqlite {
                     if replace_metadata {
                         object.key_metadata.metadata = metadata;
                         object.key_metadata.content_type = content_type;
+                        object.key_metadata.content_encoding = content_encoding;
                         object.key_metadata.cache_control = cache_control;
                         object.key_metadata.expires = expires.map(Into::into);
                     }
@@ -1287,6 +1339,7 @@ impl S3 for Sqlite {
         if replace_metadata {
             object.key_metadata.metadata = metadata;
             object.key_metadata.content_type = content_type;
+            object.key_metadata.content_encoding = content_encoding;
             object.key_metadata.cache_control = cache_control;
             object.key_metadata.expires = expires.map(Into::into);
         }
@@ -1670,13 +1723,18 @@ impl S3 for Sqlite {
             .read(move |connection| {
                 let transaction = connection.transaction()?;
                 let object = match version_id.as_deref() {
-                    Some(version_id) => {
+                    Some(version_id) => Some(
                         Self::try_get_object_version(&transaction, &key, version_id)?
-                            .ok_or(SqliteError::ObjectVersionNotFound)?
-                    }
-                    None => Self::try_get_object(&transaction, &key)?
-                        .ok_or(SqliteError::ObjectNotFound)?,
+                            .ok_or(SqliteError::ObjectVersionNotFound)?,
+                    ),
+                    None => Self::try_get_current_object(&transaction, &key)?,
                 };
+                let Some(object) = object else {
+                    return Ok((None, None, 0));
+                };
+                if object.key_metadata.is_delete_marker {
+                    return Ok((Some(object), None, 0));
+                }
                 let (completed_part, completed_part_count) = match part_number {
                     Some(part_number) => (
                         Self::try_get_completed_object_part(
@@ -1693,10 +1751,16 @@ impl S3 for Sqlite {
                     ),
                     None => (None, 0),
                 };
-                Ok((object, completed_part, completed_part_count))
+                Ok((Some(object), completed_part, completed_part_count))
             })
             .await
             .map_err(s3_error_from_sqlite)?;
+        let Some(object) = object else {
+            return Err(not_found_delete_marker_error(false));
+        };
+        if object.key_metadata.is_delete_marker {
+            return Err(not_found_delete_marker_error(true));
+        }
         if let Err(error) = validate_read_conditions(
             &object.key_metadata,
             &ObjectReadConditions {
@@ -1763,6 +1827,7 @@ impl S3 for Sqlite {
             body: Some(StreamingBlob::wrap::<_, S3Error>(body)),
             accept_ranges: Some("bytes".to_string()),
             cache_control: object.key_metadata.cache_control,
+            content_encoding: object.key_metadata.content_encoding,
             content_range: (range.is_some() || part_number.is_some())
                 .then(|| {
                     object_range
@@ -1848,14 +1913,19 @@ impl S3 for Sqlite {
             .read(move |connection| {
                 let transaction = connection.transaction()?;
                 let object = match version_id.as_deref() {
-                    Some(version_id) => {
+                    Some(version_id) => Some(
                         Self::try_get_version_metadata(&transaction, &key, version_id)?
                             .filter(|metadata| metadata.is_delete_marker.not())
-                            .ok_or(SqliteError::ObjectVersionNotFound)?
-                    }
-                    None => Self::try_get_metadata(&transaction, &key)?
-                        .ok_or(SqliteError::ObjectNotFound)?,
+                            .ok_or(SqliteError::ObjectVersionNotFound)?,
+                    ),
+                    None => Self::try_get_current_metadata(&transaction, &key)?,
                 };
+                let Some(object) = object else {
+                    return Ok((None, None, 0));
+                };
+                if object.is_delete_marker {
+                    return Ok((Some(object), None, 0));
+                }
                 let (completed_part, completed_part_count) = match part_number {
                     Some(part_number) => (
                         Self::try_get_completed_object_part(
@@ -1872,10 +1942,16 @@ impl S3 for Sqlite {
                     ),
                     None => (None, 0),
                 };
-                Ok((object, completed_part, completed_part_count))
+                Ok((Some(object), completed_part, completed_part_count))
             })
             .await
             .map_err(s3_error_from_sqlite)?;
+        let Some(object) = object else {
+            return Err(not_found_delete_marker_error(false));
+        };
+        if object.is_delete_marker {
+            return Err(not_found_delete_marker_error(true));
+        }
         if let Err(error) = validate_read_conditions(
             &object,
             &ObjectReadConditions {
@@ -1921,6 +1997,7 @@ impl S3 for Sqlite {
         let output = HeadObjectOutput {
             accept_ranges: Some("bytes".to_string()),
             cache_control: object.cache_control,
+            content_encoding: object.content_encoding,
             content_length: Some(content_length),
             content_range: (range.is_some() || part_number.is_some())
                 .then(|| {
@@ -2003,15 +2080,44 @@ impl S3 for Sqlite {
     ) -> S3Result<S3Response<ListBucketsOutput>> {
         let ListBucketsInput {
             bucket_region: _,
-            continuation_token: _,
-            max_buckets: _,
-            prefix: _,
+            continuation_token,
+            max_buckets,
+            prefix,
         } = req.input;
 
-        let mut buckets: Vec<Bucket> = Vec::new();
+        let limit = usize::try_from(list_limit(max_buckets, 10_000, 10_000)?)
+            .map_err(S3Error::internal_error)?;
+        let after_bucket = continuation_token
+            .as_deref()
+            .map(decode_continuation_token)
+            .transpose()?;
+        let prefix_filter = prefix
+            .as_deref()
+            .and_then(|prefix| prefix.is_empty().not().then_some(prefix));
+        let mut names = self
+            .buckets
+            .read()
+            .await
+            .keys()
+            .filter(|name| prefix_filter.is_none_or(|prefix| name.starts_with(prefix)))
+            .cloned()
+            .collect::<Vec<_>>();
+        names.sort_unstable();
 
-        for name in self.buckets.read().await.keys() {
-            let file_path = self.get_bucket_path(name).map_err(s3_error_from_sqlite)?;
+        let start = after_bucket.as_ref().map_or(0, |after_bucket| {
+            names.partition_point(|name| name.as_str() <= after_bucket.as_str())
+        });
+        let page_names = names
+            .into_iter()
+            .skip(start)
+            .take(limit.saturating_add(1))
+            .collect::<Vec<_>>();
+        let is_truncated = page_names.len() > limit;
+        let mut buckets: Vec<Bucket> = Vec::with_capacity(page_names.len().min(limit));
+        let mut last_bucket_name = None;
+
+        for name in page_names.into_iter().take(limit) {
+            let file_path = self.get_bucket_path(&name).map_err(s3_error_from_sqlite)?;
             let file_meta = fs::metadata(file_path)
                 .await
                 .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
@@ -2028,13 +2134,16 @@ impl S3 for Sqlite {
                 name: Some(name.clone()),
             };
             buckets.push(bucket);
+            last_bucket_name = Some(name);
         }
 
         let output = ListBucketsOutput {
-            continuation_token: None,
+            continuation_token: is_truncated
+                .then(|| last_bucket_name.as_deref().map(encode_continuation_token))
+                .flatten(),
             buckets: Some(buckets),
             owner: None,
-            prefix: None,
+            prefix,
         };
         Ok(S3Response::new(output))
     }
@@ -2439,6 +2548,7 @@ impl S3 for Sqlite {
             key,
             metadata,
             cache_control,
+            content_encoding,
             content_length: _,
             content_md5,
             content_type,
@@ -2449,6 +2559,7 @@ impl S3 for Sqlite {
             ..
         } = input;
         let write_conditions = object_write_conditions(if_match, if_none_match);
+        let content_encoding = normalize_content_encoding(content_encoding);
 
         self.validate_mutable_bucket(&bucket)
             .map_err(s3_error_from_sqlite)?;
@@ -2505,6 +2616,7 @@ impl S3 for Sqlite {
                             size,
                             metadata,
                             content_type,
+                            content_encoding,
                             cache_control,
                             expires: expires.map(Into::into),
                             last_modified: OffsetDateTime::now_utc(),
@@ -2538,6 +2650,7 @@ impl S3 for Sqlite {
             bucket,
             key,
             cache_control,
+            content_encoding,
             content_type,
             expires,
             metadata,
@@ -2567,6 +2680,7 @@ impl S3 for Sqlite {
                         access_key: req.credentials.map(|credentials| credentials.access_key),
                         metadata,
                         content_type,
+                        content_encoding: normalize_content_encoding(content_encoding),
                         cache_control,
                         expires: expires.map(Into::into),
                     },

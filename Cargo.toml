@@ -15,6 +15,7 @@ binary = [
     "clap",
     "hyper",
     "hyper-util",
+    "http-body-util",
     "tokio/macros",
     "tokio/net",
     "tokio/rt-multi-thread",
@@ -44,6 +45,7 @@ hyper-util = { version = "0.1.20", optional = true, default-features = false, fe
     "service",
     "tokio",
 ] }
+http-body-util = { version = "0.1.3", optional = true }
 md-5 = "0.11.0-rc.5"
 mime = "0.3.17"
 path-absolutize = "3.1.1"

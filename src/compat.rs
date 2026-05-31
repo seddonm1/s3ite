@@ -1,4 +1,4 @@
-//! Header-level compatibility checks that run before the `s3s` service.
+//! Protocol compatibility layers that run before the `s3s` service.
 
 use std::{
     future::Future,
@@ -7,16 +7,116 @@ use std::{
     task::{Context, Poll},
 };
 
-use hyper::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
+use hyper::{
+    body::Incoming,
+    http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header},
+};
 use s3s::{
     Body, HttpError, HttpResponse,
     crypto::{Checksum, Sha1},
+    header::{
+        CONTENT_ENCODING, CONTENT_LENGTH, X_AMZ_CONTENT_SHA256, X_AMZ_DECODED_CONTENT_LENGTH,
+    },
 };
 use tower::{Layer, Service};
 
-// `s3s` validates authentication after request normalization. A few legacy
-// SigV2 CreateBucket requests from Ceph s3-tests need header/date checks before
-// they reach that layer, plus a path-style trailing-slash signature shim.
+type CompatBody = UnsyncBoxBody<Bytes, hyper::Error>;
+
+/// Normalizes decoded HTTP chunked uploads into fixed-length bodies for `s3s`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ChunkedBodyCompatLayer;
+
+impl<S> Layer<S> for ChunkedBodyCompatLayer {
+    type Service = ChunkedBodyCompatService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        ChunkedBodyCompatService { inner }
+    }
+}
+
+/// Service wrapper for [`ChunkedBodyCompatLayer`].
+#[derive(Clone, Debug)]
+pub(crate) struct ChunkedBodyCompatService<S> {
+    inner: S,
+}
+
+impl<S> Service<Request<Incoming>> for ChunkedBodyCompatService<S>
+where
+    S: Service<Request<CompatBody>, Response = HttpResponse, Error = HttpError>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = HttpResponse;
+    type Error = HttpError;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<Incoming>) -> Self::Future {
+        if should_preserve_body_stream(&req) {
+            let future = self.inner.call(req.map(BodyExt::boxed_unsync));
+            return Box::pin(future);
+        }
+
+        let mut inner = {
+            let clone = self.inner.clone();
+            std::mem::replace(&mut self.inner, clone)
+        };
+        Box::pin(async move {
+            let (mut parts, body) = req.into_parts();
+            let bytes = body
+                .collect()
+                .await
+                .map_err(|err| HttpError::new(Box::new(err)))?
+                .to_bytes();
+            let content_length = bytes
+                .len()
+                .to_string()
+                .parse()
+                .map_err(|err| HttpError::new(Box::new(err)))?;
+            parts.headers.insert(CONTENT_LENGTH, content_length);
+            parts.headers.remove(header::TRANSFER_ENCODING);
+            inner
+                .call(Request::from_parts(
+                    parts,
+                    Full::new(bytes)
+                        .map_err(|never| match never {})
+                        .boxed_unsync(),
+                ))
+                .await
+        })
+    }
+}
+
+fn should_preserve_body_stream(req: &Request<Incoming>) -> bool {
+    if !matches!(*req.method(), Method::PUT | Method::POST) {
+        return true;
+    }
+
+    let headers = req.headers();
+    headers.contains_key(CONTENT_LENGTH)
+        || headers.contains_key(X_AMZ_DECODED_CONTENT_LENGTH)
+        || headers
+            .get(X_AMZ_CONTENT_SHA256)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("STREAMING-"))
+        || headers
+            .get(CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case("aws-chunked"))
+            })
+}
+
+/// Handles request-header compatibility checks before `s3s` normalization.
 #[derive(Clone, Debug)]
 pub(crate) struct HeaderAuthCompatLayer {
     secret_key: Option<Arc<str>>,

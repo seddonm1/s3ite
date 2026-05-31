@@ -329,12 +329,13 @@ async fn test_list_buckets() -> Result<()> {
     let _guard = serial().await;
     let context = TestContext::new(None).await?;
 
+    let id = Uuid::new_v4();
     let buckets = vec![
-        format!("test-list-buckets-{}", Uuid::new_v4()),
-        format!("test-list-buckets-{}", Uuid::new_v4()),
-        format!("test-list-buckets-{}", Uuid::new_v4()),
-        format!("test-list-buckets-{}", Uuid::new_v4()),
-        format!("test-list-buckets-{}", Uuid::new_v4()),
+        format!("test-list-buckets-{id}-a"),
+        format!("test-list-buckets-{id}-b"),
+        format!("test-list-buckets-{id}-c"),
+        format!("test-list-buckets-{id}-d"),
+        format!("test-list-buckets-{id}-e"),
     ];
 
     for bucket in &buckets {
@@ -349,11 +350,33 @@ async fn test_list_buckets() -> Result<()> {
     }
     let list_buckets = result?;
 
-    list_buckets.buckets().iter().all(|list_bucket| {
+    assert!(list_buckets.buckets().iter().all(|list_bucket| {
         buckets
             .iter()
             .any(|bucket| Some(bucket.as_str()) == list_bucket.name())
-    });
+    }));
+
+    let first_page = context
+        .list_buckets()
+        .prefix(format!("test-list-buckets-{id}-"))
+        .max_buckets(1)
+        .send()
+        .await?;
+    assert_eq!(first_page.buckets().len(), 1);
+    assert_eq!(first_page.buckets()[0].name(), Some(buckets[0].as_str()));
+    let continuation_token = first_page
+        .continuation_token()
+        .ok_or_else(|| anyhow::anyhow!("first page should be truncated"))?;
+
+    let second_page = context
+        .list_buckets()
+        .prefix(format!("test-list-buckets-{id}-"))
+        .max_buckets(1)
+        .continuation_token(continuation_token)
+        .send()
+        .await?;
+    assert_eq!(second_page.buckets().len(), 1);
+    assert_eq!(second_page.buckets()[0].name(), Some(buckets[1].as_str()));
 
     for bucket in &buckets {
         delete_bucket(&context, bucket).await?;
@@ -412,6 +435,22 @@ async fn test_single_object() -> Result<()> {
             .map(|etag| etag.trim_matches('"')),
         Some(content_etag)
     );
+
+    context
+        .put_object()
+        .bucket(&bucket)
+        .key("encoded.txt")
+        .content_encoding("gzip, aws-chunked")
+        .body(ByteStream::from_static(b"encoded"))
+        .send()
+        .await?;
+    let encoded_head = context
+        .head_object()
+        .bucket(&bucket)
+        .key("encoded.txt")
+        .send()
+        .await?;
+    assert_eq!(encoded_head.content_encoding(), Some("gzip"));
 
     // delete_object
     delete_object(&context, &bucket, key).await?;

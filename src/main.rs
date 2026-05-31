@@ -21,9 +21,9 @@ use tower_http::cors::CorsLayer;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-mod header_auth;
+mod compat;
 
-use self::header_auth::HeaderAuthCompatLayer;
+use self::compat::{ChunkedBodyCompatLayer, HeaderAuthCompatLayer};
 
 type MainResult<T> = std::result::Result<T, MainError>;
 
@@ -107,6 +107,7 @@ async fn main() -> MainResult<()> {
                     tower::ServiceBuilder::new()
                         .layer(CorsLayer::very_permissive())
                         .layer(auth_compat.clone())
+                        .layer(ChunkedBodyCompatLayer)
                         .layer(ConcurrencyLimitLayer::new(config.concurrency_limit.into()))
                         .service(svc.clone()),
                 ),
@@ -121,6 +122,7 @@ async fn main() -> MainResult<()> {
                 TowerToHyperService::new(
                     tower::ServiceBuilder::new()
                         .layer(auth_compat.clone())
+                        .layer(ChunkedBodyCompatLayer)
                         .layer(ConcurrencyLimitLayer::new(config.concurrency_limit.into()))
                         .service(svc.clone()),
                 ),

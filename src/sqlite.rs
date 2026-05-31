@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::database::BucketConnection;
 
-const BUCKET_SCHEMA_VERSION: i32 = 1;
+const BUCKET_SCHEMA_VERSION: i32 = 2;
 const NULL_VERSION_ID: &str = "null";
 const VERSION_ID_LEN: usize = 31;
 const VERSION_ID_ALPHABET: &[u8; 64] =
@@ -37,6 +37,7 @@ CREATE TABLE object_version (
     size INTEGER NOT NULL CHECK(size >= 0),
     metadata TEXT,
     content_type TEXT,
+    content_encoding TEXT,
     cache_control TEXT,
     expires TEXT,
     last_modified TEXT NOT NULL,
@@ -55,6 +56,7 @@ CREATE TABLE object_version (
             AND size = 0
             AND metadata IS NULL
             AND content_type IS NULL
+            AND content_encoding IS NULL
             AND cache_control IS NULL
             AND expires IS NULL
             AND md5 IS NULL
@@ -91,6 +93,7 @@ CREATE TABLE multipart_upload (
     access_key TEXT,
     metadata TEXT,
     content_type TEXT,
+    content_encoding TEXT,
     cache_control TEXT,
     expires TEXT,
     UNIQUE(upload_id, bucket, key)
@@ -122,7 +125,7 @@ CREATE TABLE completed_multipart_upload (
 INSERT INTO bucket_state (id, versioning_state)
 VALUES (1, 'never_configured');
 
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 ";
 
 /// Result type returned by `SQLite` storage operations.
@@ -375,6 +378,7 @@ pub(crate) struct KeyMetadata {
     pub(crate) size: i64,
     pub(crate) metadata: Option<HashMap<String, String>>,
     pub(crate) content_type: Option<String>,
+    pub(crate) content_encoding: Option<String>,
     pub(crate) cache_control: Option<String>,
     pub(crate) expires: Option<OffsetDateTime>,
     pub(crate) last_modified: OffsetDateTime,
@@ -457,6 +461,7 @@ pub(crate) struct MultipartUploadState {
     pub(crate) access_key: Option<String>,
     pub(crate) metadata: Option<HashMap<String, String>>,
     pub(crate) content_type: Option<String>,
+    pub(crate) content_encoding: Option<String>,
     pub(crate) cache_control: Option<String>,
     pub(crate) expires: Option<OffsetDateTime>,
 }
@@ -830,6 +835,7 @@ impl Sqlite {
                     size: completed_object.size,
                     metadata: upload_state.metadata,
                     content_type: upload_state.content_type,
+                    content_encoding: upload_state.content_encoding,
                     cache_control: upload_state.cache_control,
                     expires: upload_state.expires,
                     last_modified: OffsetDateTime::now_utc(),
@@ -1197,6 +1203,14 @@ impl Sqlite {
         Self::try_get_object_internal(transaction, key, None, false)
     }
 
+    /// Fetches the current object body and metadata including delete markers.
+    pub(crate) fn try_get_current_object(
+        transaction: &Transaction,
+        key: &str,
+    ) -> SqliteResult<Option<KeyValue>> {
+        Self::try_get_object_internal(transaction, key, None, true)
+    }
+
     /// Fetches an exact visible object body and metadata by key and version ID.
     pub(crate) fn try_get_object_version(
         transaction: &Transaction,
@@ -1222,6 +1236,7 @@ impl Sqlite {
                 size,
                 metadata,
                 content_type,
+                content_encoding,
                 cache_control,
                 expires,
                 last_modified,
@@ -1256,12 +1271,13 @@ impl Sqlite {
                                 )
                             })?,
                         content_type: row.get(5)?,
-                        cache_control: row.get(6)?,
-                        expires: row.get(7)?,
-                        last_modified: row.get(8)?,
-                        md5: row.get(9)?,
-                        is_latest: row_bool(row, 10)?,
-                        is_delete_marker: row_bool(row, 11)?,
+                        content_encoding: row.get(6)?,
+                        cache_control: row.get(7)?,
+                        expires: row.get(8)?,
+                        last_modified: row.get(9)?,
+                        md5: row.get(10)?,
+                        is_latest: row_bool(row, 11)?,
+                        is_delete_marker: row_bool(row, 12)?,
                     },
                 })
             })
@@ -1276,6 +1292,14 @@ impl Sqlite {
         Self::try_get_metadata_internal(transaction, key, None, false)
     }
 
+    /// Fetches current object metadata including delete markers.
+    pub(crate) fn try_get_current_metadata(
+        transaction: &Transaction,
+        key: &str,
+    ) -> SqliteResult<Option<KeyMetadata>> {
+        Self::try_get_metadata_internal(transaction, key, None, true)
+    }
+
     /// Fetches the newest non-delete-marker metadata for conditional deletes.
     pub(crate) fn try_get_latest_object_metadata(
         transaction: &Transaction,
@@ -1288,6 +1312,7 @@ impl Sqlite {
                 size,
                 metadata,
                 content_type,
+                content_encoding,
                 cache_control,
                 expires,
                 last_modified,
@@ -1317,12 +1342,13 @@ impl Sqlite {
                             )
                         })?,
                     content_type: row.get(3)?,
-                    cache_control: row.get(4)?,
-                    expires: row.get(5)?,
-                    last_modified: row.get(6)?,
-                    md5: row.get(7)?,
-                    is_latest: row_bool(row, 8)?,
-                    is_delete_marker: row_bool(row, 9)?,
+                    content_encoding: row.get(4)?,
+                    cache_control: row.get(5)?,
+                    expires: row.get(6)?,
+                    last_modified: row.get(7)?,
+                    md5: row.get(8)?,
+                    is_latest: row_bool(row, 9)?,
+                    is_delete_marker: row_bool(row, 10)?,
                 })
             })
             .optional()?)
@@ -1351,6 +1377,7 @@ impl Sqlite {
                 size,
                 metadata,
                 content_type,
+                content_encoding,
                 cache_control,
                 expires,
                 last_modified,
@@ -1381,12 +1408,13 @@ impl Sqlite {
                             )
                         })?,
                     content_type: row.get(3)?,
-                    cache_control: row.get(4)?,
-                    expires: row.get(5)?,
-                    last_modified: row.get(6)?,
-                    md5: row.get(7)?,
-                    is_latest: row_bool(row, 8)?,
-                    is_delete_marker: row_bool(row, 9)?,
+                    content_encoding: row.get(4)?,
+                    cache_control: row.get(5)?,
+                    expires: row.get(6)?,
+                    last_modified: row.get(7)?,
+                    md5: row.get(8)?,
+                    is_latest: row_bool(row, 9)?,
+                    is_delete_marker: row_bool(row, 10)?,
                 })
             })
             .optional()?)
@@ -1430,12 +1458,13 @@ impl Sqlite {
                 size,
                 metadata,
                 content_type,
+                content_encoding,
                 cache_control,
                 expires,
                 last_modified,
                 md5
             )
-            VALUES (?1, ?2, 1, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10);",
+            VALUES (?1, ?2, 1, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11);",
         )?;
 
         let size = sql_size(key_metadata.size)?;
@@ -1450,6 +1479,7 @@ impl Sqlite {
                 .transpose()
                 .map_err(|err| ToSqlConversionFailure(Box::new(err)))?,
             key_metadata.content_type,
+            key_metadata.content_encoding,
             key_metadata.cache_control,
             key_metadata.expires,
             key_metadata.last_modified,
@@ -1652,12 +1682,13 @@ impl Sqlite {
                 size,
                 metadata,
                 content_type,
+                content_encoding,
                 cache_control,
                 expires,
                 last_modified,
                 md5
             )
-            VALUES (?1, ?2, 1, 1, NULL, 0, NULL, NULL, NULL, NULL, ?3, NULL);",
+            VALUES (?1, ?2, 1, 1, NULL, 0, NULL, NULL, NULL, NULL, NULL, ?3, NULL);",
         )?;
         Ok(stmt.execute((key, version_id, OffsetDateTime::now_utc()))?)
     }
@@ -1672,8 +1703,8 @@ impl Sqlite {
     ) -> SqliteResult<usize> {
         let mut stmt = transaction.prepare_cached(
             "
-            INSERT INTO multipart_upload (upload_id, initiated, last_modified, bucket, key, access_key, metadata, content_type, cache_control, expires)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10);",
+            INSERT INTO multipart_upload (upload_id, initiated, last_modified, bucket, key, access_key, metadata, content_type, content_encoding, cache_control, expires)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11);",
         )?;
 
         let now = OffsetDateTime::now_utc();
@@ -1690,6 +1721,7 @@ impl Sqlite {
                 .transpose()
                 .map_err(|err| ToSqlConversionFailure(Box::new(err)))?,
             state.content_type,
+            state.content_encoding,
             state.cache_control,
             state.expires,
         ))?)
@@ -1704,7 +1736,7 @@ impl Sqlite {
     ) -> SqliteResult<Option<MultipartUploadState>> {
         let mut stmt = transaction.prepare_cached(
             "
-            SELECT access_key, metadata, content_type, cache_control, expires
+            SELECT access_key, metadata, content_type, content_encoding, cache_control, expires
             FROM multipart_upload
             WHERE upload_id = ?1 AND bucket = ?2 AND key = ?3;",
         )?;
@@ -1725,8 +1757,9 @@ impl Sqlite {
                             )
                         })?,
                     content_type: row.get(2)?,
-                    cache_control: row.get(3)?,
-                    expires: row.get(4)?,
+                    content_encoding: row.get(3)?,
+                    cache_control: row.get(4)?,
+                    expires: row.get(5)?,
                 })
             })
             .optional()?)
@@ -2134,6 +2167,7 @@ mod tests {
                 access_key: None,
                 metadata: None,
                 content_type: None,
+                content_encoding: None,
                 cache_control: None,
                 expires: None,
             },
@@ -2176,6 +2210,7 @@ mod tests {
                 access_key: None,
                 metadata: None,
                 content_type: None,
+                content_encoding: None,
                 cache_control: None,
                 expires: None,
             },
