@@ -16,6 +16,7 @@ use support::{
     server::TestServer,
 };
 
+/// Verifies bucket versioning state transitions between none, suspended, and enabled.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_versioning_bucket_create_suspend() -> Result<()> {
@@ -62,6 +63,7 @@ async fn test_versioning_bucket_create_suspend() -> Result<()> {
     Ok(())
 }
 
+/// Verifies enabled versioning creates readable versions and delete markers.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_versioning_obj_create_read_remove() -> Result<()> {
@@ -139,6 +141,7 @@ async fn test_versioning_obj_create_read_remove() -> Result<()> {
     Ok(())
 }
 
+/// Verifies suspended versioning overwrites the null version and delete marker.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_versioning_obj_plain_null_version_overwrite_suspended() -> Result<()> {
@@ -199,6 +202,7 @@ async fn test_versioning_obj_plain_null_version_overwrite_suspended() -> Result<
     Ok(())
 }
 
+/// Verifies unversioned buckets list null object versions with pagination.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_list_object_versions_for_unversioned_bucket() -> Result<()> {
@@ -280,6 +284,7 @@ async fn test_list_object_versions_for_unversioned_bucket() -> Result<()> {
     Ok(())
 }
 
+/// Verifies deleted ListObjectVersions markers can still advance pagination.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_list_object_versions_deleted_marker_continues_listing() -> Result<()> {

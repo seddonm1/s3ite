@@ -19,16 +19,12 @@ use support::{
     server::TestServer,
 };
 
+/// Verifies ListObjects v1 ordering, max-keys truncation, and markers.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_bucket_list_many() -> Result<()> {
     // Mirrors s3tests/functional/test_s3.py::test_bucket_list_many
-    let server = TestServer::spawn().await?;
-    let client = sdk::client(&server);
-    let bucket = bucket_name("s3ite-list");
-
-    create_bucket(&client, &bucket).await?;
-    put_keys(&client, &bucket, &["foo", "bar", "baz"]).await?;
+    let (_server, client, bucket) = seeded_bucket(&["foo", "bar", "baz"]).await?;
 
     let first = client
         .list_objects()
@@ -52,16 +48,12 @@ async fn test_bucket_list_many() -> Result<()> {
     Ok(())
 }
 
+/// Verifies ListObjectsV2 ordering, max-keys truncation, and start-after.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_bucket_listv2_many() -> Result<()> {
     // Mirrors s3tests/functional/test_s3.py::test_bucket_listv2_many
-    let server = TestServer::spawn().await?;
-    let client = sdk::client(&server);
-    let bucket = bucket_name("s3ite-list");
-
-    create_bucket(&client, &bucket).await?;
-    put_keys(&client, &bucket, &["foo", "bar", "baz"]).await?;
+    let (_server, client, bucket) = seeded_bucket(&["foo", "bar", "baz"]).await?;
 
     let first = client
         .list_objects_v2()
@@ -87,82 +79,475 @@ async fn test_bucket_listv2_many() -> Result<()> {
     Ok(())
 }
 
+/// Verifies ListObjects v1 slash delimiters emit contents and common prefixes.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_bucket_list_delimiter_basic() -> Result<()> {
     // Mirrors s3tests/functional/test_s3.py::test_bucket_list_delimiter_basic
-    let server = TestServer::spawn().await?;
-    let client = sdk::client(&server);
-    let bucket = bucket_name("s3ite-list");
-
-    create_bucket(&client, &bucket).await?;
-    put_keys(
-        &client,
-        &bucket,
+    delimiter_case_v1(
+        "/",
+        Some("/"),
         &["foo/bar", "foo/bar/xyzzy", "quux/thud", "asdf"],
+        &["asdf"],
+        &["foo/", "quux/"],
     )
-    .await?;
-
-    let response = client
-        .list_objects()
-        .bucket(&bucket)
-        .delimiter("/")
-        .send()
-        .await?;
-    assert_eq!(response.delimiter(), Some("/"));
-    assert_eq!(object_keys(response.contents()), vec!["asdf"]);
-    assert_eq!(prefixes(response.common_prefixes()), vec!["foo/", "quux/"]);
-
-    Ok(())
+    .await
 }
 
+/// Verifies ListObjectsV2 slash delimiters emit contents, prefixes, and key count.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_bucket_listv2_delimiter_basic() -> Result<()> {
     // Mirrors s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_basic
-    let server = TestServer::spawn().await?;
-    let client = sdk::client(&server);
-    let bucket = bucket_name("s3ite-list");
-
-    create_bucket(&client, &bucket).await?;
-    put_keys(
-        &client,
-        &bucket,
+    delimiter_case_v2(
+        "/",
+        Some("/"),
         &["foo/bar", "foo/bar/xyzzy", "quux/thud", "asdf"],
+        &["asdf"],
+        &["foo/", "quux/"],
     )
-    .await?;
-
-    let response = client
-        .list_objects_v2()
-        .bucket(&bucket)
-        .delimiter("/")
-        .send()
-        .await?;
-    assert_eq!(response.delimiter(), Some("/"));
-    assert_eq!(object_keys(response.contents()), vec!["asdf"]);
-    assert_eq!(prefixes(response.common_prefixes()), vec!["foo/", "quux/"]);
-    assert_eq!(response.key_count(), Some(3));
-
-    Ok(())
+    .await
 }
 
+/// Verifies URL encoding applies to returned ListObjects v1 keys and prefixes.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_bucket_list_encoding_basic() -> Result<()> {
     // Mirrors s3tests/functional/test_s3.py::test_bucket_list_encoding_basic
+    encoding_case_v1().await
+}
+
+/// Verifies URL encoding applies to returned ListObjectsV2 keys and prefixes.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_listv2_encoding_basic() -> Result<()> {
     // Mirrors s3tests/functional/test_s3.py::test_bucket_listv2_encoding_basic
+    encoding_case_v2().await
+}
+
+/// Verifies ListObjects v1 alternate delimiter characters group prefixes literally.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_list_delimiter_alt() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_delimiter_alt
+    delimiter_case_v1(
+        "a",
+        Some("a"),
+        &["bar", "baz", "cab", "foo"],
+        &["foo"],
+        &["ba", "ca"],
+    )
+    .await
+}
+
+/// Verifies ListObjectsV2 alternate delimiter characters group prefixes literally.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_listv2_delimiter_alt() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_alt
+    delimiter_case_v2(
+        "a",
+        Some("a"),
+        &["bar", "baz", "cab", "foo"],
+        &["foo"],
+        &["ba", "ca"],
+    )
+    .await
+}
+
+/// Verifies ListObjects v1 percent delimiters are treated literally.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_list_delimiter_percentage() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_delimiter_percentage
+    delimiter_case_v1(
+        "%",
+        Some("%"),
+        &["b%ar", "b%az", "c%ab", "foo"],
+        &["foo"],
+        &["b%", "c%"],
+    )
+    .await
+}
+
+/// Verifies ListObjectsV2 percent delimiters are treated literally.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_listv2_delimiter_percentage() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_percentage
+    delimiter_case_v2(
+        "%",
+        Some("%"),
+        &["b%ar", "b%az", "c%ab", "foo"],
+        &["foo"],
+        &["b%", "c%"],
+    )
+    .await
+}
+
+/// Verifies ListObjects v1 whitespace delimiters are treated literally.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_list_delimiter_whitespace() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_delimiter_whitespace
+    delimiter_case_v1(
+        " ",
+        Some(" "),
+        &["b ar", "b az", "c ab", "foo"],
+        &["foo"],
+        &["b ", "c "],
+    )
+    .await
+}
+
+/// Verifies ListObjectsV2 whitespace delimiters are treated literally.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_listv2_delimiter_whitespace() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_whitespace
+    delimiter_case_v2(
+        " ",
+        Some(" "),
+        &["b ar", "b az", "c ab", "foo"],
+        &["foo"],
+        &["b ", "c "],
+    )
+    .await
+}
+
+/// Verifies ListObjects v1 dot delimiters are treated literally.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_list_delimiter_dot() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_delimiter_dot
+    delimiter_case_v1(
+        ".",
+        Some("."),
+        &["b.ar", "b.az", "c.ab", "foo"],
+        &["foo"],
+        &["b.", "c."],
+    )
+    .await
+}
+
+/// Verifies ListObjectsV2 dot delimiters are treated literally.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_listv2_delimiter_dot() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_dot
+    delimiter_case_v2(
+        ".",
+        Some("."),
+        &["b.ar", "b.az", "c.ab", "foo"],
+        &["foo"],
+        &["b.", "c."],
+    )
+    .await
+}
+
+/// Verifies ListObjects v1 empty delimiters do not group keys.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_list_delimiter_empty() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_delimiter_empty
+    delimiter_case_v1(
+        "",
+        None,
+        &["bar", "baz", "cab", "foo"],
+        &["bar", "baz", "cab", "foo"],
+        &[],
+    )
+    .await
+}
+
+/// Verifies ListObjectsV2 empty delimiters do not group keys.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_listv2_delimiter_empty() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_empty
+    delimiter_case_v2(
+        "",
+        None,
+        &["bar", "baz", "cab", "foo"],
+        &["bar", "baz", "cab", "foo"],
+        &[],
+    )
+    .await
+}
+
+/// Verifies ListObjects v1 without a delimiter returns all keys.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_list_delimiter_none() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_delimiter_none
+    let (_server, client, bucket) = seeded_bucket(&["bar", "baz", "cab", "foo"]).await?;
+    let response = client.list_objects().bucket(&bucket).send().await?;
+    assert_eq!(response.delimiter(), None);
+    assert_eq!(
+        object_keys(response.contents()),
+        vec!["bar", "baz", "cab", "foo"]
+    );
+    assert!(response.common_prefixes().is_empty());
+    Ok(())
+}
+
+/// Verifies ListObjectsV2 without a delimiter returns all keys.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_listv2_delimiter_none() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_none
+    let (_server, client, bucket) = seeded_bucket(&["bar", "baz", "cab", "foo"]).await?;
+    let response = client.list_objects_v2().bucket(&bucket).send().await?;
+    assert_eq!(response.delimiter(), None);
+    assert_eq!(
+        object_keys(response.contents()),
+        vec!["bar", "baz", "cab", "foo"]
+    );
+    assert!(response.common_prefixes().is_empty());
+    Ok(())
+}
+
+/// Verifies ListObjects v1 with an unmatched delimiter returns all keys.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_list_delimiter_not_exist() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_delimiter_not_exist
+    delimiter_case_v1(
+        "/",
+        Some("/"),
+        &["bar", "baz", "cab", "foo"],
+        &["bar", "baz", "cab", "foo"],
+        &[],
+    )
+    .await
+}
+
+/// Verifies ListObjectsV2 with an unmatched delimiter returns all keys.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_listv2_delimiter_not_exist() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_not_exist
+    delimiter_case_v2(
+        "/",
+        Some("/"),
+        &["bar", "baz", "cab", "foo"],
+        &["bar", "baz", "cab", "foo"],
+        &[],
+    )
+    .await
+}
+
+/// Verifies ListObjects v1 prefix filtering with slash-style keys.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_list_prefix_basic() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_prefix_basic
+    prefix_case_v1(
+        "foo/",
+        &["foo/bar", "foo/baz", "quux"],
+        &["foo/bar", "foo/baz"],
+    )
+    .await
+}
+
+/// Verifies ListObjectsV2 prefix filtering with slash-style keys.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_listv2_prefix_basic() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_listv2_prefix_basic
+    prefix_case_v2(
+        "foo/",
+        &["foo/bar", "foo/baz", "quux"],
+        &["foo/bar", "foo/baz"],
+    )
+    .await
+}
+
+/// Verifies ListObjects v1 prefix filtering with non-slash prefixes.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_list_prefix_alt() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_prefix_alt
+    prefix_case_v1("ba", &["bar", "baz", "foo"], &["bar", "baz"]).await
+}
+
+/// Verifies ListObjectsV2 prefix filtering with non-slash prefixes.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_listv2_prefix_alt() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_listv2_prefix_alt
+    prefix_case_v2("ba", &["bar", "baz", "foo"], &["bar", "baz"]).await
+}
+
+/// Verifies ListObjects v1 empty prefixes return all keys and echo empty prefix.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_list_prefix_empty() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_prefix_empty
+    prefix_case_v1(
+        "",
+        &["foo/bar", "foo/baz", "quux"],
+        &["foo/bar", "foo/baz", "quux"],
+    )
+    .await
+}
+
+/// Verifies ListObjectsV2 empty prefixes return all keys and echo empty prefix.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_listv2_prefix_empty() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_listv2_prefix_empty
+    prefix_case_v2(
+        "",
+        &["foo/bar", "foo/baz", "quux"],
+        &["foo/bar", "foo/baz", "quux"],
+    )
+    .await
+}
+
+/// Verifies ListObjects v1 missing prefixes return no keys.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_list_prefix_not_exist() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_prefix_not_exist
+    prefix_case_v1("d", &["foo/bar", "foo/baz", "quux"], &[]).await
+}
+
+/// Verifies ListObjectsV2 missing prefixes return no keys.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_listv2_prefix_not_exist() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_listv2_prefix_not_exist
+    prefix_case_v2("d", &["foo/bar", "foo/baz", "quux"], &[]).await
+}
+
+/// Verifies ListObjects v1 prefix and delimiter together split matching keys.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_list_prefix_delimiter_basic() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_prefix_delimiter_basic
+    prefix_delimiter_case_v1().await
+}
+
+/// Verifies ListObjectsV2 prefix and delimiter together split matching keys.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_listv2_prefix_delimiter_basic() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_listv2_prefix_delimiter_basic
+    prefix_delimiter_case_v2().await
+}
+
+/// Verifies ListObjects v1 echoes unreadable prefixes without URL encoding.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_list_prefix_unreadable() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_prefix_unreadable
+    let (_server, client, bucket) = seeded_bucket(&["foo/bar", "foo/baz", "quux"]).await?;
+    let response = client
+        .list_objects()
+        .bucket(&bucket)
+        .prefix("\n")
+        .send()
+        .await?;
+    assert_eq!(response.prefix(), Some("\n"));
+    assert!(response.contents().is_empty());
+    assert!(response.common_prefixes().is_empty());
+    Ok(())
+}
+
+/// Verifies ListObjectsV2 echoes unreadable prefixes without URL encoding.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_listv2_prefix_unreadable() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_listv2_prefix_unreadable
+    let (_server, client, bucket) = seeded_bucket(&["foo/bar", "foo/baz", "quux"]).await?;
+    let response = client
+        .list_objects_v2()
+        .bucket(&bucket)
+        .prefix("\n")
+        .send()
+        .await?;
+    assert_eq!(response.prefix(), Some("\n"));
+    assert!(response.contents().is_empty());
+    assert!(response.common_prefixes().is_empty());
+    Ok(())
+}
+
+async fn seeded_bucket(keys: &[&'static str]) -> Result<(TestServer, Client, String)> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-list");
-
     create_bucket(&client, &bucket).await?;
-    put_keys(
-        &client,
-        &bucket,
-        &["foo+1/bar", "foo/bar/xyzzy", "quux ab/thud", "asdf+b"],
-    )
-    .await?;
+    put_keys(&client, &bucket, keys).await?;
+    Ok((server, client, bucket))
+}
 
+async fn put_keys(client: &Client, bucket: &str, keys: &[&'static str]) -> Result<()> {
+    for key in keys {
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(*key)
+            .body(ByteStream::from_static(key.as_bytes()))
+            .send()
+            .await?;
+    }
+    Ok(())
+}
+
+async fn delimiter_case_v1(
+    delimiter: &str,
+    expected_delimiter: Option<&str>,
+    keys: &[&'static str],
+    expected_keys: &[&str],
+    expected_prefixes: &[&str],
+) -> Result<()> {
+    let (_server, client, bucket) = seeded_bucket(keys).await?;
+    let response = client
+        .list_objects()
+        .bucket(&bucket)
+        .delimiter(delimiter)
+        .send()
+        .await?;
+    assert_eq!(response.delimiter(), expected_delimiter);
+    assert_eq!(object_keys(response.contents()), expected_keys.to_vec());
+    assert_eq!(
+        prefixes(response.common_prefixes()),
+        expected_prefixes.to_vec()
+    );
+    Ok(())
+}
+
+async fn delimiter_case_v2(
+    delimiter: &str,
+    expected_delimiter: Option<&str>,
+    keys: &[&'static str],
+    expected_keys: &[&str],
+    expected_prefixes: &[&str],
+) -> Result<()> {
+    let (_server, client, bucket) = seeded_bucket(keys).await?;
+    let response = client
+        .list_objects_v2()
+        .bucket(&bucket)
+        .delimiter(delimiter)
+        .send()
+        .await?;
+    assert_eq!(response.delimiter(), expected_delimiter);
+    assert_eq!(object_keys(response.contents()), expected_keys.to_vec());
+    assert_eq!(
+        prefixes(response.common_prefixes()),
+        expected_prefixes.to_vec()
+    );
+    assert_eq!(
+        response.key_count(),
+        Some((expected_keys.len() + expected_prefixes.len()) as i32)
+    );
+    Ok(())
+}
+
+async fn encoding_case_v1() -> Result<()> {
+    let (_server, client, bucket) =
+        seeded_bucket(&["foo+1/bar", "foo/bar/xyzzy", "quux ab/thud", "asdf+b"]).await?;
     let response = client
         .list_objects()
         .bucket(&bucket)
@@ -176,7 +561,12 @@ async fn test_bucket_list_encoding_basic() -> Result<()> {
         prefixes(response.common_prefixes()),
         vec!["foo%2B1/", "foo/", "quux%20ab/"]
     );
+    Ok(())
+}
 
+async fn encoding_case_v2() -> Result<()> {
+    let (_server, client, bucket) =
+        seeded_bucket(&["foo+1/bar", "foo/bar/xyzzy", "quux ab/thud", "asdf+b"]).await?;
     let response = client
         .list_objects_v2()
         .bucket(&bucket)
@@ -191,213 +581,40 @@ async fn test_bucket_list_encoding_basic() -> Result<()> {
         vec!["foo%2B1/", "foo/", "quux%20ab/"]
     );
     assert_eq!(response.key_count(), Some(4));
-
     Ok(())
 }
 
-#[tokio::test]
-#[serial(conformance)]
-async fn test_bucket_list_delimiter_special_characters() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_delimiter_alt
-    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_delimiter_percentage
-    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_delimiter_whitespace
-    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_delimiter_dot
-    // Mirrors the corresponding list_objects_v2 variants.
-    for (delimiter, keys, expected_prefixes) in [
-        ("a", ["bar", "baz", "cab", "foo"], ["ba", "ca"]),
-        ("%", ["b%ar", "b%az", "c%ab", "foo"], ["b%", "c%"]),
-        (" ", ["b ar", "b az", "c ab", "foo"], ["b ", "c "]),
-        (".", ["b.ar", "b.az", "c.ab", "foo"], ["b.", "c."]),
-    ] {
-        let server = TestServer::spawn().await?;
-        let client = sdk::client(&server);
-        let bucket = bucket_name("s3ite-list");
-
-        create_bucket(&client, &bucket).await?;
-        put_keys(&client, &bucket, &keys).await?;
-
-        let response = client
-            .list_objects()
-            .bucket(&bucket)
-            .delimiter(delimiter)
-            .send()
-            .await?;
-        assert_eq!(response.delimiter(), Some(delimiter));
-        assert_eq!(object_keys(response.contents()), vec!["foo"]);
-        assert_eq!(
-            prefixes(response.common_prefixes()),
-            expected_prefixes.to_vec()
-        );
-
-        let response = client
-            .list_objects_v2()
-            .bucket(&bucket)
-            .delimiter(delimiter)
-            .send()
-            .await?;
-        assert_eq!(response.delimiter(), Some(delimiter));
-        assert_eq!(object_keys(response.contents()), vec!["foo"]);
-        assert_eq!(
-            prefixes(response.common_prefixes()),
-            expected_prefixes.to_vec()
-        );
-    }
-
+async fn prefix_case_v1(prefix: &str, keys: &[&'static str], expected_keys: &[&str]) -> Result<()> {
+    let (_server, client, bucket) = seeded_bucket(keys).await?;
+    let response = client
+        .list_objects()
+        .bucket(&bucket)
+        .prefix(prefix)
+        .send()
+        .await?;
+    assert_eq!(response.prefix(), Some(prefix));
+    assert_eq!(object_keys(response.contents()), expected_keys.to_vec());
+    assert!(response.common_prefixes().is_empty());
     Ok(())
 }
 
-#[tokio::test]
-#[serial(conformance)]
-async fn test_bucket_list_delimiter_empty_none_and_missing() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_delimiter_empty
-    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_delimiter_none
-    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_delimiter_not_exist
-    // Mirrors the corresponding list_objects_v2 variants.
-    let server = TestServer::spawn().await?;
-    let client = sdk::client(&server);
-    let bucket = bucket_name("s3ite-list");
-    let keys = ["bar", "baz", "cab", "foo"];
-
-    create_bucket(&client, &bucket).await?;
-    put_keys(&client, &bucket, &keys).await?;
-
-    let empty = client
-        .list_objects()
-        .bucket(&bucket)
-        .delimiter("")
-        .send()
-        .await?;
-    assert_eq!(empty.delimiter(), None);
-    assert_eq!(object_keys(empty.contents()), keys.to_vec());
-    assert!(empty.common_prefixes().is_empty());
-
-    let no_delimiter = client.list_objects().bucket(&bucket).send().await?;
-    assert_eq!(no_delimiter.delimiter(), None);
-    assert_eq!(object_keys(no_delimiter.contents()), keys.to_vec());
-    assert!(no_delimiter.common_prefixes().is_empty());
-
-    let missing = client
-        .list_objects()
-        .bucket(&bucket)
-        .delimiter("/")
-        .send()
-        .await?;
-    assert_eq!(missing.delimiter(), Some("/"));
-    assert_eq!(object_keys(missing.contents()), keys.to_vec());
-    assert!(missing.common_prefixes().is_empty());
-
-    let empty_v2 = client
+async fn prefix_case_v2(prefix: &str, keys: &[&'static str], expected_keys: &[&str]) -> Result<()> {
+    let (_server, client, bucket) = seeded_bucket(keys).await?;
+    let response = client
         .list_objects_v2()
         .bucket(&bucket)
-        .delimiter("")
+        .prefix(prefix)
         .send()
         .await?;
-    assert_eq!(empty_v2.delimiter(), None);
-    assert_eq!(object_keys(empty_v2.contents()), keys.to_vec());
-    assert!(empty_v2.common_prefixes().is_empty());
-
-    let missing_v2 = client
-        .list_objects_v2()
-        .bucket(&bucket)
-        .delimiter("/")
-        .send()
-        .await?;
-    assert_eq!(missing_v2.delimiter(), Some("/"));
-    assert_eq!(object_keys(missing_v2.contents()), keys.to_vec());
-    assert!(missing_v2.common_prefixes().is_empty());
-
+    assert_eq!(response.prefix(), Some(prefix));
+    assert_eq!(object_keys(response.contents()), expected_keys.to_vec());
+    assert!(response.common_prefixes().is_empty());
     Ok(())
 }
 
-#[tokio::test]
-#[serial(conformance)]
-async fn test_bucket_list_prefix_basic_alt_empty_missing() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_prefix_basic
-    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_prefix_alt
-    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_prefix_empty
-    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_prefix_not_exist
-    // Mirrors the corresponding list_objects_v2 variants.
-    let server = TestServer::spawn().await?;
-    let client = sdk::client(&server);
-    let bucket = bucket_name("s3ite-list");
-
-    create_bucket(&client, &bucket).await?;
-    put_keys(
-        &client,
-        &bucket,
-        &["bar", "baz", "foo/bar", "foo/baz", "quux"],
-    )
-    .await?;
-
-    let prefixed = client
-        .list_objects()
-        .bucket(&bucket)
-        .prefix("foo/")
-        .send()
-        .await?;
-    assert_eq!(prefixed.prefix(), Some("foo/"));
-    assert_eq!(object_keys(prefixed.contents()), vec!["foo/bar", "foo/baz"]);
-    assert!(prefixed.common_prefixes().is_empty());
-
-    let prefixed_v2 = client
-        .list_objects_v2()
-        .bucket(&bucket)
-        .prefix("foo/")
-        .send()
-        .await?;
-    assert_eq!(prefixed_v2.prefix(), Some("foo/"));
-    assert_eq!(
-        object_keys(prefixed_v2.contents()),
-        vec!["foo/bar", "foo/baz"]
-    );
-    assert!(prefixed_v2.common_prefixes().is_empty());
-
-    let alt = client
-        .list_objects()
-        .bucket(&bucket)
-        .prefix("ba")
-        .send()
-        .await?;
-    assert_eq!(alt.prefix(), Some("ba"));
-    assert_eq!(object_keys(alt.contents()), vec!["bar", "baz"]);
-
-    let empty = client
-        .list_objects()
-        .bucket(&bucket)
-        .prefix("")
-        .send()
-        .await?;
-    assert_eq!(empty.prefix(), Some(""));
-    assert_eq!(
-        object_keys(empty.contents()),
-        vec!["bar", "baz", "foo/bar", "foo/baz", "quux"]
-    );
-
-    let missing = client
-        .list_objects_v2()
-        .bucket(&bucket)
-        .prefix("missing")
-        .send()
-        .await?;
-    assert_eq!(missing.prefix(), Some("missing"));
-    assert!(missing.contents().is_empty());
-    assert!(missing.common_prefixes().is_empty());
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial(conformance)]
-async fn test_bucket_list_prefix_delimiter_basic() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_prefix_delimiter_basic
-    // Mirrors s3tests/functional/test_s3.py::test_bucket_listv2_prefix_delimiter_basic
-    let server = TestServer::spawn().await?;
-    let client = sdk::client(&server);
-    let bucket = bucket_name("s3ite-list");
-
-    create_bucket(&client, &bucket).await?;
-    put_keys(&client, &bucket, &["foo/bar", "foo/baz/xyzzy", "quux/thud"]).await?;
-
+async fn prefix_delimiter_case_v1() -> Result<()> {
+    let (_server, client, bucket) =
+        seeded_bucket(&["foo/bar", "foo/baz/xyzzy", "quux/thud"]).await?;
     let response = client
         .list_objects()
         .bucket(&bucket)
@@ -409,7 +626,12 @@ async fn test_bucket_list_prefix_delimiter_basic() -> Result<()> {
     assert_eq!(response.delimiter(), Some("/"));
     assert_eq!(object_keys(response.contents()), vec!["foo/bar"]);
     assert_eq!(prefixes(response.common_prefixes()), vec!["foo/baz/"]);
+    Ok(())
+}
 
+async fn prefix_delimiter_case_v2() -> Result<()> {
+    let (_server, client, bucket) =
+        seeded_bucket(&["foo/bar", "foo/baz/xyzzy", "quux/thud"]).await?;
     let response = client
         .list_objects_v2()
         .bucket(&bucket)
@@ -421,68 +643,7 @@ async fn test_bucket_list_prefix_delimiter_basic() -> Result<()> {
     assert_eq!(response.delimiter(), Some("/"));
     assert_eq!(object_keys(response.contents()), vec!["foo/bar"]);
     assert_eq!(prefixes(response.common_prefixes()), vec!["foo/baz/"]);
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial(conformance)]
-async fn test_bucket_list_prefix_unreadable() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_prefix_unreadable
-    let server = TestServer::spawn().await?;
-    let client = sdk::client(&server);
-    let bucket = bucket_name("s3ite-list");
-
-    create_bucket(&client, &bucket).await?;
-    put_keys(&client, &bucket, &["foo/bar", "foo/baz", "quux"]).await?;
-
-    let response = client
-        .list_objects()
-        .bucket(&bucket)
-        .prefix("\n")
-        .send()
-        .await?;
-    assert_eq!(response.prefix(), Some("\n"));
-    assert!(response.contents().is_empty());
-    assert!(response.common_prefixes().is_empty());
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial(conformance)]
-async fn test_bucket_listv2_prefix_unreadable() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_bucket_listv2_prefix_unreadable
-    let server = TestServer::spawn().await?;
-    let client = sdk::client(&server);
-    let bucket = bucket_name("s3ite-list");
-
-    create_bucket(&client, &bucket).await?;
-    put_keys(&client, &bucket, &["foo/bar", "foo/baz", "quux"]).await?;
-
-    let response = client
-        .list_objects_v2()
-        .bucket(&bucket)
-        .prefix("\n")
-        .send()
-        .await?;
-    assert_eq!(response.prefix(), Some("\n"));
-    assert!(response.contents().is_empty());
-    assert!(response.common_prefixes().is_empty());
-
-    Ok(())
-}
-
-async fn put_keys(client: &Client, bucket: &str, keys: &[&'static str]) -> Result<()> {
-    for key in keys {
-        client
-            .put_object()
-            .bucket(bucket)
-            .key(*key)
-            .body(ByteStream::from_static(key.as_bytes()))
-            .send()
-            .await?;
-    }
+    assert_eq!(response.key_count(), Some(2));
     Ok(())
 }
 

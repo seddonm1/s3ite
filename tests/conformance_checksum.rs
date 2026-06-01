@@ -35,6 +35,7 @@ const CRC32C_5_MIB_B: &str = "TH4EZg==";
 const CRC32C_5_MIB_C: &str = "Z7mBIQ==";
 const CRC32C_15_MIB_ABC: &str = "xU+Krw==";
 
+/// Verifies explicit SHA256 object checksums are stored, exposed, and validated.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_object_checksum_sha256() -> Result<()> {
@@ -91,6 +92,7 @@ async fn test_object_checksum_sha256() -> Result<()> {
     Ok(())
 }
 
+/// Verifies explicit CRC64NVME object checksums are stored, exposed, and validated.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_object_checksum_crc64nvme() -> Result<()> {
@@ -147,6 +149,7 @@ async fn test_object_checksum_crc64nvme() -> Result<()> {
     Ok(())
 }
 
+/// Verifies default CRC64NVME checksums appear through HeadObject and attributes.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_default_crc64nvme_for_put_and_attributes() -> Result<()> {
@@ -197,6 +200,7 @@ async fn test_default_crc64nvme_for_put_and_attributes() -> Result<()> {
     Ok(())
 }
 
+/// Verifies CopyObject inherits the source checksum algorithm when unspecified.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_copy_object_inherits_source_checksum_algorithm() -> Result<()> {
@@ -246,6 +250,7 @@ async fn test_copy_object_inherits_source_checksum_algorithm() -> Result<()> {
     Ok(())
 }
 
+/// Verifies multipart CRC32 full-object completion and part checksum exposure.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_multipart_use_cksum_helper_crc32() -> Result<()> {
@@ -296,6 +301,7 @@ async fn test_multipart_use_cksum_helper_crc32() -> Result<()> {
     Ok(())
 }
 
+/// Verifies multipart CRC32C full-object completion and part checksum exposure.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_multipart_use_cksum_helper_crc32c() -> Result<()> {

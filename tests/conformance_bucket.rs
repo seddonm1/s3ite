@@ -16,6 +16,7 @@ use support::{
     server::TestServer,
 };
 
+/// Verifies a fresh server reports no buckets.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_bucket_list_empty() -> Result<()> {
@@ -29,6 +30,7 @@ async fn test_bucket_list_empty() -> Result<()> {
     Ok(())
 }
 
+/// Verifies bucket creation appears in listing and deletion removes it.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_bucket_create_delete() -> Result<()> {
@@ -60,6 +62,7 @@ async fn test_bucket_create_delete() -> Result<()> {
     Ok(())
 }
 
+/// Verifies HeadBucket succeeds for an existing bucket.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_bucket_head() -> Result<()> {
@@ -74,6 +77,7 @@ async fn test_bucket_head() -> Result<()> {
     Ok(())
 }
 
+/// Verifies HeadBucket reports not found for a missing bucket.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_bucket_head_notexist() -> Result<()> {
@@ -91,6 +95,7 @@ async fn test_bucket_head_notexist() -> Result<()> {
     Ok(())
 }
 
+/// Verifies bad credentials and unsigned ListBuckets requests are rejected.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_list_buckets_bad_auth() -> Result<()> {

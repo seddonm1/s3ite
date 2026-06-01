@@ -22,6 +22,7 @@ use support::{
 
 const MIB: usize = 1024 * 1024;
 
+/// Verifies multipart upload completion is idempotent and materializes bytes.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_multipart_upload() -> Result<()> {
@@ -63,6 +64,7 @@ async fn test_multipart_upload() -> Result<()> {
     Ok(())
 }
 
+/// Verifies active multipart uploads are listed and aborted uploads disappear.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_list_multipart_upload() -> Result<()> {
@@ -97,6 +99,7 @@ async fn test_list_multipart_upload() -> Result<()> {
     Ok(())
 }
 
+/// Verifies completing with a missing part number fails with InvalidPart.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_multipart_upload_missing_part() -> Result<()> {
@@ -126,6 +129,7 @@ async fn test_multipart_upload_missing_part() -> Result<()> {
     Ok(())
 }
 
+/// Verifies completing with the wrong part ETag fails with InvalidPart.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_multipart_upload_incorrect_etag() -> Result<()> {
@@ -152,6 +156,7 @@ async fn test_multipart_upload_incorrect_etag() -> Result<()> {
     Ok(())
 }
 
+/// Verifies completed multipart partNumber reads return exact part bytes.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_multipart_get_part() -> Result<()> {
@@ -210,6 +215,7 @@ async fn test_multipart_get_part() -> Result<()> {
     Ok(())
 }
 
+/// Verifies duplicate part entries complete with the final uploaded part.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_multipart_resend_first_finishes_last() -> Result<()> {

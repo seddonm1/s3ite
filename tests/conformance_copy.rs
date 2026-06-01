@@ -18,6 +18,7 @@ use support::{
 
 const MIB: usize = 1024 * 1024;
 
+/// Verifies copying within the same bucket preserves object bytes.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_object_copy_same_bucket() -> Result<()> {
@@ -44,6 +45,7 @@ async fn test_object_copy_same_bucket() -> Result<()> {
     Ok(())
 }
 
+/// Verifies CopyObject preserves the source content type by default.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_object_copy_verify_contenttype() -> Result<()> {
@@ -83,6 +85,7 @@ async fn test_object_copy_verify_contenttype() -> Result<()> {
     Ok(())
 }
 
+/// Verifies self-copy without metadata changes is rejected.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_object_copy_to_itself() -> Result<()> {
@@ -110,6 +113,7 @@ async fn test_object_copy_to_itself() -> Result<()> {
     Ok(())
 }
 
+/// Verifies self-copy with replacement metadata updates object metadata.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_object_copy_to_itself_with_metadata() -> Result<()> {
@@ -146,6 +150,7 @@ async fn test_object_copy_to_itself_with_metadata() -> Result<()> {
     Ok(())
 }
 
+/// Verifies copying across buckets preserves object bytes.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_object_copy_diff_bucket() -> Result<()> {
@@ -174,6 +179,7 @@ async fn test_object_copy_diff_bucket() -> Result<()> {
     Ok(())
 }
 
+/// Verifies CopyObject retains user metadata and content type by default.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_object_copy_retaining_metadata() -> Result<()> {
@@ -222,6 +228,7 @@ async fn test_object_copy_retaining_metadata() -> Result<()> {
     Ok(())
 }
 
+/// Verifies replacement metadata and content type are applied during copy.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_object_copy_replacing_metadata() -> Result<()> {
@@ -274,6 +281,7 @@ async fn test_object_copy_replacing_metadata() -> Result<()> {
     Ok(())
 }
 
+/// Verifies copying from a missing source bucket fails.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_object_copy_bucket_not_found() -> Result<()> {
@@ -299,6 +307,7 @@ async fn test_object_copy_bucket_not_found() -> Result<()> {
     Ok(())
 }
 
+/// Verifies copying from a missing source key fails.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_object_copy_key_not_found() -> Result<()> {

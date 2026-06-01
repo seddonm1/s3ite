@@ -16,6 +16,7 @@ use support::{
     server::TestServer,
 };
 
+/// Verifies HeadObject reports zero content length for an empty object.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_object_head_zero_bytes() -> Result<()> {
@@ -38,6 +39,7 @@ async fn test_object_head_zero_bytes() -> Result<()> {
     Ok(())
 }
 
+/// Verifies PutObject returns the MD5-based ETag for a small object.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_object_write_check_etag() -> Result<()> {
@@ -63,6 +65,7 @@ async fn test_object_write_check_etag() -> Result<()> {
     Ok(())
 }
 
+/// Verifies object writes, overwrites, reads, and deletes through HTTP.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_object_write_read_update_read_delete() -> Result<()> {
@@ -94,6 +97,7 @@ async fn test_object_write_read_update_read_delete() -> Result<()> {
     Ok(())
 }
 
+/// Verifies a PUT without metadata replaces previous user metadata.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_object_metadata_replaced_on_put() -> Result<()> {
@@ -128,6 +132,7 @@ async fn test_object_metadata_replaced_on_put() -> Result<()> {
     Ok(())
 }
 
+/// Verifies copying a zero-byte object preserves an empty body.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_object_copy_zero_size() -> Result<()> {
@@ -159,6 +164,7 @@ async fn test_object_copy_zero_size() -> Result<()> {
     Ok(())
 }
 
+/// Verifies ranged GET returns partial content and Content-Range.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_ranged_request_response_code() -> Result<()> {
@@ -188,6 +194,7 @@ async fn test_ranged_request_response_code() -> Result<()> {
     Ok(())
 }
 
+/// Verifies unsatisfiable ranged GET fails with InvalidRange.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_ranged_request_invalid_range() -> Result<()> {
