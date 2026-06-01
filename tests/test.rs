@@ -6,12 +6,22 @@
     clippy::unwrap_used, //
 )]
 
-use std::{collections::HashMap, fs, ops::Deref, path::PathBuf, sync::LazyLock};
+use std::{
+    collections::HashMap,
+    fs,
+    ops::Deref,
+    path::PathBuf,
+    sync::LazyLock,
+    time::{Duration, SystemTime},
+};
 
 use anyhow::Result;
 use aws_config::SdkConfig;
 use aws_credential_types::provider::SharedCredentialsProvider;
-use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode, ChecksumType};
+use aws_sdk_s3::presigning::PresigningConfig;
+use aws_sdk_s3::types::{
+    BucketCannedAcl, ChecksumAlgorithm, ChecksumMode, ChecksumType, ObjectCannedAcl, Permission,
+};
 use aws_sdk_s3::{
     Client,
     config::{Credentials, Region, RequestChecksumCalculation},
@@ -23,7 +33,12 @@ use aws_sdk_s3::{
     },
 };
 use s3ite::{Bucket, Config, Sqlite};
-use s3s::{auth::SimpleAuth, host::MultiDomain, service::S3ServiceBuilder};
+use s3s::{
+    Body, HttpRequest, HttpResponse,
+    auth::SimpleAuth,
+    host::MultiDomain,
+    service::{S3Service, S3ServiceBuilder},
+};
 use tokio::sync::{Mutex, MutexGuard};
 use tracing::{debug, error};
 use uuid::Uuid;
@@ -58,6 +73,7 @@ static TRACING: LazyLock<()> = LazyLock::new(|| {
 
 pub struct TestContext {
     pub client: Client,
+    service: S3Service,
     root: PathBuf,
     cleanup: bool,
 }
@@ -96,7 +112,7 @@ impl TestContext {
         };
 
         // Convert to aws http client
-        let client = s3s_aws::Client::from(service);
+        let client = s3s_aws::Client::from(service.clone());
 
         // Setup aws sdk config
         let config = SdkConfig::builder()
@@ -109,6 +125,7 @@ impl TestContext {
 
         Ok(Self {
             client: Client::new(&config),
+            service,
             root,
             cleanup,
         })
@@ -397,6 +414,45 @@ async fn delete_bucket(c: &Client, bucket: &str) -> Result<()> {
 fn assert_error_contains(error: impl std::fmt::Debug, text: &str) {
     let error = format!("{error:?}");
     assert!(error.contains(text), "expected {text:?} in {error}");
+}
+
+fn request_host(uri: &str) -> &str {
+    let authority = uri
+        .strip_prefix("http://")
+        .or_else(|| uri.strip_prefix("https://"))
+        .unwrap_or(uri);
+    authority.split('/').next().unwrap_or(DOMAIN_NAME)
+}
+
+fn unsigned_get_request(bucket: &str, key: &str) -> Result<HttpRequest> {
+    let uri = format!("http://{DOMAIN_NAME}/{bucket}/{key}");
+    let mut request = HttpRequest::builder()
+        .method("GET")
+        .uri(uri.as_str())
+        .body(Body::empty())?;
+    request
+        .headers_mut()
+        .insert("host", request_host(uri.as_str()).parse()?);
+    Ok(request)
+}
+
+fn presigned_get_request(uri: &str) -> Result<HttpRequest> {
+    let mut request = HttpRequest::builder()
+        .method("GET")
+        .uri(uri)
+        .body(Body::empty())?;
+    request
+        .headers_mut()
+        .insert("host", request_host(uri).parse()?);
+    Ok(request)
+}
+
+async fn call_test_service(context: &TestContext, request: HttpRequest) -> Result<HttpResponse> {
+    context
+        .service
+        .call(request)
+        .await
+        .map_err(|err| anyhow::anyhow!("{err:?}"))
 }
 
 #[tokio::test]
@@ -3777,6 +3833,194 @@ async fn test_bucket_read_only_blocks_delete_and_upload_part() -> Result<()> {
 
     let object = context.get_object().bucket(&bucket).key(key).send().await?;
     assert_eq!(object.body.collect().await?.into_bytes().as_ref(), content);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_owner_only_acl_surface() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+    let bucket = format!("test-owner-acl-{}", Uuid::new_v4());
+    let rejected_bucket = format!("test-owner-acl-rejected-{}", Uuid::new_v4());
+    let key = "object.txt";
+
+    create_bucket(&context, &bucket).await?;
+    let bucket_acl = context.get_bucket_acl().bucket(&bucket).send().await?;
+    assert_eq!(
+        bucket_acl.owner().and_then(|owner| owner.id()),
+        Some("s3ite")
+    );
+    assert_eq!(bucket_acl.grants().len(), 1);
+    assert_eq!(
+        bucket_acl.grants()[0].permission(),
+        Some(&Permission::FullControl)
+    );
+
+    context
+        .put_bucket_acl()
+        .bucket(&bucket)
+        .acl(BucketCannedAcl::Private)
+        .send()
+        .await?;
+    let Err(err) = context
+        .put_bucket_acl()
+        .bucket(&bucket)
+        .acl(BucketCannedAcl::PublicRead)
+        .send()
+        .await
+    else {
+        anyhow::bail!("public bucket ACL should be rejected");
+    };
+    assert_error_contains(err, "AccessControlListNotSupported");
+
+    let Err(err) = context
+        .put_bucket_acl()
+        .bucket(&bucket)
+        .grant_read("uri=\"http://acs.amazonaws.com/groups/global/AllUsers\"")
+        .send()
+        .await
+    else {
+        anyhow::bail!("bucket ACL grant headers should be rejected");
+    };
+    assert_error_contains(err, "AccessControlListNotSupported");
+
+    put_object(&context, &bucket, key, b"owner-only").await?;
+    context
+        .put_object()
+        .bucket(&bucket)
+        .key("private-write.txt")
+        .acl(ObjectCannedAcl::Private)
+        .body(ByteStream::from_static(b"private"))
+        .send()
+        .await?;
+    context
+        .copy_object()
+        .bucket(&bucket)
+        .key("private-copy.txt")
+        .copy_source(format!("{bucket}/private-write.txt"))
+        .acl(ObjectCannedAcl::BucketOwnerFullControl)
+        .send()
+        .await?;
+    let object_acl = context
+        .get_object_acl()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+    assert_eq!(
+        object_acl.owner().and_then(|owner| owner.id()),
+        Some("s3ite")
+    );
+    assert_eq!(object_acl.grants().len(), 1);
+    assert_eq!(
+        object_acl.grants()[0].permission(),
+        Some(&Permission::FullControl)
+    );
+
+    context
+        .put_object_acl()
+        .bucket(&bucket)
+        .key(key)
+        .acl(ObjectCannedAcl::Private)
+        .send()
+        .await?;
+    context
+        .put_object_acl()
+        .bucket(&bucket)
+        .key(key)
+        .acl(ObjectCannedAcl::BucketOwnerFullControl)
+        .send()
+        .await?;
+    let Err(err) = context
+        .put_object_acl()
+        .bucket(&bucket)
+        .key(key)
+        .acl(ObjectCannedAcl::PublicRead)
+        .send()
+        .await
+    else {
+        anyhow::bail!("public object ACL should be rejected");
+    };
+    assert_error_contains(err, "AccessControlListNotSupported");
+
+    let Err(err) = context
+        .put_object()
+        .bucket(&bucket)
+        .key("public.txt")
+        .acl(ObjectCannedAcl::PublicRead)
+        .body(ByteStream::from_static(b"public"))
+        .send()
+        .await
+    else {
+        anyhow::bail!("public object write ACL should be rejected");
+    };
+    assert_error_contains(err, "AccessControlListNotSupported");
+
+    let Err(err) = context
+        .create_bucket()
+        .bucket(&rejected_bucket)
+        .acl(BucketCannedAcl::PublicRead)
+        .send()
+        .await
+    else {
+        anyhow::bail!("public bucket create ACL should be rejected");
+    };
+    assert_error_contains(err, "AccessControlListNotSupported");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_owner_signed_unsigned_and_presigned_get() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+    let bucket = format!("test-presigned-owner-{}", Uuid::new_v4());
+    let key = "shared.txt";
+    let content = b"shared through a presigned URL";
+
+    create_bucket(&context, &bucket).await?;
+    put_object(&context, &bucket, key, content).await?;
+    let signed = context.get_object().bucket(&bucket).key(key).send().await?;
+    assert_eq!(signed.body.collect().await?.into_bytes().as_ref(), content);
+
+    let response = call_test_service(&context, unsigned_get_request(&bucket, key)?).await?;
+    assert_eq!(response.status().as_u16(), 403);
+
+    let presigned = context
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .presigned(PresigningConfig::expires_in(Duration::from_secs(60))?)
+        .await?;
+    let response = call_test_service(&context, presigned_get_request(presigned.uri())?).await?;
+    assert_eq!(response.status().as_u16(), 200);
+    let mut body = response.into_body();
+    let bytes = body
+        .store_all_limited(1024)
+        .await
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
+    assert_eq!(bytes.as_ref(), content);
+
+    let expired = context
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .presigned(
+            PresigningConfig::builder()
+                .start_time(SystemTime::now() - Duration::from_secs(3600))
+                .expires_in(Duration::from_secs(1))
+                .build()?,
+        )
+        .await?;
+    let response = call_test_service(&context, presigned_get_request(expired.uri())?).await?;
+    assert_eq!(response.status().as_u16(), 403);
+
+    let malformed_uri = format!("{}&s3ite-malformed-signature=true", presigned.uri());
+    let response = call_test_service(&context, presigned_get_request(&malformed_uri)?).await?;
+    assert_eq!(response.status().as_u16(), 403);
 
     Ok(())
 }

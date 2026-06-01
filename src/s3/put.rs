@@ -2,12 +2,13 @@
 
 use super::{
     CONTENT_MD5, ChecksumInput, ChecksumPolicy, ChecksumTypeKind, Digest, ETag, KeyMetadata,
-    KeyValue, Md5, Not, OffsetDateTime, PutObjectInput, PutObjectOutput, S3Error, S3ErrorCode,
-    S3Request, S3Response, S3Result, Sqlite, StorageClass, StoredChecksum, StreamingBlob,
-    TryStreamExt, checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_sha1,
-    checksum_sha256, checksum_type_output, copy_bytes, debug, finish_payload_checksum, hex,
-    normalize_content_encoding, object_write_conditions, payload_checksum_accumulator, s3_error,
-    s3_error_from_sqlite, validate_content_md5,
+    KeyValue, Md5, Not, ObjectAclRequest, OffsetDateTime, PutObjectInput, PutObjectOutput, S3Error,
+    S3ErrorCode, S3Request, S3Response, S3Result, Sqlite, StorageClass, StoredChecksum,
+    StreamingBlob, TryStreamExt, checksum_crc32, checksum_crc32c, checksum_crc64nvme,
+    checksum_sha1, checksum_sha256, checksum_type_output, copy_bytes, debug,
+    finish_payload_checksum, hex, normalize_content_encoding, object_write_conditions,
+    payload_checksum_accumulator, s3_error, s3_error_from_sqlite, validate_content_md5,
+    validate_object_acl,
 };
 
 /// Fully buffered object body plus hashes needed by the storage write.
@@ -70,6 +71,34 @@ fn validate_put_storage_class(storage_class: Option<&StorageClass>) -> S3Result<
     Ok(())
 }
 
+/// Ensures the destination bucket exists and can be mutated.
+async fn validate_put_object_bucket(sqlite: &Sqlite, bucket: &str) -> S3Result<()> {
+    sqlite
+        .validate_mutable_bucket(bucket)
+        .map_err(s3_error_from_sqlite)?;
+    if sqlite.buckets.read().await.contains_key(bucket).not() {
+        return Err(s3_error(S3ErrorCode::NoSuchBucket));
+    }
+    Ok(())
+}
+
+/// Validates that `PutObject` ACL headers are owner-equivalent no-ops.
+fn validate_put_object_acl_input(input: &PutObjectInput) -> S3Result<()> {
+    validate_object_acl(&ObjectAclRequest {
+        acl: input.acl.as_ref(),
+        has_access_control_policy: false,
+        grant_header_count: [
+            input.grant_full_control.is_some(),
+            input.grant_read.is_some(),
+            input.grant_read_acp.is_some(),
+            input.grant_write_acp.is_some(),
+        ]
+        .into_iter()
+        .filter(|value| *value)
+        .count(),
+    })
+}
+
 /// Builds the S3 `PutObject` response from the stored object identity.
 fn put_object_output(
     md5: String,
@@ -97,6 +126,9 @@ pub(super) async fn put_object(
     req: S3Request<PutObjectInput>,
 ) -> S3Result<S3Response<PutObjectOutput>> {
     let S3Request { input, headers, .. } = req;
+    validate_put_object_bucket(sqlite, &input.bucket).await?;
+    validate_put_object_acl_input(&input)?;
+
     let PutObjectInput {
         body,
         bucket,
@@ -121,15 +153,6 @@ pub(super) async fn put_object(
     } = input;
     let write_conditions = object_write_conditions(if_match, if_none_match);
     let content_encoding = normalize_content_encoding(content_encoding);
-
-    sqlite
-        .validate_mutable_bucket(&bucket)
-        .map_err(s3_error_from_sqlite)?;
-
-    if sqlite.buckets.read().await.contains_key(&bucket).not() {
-        return Err(s3_error(S3ErrorCode::NoSuchBucket));
-    }
-
     validate_put_storage_class(storage_class.as_ref())?;
 
     let Some(body) = body else {

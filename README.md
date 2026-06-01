@@ -149,6 +149,12 @@ buckets:
 
 If `access_key` and `secret_key` are omitted, authentication is disabled.
 
+### Auth Model
+
+s3ite uses a Level 1 owner-only auth model. When `access_key` and `secret_key` are configured, valid signed requests and valid presigned URLs act as the single owner identity, and unsigned requests are denied. When those keys are omitted, auth is disabled and every request behaves as that owner.
+
+ACLs are not a permission system in s3ite. `GetBucketAcl` and `GetObjectAcl` return a synthetic owner `FULL_CONTROL` ACL for compatibility, and owner-equivalent ACL writes such as `private` are accepted as no-ops. Public ACLs, explicit grant headers, ACL XML bodies, IAM, bucket policies, object ownership controls, and anonymous public access are unsupported. Use presigned URLs for temporary object sharing.
+
 ## Docker
 
 ```bash
@@ -204,4 +210,11 @@ To run a specific test, pass pytest arguments directly:
 
 ```bash
 scripts/run-s3-tests.sh s3tests/functional/test_s3.py::test_object_write_read_update_read_delete
+```
+
+The current Level 1 auth model intentionally excludes ACL, public/anonymous access, ownership-control, IAM, and policy surfaces. To focus the Ceph suite on the supported object core, add a pytest name filter:
+
+```bash
+scripts/run-s3-tests.sh -q --tb=short \
+  -k 'not acl and not grant and not public and not anonymous and not ownership and not policy and not iam'
 ```

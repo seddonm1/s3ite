@@ -1,12 +1,12 @@
 use super::{
-    Bucket, BucketVersioningState, BucketVersioningStatus, CreateBucketInput, CreateBucketOutput,
-    DeleteBucketInput, DeleteBucketOutput, GetBucketLocationInput, GetBucketLocationOutput,
-    GetBucketVersioningInput, GetBucketVersioningOutput, HeadBucketInput, HeadBucketOutput,
-    InternalError, ListBucketsInput, ListBucketsOutput, MFADelete, Not, OWNER_DISPLAY_NAME,
-    OWNER_ID, Owner, PutBucketVersioningInput, PutBucketVersioningOutput, S3Error, S3ErrorCode,
-    S3Request, S3Response, S3Result, Sqlite, SqliteError, Timestamp, decode_continuation_token,
+    Bucket, BucketAclRequest, BucketVersioningState, BucketVersioningStatus, CreateBucketInput,
+    CreateBucketOutput, DeleteBucketInput, DeleteBucketOutput, GetBucketLocationInput,
+    GetBucketLocationOutput, GetBucketVersioningInput, GetBucketVersioningOutput, HeadBucketInput,
+    HeadBucketOutput, InternalError, ListBucketsInput, ListBucketsOutput, MFADelete, Not,
+    PutBucketVersioningInput, PutBucketVersioningOutput, S3Error, S3ErrorCode, S3Request,
+    S3Response, S3Result, Sqlite, SqliteError, Timestamp, decode_continuation_token,
     encode_continuation_token, fs, list_limit, s3_error, s3_error_from_sqlite,
-    s3_error_with_message,
+    s3_error_with_message, validate_bucket_acl,
 };
 
 /// Returns whether a bucket name satisfies S3 DNS-compatible naming rules.
@@ -45,25 +45,40 @@ fn looks_like_ipv4_address(bucket: &str) -> bool {
     })
 }
 
-/// Returns the canonical owner used by s3ite ACL and listing responses.
-pub(super) fn owner() -> Owner {
-    Owner {
-        display_name: Some(OWNER_DISPLAY_NAME.to_string()),
-        id: Some(OWNER_ID.to_string()),
-    }
-}
-
 /// Creates a bucket database if it does not already exist.
 #[tracing::instrument]
 pub(super) async fn create_bucket(
     sqlite: &Sqlite,
     req: S3Request<CreateBucketInput>,
 ) -> S3Result<S3Response<CreateBucketOutput>> {
-    let CreateBucketInput { bucket, .. } = req.input;
+    let CreateBucketInput {
+        acl,
+        bucket,
+        grant_full_control,
+        grant_read,
+        grant_read_acp,
+        grant_write,
+        grant_write_acp,
+        ..
+    } = req.input;
 
     if is_valid_bucket_name(&bucket).not() {
         return Err(s3_error(S3ErrorCode::InvalidBucketName));
     }
+    validate_bucket_acl(&BucketAclRequest {
+        acl: acl.as_ref(),
+        has_access_control_policy: false,
+        grant_header_count: [
+            grant_full_control.is_some(),
+            grant_read.is_some(),
+            grant_read_acp.is_some(),
+            grant_write.is_some(),
+            grant_write_acp.is_some(),
+        ]
+        .into_iter()
+        .filter(|value| *value)
+        .count(),
+    })?;
 
     sqlite
         .try_create_bucket(&bucket)

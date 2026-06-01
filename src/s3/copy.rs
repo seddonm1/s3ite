@@ -4,11 +4,12 @@ use std::collections::HashMap;
 
 use super::{
     ChecksumAlgorithmKind, CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource, ETag,
-    KeyValue, MetadataDirective, Not, ObjectReadConditions, OffsetDateTime, S3ErrorCode, S3Request,
-    S3Response, S3Result, Sqlite, SqliteResult, StoredChecksum, checksum_algorithm_from_request,
-    checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_sha1, checksum_sha256,
-    checksum_type_output, normalize_content_encoding, object_write_checksum_from_value, s3_error,
-    s3_error_from_sqlite, s3_error_with_message, validate_copy_source_conditions,
+    KeyValue, MetadataDirective, Not, ObjectAclRequest, ObjectReadConditions, OffsetDateTime,
+    S3ErrorCode, S3Request, S3Response, S3Result, Sqlite, SqliteResult, StoredChecksum,
+    checksum_algorithm_from_request, checksum_crc32, checksum_crc32c, checksum_crc64nvme,
+    checksum_sha1, checksum_sha256, checksum_type_output, normalize_content_encoding,
+    object_write_checksum_from_value, s3_error, s3_error_from_sqlite, s3_error_with_message,
+    validate_copy_source_conditions, validate_object_acl,
 };
 
 /// Parsed copy request with source, destination, metadata, and checksum intent.
@@ -33,6 +34,7 @@ fn parse_copy_object_request(input: CopyObjectInput) -> S3Result<CopyObjectReque
     let CopyObjectInput {
         bucket: target_bucket,
         key: target_key,
+        acl,
         cache_control,
         content_encoding,
         content_type,
@@ -45,6 +47,10 @@ fn parse_copy_object_request(input: CopyObjectInput) -> S3Result<CopyObjectReque
         expires,
         metadata,
         metadata_directive,
+        grant_full_control,
+        grant_read,
+        grant_read_acp,
+        grant_write_acp,
         ..
     } = input;
 
@@ -64,6 +70,19 @@ fn parse_copy_object_request(input: CopyObjectInput) -> S3Result<CopyObjectReque
         .as_ref()
         .is_some_and(|directive| directive.as_str() == MetadataDirective::REPLACE);
     let target_checksum_kind = checksum_algorithm_from_request(checksum_algorithm)?;
+    validate_object_acl(&ObjectAclRequest {
+        acl: acl.as_ref(),
+        has_access_control_policy: false,
+        grant_header_count: [
+            grant_full_control.is_some(),
+            grant_read.is_some(),
+            grant_read_acp.is_some(),
+            grant_write_acp.is_some(),
+        ]
+        .into_iter()
+        .filter(|value| *value)
+        .count(),
+    })?;
 
     Ok(CopyObjectRequest {
         target_bucket,

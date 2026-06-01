@@ -7,17 +7,17 @@ use super::{
     CreateMultipartUploadOutput, Digest, ETag, Initiator, InternalError, KeyValue, LIST_BATCH_SIZE,
     ListMultipartUploadsInput, ListMultipartUploadsOutput, ListPartsInput, ListPartsOutput, Md5,
     Multipart, MultipartCompletionPart, MultipartCompletionRequest, MultipartUpload,
-    MultipartUploadState, MultipartUploadSummary, Not, ObjectReadConditions, OffsetDateTime, Part,
-    S3Error, S3ErrorCode, S3Range, S3Request, S3Response, S3Result, Sqlite, SqliteError,
-    SqliteResult, StorageClass, TryStreamExt, UploadPartCopyInput, UploadPartCopyOutput,
-    UploadPartInput, UploadPartOutput, Uuid, checksum_algorithm_output, checksum_crc32,
-    checksum_crc32c, checksum_crc64nvme, checksum_sha1, checksum_sha256, checksum_type_output,
-    common_prefix_for_key, configured_part_checksum, copy_bytes, debug, decode_list_input_value,
-    default_crc64nvme_full_object_checksum, encode_list_value, finish_part_checksum, hex,
-    is_url_encoding, multipart_checksum_config, normalize_content_encoding,
-    object_write_conditions, output_delimiter, owner, part_checksum_accumulator, s3_error,
-    s3_error_from_sqlite, s3_error_with_message, validate_content_md5,
-    validate_copy_source_conditions,
+    MultipartUploadState, MultipartUploadSummary, Not, ObjectAclRequest, ObjectReadConditions,
+    OffsetDateTime, Part, S3Error, S3ErrorCode, S3Range, S3Request, S3Response, S3Result, Sqlite,
+    SqliteError, SqliteResult, StorageClass, TryStreamExt, UploadPartCopyInput,
+    UploadPartCopyOutput, UploadPartInput, UploadPartOutput, Uuid, checksum_algorithm_output,
+    checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_sha1, checksum_sha256,
+    checksum_type_output, common_prefix_for_key, configured_part_checksum, copy_bytes, debug,
+    decode_list_input_value, default_crc64nvme_full_object_checksum, encode_list_value,
+    finish_part_checksum, hex, is_url_encoding, multipart_checksum_config,
+    normalize_content_encoding, object_write_conditions, output_delimiter, owner,
+    part_checksum_accumulator, s3_error, s3_error_from_sqlite, s3_error_with_message,
+    validate_content_md5, validate_copy_source_conditions, validate_object_acl,
 };
 
 /// Normalizes a completed multipart part list while preserving S3 ordering rules.
@@ -631,6 +631,7 @@ pub(super) async fn create_multipart_upload(
     req: S3Request<CreateMultipartUploadInput>,
 ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
     let CreateMultipartUploadInput {
+        acl,
         bucket,
         key,
         cache_control,
@@ -639,6 +640,10 @@ pub(super) async fn create_multipart_upload(
         checksum_algorithm,
         checksum_type,
         expires,
+        grant_full_control,
+        grant_read,
+        grant_read_acp,
+        grant_write_acp,
         metadata,
         ..
     } = req.input;
@@ -646,6 +651,19 @@ pub(super) async fn create_multipart_upload(
     sqlite
         .validate_mutable_bucket(&bucket)
         .map_err(s3_error_from_sqlite)?;
+    validate_object_acl(&ObjectAclRequest {
+        acl: acl.as_ref(),
+        has_access_control_policy: false,
+        grant_header_count: [
+            grant_full_control.is_some(),
+            grant_read.is_some(),
+            grant_read_acp.is_some(),
+            grant_write_acp.is_some(),
+        ]
+        .into_iter()
+        .filter(|value| *value)
+        .count(),
+    })?;
 
     let upload_id = Uuid::new_v4();
     let checksum = multipart_checksum_config(checksum_algorithm.clone(), checksum_type)?;

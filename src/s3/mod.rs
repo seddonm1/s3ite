@@ -8,13 +8,14 @@ use s3s::{
     S3ErrorCode::InternalError,
     S3Request, S3Response, S3Result, StdError,
     dto::{
-        AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketVersioningStatus,
-        ChecksumMode, CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
-        CompletedPart, CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopyPartResult,
-        CopySource, CreateBucketInput, CreateBucketOutput, CreateMultipartUploadInput,
-        CreateMultipartUploadOutput, DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput,
-        DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
-        ETagCondition, Error as DeleteError, GetBucketLocationInput, GetBucketLocationOutput,
+        AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketCannedACL,
+        BucketVersioningStatus, ChecksumMode, CommonPrefix, CompleteMultipartUploadInput,
+        CompleteMultipartUploadOutput, CompletedPart, CopyObjectInput, CopyObjectOutput,
+        CopyObjectResult, CopyPartResult, CopySource, CreateBucketInput, CreateBucketOutput,
+        CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketInput,
+        DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput,
+        DeleteObjectsOutput, DeletedObject, ETag, ETagCondition, Error as DeleteError,
+        GetBucketAclInput, GetBucketAclOutput, GetBucketLocationInput, GetBucketLocationOutput,
         GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectAclInput, GetObjectAclOutput,
         GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectAttributesParts,
         GetObjectInput, GetObjectOutput, Grant, Grantee, HeadBucketInput, HeadBucketOutput,
@@ -22,10 +23,11 @@ use s3s::{
         ListMultipartUploadsInput, ListMultipartUploadsOutput, ListObjectVersionsInput,
         ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
         ListObjectsV2Output, ListPartsInput, ListPartsOutput, MFADelete, MetadataDirective,
-        MultipartUpload, ObjectAttributes, ObjectPart, Owner, Part, Permission,
-        PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectInput, PutObjectOutput,
-        Range as S3Range, StorageClass, StreamingBlob, Timestamp, Type, UploadPartCopyInput,
-        UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
+        MultipartUpload, ObjectAttributes, ObjectCannedACL, ObjectPart, Owner, Part, Permission,
+        PutBucketAclInput, PutBucketAclOutput, PutBucketVersioningInput, PutBucketVersioningOutput,
+        PutObjectAclInput, PutObjectAclOutput, PutObjectInput, PutObjectOutput, Range as S3Range,
+        StorageClass, StreamingBlob, Timestamp, Type, UploadPartCopyInput, UploadPartCopyOutput,
+        UploadPartInput, UploadPartOutput,
     },
     header::{CONTENT_MD5, CONTENT_TYPE, ETAG, X_AMZ_DELETE_MARKER, X_AMZ_REQUEST_ID},
 };
@@ -50,7 +52,6 @@ const CONTINUATION_TOKEN_PREFIX: &str = "s3ite:v1:";
 const OWNER_DISPLAY_NAME: &str = "s3ite";
 const OWNER_ID: &str = "s3ite";
 
-mod acl;
 mod bucket;
 mod checksum;
 mod copy;
@@ -59,10 +60,10 @@ mod error;
 mod get;
 mod list;
 mod multipart;
+mod owner;
 mod put;
 
 use self::{
-    bucket::owner,
     checksum::{
         ChecksumInput, ChecksumPolicy, checksum_algorithm_from_request, checksum_algorithm_output,
         checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_mode_enabled, checksum_sha1,
@@ -81,6 +82,7 @@ use self::{
         output_delimiter,
     },
     multipart::{requested_part_range, validate_part_number},
+    owner::{BucketAclRequest, ObjectAclRequest, owner, validate_bucket_acl, validate_object_acl},
 };
 
 /// Stores HTTP content encodings while hiding S3's transport-only aws-chunked marker.
@@ -352,6 +354,15 @@ impl S3 for Sqlite {
         bucket::get_bucket_location(self, req).await
     }
 
+    /// Returns the fixed owner ACL for an existing bucket.
+    #[tracing::instrument]
+    async fn get_bucket_acl(
+        &self,
+        req: S3Request<GetBucketAclInput>,
+    ) -> S3Result<S3Response<GetBucketAclOutput>> {
+        owner::get_bucket_acl(self, req).await
+    }
+
     /// Returns the bucket versioning state.
     #[tracing::instrument]
     async fn get_bucket_versioning(
@@ -412,7 +423,16 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<GetObjectAclInput>,
     ) -> S3Result<S3Response<GetObjectAclOutput>> {
-        acl::get_object_acl(self, req).await
+        owner::get_object_acl(self, req).await
+    }
+
+    /// Accepts owner-equivalent bucket ACL writes as no-ops.
+    #[tracing::instrument]
+    async fn put_bucket_acl(
+        &self,
+        req: S3Request<PutBucketAclInput>,
+    ) -> S3Result<S3Response<PutBucketAclOutput>> {
+        owner::put_bucket_acl(self, req).await
     }
 
     /// Lists all open bucket databases.
@@ -467,6 +487,15 @@ impl S3 for Sqlite {
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
         put::put_object(self, req).await
+    }
+
+    /// Accepts owner-equivalent object ACL writes as no-ops.
+    #[tracing::instrument]
+    async fn put_object_acl(
+        &self,
+        req: S3Request<PutObjectAclInput>,
+    ) -> S3Result<S3Response<PutObjectAclOutput>> {
+        owner::put_object_acl(self, req).await
     }
 
     /// Creates multipart upload state for a future object.
