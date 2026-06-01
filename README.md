@@ -107,7 +107,7 @@ only when a deployment needs to override them. The available options are:
 - `concurrency_limit`: Enforces a limit on the concurrent number of HTTP requests the service can handle. This can be tuned depending on infrastructure as SSD/HDD will handle resource contention very differently.
 - `readers`: Controls the number of short metadata/query `SQLite` reader connections. Defaults to `4`.
 - `blob_readers`: Controls the number of long-lived `GetObject` BLOB stream reader connections. Defaults to `16`.
-- `blob_read_timeout_seconds`: Seconds a BLOB reader may stay blocked by an unconsumed response before releasing its SQLite handle. Defaults to `300`; set to `0` to disable.
+- `blob_read_timeout_seconds`: Seconds a BLOB reader may stay blocked by an unconsumed response before releasing its SQLite handle. Defaults to `120`; set to `0` to disable.
 - `maintenance_interval_seconds`: Interval for background database maintenance. Defaults to `60`; set to `0` to disable periodic maintenance.
 - `maintenance_vacuum_pages`: Number of free SQLite pages to reclaim with `PRAGMA incremental_vacuum(N)` during each maintenance pass. Defaults to `100`; set to `0` to skip incremental vacuum.
 - `multipart_upload_ttl_seconds`: TTL for inactive incomplete multipart uploads. Defaults to `86400`; set to `0` to disable background cleanup.
@@ -164,7 +164,7 @@ s3ite:latest \
 --concurrency-limit 16 \
 --readers 4 \
 --blob-readers 16 \
---blob-read-timeout-seconds 300 \
+--blob-read-timeout-seconds 120 \
 --access-key AKIAIOSFODNN7EXAMPLE \
 --secret-key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 ```

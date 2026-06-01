@@ -564,7 +564,7 @@ fn default_blob_readers() -> usize {
 }
 
 fn default_blob_read_timeout_seconds() -> u64 {
-    300
+    120
 }
 
 fn default_maintenance_interval_seconds() -> u64 {
@@ -651,7 +651,7 @@ mod tests {
     fn readers_default_and_deserialize_override() -> TestResult {
         assert_eq!(Config::default().readers, 4);
         assert_eq!(Config::default().blob_readers, 16);
-        assert_eq!(Config::default().blob_read_timeout_seconds, 300);
+        assert_eq!(Config::default().blob_read_timeout_seconds, 120);
 
         let config: Config = yaml_serde::from_str(
             "
