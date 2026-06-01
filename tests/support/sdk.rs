@@ -17,6 +17,10 @@ pub fn bad_secret_client(server: &TestServer) -> Client {
     client_with_credentials(server, server.access_key(), "wrong-secret-key-for-tests")
 }
 
+pub fn bad_access_key_client(server: &TestServer) -> Client {
+    client_with_credentials(server, "wrong-access-key-for-tests", server.secret_key())
+}
+
 fn client_with_credentials(server: &TestServer, access_key: &str, secret_key: &str) -> Client {
     let credentials = Credentials::new(access_key, secret_key, None, None, "s3ite-test");
     let config = SdkConfig::builder()

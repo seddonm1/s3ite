@@ -1642,6 +1642,28 @@ async fn test_bucket_list_return_data_versioning() -> Result<()> {
     Ok(())
 }
 
+/// Verifies ListObjects prefix filtering works for special prefixes.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_list_special_prefix() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_special_prefix
+    let keys = ["_bla/1", "_bla/2", "_bla/3", "_bla/4", "abcd"];
+    let (_server, client, bucket) = seeded_bucket(&keys).await?;
+
+    let response = client.list_objects().bucket(&bucket).send().await?;
+    assert_eq!(object_keys(response.contents()).len(), 5);
+
+    let response = client
+        .list_objects()
+        .bucket(&bucket)
+        .prefix("_bla/")
+        .send()
+        .await?;
+    assert_eq!(object_keys(response.contents()), keys[..4].to_vec());
+
+    Ok(())
+}
+
 async fn seeded_bucket(keys: &[&str]) -> Result<(TestServer, Client, String)> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
