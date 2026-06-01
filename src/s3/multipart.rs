@@ -273,14 +273,11 @@ fn load_upload_part_copy_source(
     transaction: &rusqlite::Transaction<'_>,
     request: &UploadPartCopyRequest,
 ) -> SqliteResult<CopiedPart> {
-    let object = match request.source_version_id.as_deref() {
-        Some(version_id) => {
-            Sqlite::try_get_object_version(transaction, &request.source_key, version_id)?
-                .ok_or(SqliteError::ObjectVersionNotFound)?
-        }
-        None => Sqlite::try_get_object(transaction, &request.source_key)?
-            .ok_or(SqliteError::ObjectNotFound)?,
-    };
+    let object = Sqlite::try_get_copy_source_object(
+        transaction,
+        &request.source_key,
+        request.source_version_id.as_deref(),
+    )?;
     validate_copy_source_conditions(&object.key_metadata, &request.source_conditions)?;
     let object_size =
         u64::try_from(object.key_metadata.size).map_err(|_| SqliteError::InvalidObjectRange)?;

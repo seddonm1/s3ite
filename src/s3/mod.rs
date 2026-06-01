@@ -53,10 +53,13 @@ const OWNER_ID: &str = "s3ite";
 mod acl;
 mod bucket;
 mod checksum;
+mod copy;
+mod delete;
 mod error;
+mod get;
 mod list;
 mod multipart;
-mod object;
+mod put;
 
 use self::{
     bucket::owner,
@@ -78,8 +81,22 @@ use self::{
         output_delimiter,
     },
     multipart::{requested_part_range, validate_part_number},
-    object::normalize_content_encoding,
 };
+
+/// Stores HTTP content encodings while hiding S3's transport-only aws-chunked marker.
+pub(super) fn normalize_content_encoding(content_encoding: Option<String>) -> Option<String> {
+    let content_encoding = content_encoding?;
+    let values = content_encoding
+        .split(',')
+        .filter_map(|value| {
+            let value = value.trim();
+            (value.is_empty().not() && value.eq_ignore_ascii_case("aws-chunked").not())
+                .then(|| value.to_string())
+        })
+        .collect::<Vec<_>>();
+
+    values.is_empty().not().then(|| values.join(", "))
+}
 
 #[derive(Clone, Debug)]
 struct ObjectReadConditions {
@@ -296,7 +313,7 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<CopyObjectInput>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
-        object::copy_object(self, req).await
+        copy::copy_object(self, req).await
     }
 
     /// Deletes an empty bucket database and its `SQLite` sidecar files.
@@ -314,7 +331,7 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
-        object::delete_object(self, req).await
+        delete::delete_object(self, req).await
     }
 
     /// Deletes a batch of objects and returns S3 multi-delete results.
@@ -323,7 +340,7 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
-        object::delete_objects(self, req).await
+        delete::delete_objects(self, req).await
     }
 
     /// Returns the default bucket location for an existing bucket.
@@ -359,7 +376,7 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
-        object::get_object(self, req).await
+        get::get_object(self, req).await
     }
 
     /// Checks whether a bucket exists.
@@ -377,7 +394,7 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
-        object::head_object(self, req).await
+        get::head_object(self, req).await
     }
 
     /// Returns selected object attributes without returning the object body.
@@ -386,7 +403,7 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<GetObjectAttributesInput>,
     ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
-        object::get_object_attributes(self, req).await
+        get::get_object_attributes(self, req).await
     }
 
     /// Returns the fixed owner ACL for an existing object.
@@ -449,7 +466,7 @@ impl S3 for Sqlite {
         &self,
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
-        object::put_object(self, req).await
+        put::put_object(self, req).await
     }
 
     /// Creates multipart upload state for a future object.

@@ -18,10 +18,13 @@ use crate::database::BucketConnection;
 
 mod bucket;
 mod checksum;
+mod copy;
+mod delete;
 mod error;
+mod get;
 mod list;
 mod multipart;
-mod object;
+mod put;
 
 use self::checksum::{
     decode_base64, decode_md5_hex, encode_hex, optional_multipart_checksum_config,
