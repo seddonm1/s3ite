@@ -10,7 +10,9 @@ use anyhow::{Result, bail};
 use aws_sdk_s3::{
     Client,
     primitives::ByteStream,
-    types::{BucketVersioningStatus, Delete, ObjectIdentifier},
+    types::{
+        BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier,
+    },
 };
 use reqwest::{Method, StatusCode};
 use serial_test::serial;
@@ -20,6 +22,8 @@ use support::{
     raw_http, sdk,
     server::TestServer,
 };
+
+const MIB: usize = 1024 * 1024;
 
 /// Verifies bucket versioning state transitions between none, suspended, and enabled.
 #[tokio::test]
@@ -561,6 +565,65 @@ async fn test_versioning_obj_create_versions_remove_all() -> Result<()> {
     Ok(())
 }
 
+/// Verifies multipart overwrites create independently readable object versions.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_versioning_obj_create_overwrite_multipart() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_versioning_obj_create_overwrite_multipart
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ver");
+    let key = "testobj";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+
+    let mut versions = Vec::new();
+    for byte in [b'a', b'b', b'c'] {
+        let body = vec![byte; 6 * MIB];
+        let completed = multipart_upload(&client, &bucket, key, body.clone()).await?;
+        let version_id = completed
+            .version_id()
+            .ok_or_else(|| anyhow::anyhow!("multipart completion missing version ID"))?
+            .to_string();
+        versions.push(ObjectVersion {
+            version_id,
+            content: body,
+        });
+    }
+
+    for version in &versions {
+        assert_eq!(
+            get_object_version_bytes(&client, &bucket, key, &version.version_id).await?,
+            version.content
+        );
+    }
+    assert_eq!(
+        get_object_bytes(&client, &bucket, key).await?,
+        versions
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("missing latest multipart version"))?
+            .content
+    );
+
+    let listed = client.list_object_versions().bucket(&bucket).send().await?;
+    let listed_version_ids = listed
+        .versions()
+        .iter()
+        .filter_map(|version| version.version_id())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        listed_version_ids,
+        versions
+            .iter()
+            .rev()
+            .map(|version| version.version_id.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    Ok(())
+}
+
 /// Verifies exact-version removal works for special key names.
 #[tokio::test]
 #[serial(conformance)]
@@ -758,6 +821,54 @@ async fn test_versioning_bucket_atomic_upload_return_version_id() -> Result<()> 
         .body(ByteStream::from_static(b""))
         .send()
         .await?;
+    assert_eq!(suspended.version_id(), None);
+
+    Ok(())
+}
+
+/// Verifies multipart completion returns VersionId based on bucket versioning state.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_versioning_bucket_multipart_upload_return_version_id() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_versioning_bucket_multipart_upload_return_version_id
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let enabled_bucket = bucket_name("s3ite-ver");
+    let unversioned_bucket = bucket_name("s3ite-ver");
+    let suspended_bucket = bucket_name("s3ite-ver");
+
+    create_bucket(&client, &enabled_bucket).await?;
+    put_bucket_versioning(&client, &enabled_bucket, BucketVersioningStatus::Enabled).await?;
+    let enabled = multipart_upload(&client, &enabled_bucket, "bar", vec![b'a'; 6 * MIB]).await?;
+    let enabled_version_id = enabled
+        .version_id()
+        .ok_or_else(|| anyhow::anyhow!("enabled multipart completion missing version ID"))?;
+    let listed = client
+        .list_object_versions()
+        .bucket(&enabled_bucket)
+        .send()
+        .await?;
+    assert!(
+        listed
+            .versions()
+            .iter()
+            .any(|version| version.version_id() == Some(enabled_version_id))
+    );
+
+    create_bucket(&client, &unversioned_bucket).await?;
+    let unversioned =
+        multipart_upload(&client, &unversioned_bucket, "baz", vec![b'b'; 6 * MIB]).await?;
+    assert_eq!(unversioned.version_id(), None);
+
+    create_bucket(&client, &suspended_bucket).await?;
+    put_bucket_versioning(
+        &client,
+        &suspended_bucket,
+        BucketVersioningStatus::Suspended,
+    )
+    .await?;
+    let suspended =
+        multipart_upload(&client, &suspended_bucket, "foo", vec![b'c'; 6 * MIB]).await?;
     assert_eq!(suspended.version_id(), None);
 
     Ok(())
@@ -1196,6 +1307,51 @@ async fn get_object_version_bytes(
         .await?
         .into_bytes()
         .to_vec())
+}
+
+async fn multipart_upload(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    body: Vec<u8>,
+) -> Result<aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput> {
+    let upload_id = client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await?
+        .upload_id()
+        .ok_or_else(|| anyhow::anyhow!("create multipart response missing upload ID"))?
+        .to_string();
+    let response = client
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from(body))
+        .send()
+        .await?;
+    let part = CompletedPart::builder()
+        .e_tag(
+            response
+                .e_tag()
+                .ok_or_else(|| anyhow::anyhow!("upload part response missing ETag"))?,
+        )
+        .part_number(1)
+        .build();
+    let upload = CompletedMultipartUpload::builder()
+        .set_parts(Some(vec![part]))
+        .build();
+    Ok(client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(upload)
+        .send()
+        .await?)
 }
 
 fn assert_ceph_shaped_version_id(version_id: &str) {

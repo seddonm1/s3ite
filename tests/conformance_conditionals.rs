@@ -10,7 +10,9 @@ use anyhow::{Result, bail};
 use aws_sdk_s3::{
     Client,
     primitives::{ByteStream, DateTime},
-    types::{BucketVersioningStatus, Delete, ObjectIdentifier},
+    types::{
+        BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier,
+    },
 };
 use serial_test::serial;
 use support::{
@@ -364,6 +366,269 @@ async fn test_copy_object_ifnonematch_failed() -> Result<()> {
         .send()
         .await?;
     assert_eq!(get_object_bytes(&client, &bucket, "bar").await?, b"bar");
+
+    Ok(())
+}
+
+/// Verifies multipart completion honors If-Match and If-None-Match.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_multipart_put_object_if_match() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_multipart_put_object_if_match
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-cond");
+    let key = "obj";
+
+    create_bucket(&client, &bucket).await?;
+    let response =
+        successful_conditional_multipart_upload(&client, &bucket, key, b"abc", None, Some("*"))
+            .await?;
+    let mut etag = response
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("multipart completion missing ETag"))?
+        .to_string();
+
+    failing_conditional_multipart_upload(
+        &client,
+        &bucket,
+        key,
+        b"abc",
+        None,
+        Some("*"),
+        "PreconditionFailed",
+    )
+    .await?;
+    failing_conditional_multipart_upload(
+        &client,
+        &bucket,
+        key,
+        b"abc",
+        None,
+        Some(&etag),
+        "PreconditionFailed",
+    )
+    .await?;
+
+    let response = successful_conditional_multipart_upload(
+        &client,
+        &bucket,
+        key,
+        b"abc",
+        None,
+        Some("badetag"),
+    )
+    .await?;
+    etag = response
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("multipart completion missing ETag"))?
+        .to_string();
+    let response =
+        successful_conditional_multipart_upload(&client, &bucket, key, b"abc", Some(&etag), None)
+            .await?;
+    etag = response
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("multipart completion missing ETag"))?
+        .to_string();
+
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+
+    failing_conditional_multipart_upload(
+        &client,
+        &bucket,
+        key,
+        b"abc",
+        Some("*"),
+        None,
+        "NoSuchKey",
+    )
+    .await?;
+    failing_conditional_multipart_upload(
+        &client,
+        &bucket,
+        key,
+        b"abc",
+        Some("badetag"),
+        None,
+        "NoSuchKey",
+    )
+    .await?;
+
+    let response =
+        successful_conditional_multipart_upload(&client, &bucket, key, b"abc", None, Some(&etag))
+            .await?;
+    etag = response
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("multipart completion missing ETag"))?
+        .to_string();
+    successful_conditional_multipart_upload(&client, &bucket, key, b"abc", Some("*"), None).await?;
+    failing_conditional_multipart_upload(
+        &client,
+        &bucket,
+        key,
+        b"abc",
+        Some("badetag"),
+        None,
+        "PreconditionFailed",
+    )
+    .await?;
+    successful_conditional_multipart_upload(&client, &bucket, key, b"abc", Some(&etag), None)
+        .await?;
+
+    Ok(())
+}
+
+/// Verifies versioned multipart completion checks If-None-Match against latest.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_multipart_put_current_object_if_none_match() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_multipart_put_current_object_if_none_match
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-cond");
+    let key = "obj";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    let response =
+        successful_conditional_multipart_upload(&client, &bucket, key, b"data1", None, Some("*"))
+            .await?;
+    let etag = response
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("multipart completion missing ETag"))?
+        .to_string();
+    let response =
+        successful_conditional_multipart_upload(&client, &bucket, key, b"data2", None, None)
+            .await?;
+    let latest_etag = response
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("multipart completion missing ETag"))?
+        .to_string();
+
+    failing_conditional_multipart_upload(
+        &client,
+        &bucket,
+        key,
+        b"abc",
+        None,
+        Some("*"),
+        "PreconditionFailed",
+    )
+    .await?;
+    failing_conditional_multipart_upload(
+        &client,
+        &bucket,
+        key,
+        b"abc",
+        None,
+        Some(&latest_etag),
+        "PreconditionFailed",
+    )
+    .await?;
+
+    successful_conditional_multipart_upload(&client, &bucket, key, b"abc", None, Some(&etag))
+        .await?;
+    successful_conditional_multipart_upload(&client, &bucket, key, b"abc", None, Some("badetag"))
+        .await?;
+
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+
+    Ok(())
+}
+
+/// Verifies versioned multipart completion checks If-Match against latest.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_multipart_put_current_object_if_match() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_multipart_put_current_object_if_match
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-cond");
+    let key = "obj";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    failing_conditional_multipart_upload(
+        &client,
+        &bucket,
+        key,
+        b"abc",
+        Some("*"),
+        None,
+        "NoSuchKey",
+    )
+    .await?;
+    failing_conditional_multipart_upload(
+        &client,
+        &bucket,
+        key,
+        b"abc",
+        Some("badetag"),
+        None,
+        "NoSuchKey",
+    )
+    .await?;
+
+    let response = successful_conditional_multipart_upload(
+        &client,
+        &bucket,
+        key,
+        b"data1",
+        None,
+        Some("deadbeef"),
+    )
+    .await?;
+    let etag = response
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("multipart completion missing ETag"))?
+        .to_string();
+    let response =
+        successful_conditional_multipart_upload(&client, &bucket, key, b"data2", Some("*"), None)
+            .await?;
+    let latest_etag = response
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("multipart completion missing ETag"))?
+        .to_string();
+
+    failing_conditional_multipart_upload(
+        &client,
+        &bucket,
+        key,
+        b"abc",
+        Some("badetag"),
+        None,
+        "PreconditionFailed",
+    )
+    .await?;
+    failing_conditional_multipart_upload(
+        &client,
+        &bucket,
+        key,
+        b"abc",
+        Some(&etag),
+        None,
+        "PreconditionFailed",
+    )
+    .await?;
+    successful_conditional_multipart_upload(
+        &client,
+        &bucket,
+        key,
+        b"abc",
+        Some(&latest_etag),
+        None,
+    )
+    .await?;
 
     Ok(())
 }
@@ -855,6 +1120,94 @@ async fn put_versioned_object(
         .ok_or_else(|| anyhow::anyhow!("versioned PutObject missing version ID"))?
         .to_string();
     Ok((version_id, etag))
+}
+
+async fn successful_conditional_multipart_upload(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    body: &[u8],
+    if_match: Option<&str>,
+    if_none_match: Option<&str>,
+) -> Result<aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput> {
+    let (upload_id, parts) = prepare_multipart_upload(client, bucket, key, body).await?;
+    let upload = CompletedMultipartUpload::builder()
+        .set_parts(Some(parts))
+        .build();
+    let mut request = client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(upload);
+    if let Some(if_match) = if_match {
+        request = request.if_match(if_match);
+    }
+    if let Some(if_none_match) = if_none_match {
+        request = request.if_none_match(if_none_match);
+    }
+    Ok(request.send().await?)
+}
+
+async fn failing_conditional_multipart_upload(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    body: &[u8],
+    if_match: Option<&str>,
+    if_none_match: Option<&str>,
+    expected: &str,
+) -> Result<()> {
+    let error = match successful_conditional_multipart_upload(
+        client,
+        bucket,
+        key,
+        body,
+        if_match,
+        if_none_match,
+    )
+    .await
+    {
+        Ok(_) => bail!("conditional multipart completion should fail"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, expected);
+    Ok(())
+}
+
+async fn prepare_multipart_upload(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    body: &[u8],
+) -> Result<(String, Vec<CompletedPart>)> {
+    let upload_id = client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await?
+        .upload_id()
+        .ok_or_else(|| anyhow::anyhow!("create multipart response missing upload ID"))?
+        .to_string();
+    let response = client
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from(body.to_vec()))
+        .send()
+        .await?;
+    let part = CompletedPart::builder()
+        .e_tag(
+            response
+                .e_tag()
+                .ok_or_else(|| anyhow::anyhow!("upload part response missing ETag"))?,
+        )
+        .part_number(1)
+        .build();
+    Ok((upload_id, vec![part]))
 }
 
 async fn head_state(client: &Client, bucket: &str, key: &str) -> Result<ObjectState> {
