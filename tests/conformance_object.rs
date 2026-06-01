@@ -152,6 +152,29 @@ async fn test_object_write_read_update_read_delete() -> Result<()> {
     Ok(())
 }
 
+/// Verifies signed owner PutObject creates a readable object.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_object_put_authenticated() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_object_put_authenticated
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-obj");
+
+    create_bucket(&client, &bucket).await?;
+    let response = client
+        .put_object()
+        .bucket(&bucket)
+        .key("foo")
+        .body(ByteStream::from_static(b"foo"))
+        .send()
+        .await?;
+    assert!(response.e_tag().is_some());
+    assert_eq!(get_object_bytes(&client, &bucket, "foo").await?, b"foo");
+
+    Ok(())
+}
+
 /// Verifies a failed PutObject does not poison later successful writes.
 #[tokio::test]
 #[serial(conformance)]
@@ -178,6 +201,40 @@ async fn test_100_continue_error_retry() -> Result<()> {
     create_bucket(&client, &bucket).await?;
     put_object(&client, &bucket, "foo", b"bar").await?;
     assert_eq!(get_object_bytes(&client, &bucket, "foo").await?, b"bar");
+
+    Ok(())
+}
+
+/// Verifies stored Content-Encoding strips transport-only aws-chunked markers.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_object_content_encoding_aws_chunked() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_object_content_encoding_aws_chunked
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-obj");
+    let key = "encoding";
+
+    create_bucket(&client, &bucket).await?;
+    for (content_encoding, expected) in [
+        ("gzip", Some("gzip")),
+        ("deflate, gzip", Some("deflate, gzip")),
+        ("gzip, aws-chunked", Some("gzip")),
+        ("aws-chunked, gzip", Some("gzip")),
+        ("aws-chunked", None),
+        ("aws-chunked, aws-chunked", None),
+    ] {
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .content_encoding(content_encoding)
+            .body(ByteStream::from_static(b""))
+            .send()
+            .await?;
+        let response = client.head_object().bucket(&bucket).key(key).send().await?;
+        assert_eq!(response.content_encoding(), expected);
+    }
 
     Ok(())
 }

@@ -564,6 +564,37 @@ async fn test_multipart_copy_special_names() -> Result<()> {
     Ok(())
 }
 
+/// Verifies UploadPartCopy decodes percent-encoded copy-source keys exactly once.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_upload_part_copy_percent_encoded_key() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_upload_part_copy_percent_encoded_key
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-mpu");
+    let key = "anyfile.txt";
+    let encoded_key = "anyfilename%25.txt";
+    let raw_key = "anyfilename%.txt";
+
+    create_bucket(&client, &bucket).await?;
+    put_object(&client, &bucket, encoded_key, b"foo").await?;
+    put_object(&client, &bucket, key, b"foo").await?;
+
+    let upload_id = create_upload(&client, &bucket, key).await?;
+    let copy_source = format!("{bucket}/{}", raw_http::path_segment(raw_key));
+    let error =
+        match upload_part_copy(&client, &bucket, key, &upload_id, 1, &copy_source, None).await {
+            Ok(_) => bail!("copy source must decode to the missing raw percent key"),
+            Err(error) => error,
+        };
+    assert_error_contains(&error, "NoSuchKey");
+    abort_upload(&client, &bucket, key, &upload_id).await?;
+
+    assert_eq!(get_object_bytes(&client, &bucket, key).await?, b"foo");
+
+    Ok(())
+}
+
 /// Verifies multipart copy can copy exact source object versions.
 #[tokio::test]
 #[serial(conformance)]
