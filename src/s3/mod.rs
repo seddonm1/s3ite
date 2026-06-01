@@ -41,8 +41,8 @@ use crate::checksum::{ChecksumAlgorithmKind, ChecksumTypeKind};
 use crate::sqlite::{
     BucketVersioningState, CompletedObjectPart, KeyMetadata, KeyValue, Multipart,
     MultipartCompletionPart, MultipartCompletionRequest, MultipartUploadState,
-    MultipartUploadSummary, ObjectDeleteOutcome, ObjectTagCondition, ObjectWriteConditions, Sqlite,
-    SqliteError, SqliteResult, StoredChecksum,
+    MultipartUploadSummary, ObjectBodyReference, ObjectDeleteOutcome, ObjectTagCondition,
+    ObjectWriteConditions, Sqlite, SqliteError, SqliteResult, StoredChecksum,
 };
 
 const LIST_BATCH_SIZE: i64 = 1024;

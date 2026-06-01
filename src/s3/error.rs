@@ -14,6 +14,13 @@ pub(super) fn s3_error_from_sqlite(error: SqliteError) -> S3Error {
         SqliteError::ObjectNotFound => S3Error::new(S3ErrorCode::NoSuchKey),
         SqliteError::ObjectVersionNotFound => S3Error::new(S3ErrorCode::NoSuchVersion),
         SqliteError::InvalidObjectRange => S3Error::new(S3ErrorCode::InvalidRange),
+        SqliteError::ObjectBodyInconsistent => S3Error::with_message(
+            InternalError,
+            "object body is inconsistent with object metadata",
+        ),
+        SqliteError::ObjectBodyReadTimeout => {
+            S3Error::with_message(InternalError, "object body read timed out")
+        }
         SqliteError::PreconditionFailed => S3Error::new(S3ErrorCode::PreconditionFailed),
         SqliteError::ChecksumMismatch => S3Error::new(S3ErrorCode::BadDigest),
         SqliteError::MultipartUploadNotFound => S3Error::new(S3ErrorCode::NoSuchUpload),

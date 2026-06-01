@@ -10,7 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Add a `scripts/run-s3-tests.sh` helper for local Ceph `s3-tests` runs with optional pytest arguments, including temp-workspace checkout, `uv` setup, config generation, and local `s3ite` lifecycle management.
-- Add `Config::readers` with a default of `4` and wire it to the existing `--readers` CLI option, separating `SQLite` reader threads from HTTP request concurrency.
+- Add `Config::readers` with a default of `4` and wire it to the existing `--readers` CLI option, separating `SQLite` metadata reader threads from HTTP request concurrency.
+- Add `Config::blob_readers` with a default of `16` and wire it to `--blob-readers`, giving long-lived `GetObject` BLOB streams their own reader pool.
+- Add `Config::blob_read_timeout_seconds` with a default of `300` and wire it to `--blob-read-timeout-seconds`, releasing BLOB readers blocked by unconsumed responses.
 - Add `maintenance_interval_seconds` configuration for periodic database maintenance, with `0` disabling the background task.
 - Add `maintenance_vacuum_pages` configuration for `PRAGMA incremental_vacuum(N)`, with `0` skipping incremental vacuum during maintenance.
 - Add default-on multipart cleanup TTL configuration for inactive incomplete uploads and completed-upload idempotency records, defaulting both to `86400` seconds with `0` disabling each cleanup.
@@ -34,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Ignore local reference clones and local `s3-tests` runtime artifacts.
 - Run the local `s3-tests` helper against a release `s3ite` build and exclude `fails_on_rgw` tests by default.
 - Generate conformance-test server config with permissive `CORS` disabled so presigned request validation reaches the S3 auth layer.
+- Split object metadata from object bodies in the versioned `SQLite` schema and stream `GetObject` response bodies from incremental `SQLite` BLOB reads.
 
 ### Fixed
 

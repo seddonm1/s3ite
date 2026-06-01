@@ -92,6 +92,14 @@ struct ConfigArgs {
     #[clap(long)]
     readers: Option<usize>,
 
+    /// Controls the number of long-lived BLOB reader connections to `SQLite`.
+    #[clap(long)]
+    blob_readers: Option<usize>,
+
+    /// Seconds a BLOB reader may stay blocked by an unconsumed response. Set to `0` to disable.
+    #[clap(long)]
+    blob_read_timeout_seconds: Option<u64>,
+
     /// Interval, in seconds, for background database maintenance. Set to `0` to disable.
     #[clap(long)]
     maintenance_interval_seconds: Option<u64>,
@@ -143,6 +151,16 @@ pub struct Config {
     /// Controls the number of reader connections to `SQLite`.
     #[serde(default = "default_readers")]
     pub readers: usize,
+
+    /// Controls the number of long-lived BLOB reader connections to `SQLite`.
+    #[serde(default = "default_blob_readers")]
+    pub blob_readers: usize,
+
+    /// Seconds a BLOB reader may stay blocked by an unconsumed response.
+    ///
+    /// Set to `0` to disable the timeout.
+    #[serde(default = "default_blob_read_timeout_seconds")]
+    pub blob_read_timeout_seconds: u64,
 
     /// Interval, in seconds, for background database maintenance.
     ///
@@ -200,6 +218,8 @@ impl Default for Config {
             secret_key: None,
             concurrency_limit: default_concurrency_limit(),
             readers: default_readers(),
+            blob_readers: default_blob_readers(),
+            blob_read_timeout_seconds: default_blob_read_timeout_seconds(),
             maintenance_interval_seconds: default_maintenance_interval_seconds(),
             maintenance_vacuum_pages: default_maintenance_vacuum_pages(),
             multipart_upload_ttl_seconds: default_multipart_upload_ttl_seconds(),
@@ -278,6 +298,12 @@ impl Config {
         }
         if let Some(readers) = args.readers {
             self.readers = readers;
+        }
+        if let Some(blob_readers) = args.blob_readers {
+            self.blob_readers = blob_readers;
+        }
+        if let Some(blob_read_timeout_seconds) = args.blob_read_timeout_seconds {
+            self.blob_read_timeout_seconds = blob_read_timeout_seconds;
         }
         if let Some(maintenance_interval_seconds) = args.maintenance_interval_seconds {
             self.maintenance_interval_seconds = maintenance_interval_seconds;
@@ -533,6 +559,14 @@ fn default_readers() -> usize {
     4
 }
 
+fn default_blob_readers() -> usize {
+    16
+}
+
+fn default_blob_read_timeout_seconds() -> u64 {
+    300
+}
+
 fn default_maintenance_interval_seconds() -> u64 {
     60
 }
@@ -616,9 +650,22 @@ mod tests {
     #[test]
     fn readers_default_and_deserialize_override() -> TestResult {
         assert_eq!(Config::default().readers, 4);
+        assert_eq!(Config::default().blob_readers, 16);
+        assert_eq!(Config::default().blob_read_timeout_seconds, 300);
 
-        let config: Config = yaml_serde::from_str("readers: 7\n")?;
+        let config: Config = yaml_serde::from_str(
+            "
+            readers: 7
+            blob_readers: 21
+            blob_read_timeout_seconds: 42
+            ",
+        )?;
         assert_eq!(config.readers, 7);
+        assert_eq!(config.blob_readers, 21);
+        assert_eq!(config.blob_read_timeout_seconds, 42);
+
+        let config: Config = yaml_serde::from_str("blob_read_timeout_seconds: 0\n")?;
+        assert_eq!(config.blob_read_timeout_seconds, 0);
 
         Ok(())
     }
@@ -687,6 +734,8 @@ mod tests {
             "
             port: 9000
             readers: 2
+            blob_readers: 6
+            blob_read_timeout_seconds: 90
             maintenance_interval_seconds: 60
             maintenance_vacuum_pages: 50
             cache_size: 512
@@ -705,6 +754,10 @@ mod tests {
             "9001",
             "--cache-size",
             "1024",
+            "--blob-readers",
+            "8",
+            "--blob-read-timeout-seconds",
+            "180",
             "--maintenance-interval-seconds",
             "120",
             "--maintenance-vacuum-pages",
@@ -718,6 +771,8 @@ mod tests {
 
         assert_eq!(config.port, 9001);
         assert_eq!(config.readers, 2);
+        assert_eq!(config.blob_readers, 8);
+        assert_eq!(config.blob_read_timeout_seconds, 180);
         assert_eq!(config.maintenance_interval_seconds, 120);
         assert_eq!(config.maintenance_vacuum_pages, 75);
         assert_eq!(config.sqlite.cache_size, 1024);

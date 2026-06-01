@@ -633,6 +633,99 @@ async fn test_get_object_ranges() -> Result<()> {
 
 #[tokio::test]
 #[tracing::instrument]
+async fn test_get_object_streams_large_ranges() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+
+    let bucket = format!("test-large-ranges-{}", Uuid::new_v4());
+    let key = "large.bin";
+    let content = (0u8..=250)
+        .cycle()
+        .take(128 * 1024 + 8192)
+        .collect::<Vec<_>>();
+
+    create_bucket(&context, &bucket).await?;
+    context
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(content.clone()))
+        .send()
+        .await?;
+
+    let full = context.get_object().bucket(&bucket).key(key).send().await?;
+    assert_eq!(full.content_length(), Some(content.len() as i64));
+    assert_eq!(
+        full.body.collect().await?.into_bytes().as_ref(),
+        content.as_slice()
+    );
+
+    let range_start = 128 * 1024 - 17;
+    let range_end = 128 * 1024 + 17;
+    let expected_range = format!("bytes {range_start}-{range_end}/{}", content.len());
+    let range = context
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .range(format!("bytes={range_start}-{range_end}"))
+        .send()
+        .await?;
+    assert_eq!(range.content_range(), Some(expected_range.as_str()));
+    assert_eq!(
+        range.body.collect().await?.into_bytes().as_ref(),
+        &content[range_start..=range_end]
+    );
+
+    delete_object(&context, &bucket, key).await?;
+    delete_bucket(&context, &bucket).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_get_object_drop_body_releases_reader() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(Some(Config {
+        readers: 1,
+        ..Default::default()
+    }))
+    .await?;
+
+    let bucket = format!("test-drop-body-{}", Uuid::new_v4());
+    let key = "large.bin";
+    let content = vec![42; 1024 * 1024];
+
+    create_bucket(&context, &bucket).await?;
+    context
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(content.clone()))
+        .send()
+        .await?;
+
+    let object = context.get_object().bucket(&bucket).key(key).send().await?;
+    assert_eq!(object.content_length(), Some(content.len() as i64));
+    drop(object);
+
+    let head = context
+        .head_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+    assert_eq!(head.content_length(), Some(content.len() as i64));
+    assert_eq!(get_object_bytes(&context, &bucket, key).await?, content);
+
+    delete_object(&context, &bucket, key).await?;
+    delete_bucket(&context, &bucket).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
 async fn test_get_and_head_object_conditionals() -> Result<()> {
     let _guard = serial().await;
     let context = TestContext::new(None).await?;
@@ -3581,6 +3674,29 @@ async fn test_zero_readers_fails_startup() -> Result<()> {
         anyhow::bail!("zero readers should fail startup");
     };
     assert_error_contains(err, "readers must be greater than zero");
+
+    fs::remove_dir_all(root)?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_zero_blob_readers_fails_startup() -> Result<()> {
+    let _guard = serial().await;
+    let root = PathBuf::from(format!("{FS_ROOT}-zero-blob-readers-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+
+    let Err(err) = Sqlite::new(&Config {
+        root: root.clone(),
+        blob_readers: 0,
+        ..Default::default()
+    })
+    .await
+    else {
+        anyhow::bail!("zero blob readers should fail startup");
+    };
+    assert_error_contains(err, "blob_readers must be greater than zero");
 
     fs::remove_dir_all(root)?;
 

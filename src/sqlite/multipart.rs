@@ -112,7 +112,6 @@ impl Sqlite {
             transaction,
             KeyValue {
                 key: request.key.clone(),
-                version_id: String::new(),
                 value: Some(completed_object.value),
                 key_metadata: KeyMetadata {
                     version_id: String::new(),

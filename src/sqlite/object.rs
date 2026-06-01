@@ -4,9 +4,9 @@ use rusqlite::{Error::ToSqlConversionFailure, OptionalExtension, Transaction};
 use time::OffsetDateTime;
 
 use super::{
-    BucketVersioningState, KeyMetadata, KeyValue, NULL_VERSION_ID, ObjectDeleteOutcome,
-    ObjectTagCondition, ObjectWriteConditions, ObjectWriteOutcome, Sqlite, SqliteError,
-    SqliteResult, optional_stored_checksum, row_bool, row_size, sql_size,
+    BucketVersioningState, KeyMetadata, KeyValue, NULL_VERSION_ID, ObjectBodyReference,
+    ObjectDeleteOutcome, ObjectTagCondition, ObjectWriteConditions, ObjectWriteOutcome, Sqlite,
+    SqliteError, SqliteResult, optional_stored_checksum, row_bool, row_size, sql_size,
 };
 
 const VERSION_ID_LEN: usize = 31;
@@ -136,7 +136,6 @@ impl Sqlite {
                 version_id,
                 is_latest,
                 is_delete_marker,
-                body,
                 size,
                 metadata,
                 content_type,
@@ -146,7 +145,7 @@ impl Sqlite {
                 last_modified,
                 md5
             )
-            VALUES (?1, ?2, 1, 1, NULL, 0, NULL, NULL, NULL, NULL, NULL, ?3, NULL);",
+            VALUES (?1, ?2, 1, 1, 0, NULL, NULL, NULL, NULL, NULL, ?3, NULL);",
         )?;
         Ok(stmt.execute((key, version_id, OffsetDateTime::now_utc()))?)
     }
@@ -213,14 +212,6 @@ impl Sqlite {
         Self::try_get_object_internal(transaction, key, None, false)
     }
 
-    /// Fetches the current object body and metadata including delete markers.
-    pub(crate) fn try_get_current_object(
-        transaction: &Transaction,
-        key: &str,
-    ) -> SqliteResult<Option<KeyValue>> {
-        Self::try_get_object_internal(transaction, key, None, true)
-    }
-
     /// Fetches an exact visible object body and metadata by key and version ID.
     pub(crate) fn try_get_object_version(
         transaction: &Transaction,
@@ -240,34 +231,34 @@ impl Sqlite {
         let mut stmt = transaction.prepare_cached(
             "
             SELECT
-                key,
-                version_id,
-                body,
-                size,
-                metadata,
-                content_type,
-                content_encoding,
-                cache_control,
-                expires,
-                last_modified,
-                md5,
-                checksum_algorithm,
-                checksum_type,
-                checksum_value,
-                is_latest,
-                is_delete_marker
-            FROM object_version
-            WHERE key = ?1
-                AND (?2 IS NULL OR version_id = ?2)
-                AND (?2 IS NOT NULL OR is_latest = 1)
-                AND (?3 OR is_delete_marker = 0);",
+                ov.key,
+                ov.version_id,
+                ob.body,
+                ov.size,
+                ov.metadata,
+                ov.content_type,
+                ov.content_encoding,
+                ov.cache_control,
+                ov.expires,
+                ov.last_modified,
+                ov.md5,
+                ov.checksum_algorithm,
+                ov.checksum_type,
+                ov.checksum_value,
+                ov.is_latest,
+                ov.is_delete_marker
+            FROM object_version AS ov
+            LEFT JOIN object_body AS ob ON ob.sequence = ov.sequence
+            WHERE ov.key = ?1
+                AND (?2 IS NULL OR ov.version_id = ?2)
+                AND (?2 IS NOT NULL OR ov.is_latest = 1)
+                AND (?3 OR ov.is_delete_marker = 0);",
         )?;
 
-        Ok(stmt
+        let object = stmt
             .query_row((key, version_id, include_delete_markers), |row| {
                 Ok(KeyValue {
                     key: row.get(0)?,
-                    version_id: row.get(1)?,
                     value: row.get(2)?,
                     key_metadata: KeyMetadata {
                         version_id: row.get(1)?,
@@ -296,6 +287,110 @@ impl Sqlite {
                         )?,
                         is_latest: row_bool(row, 14)?,
                         is_delete_marker: row_bool(row, 15)?,
+                    },
+                })
+            })
+            .optional()?;
+
+        if let Some(object) = object.as_ref()
+            && object.key_metadata.is_delete_marker.not()
+        {
+            let value = object
+                .value
+                .as_ref()
+                .ok_or(SqliteError::ObjectBodyInconsistent)?;
+            let value_size =
+                i64::try_from(value.len()).map_err(|_| SqliteError::ObjectBodyInconsistent)?;
+            if value_size != object.key_metadata.size {
+                return Err(SqliteError::ObjectBodyInconsistent);
+            }
+        }
+
+        Ok(object)
+    }
+
+    /// Fetches the current object metadata and body rowid by key.
+    pub(crate) fn try_get_current_object_body_reference(
+        transaction: &Transaction,
+        key: &str,
+    ) -> SqliteResult<Option<ObjectBodyReference>> {
+        Self::try_get_object_body_reference_internal(transaction, key, None, true)
+    }
+
+    /// Fetches exact visible object metadata and body rowid by key and version ID.
+    pub(crate) fn try_get_object_version_body_reference(
+        transaction: &Transaction,
+        key: &str,
+        version_id: &str,
+    ) -> SqliteResult<Option<ObjectBodyReference>> {
+        Self::try_get_object_body_reference_internal(transaction, key, Some(version_id), false)
+    }
+
+    /// Fetches metadata and rowid for opening an object body BLOB.
+    fn try_get_object_body_reference_internal(
+        transaction: &Transaction,
+        key: &str,
+        version_id: Option<&str>,
+        include_delete_markers: bool,
+    ) -> SqliteResult<Option<ObjectBodyReference>> {
+        let mut stmt = transaction.prepare_cached(
+            "
+            SELECT
+                version_id,
+                sequence,
+                size,
+                metadata,
+                content_type,
+                content_encoding,
+                cache_control,
+                expires,
+                last_modified,
+                md5,
+                checksum_algorithm,
+                checksum_type,
+                checksum_value,
+                is_latest,
+                is_delete_marker
+            FROM object_version
+            WHERE key = ?1
+                AND (?2 IS NULL OR version_id = ?2)
+                AND (?2 IS NOT NULL OR is_latest = 1)
+                AND (?3 OR is_delete_marker = 0);",
+        )?;
+
+        Ok(stmt
+            .query_row((key, version_id, include_delete_markers), |row| {
+                let version_id = row.get(0)?;
+                Ok(ObjectBodyReference {
+                    version_id,
+                    sequence: row.get(1)?,
+                    key_metadata: KeyMetadata {
+                        version_id: row.get(0)?,
+                        size: row_size(row, 2)?,
+                        metadata: row
+                            .get::<_, Option<String>>(3)?
+                            .map(|metadata| serde_json::from_str(&metadata))
+                            .transpose()
+                            .map_err(|err| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    3,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(err),
+                                )
+                            })?,
+                        content_type: row.get(4)?,
+                        content_encoding: row.get(5)?,
+                        cache_control: row.get(6)?,
+                        expires: row.get(7)?,
+                        last_modified: row.get(8)?,
+                        md5: row.get(9)?,
+                        checksum: optional_stored_checksum(
+                            row.get(10)?,
+                            row.get(11)?,
+                            row.get(12)?,
+                        )?,
+                        is_latest: row_bool(row, 13)?,
+                        is_delete_marker: row_bool(row, 14)?,
                     },
                 })
             })
@@ -457,6 +552,7 @@ impl Sqlite {
             key_metadata,
             ..
         } = kv;
+        let value = value.ok_or(SqliteError::ObjectBodyInconsistent)?;
         let state = Self::try_get_bucket_versioning_state(transaction)?;
         let version_id = match state {
             BucketVersioningState::Enabled => {
@@ -480,7 +576,6 @@ impl Sqlite {
                 version_id,
                 is_latest,
                 is_delete_marker,
-                body,
                 size,
                 metadata,
                 content_type,
@@ -493,7 +588,7 @@ impl Sqlite {
                 checksum_type,
                 checksum_value
             )
-            VALUES (?1, ?2, 1, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14);",
+            VALUES (?1, ?2, 1, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13);",
         )?;
 
         let size = sql_size(key_metadata.size)?;
@@ -504,7 +599,6 @@ impl Sqlite {
         stmt.execute(rusqlite::params![
             &key,
             &version_id,
-            value,
             size,
             key_metadata
                 .metadata
@@ -521,6 +615,15 @@ impl Sqlite {
             checksum.checksum_type(),
             checksum.as_str(),
         ])?;
+        drop(stmt);
+
+        let sequence = transaction.last_insert_rowid();
+        let mut stmt = transaction.prepare_cached(
+            "
+            INSERT INTO object_body (sequence, body)
+            VALUES (?1, ?2);",
+        )?;
+        stmt.execute((sequence, value))?;
 
         Ok(ObjectWriteOutcome {
             version_id,

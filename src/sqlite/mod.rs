@@ -45,7 +45,6 @@ CREATE TABLE object_version (
     version_id TEXT NOT NULL,
     is_latest INTEGER NOT NULL CHECK(is_latest IN (0, 1)),
     is_delete_marker INTEGER NOT NULL CHECK(is_delete_marker IN (0, 1)),
-    body BLOB,
     size INTEGER NOT NULL CHECK(size >= 0),
     metadata TEXT,
     content_type TEXT,
@@ -61,7 +60,6 @@ CREATE TABLE object_version (
     CHECK (
         (
             is_delete_marker = 0
-            AND body IS NOT NULL
             AND md5 IS NOT NULL
             AND checksum_algorithm IS NOT NULL
             AND checksum_type IS NOT NULL
@@ -70,7 +68,6 @@ CREATE TABLE object_version (
         OR
         (
             is_delete_marker = 1
-            AND body IS NULL
             AND size = 0
             AND metadata IS NULL
             AND content_type IS NULL
@@ -83,6 +80,12 @@ CREATE TABLE object_version (
             AND checksum_value IS NULL
         )
     )
+) STRICT;
+
+CREATE TABLE object_body (
+    sequence INTEGER PRIMARY KEY,
+    body BLOB NOT NULL,
+    FOREIGN KEY (sequence) REFERENCES object_version (sequence) ON DELETE CASCADE
 ) STRICT;
 
 CREATE UNIQUE INDEX object_version_latest_one
@@ -282,8 +285,15 @@ impl BucketVersioningState {
 #[derive(Debug)]
 pub(crate) struct KeyValue {
     pub(crate) key: String,
-    pub(crate) version_id: String,
     pub(crate) value: Option<Vec<u8>>,
+    pub(crate) key_metadata: KeyMetadata,
+}
+
+/// Metadata plus rowid needed to stream an object body from `SQLite`.
+#[derive(Debug)]
+pub(crate) struct ObjectBodyReference {
+    pub(crate) version_id: String,
+    pub(crate) sequence: i64,
     pub(crate) key_metadata: KeyMetadata,
 }
 
@@ -512,6 +522,11 @@ impl Sqlite {
                 "readers must be greater than zero".to_string(),
             ))?;
         }
+        if config.blob_readers == 0 {
+            Err(SqliteError::Configuration(
+                "blob_readers must be greater than zero".to_string(),
+            ))?;
+        }
 
         let root = env::current_dir()?.join(&config.root).canonicalize()?;
         let buckets = Self::try_open_configured_buckets(&root, config).await?;
@@ -698,6 +713,7 @@ mod tests {
 
     fn open_schema() -> SqliteResult<Connection> {
         let mut connection = Connection::open_in_memory()?;
+        connection.execute_batch("PRAGMA foreign_keys=true;")?;
         let transaction = connection.transaction()?;
         Sqlite::try_create_tables(&transaction)?;
         transaction.commit()?;
@@ -710,9 +726,9 @@ mod tests {
         let result = connection.execute(
             "
             INSERT INTO object_version (
-                key, version_id, is_latest, is_delete_marker, body, size, last_modified, md5
+                key, version_id, is_latest, is_delete_marker, size, last_modified, md5
             )
-            VALUES ('key', 'null', 1, 0, X'00', 1, ?1, 'md5');",
+            VALUES ('key', 'null', 1, 0, 1, ?1, 'md5');",
             [OffsetDateTime::now_utc()],
         );
 
@@ -730,7 +746,6 @@ mod tests {
                 version_id,
                 is_latest,
                 is_delete_marker,
-                body,
                 size,
                 last_modified,
                 md5,
@@ -738,11 +753,48 @@ mod tests {
                 checksum_type,
                 checksum_value
             )
-            VALUES ('key', 'null', 1, 1, NULL, 0, ?1, NULL, 3, 2, 'crc');",
+            VALUES ('key', 'null', 1, 1, 0, ?1, NULL, 3, 2, 'crc');",
             [OffsetDateTime::now_utc()],
         );
 
         assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn object_body_rows_cascade_with_object_versions() -> SqliteResult<()> {
+        let connection = open_schema()?;
+        connection.execute(
+            "
+            INSERT INTO object_version (
+                key,
+                version_id,
+                is_latest,
+                is_delete_marker,
+                size,
+                last_modified,
+                md5,
+                checksum_algorithm,
+                checksum_type,
+                checksum_value
+            )
+            VALUES ('key', 'null', 1, 0, 1, ?1, 'md5', 3, 2, 'crc');",
+            [OffsetDateTime::now_utc()],
+        )?;
+        let sequence = connection.last_insert_rowid();
+        connection.execute(
+            "INSERT INTO object_body (sequence, body) VALUES (?1, X'00');",
+            [sequence],
+        )?;
+
+        connection.execute(
+            "DELETE FROM object_version WHERE sequence = ?1;",
+            [sequence],
+        )?;
+        let body_count: i64 =
+            connection.query_row("SELECT COUNT(*) FROM object_body;", (), |row| row.get(0))?;
+
+        assert_eq!(body_count, 0);
         Ok(())
     }
 

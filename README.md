@@ -18,28 +18,37 @@ Each `bucket` is saved to a separate `.sqlite3` database named after the `bucket
 
 ### Data
 
-The main table, `data`, is a simple key/value table with a separate `metadata` store. `metadata` is split from `data` as it was found to be more performant for large `list_objects` calls presumably due to it being able to be cached by the SQLite engine. This idea was inspired by [BadgerDB](https://github.com/outcaste-io/badger) who implemented ideas from the WISCKEY paper and saw big wins with separating values from keys.
+Object metadata is stored separately from object bodies. `object_version` keeps the small, frequently scanned state used by `HEAD`, `LIST`, conditionals, and versioning. `object_body` stores the BLOB payload by the same `sequence` rowid. Keeping payload bytes out of the metadata table lets SQLite cache listing and metadata pages more effectively. This idea was inspired by [BadgerDB](https://github.com/outcaste-io/badger) and the WiscKey paper.
 
 ```sql
-CREATE TABLE IF NOT EXISTS data (
-    key TEXT PRIMARY KEY,
-    value BLOB
-);
-
-CREATE TABLE IF NOT EXISTS metadata (
-    key TEXT PRIMARY KEY,
+CREATE TABLE object_version (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    key TEXT NOT NULL,
+    version_id TEXT NOT NULL,
+    is_latest INTEGER NOT NULL,
+    is_delete_marker INTEGER NOT NULL,
     size INTEGER NOT NULL,
     metadata TEXT,
     content_type TEXT,
+    content_encoding TEXT,
     cache_control TEXT,
     expires TEXT,
     last_modified TEXT NOT NULL,
     md5 TEXT,
-    FOREIGN KEY (key) REFERENCES data (key) ON DELETE CASCADE
-) WITHOUT ROWID;
+    checksum_algorithm INTEGER,
+    checksum_type INTEGER,
+    checksum_value TEXT,
+    UNIQUE(key, version_id)
+) STRICT;
+
+CREATE TABLE object_body (
+    sequence INTEGER PRIMARY KEY,
+    body BLOB NOT NULL,
+    FOREIGN KEY (sequence) REFERENCES object_version (sequence) ON DELETE CASCADE
+) STRICT;
 ```
 
-Existing bucket databases are checked at startup and migrated forward for newly-added metadata columns where possible.
+Bucket databases are checked at startup against the supported schema version. Unsupported older schemas fail to open rather than being migrated in place.
 
 ### Multipart Uploads
 
@@ -96,7 +105,9 @@ only when a deployment needs to override them. The available options are:
 - `access_key`: The access key ID that is used to authenticate for this service.
 - `secret_key`: The secret access key that is used to authenticate for this service.
 - `concurrency_limit`: Enforces a limit on the concurrent number of HTTP requests the service can handle. This can be tuned depending on infrastructure as SSD/HDD will handle resource contention very differently.
-- `readers`: Controls the number of SQLite reader connections. Defaults to `4`.
+- `readers`: Controls the number of short metadata/query `SQLite` reader connections. Defaults to `4`.
+- `blob_readers`: Controls the number of long-lived `GetObject` BLOB stream reader connections. Defaults to `16`.
+- `blob_read_timeout_seconds`: Seconds a BLOB reader may stay blocked by an unconsumed response before releasing its SQLite handle. Defaults to `300`; set to `0` to disable.
 - `maintenance_interval_seconds`: Interval for background database maintenance. Defaults to `60`; set to `0` to disable periodic maintenance.
 - `maintenance_vacuum_pages`: Number of free SQLite pages to reclaim with `PRAGMA incremental_vacuum(N)` during each maintenance pass. Defaults to `100`; set to `0` to skip incremental vacuum.
 - `multipart_upload_ttl_seconds`: TTL for inactive incomplete multipart uploads. Defaults to `86400`; set to `0` to disable background cleanup.
@@ -152,6 +163,8 @@ s3ite:latest \
 --port 8014 \
 --concurrency-limit 16 \
 --readers 4 \
+--blob-readers 16 \
+--blob-read-timeout-seconds 300 \
 --access-key AKIAIOSFODNN7EXAMPLE \
 --secret-key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 ```

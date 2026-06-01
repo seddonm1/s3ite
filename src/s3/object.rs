@@ -1,27 +1,27 @@
 use std::{collections::HashMap, ops::Range as ByteRange};
 
 use super::{
-    Bytes, CONTENT_MD5, ChecksumAlgorithmKind, ChecksumInput, ChecksumMode, ChecksumPolicy,
+    CONTENT_MD5, ChecksumAlgorithmKind, ChecksumInput, ChecksumMode, ChecksumPolicy,
     ChecksumTypeKind, CompletedObjectPart, CopyObjectInput, CopyObjectOutput, CopyObjectResult,
     CopySource, DeleteError, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput,
     DeleteObjectsOutput, DeletedObject, Digest, ETag, ETagCondition, GetObjectAttributesInput,
     GetObjectAttributesOutput, GetObjectAttributesParts, GetObjectInput, GetObjectOutput,
-    HeadObjectInput, HeadObjectOutput, InternalError, KeyMetadata, KeyValue, Md5,
-    MetadataDirective, Not, ObjectAttributes, ObjectDeleteConditions, ObjectDeleteOutcome,
-    ObjectPart, ObjectReadConditionFailure, ObjectReadConditions, OffsetDateTime, PutObjectInput,
+    HeadObjectInput, HeadObjectOutput, KeyMetadata, KeyValue, Md5, MetadataDirective, Not,
+    ObjectAttributes, ObjectBodyReference, ObjectDeleteConditions, ObjectDeleteOutcome, ObjectPart,
+    ObjectReadConditionFailure, ObjectReadConditions, OffsetDateTime, PutObjectInput,
     PutObjectOutput, S3Error, S3ErrorCode, S3Range, S3Request, S3Response, S3Result, Sqlite,
-    SqliteError, SqliteResult, StorageClass, StoredChecksum, StreamingBlob, TryStreamExt,
-    checksum_algorithm_from_request, checksum_crc32, checksum_crc32c, checksum_crc64nvme,
-    checksum_mode_enabled, checksum_sha1, checksum_sha256, checksum_struct, checksum_type_output,
-    copy_bytes, debug, finish_payload_checksum, hex, list_limit, not_found_delete_marker_error,
-    not_modified_error, object_checksum_for_part, object_write_checksum_from_value,
-    object_write_conditions, payload_checksum_accumulator, requested_part_range, s3_error,
-    s3_error_from_sqlite, s3_error_with_message, stream, validate_content_md5,
-    validate_copy_source_conditions, validate_delete_conditions, validate_part_number,
-    validate_read_conditions,
+    SqliteError, SqliteResult, StorageClass, StoredChecksum, StreamExt, StreamingBlob,
+    TryStreamExt, checksum_algorithm_from_request, checksum_crc32, checksum_crc32c,
+    checksum_crc64nvme, checksum_mode_enabled, checksum_sha1, checksum_sha256, checksum_struct,
+    checksum_type_output, copy_bytes, debug, finish_payload_checksum, hex, list_limit,
+    not_found_delete_marker_error, not_modified_error, object_checksum_for_part,
+    object_write_checksum_from_value, object_write_conditions, payload_checksum_accumulator,
+    requested_part_range, s3_error, s3_error_from_sqlite, s3_error_with_message, stream,
+    validate_content_md5, validate_copy_source_conditions, validate_delete_conditions,
+    validate_part_number, validate_read_conditions,
 };
 
-use crate::database::BucketConnection;
+use crate::database::{BlobReadReceiver, BlobReadRequest, BucketConnection};
 
 pub(super) fn visible_version_id(version_id: String) -> Option<String> {
     (version_id != "null").then_some(version_id)
@@ -460,9 +460,28 @@ pub(super) async fn delete_objects(
 }
 
 struct ObjectBodyRead {
-    object: KeyValue,
+    object: ObjectBodyReference,
     completed_part: Option<CompletedObjectPart>,
     completed_part_count: i32,
+    object_range: ByteRange<u64>,
+    body: BlobReadReceiver,
+}
+
+struct ObjectBodyReadFound {
+    object: ObjectBodyReference,
+    completed_part: Option<CompletedObjectPart>,
+    completed_part_count: i32,
+    object_range: ByteRange<u64>,
+}
+
+enum ObjectBodyReadStart {
+    Missing,
+    DeleteMarker,
+    ConditionFailed {
+        failure: ObjectReadConditionFailure,
+        md5: Option<String>,
+    },
+    Found(Box<ObjectBodyReadFound>),
 }
 
 struct ObjectMetadataRead {
@@ -524,6 +543,41 @@ fn requested_object_range(
     }
 }
 
+fn completed_part_range_sqlite(part: &CompletedObjectPart) -> SqliteResult<ByteRange<u64>> {
+    let start = u64::try_from(part.start).map_err(|_| SqliteError::ObjectBodyInconsistent)?;
+    let size = u64::try_from(part.size).map_err(|_| SqliteError::ObjectBodyInconsistent)?;
+    let end = start
+        .checked_add(size)
+        .ok_or(SqliteError::ObjectBodyInconsistent)?;
+    Ok(start..end)
+}
+
+fn requested_object_range_sqlite(
+    part_number: Option<i32>,
+    range: Option<&S3Range>,
+    completed_part: Option<&CompletedObjectPart>,
+    completed_part_count: i32,
+    object_size: u64,
+) -> SqliteResult<ByteRange<u64>> {
+    match (part_number, range) {
+        (Some(part_number), _) => match completed_part {
+            Some(part) => completed_part_range_sqlite(part),
+            None if completed_part_count == 0 && part_number == 1 => Ok(0..object_size),
+            None => Err(SqliteError::InvalidMultipartPart),
+        },
+        (None, None) => Ok(0..object_size),
+        (None, Some(range)) => {
+            let object_range = range
+                .check(object_size)
+                .map_err(|_| SqliteError::InvalidObjectRange)?;
+            if object_range.is_empty() {
+                return Err(SqliteError::InvalidObjectRange);
+            }
+            Ok(object_range)
+        }
+    }
+}
+
 fn content_range_header(
     range_requested: bool,
     part_number_requested: bool,
@@ -559,40 +613,85 @@ async fn load_get_object(
     key: String,
     version_id: Option<String>,
     part_number: Option<i32>,
+    range: Option<S3Range>,
+    conditions: ObjectReadConditions,
 ) -> S3Result<ObjectBodyRead> {
-    let (object, completed_part, completed_part_count) = connection
-        .read(move |connection| {
-            let transaction = connection.transaction()?;
+    let (start, body) = connection
+        .read_blob(move |transaction| {
             let object = match version_id.as_deref() {
                 Some(version_id) => Some(
-                    Sqlite::try_get_object_version(&transaction, &key, version_id)?
+                    Sqlite::try_get_object_version_body_reference(transaction, &key, version_id)?
                         .ok_or(SqliteError::ObjectVersionNotFound)?,
                 ),
-                None => Sqlite::try_get_current_object(&transaction, &key)?,
+                None => Sqlite::try_get_current_object_body_reference(transaction, &key)?,
             };
             let Some(object) = object else {
-                return Ok((None, None, 0));
+                return Ok((ObjectBodyReadStart::Missing, None));
             };
             if object.key_metadata.is_delete_marker {
-                return Ok((Some(object), None, 0));
+                return Ok((ObjectBodyReadStart::DeleteMarker, None));
             }
+            if let Err(failure) = validate_read_conditions(&object.key_metadata, &conditions) {
+                return Ok((
+                    ObjectBodyReadStart::ConditionFailed {
+                        failure,
+                        md5: object.key_metadata.md5.clone(),
+                    },
+                    None,
+                ));
+            }
+
+            let object_size = u64::try_from(object.key_metadata.size)
+                .map_err(|_| SqliteError::ObjectBodyInconsistent)?;
             let (completed_part, completed_part_count) =
-                load_completed_part_info(&transaction, &key, &object.version_id, part_number)?;
-            Ok((Some(object), completed_part, completed_part_count))
+                load_completed_part_info(transaction, &key, &object.version_id, part_number)?;
+            let object_range = requested_object_range_sqlite(
+                part_number,
+                range.as_ref(),
+                completed_part.as_ref(),
+                completed_part_count,
+                object_size,
+            )?;
+            let length = object_range.end - object_range.start;
+            let request = BlobReadRequest::new(
+                "object_body",
+                "body",
+                object.sequence,
+                object_range.start,
+                length,
+                object_size,
+            );
+
+            Ok((
+                ObjectBodyReadStart::Found(Box::new(ObjectBodyReadFound {
+                    object,
+                    completed_part,
+                    completed_part_count,
+                    object_range,
+                })),
+                Some(request),
+            ))
         })
         .await
         .map_err(s3_error_from_sqlite)?;
-    let Some(object) = object else {
-        return Err(not_found_delete_marker_error(false));
-    };
-    if object.key_metadata.is_delete_marker {
-        return Err(not_found_delete_marker_error(true));
+
+    match start {
+        ObjectBodyReadStart::Missing => Err(not_found_delete_marker_error(false)),
+        ObjectBodyReadStart::DeleteMarker => Err(not_found_delete_marker_error(true)),
+        ObjectBodyReadStart::ConditionFailed { failure, md5 } => Err(match failure {
+            ObjectReadConditionFailure::PreconditionFailed => {
+                s3_error(S3ErrorCode::PreconditionFailed)
+            }
+            ObjectReadConditionFailure::NotModified => not_modified_error(md5.as_deref())?,
+        }),
+        ObjectBodyReadStart::Found(read) => Ok(ObjectBodyRead {
+            object: read.object,
+            completed_part: read.completed_part,
+            completed_part_count: read.completed_part_count,
+            object_range: read.object_range,
+            body,
+        }),
     }
-    Ok(ObjectBodyRead {
-        object,
-        completed_part,
-        completed_part_count,
-    })
 }
 
 async fn load_head_object(
@@ -658,34 +757,54 @@ fn get_object_output(
     part_number: Option<i32>,
     checksum_mode: Option<&ChecksumMode>,
 ) -> S3Result<GetObjectOutput> {
-    let KeyValue {
+    let ObjectBodyReference {
         version_id,
-        value,
         key_metadata,
         ..
     } = read.object;
     let object_size = u64::try_from(key_metadata.size).map_err(S3Error::internal_error)?;
-    let object_range = requested_object_range(
-        part_number,
-        range,
-        read.completed_part.as_ref(),
-        read.completed_part_count,
-        object_size,
-    )?;
+    let object_range = read.object_range;
     let content_length = object_range.end - object_range.start;
     let content_length_i64 = i64::try_from(content_length).map_err(S3Error::internal_error)?;
-    let value = stored_object_value(value, key_metadata.size)?;
-    let start = usize::try_from(object_range.start).map_err(S3Error::internal_error)?;
-    let end = usize::try_from(object_range.end).map_err(S3Error::internal_error)?;
-    if start > end || end > value.len() {
-        return Err(S3Error::with_message(
-            InternalError,
-            "object metadata size exceeds stored value length",
-        ));
-    }
-
-    let value = Bytes::from(value).slice(start..end);
-    let body = stream::once(async { Ok(value) });
+    let body = stream::unfold(
+        (read.body, content_length, false),
+        |(mut receiver, remaining, done)| async move {
+            if done {
+                return None;
+            }
+            match receiver.recv().await {
+                Some(Ok(bytes)) => {
+                    let Ok(chunk_len) = u64::try_from(bytes.len()) else {
+                        return Some((
+                            Err(S3Error::with_message(
+                                S3ErrorCode::InternalError,
+                                "object body chunk length does not fit u64",
+                            )),
+                            (receiver, 0, true),
+                        ));
+                    };
+                    let Some(remaining) = remaining.checked_sub(chunk_len) else {
+                        return Some((
+                            Err(s3_error_from_sqlite(SqliteError::ObjectBodyInconsistent)),
+                            (receiver, 0, true),
+                        ));
+                    };
+                    Some((Ok(bytes), (receiver, remaining, false)))
+                }
+                Some(Err(error)) => Some((Err(s3_error_from_sqlite(error)), (receiver, 0, true))),
+                None if remaining == 0 => None,
+                None if receiver.timed_out() => Some((
+                    Err(s3_error_from_sqlite(SqliteError::ObjectBodyReadTimeout)),
+                    (receiver, 0, true),
+                )),
+                None => Some((
+                    Err(s3_error_from_sqlite(SqliteError::ObjectBodyInconsistent)),
+                    (receiver, 0, true),
+                )),
+            }
+        },
+    )
+    .fuse();
     let response_checksum = response_checksum(
         key_metadata.checksum.as_ref(),
         read.completed_part.as_ref(),
@@ -722,17 +841,6 @@ fn get_object_output(
         version_id: Some(version_id),
         ..Default::default()
     })
-}
-
-fn stored_object_value(value: Option<Vec<u8>>, size: i64) -> S3Result<Vec<u8>> {
-    match value {
-        Some(value) => Ok(value),
-        None if size == 0 => Ok(Vec::new()),
-        None => Err(S3Error::with_message(
-            InternalError,
-            "object metadata has nonzero size but no value",
-        )),
-    }
 }
 
 fn head_object_output(
@@ -817,16 +925,20 @@ pub(super) async fn get_object(
         .try_get_connection(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
-    let read = load_get_object(&connection, key, version_id, part_number).await?;
-    validate_loaded_read_conditions(
-        &read.object.key_metadata,
-        &ObjectReadConditions {
+    let read = load_get_object(
+        &connection,
+        key,
+        version_id,
+        part_number,
+        range,
+        ObjectReadConditions {
             etag_matches: if_match,
             modified_since: if_modified_since.map(Into::into),
             etag_none_matches: if_none_match,
             unmodified_since: if_unmodified_since.map(Into::into),
         },
-    )?;
+    )
+    .await?;
     let output = get_object_output(read, range.as_ref(), part_number, checksum_mode.as_ref())?;
     Ok(S3Response::new(output))
 }
@@ -1176,7 +1288,6 @@ pub(super) async fn put_object(
                 &transaction,
                 KeyValue {
                     key,
-                    version_id: String::new(),
                     value: Some(value),
                     key_metadata: KeyMetadata {
                         version_id: String::new(),

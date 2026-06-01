@@ -31,6 +31,12 @@ pub enum SqliteError {
     /// A requested object byte range is not satisfiable.
     #[error("object range is invalid")]
     InvalidObjectRange,
+    /// Object metadata and body storage are inconsistent.
+    #[error("object body is inconsistent with object metadata")]
+    ObjectBodyInconsistent,
+    /// A BLOB stream stalled while waiting for response backpressure to clear.
+    #[error("object body read timed out")]
+    ObjectBodyReadTimeout,
     /// Object write preconditions did not match current stored metadata.
     #[error("object precondition failed")]
     PreconditionFailed,
