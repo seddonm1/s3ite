@@ -1,3 +1,5 @@
+//! S3 `PutObject` request handling.
+
 use super::{
     CONTENT_MD5, ChecksumInput, ChecksumPolicy, ChecksumTypeKind, Digest, ETag, KeyMetadata,
     KeyValue, Md5, Not, OffsetDateTime, PutObjectInput, PutObjectOutput, S3Error, S3ErrorCode,
@@ -8,6 +10,7 @@ use super::{
     s3_error_from_sqlite, validate_content_md5,
 };
 
+/// Fully buffered object body plus hashes needed by the storage write.
 struct BufferedObjectBody {
     value: Vec<u8>,
     size: i64,
@@ -15,6 +18,7 @@ struct BufferedObjectBody {
     checksum: StoredChecksum,
 }
 
+/// Reads the request body while accumulating MD5 and the selected S3 checksum.
 async fn read_put_object_body(
     body: StreamingBlob,
     content_md5_header_present: bool,
@@ -55,6 +59,7 @@ async fn read_put_object_body(
     })
 }
 
+/// Validates the limited storage classes supported by this backend.
 fn validate_put_storage_class(storage_class: Option<&StorageClass>) -> S3Result<()> {
     if let Some(storage_class) = storage_class {
         let is_valid = ["STANDARD", "REDUCED_REDUNDANCY"].contains(&storage_class.as_str());
@@ -65,6 +70,7 @@ fn validate_put_storage_class(storage_class: Option<&StorageClass>) -> S3Result<
     Ok(())
 }
 
+/// Builds the S3 `PutObject` response from the stored object identity.
 fn put_object_output(
     md5: String,
     checksum: &StoredChecksum,

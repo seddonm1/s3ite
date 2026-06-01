@@ -1,3 +1,5 @@
+//! S3 object delete request handling.
+
 use super::{
     DeleteError, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput,
     DeletedObject, ETagCondition, Not, ObjectDeleteConditions, ObjectDeleteOutcome, S3ErrorCode,

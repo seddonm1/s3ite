@@ -1,3 +1,5 @@
+//! S3 object read and attribute request handling.
+
 use std::ops::Range as ByteRange;
 
 use super::{
@@ -15,10 +17,12 @@ use super::{
 
 use crate::database::{BlobReadReceiver, BlobReadRequest, BucketConnection};
 
+/// Hides the special S3 `null` version ID from response fields that omit it.
 fn visible_version_id(version_id: String) -> Option<String> {
     (version_id != "null").then_some(version_id)
 }
 
+/// Returns whether the comma-separated object attributes request includes a name.
 fn has_object_attribute(attributes: &[ObjectAttributes], name: &str) -> bool {
     attributes.iter().any(|attribute| {
         attribute
@@ -28,6 +32,7 @@ fn has_object_attribute(attributes: &[ObjectAttributes], name: &str) -> bool {
     })
 }
 
+/// Loaded object metadata plus the streaming body reader for `GetObject`.
 struct ObjectBodyRead {
     object: ObjectBodyReference,
     completed_part: Option<CompletedObjectPart>,
@@ -36,6 +41,7 @@ struct ObjectBodyRead {
     body: BlobReadReceiver,
 }
 
+/// Metadata selected inside the blob-reader transaction before streaming starts.
 struct ObjectBodyReadFound {
     object: ObjectBodyReference,
     completed_part: Option<CompletedObjectPart>,
@@ -43,22 +49,29 @@ struct ObjectBodyReadFound {
     object_range: ByteRange<u64>,
 }
 
+/// Result of resolving an object body read before opening the response stream.
 enum ObjectBodyReadStart {
+    /// No current or requested object version exists.
     Missing,
+    /// The resolved current version is a delete marker.
     DeleteMarker,
+    /// Preconditions failed while evaluating metadata in the reader transaction.
     ConditionFailed {
         failure: ObjectReadConditionFailure,
         md5: Option<String>,
     },
+    /// The object exists and has an associated blob read request.
     Found(Box<ObjectBodyReadFound>),
 }
 
+/// Object metadata selected for `HeadObject` and attribute responses.
 struct ObjectMetadataRead {
     metadata: KeyMetadata,
     completed_part: Option<CompletedObjectPart>,
     completed_part_count: i32,
 }
 
+/// Validates S3 range and `partNumber` request parameters before storage access.
 fn validate_range_request(range: Option<&S3Range>, part_number: Option<i32>) -> S3Result<()> {
     if range.is_some() && part_number.is_some() {
         return Err(s3_error_with_message(
@@ -72,6 +85,7 @@ fn validate_range_request(range: Option<&S3Range>, part_number: Option<i32>) -> 
     Ok(())
 }
 
+/// Maps loaded object conditional validation failures into protocol errors.
 fn validate_loaded_read_conditions(
     metadata: &KeyMetadata,
     conditions: &ObjectReadConditions,
@@ -87,6 +101,7 @@ fn validate_loaded_read_conditions(
     Ok(())
 }
 
+/// Computes the byte span represented by a range or completed multipart part.
 fn requested_object_range(
     part_number: Option<i32>,
     range: Option<&S3Range>,
@@ -112,6 +127,7 @@ fn requested_object_range(
     }
 }
 
+/// Converts a completed multipart part boundary into a byte span.
 fn completed_part_range_sqlite(part: &CompletedObjectPart) -> SqliteResult<ByteRange<u64>> {
     let start = u64::try_from(part.start).map_err(|_| SqliteError::ObjectBodyInconsistent)?;
     let size = u64::try_from(part.size).map_err(|_| SqliteError::ObjectBodyInconsistent)?;
@@ -121,6 +137,7 @@ fn completed_part_range_sqlite(part: &CompletedObjectPart) -> SqliteResult<ByteR
     Ok(start..end)
 }
 
+/// Computes the byte span for a streaming read inside the `SQLite` reader path.
 fn requested_object_range_sqlite(
     part_number: Option<i32>,
     range: Option<&S3Range>,
@@ -147,6 +164,7 @@ fn requested_object_range_sqlite(
     }
 }
 
+/// Formats the response `Content-Range` header when a partial span was requested.
 fn content_range_header(
     range_requested: bool,
     part_number_requested: bool,
@@ -163,6 +181,7 @@ fn content_range_header(
         .flatten()
 }
 
+/// Selects the checksum value that should be exposed for the response shape.
 fn response_checksum(
     object_checksum: Option<&StoredChecksum>,
     completed_part: Option<&CompletedObjectPart>,
@@ -177,6 +196,7 @@ fn response_checksum(
     }
 }
 
+/// Resolves object metadata and opens a bounded blob stream for `GetObject`.
 async fn load_get_object(
     connection: &BucketConnection,
     key: String,
@@ -263,6 +283,7 @@ async fn load_get_object(
     }
 }
 
+/// Loads metadata and completed-part state for `HeadObject`.
 async fn load_head_object(
     connection: &BucketConnection,
     key: String,
@@ -305,6 +326,7 @@ async fn load_head_object(
     })
 }
 
+/// Loads completed multipart part metadata when `partNumber` was requested.
 fn load_completed_part_info(
     transaction: &rusqlite::Transaction<'_>,
     key: &str,
@@ -320,6 +342,7 @@ fn load_completed_part_info(
     }
 }
 
+/// Builds a `GetObject` response around the `SQLite` blob reader stream.
 fn get_object_output(
     read: ObjectBodyRead,
     range: Option<&S3Range>,
@@ -412,6 +435,7 @@ fn get_object_output(
     })
 }
 
+/// Builds a `HeadObject` response using metadata-only object state.
 fn head_object_output(
     read: ObjectMetadataRead,
     range: Option<&S3Range>,
@@ -551,6 +575,7 @@ pub(super) async fn head_object(
     Ok(S3Response::new(output))
 }
 
+/// Builds paginated object-part attributes for `GetObjectAttributes`.
 fn object_attributes_parts(
     wants_object_parts: bool,
     total_parts_count: i32,

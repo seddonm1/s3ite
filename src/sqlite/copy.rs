@@ -1,3 +1,5 @@
+//! `SQLite` helpers for object copy sources.
+
 use rusqlite::Transaction;
 
 use super::{KeyValue, Sqlite, SqliteError, SqliteResult};

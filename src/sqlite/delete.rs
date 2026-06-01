@@ -1,3 +1,5 @@
+//! `SQLite` object deletion and delete-marker helpers.
+
 use rusqlite::Transaction;
 use time::OffsetDateTime;
 

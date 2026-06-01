@@ -1,3 +1,5 @@
+//! `SQLite` object read helpers.
+
 use std::ops::Not;
 
 use rusqlite::{OptionalExtension, Transaction};

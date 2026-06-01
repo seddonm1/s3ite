@@ -1,3 +1,5 @@
+//! S3 `CopyObject` request handling.
+
 use std::collections::HashMap;
 
 use super::{
@@ -9,6 +11,7 @@ use super::{
     s3_error_from_sqlite, s3_error_with_message, validate_copy_source_conditions,
 };
 
+/// Parsed copy request with source, destination, metadata, and checksum intent.
 struct CopyObjectRequest {
     target_bucket: String,
     target_key: String,
@@ -25,6 +28,7 @@ struct CopyObjectRequest {
     target_checksum_kind: Option<ChecksumAlgorithmKind>,
 }
 
+/// Normalizes an S3 `CopyObject` input into the local copy operation shape.
 fn parse_copy_object_request(input: CopyObjectInput) -> S3Result<CopyObjectRequest> {
     let CopyObjectInput {
         bucket: target_bucket,
@@ -83,6 +87,7 @@ fn parse_copy_object_request(input: CopyObjectInput) -> S3Result<CopyObjectReque
     })
 }
 
+/// Rejects invalid destination/source combinations before opening transactions.
 fn validate_copy_target(request: &CopyObjectRequest) -> S3Result<()> {
     if request.source_bucket.as_str() == request.target_bucket.as_str()
         && request.source_key.as_str() == request.target_key.as_str()
@@ -96,6 +101,7 @@ fn validate_copy_target(request: &CopyObjectRequest) -> S3Result<()> {
     Ok(())
 }
 
+/// Loads the source object selected by key and optional version ID.
 fn load_copy_source_object(
     transaction: &rusqlite::Transaction<'_>,
     key: &str,
@@ -104,6 +110,7 @@ fn load_copy_source_object(
     Sqlite::try_get_copy_source_object(transaction, key, version_id)
 }
 
+/// Rewrites loaded source metadata for the destination object.
 fn prepare_copied_object(
     mut object: KeyValue,
     request: &CopyObjectRequest,
@@ -141,6 +148,7 @@ fn prepare_copied_object(
     Ok((object, checksum))
 }
 
+/// Builds the S3 copy result from the stored target object metadata.
 fn copy_object_result(
     checksum: &StoredChecksum,
     md5: Option<String>,
@@ -159,6 +167,7 @@ fn copy_object_result(
     }
 }
 
+/// Copies within one bucket so source validation and target write share a transaction.
 async fn copy_object_same_bucket(
     sqlite: &Sqlite,
     request: CopyObjectRequest,
@@ -190,6 +199,7 @@ async fn copy_object_same_bucket(
         .map_err(s3_error_from_sqlite)
 }
 
+/// Copies across buckets by reading source state before writing the target bucket.
 async fn copy_object_cross_bucket(
     sqlite: &Sqlite,
     request: CopyObjectRequest,
