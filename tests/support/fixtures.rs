@@ -1,5 +1,9 @@
 use anyhow::Result;
-use aws_sdk_s3::{Client, primitives::ByteStream};
+use aws_sdk_s3::{
+    Client,
+    primitives::ByteStream,
+    types::{BucketVersioningStatus, VersioningConfiguration},
+};
 use uuid::Uuid;
 
 pub fn bucket_name(prefix: &str) -> String {
@@ -39,4 +43,19 @@ pub async fn get_object_bytes(client: &Client, bucket: &str, key: &str) -> Resul
         .await?
         .into_bytes()
         .to_vec())
+}
+
+pub async fn put_bucket_versioning(
+    client: &Client,
+    bucket: &str,
+    status: BucketVersioningStatus,
+) -> Result<()> {
+    let versioning = VersioningConfiguration::builder().status(status).build();
+    client
+        .put_bucket_versioning()
+        .bucket(bucket)
+        .versioning_configuration(versioning)
+        .send()
+        .await?;
+    Ok(())
 }
