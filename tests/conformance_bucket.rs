@@ -62,6 +62,37 @@ async fn test_bucket_create_delete() -> Result<()> {
 
 #[tokio::test]
 #[serial(conformance)]
+async fn test_bucket_head() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_head
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-conf");
+
+    client.create_bucket().bucket(&bucket).send().await?;
+    client.head_bucket().bucket(&bucket).send().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_head_notexist() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_head_notexist
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-missing");
+
+    let error = match client.head_bucket().bucket(&bucket).send().await {
+        Ok(_) => bail!("HeadBucket for a missing bucket should fail"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "StatusCode(404)");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(conformance)]
 async fn test_list_buckets_bad_auth() -> Result<()> {
     // Mirrors s3tests/functional/test_s3.py::test_list_buckets_bad_auth
     let server = TestServer::spawn().await?;
