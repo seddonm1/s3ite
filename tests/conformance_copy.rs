@@ -7,12 +7,15 @@
 mod support;
 
 use anyhow::{Result, bail};
-use aws_sdk_s3::{primitives::ByteStream, types::MetadataDirective};
+use aws_sdk_s3::{
+    primitives::ByteStream,
+    types::{BucketVersioningStatus, MetadataDirective},
+};
 use serial_test::serial;
 use support::{
     assertions::assert_error_contains,
-    fixtures::{bucket_name, create_bucket, get_object_bytes, put_object},
-    sdk,
+    fixtures::{bucket_name, create_bucket, get_object_bytes, put_bucket_versioning, put_object},
+    raw_http, sdk,
     server::TestServer,
 };
 
@@ -175,6 +178,162 @@ async fn test_object_copy_diff_bucket() -> Result<()> {
         get_object_bytes(&client, &target_bucket, "bar321foo").await?,
         b"foo"
     );
+
+    Ok(())
+}
+
+/// Verifies CopyObject can copy exact versions in and across versioned buckets.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_object_copy_versioned_bucket() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_object_copy_versioned_bucket
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-copy");
+    let versioned_target_bucket = bucket_name("s3ite-copy-versioned");
+    let plain_target_bucket = bucket_name("s3ite-copy-plain");
+    let body = vec![0; 5];
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    let source = client
+        .put_object()
+        .bucket(&bucket)
+        .key("foo123bar")
+        .body(ByteStream::from(body.clone()))
+        .send()
+        .await?;
+    let source_version_id = source
+        .version_id()
+        .ok_or_else(|| anyhow::anyhow!("versioned PutObject missing version ID"))?;
+
+    client
+        .copy_object()
+        .bucket(&bucket)
+        .key("bar321foo")
+        .copy_source(format!("{bucket}/foo123bar?versionId={source_version_id}"))
+        .send()
+        .await?;
+    assert_eq!(get_object_bytes(&client, &bucket, "bar321foo").await?, body);
+
+    let copied = client
+        .get_object()
+        .bucket(&bucket)
+        .key("bar321foo")
+        .send()
+        .await?;
+    let copied_version_id = copied
+        .version_id()
+        .ok_or_else(|| anyhow::anyhow!("copied version missing version ID"))?
+        .to_string();
+    assert_eq!(copied.content_length(), Some(5));
+
+    client
+        .copy_object()
+        .bucket(&bucket)
+        .key("bar321foo2")
+        .copy_source(format!("{bucket}/bar321foo?versionId={copied_version_id}"))
+        .send()
+        .await?;
+    assert_eq!(
+        get_object_bytes(&client, &bucket, "bar321foo2").await?,
+        body
+    );
+
+    create_bucket(&client, &versioned_target_bucket).await?;
+    put_bucket_versioning(
+        &client,
+        &versioned_target_bucket,
+        BucketVersioningStatus::Enabled,
+    )
+    .await?;
+    client
+        .copy_object()
+        .bucket(&versioned_target_bucket)
+        .key("bar321foo3")
+        .copy_source(format!("{bucket}/foo123bar?versionId={source_version_id}"))
+        .send()
+        .await?;
+    assert_eq!(
+        get_object_bytes(&client, &versioned_target_bucket, "bar321foo3").await?,
+        body
+    );
+
+    create_bucket(&client, &plain_target_bucket).await?;
+    client
+        .copy_object()
+        .bucket(&plain_target_bucket)
+        .key("bar321foo4")
+        .copy_source(format!("{bucket}/foo123bar?versionId={source_version_id}"))
+        .send()
+        .await?;
+    assert_eq!(
+        get_object_bytes(&client, &plain_target_bucket, "bar321foo4").await?,
+        body
+    );
+
+    client
+        .copy_object()
+        .bucket(&bucket)
+        .key("foo123bar2")
+        .copy_source(format!("{plain_target_bucket}/bar321foo4"))
+        .send()
+        .await?;
+    assert_eq!(
+        get_object_bytes(&client, &bucket, "foo123bar2").await?,
+        body
+    );
+
+    Ok(())
+}
+
+/// Verifies CopyObject source version parsing handles URL-encoded keys.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_object_copy_versioned_url_encoding() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_object_copy_versioned_url_encoding
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-copy");
+    let source_key = "foo?bar";
+    let target_key = "bar&foo";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    let source = client
+        .put_object()
+        .bucket(&bucket)
+        .key(source_key)
+        .body(ByteStream::from_static(b""))
+        .send()
+        .await?;
+    let source_version_id = source
+        .version_id()
+        .ok_or_else(|| anyhow::anyhow!("versioned PutObject missing version ID"))?;
+
+    client
+        .head_object()
+        .bucket(&bucket)
+        .key(source_key)
+        .version_id(source_version_id)
+        .send()
+        .await?;
+    client
+        .copy_object()
+        .bucket(&bucket)
+        .key(target_key)
+        .copy_source(format!(
+            "{bucket}/{}?versionId={source_version_id}",
+            raw_http::path_segment(source_key)
+        ))
+        .send()
+        .await?;
+    client
+        .head_object()
+        .bucket(&bucket)
+        .key(target_key)
+        .send()
+        .await?;
 
     Ok(())
 }

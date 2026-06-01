@@ -10,12 +10,12 @@ use anyhow::{Result, bail};
 use aws_sdk_s3::{
     Client,
     primitives::{ByteStream, DateTime},
-    types::{Delete, ObjectIdentifier},
+    types::{BucketVersioningStatus, Delete, ObjectIdentifier},
 };
 use serial_test::serial;
 use support::{
     assertions::assert_error_contains,
-    fixtures::{bucket_name, create_bucket, get_object_bytes, put_object},
+    fixtures::{bucket_name, create_bucket, get_object_bytes, put_bucket_versioning, put_object},
     sdk,
     server::TestServer,
 };
@@ -465,6 +465,153 @@ async fn test_delete_object_if_match_last_modified_time() -> Result<()> {
     Ok(())
 }
 
+/// Verifies DeleteObject enforces If-Match against an exact object version.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_delete_object_version_if_match() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_delete_object_version_if_match
+    let (_server, client, bucket, version, state) = seeded_versioned_object().await?;
+
+    let error = match client
+        .delete_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .version_id(&version)
+        .if_match("\"ABCORZ\"")
+        .send()
+        .await
+    {
+        Ok(_) => bail!("mismatched version delete If-Match should fail"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "PreconditionFailed");
+
+    let response = client
+        .delete_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .version_id(&version)
+        .if_match(&state.etag)
+        .send()
+        .await?;
+    assert_eq!(response.delete_marker(), None);
+
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .version_id(&version)
+        .if_match("*")
+        .send()
+        .await?;
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .version_id(&version)
+        .if_match("\"ABCORZ\"")
+        .send()
+        .await?;
+
+    let (version, _) = put_versioned_object(&client, &bucket, KEY).await?;
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .version_id(version)
+        .if_match("*")
+        .send()
+        .await?;
+
+    Ok(())
+}
+
+/// Verifies DeleteObject enforces If-Match-Last-Modified-Time for an exact version.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_delete_object_version_if_match_last_modified_time() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_delete_object_version_if_match_last_modified_time
+    let (_server, client, bucket, version, state) = seeded_versioned_object().await?;
+
+    let error = match client
+        .delete_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .version_id(&version)
+        .if_match_last_modified_time(state.before)
+        .send()
+        .await
+    {
+        Ok(_) => bail!("mismatched version delete Last-Modified should fail"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "PreconditionFailed");
+
+    let response = client
+        .delete_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .version_id(&version)
+        .if_match_last_modified_time(state.last_modified)
+        .send()
+        .await?;
+    assert_eq!(response.delete_marker(), None);
+
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .version_id(&version)
+        .if_match_last_modified_time(state.before)
+        .send()
+        .await?;
+
+    Ok(())
+}
+
+/// Verifies DeleteObject enforces If-Match-Size for an exact version.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_delete_object_version_if_match_size() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_delete_object_version_if_match_size
+    let (_server, client, bucket, version, _state) = seeded_versioned_object_with_body(b"").await?;
+
+    let error = match client
+        .delete_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .version_id(&version)
+        .if_match_size(9999)
+        .send()
+        .await
+    {
+        Ok(_) => bail!("mismatched version delete size should fail"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "PreconditionFailed");
+
+    let response = client
+        .delete_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .version_id(&version)
+        .if_match_size(0)
+        .send()
+        .await?;
+    assert_eq!(response.delete_marker(), None);
+
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .version_id(&version)
+        .if_match_size(9999)
+        .send()
+        .await?;
+
+    Ok(())
+}
+
 /// Verifies DeleteObjects reports per-key If-Match failures.
 #[tokio::test]
 #[serial(conformance)]
@@ -508,6 +655,135 @@ async fn test_delete_objects_if_match() -> Result<()> {
     Ok(())
 }
 
+/// Verifies DeleteObjects reports per-key If-Match failures for exact versions.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_delete_objects_version_if_match() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_delete_objects_version_if_match
+    let (_server, client, bucket, version, state) = seeded_versioned_object().await?;
+
+    let failed = delete_objects_for_version(KEY, &version)
+        .e_tag("\"ABCORZ\"")
+        .build()?;
+    let response = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(Delete::builder().objects(failed).build()?)
+        .send()
+        .await?;
+    assert_eq!(response.errors()[0].code(), Some("PreconditionFailed"));
+
+    let matched = delete_objects_for_version(KEY, &version)
+        .e_tag(state.etag)
+        .build()?;
+    let response = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(Delete::builder().objects(matched).build()?)
+        .send()
+        .await?;
+    assert_eq!(response.deleted()[0].key(), Some(KEY));
+    assert_eq!(response.deleted()[0].delete_marker(), None);
+
+    let missing = delete_objects_for_version(KEY, &version)
+        .e_tag("\"ABCORZ\"")
+        .build()?;
+    let response = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(Delete::builder().objects(missing).build()?)
+        .send()
+        .await?;
+    assert!(response.errors().is_empty());
+
+    Ok(())
+}
+
+/// Verifies DeleteObjects reports Last-Modified precondition failures for exact versions.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_delete_objects_version_if_match_last_modified_time() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_delete_objects_version_if_match_last_modified_time
+    let (_server, client, bucket, version, state) = seeded_versioned_object().await?;
+    put_versioned_object(&client, &bucket, KEY).await?;
+
+    let failed = delete_objects_for_version(KEY, &version)
+        .last_modified_time(state.before)
+        .build()?;
+    let response = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(Delete::builder().objects(failed).build()?)
+        .send()
+        .await?;
+    assert_eq!(response.errors()[0].code(), Some("PreconditionFailed"));
+
+    let matched = delete_objects_for_version(KEY, &version)
+        .last_modified_time(state.last_modified)
+        .build()?;
+    let response = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(Delete::builder().objects(matched).build()?)
+        .send()
+        .await?;
+    assert_eq!(response.deleted()[0].key(), Some(KEY));
+
+    let missing = delete_objects_for_version(KEY, &version)
+        .last_modified_time(state.before)
+        .build()?;
+    let response = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(Delete::builder().objects(missing).build()?)
+        .send()
+        .await?;
+    assert!(response.errors().is_empty());
+
+    Ok(())
+}
+
+/// Verifies DeleteObjects reports size precondition failures for exact versions.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_delete_objects_version_if_match_size() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_delete_objects_version_if_match_size
+    let (_server, client, bucket, version, _state) = seeded_versioned_object_with_body(b"").await?;
+
+    let failed = delete_objects_for_version(KEY, &version)
+        .size(9999)
+        .build()?;
+    let response = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(Delete::builder().objects(failed).build()?)
+        .send()
+        .await?;
+    assert_eq!(response.errors()[0].code(), Some("PreconditionFailed"));
+
+    let matched = delete_objects_for_version(KEY, &version).size(0).build()?;
+    let response = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(Delete::builder().objects(matched).build()?)
+        .send()
+        .await?;
+    assert_eq!(response.deleted()[0].key(), Some(KEY));
+
+    let missing = delete_objects_for_version(KEY, &version)
+        .size(9999)
+        .build()?;
+    let response = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(Delete::builder().objects(missing).build()?)
+        .send()
+        .await?;
+    assert!(response.errors().is_empty());
+
+    Ok(())
+}
+
 #[derive(Debug)]
 struct ObjectState {
     etag: String,
@@ -532,6 +808,55 @@ async fn seeded_object_with_body(
     Ok((server, client, bucket, state))
 }
 
+async fn seeded_versioned_object() -> Result<(TestServer, Client, String, String, ObjectState)> {
+    seeded_versioned_object_with_body(b"bar").await
+}
+
+async fn seeded_versioned_object_with_body(
+    body: &'static [u8],
+) -> Result<(TestServer, Client, String, String, ObjectState)> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-cond");
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    let version_id = client
+        .put_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .body(ByteStream::from_static(body))
+        .send()
+        .await?
+        .version_id()
+        .ok_or_else(|| anyhow::anyhow!("versioned PutObject missing version ID"))?
+        .to_string();
+    let state = head_version_state(&client, &bucket, KEY, &version_id).await?;
+    Ok((server, client, bucket, version_id, state))
+}
+
+async fn put_versioned_object(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+) -> Result<(String, String)> {
+    let response = client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"bar"))
+        .send()
+        .await?;
+    let etag = response
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("PutObject response missing ETag"))?
+        .to_string();
+    let version_id = response
+        .version_id()
+        .ok_or_else(|| anyhow::anyhow!("versioned PutObject missing version ID"))?
+        .to_string();
+    Ok((version_id, etag))
+}
+
 async fn head_state(client: &Client, bucket: &str, key: &str) -> Result<ObjectState> {
     let head = client.head_object().bucket(bucket).key(key).send().await?;
     let etag = head
@@ -549,6 +874,43 @@ async fn head_state(client: &Client, bucket: &str, key: &str) -> Result<ObjectSt
         before,
         after,
     })
+}
+
+async fn head_version_state(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> Result<ObjectState> {
+    let head = client
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .version_id(version_id)
+        .send()
+        .await?;
+    let etag = head
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("head object response missing ETag"))?
+        .to_string();
+    let last_modified = *head
+        .last_modified()
+        .ok_or_else(|| anyhow::anyhow!("head object response missing Last-Modified"))?;
+    let before = DateTime::from_secs(last_modified.secs() - 1);
+    let after = DateTime::from_secs(last_modified.secs() + 1);
+    Ok(ObjectState {
+        etag,
+        last_modified,
+        before,
+        after,
+    })
+}
+
+fn delete_objects_for_version(
+    key: &str,
+    version_id: &str,
+) -> aws_sdk_s3::types::builders::ObjectIdentifierBuilder {
+    ObjectIdentifier::builder().key(key).version_id(version_id)
 }
 
 async fn assert_deleted(client: &Client, bucket: &str, key: &str) -> Result<()> {

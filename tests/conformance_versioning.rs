@@ -7,12 +7,17 @@
 mod support;
 
 use anyhow::{Result, bail};
-use aws_sdk_s3::{primitives::ByteStream, types::BucketVersioningStatus};
+use aws_sdk_s3::{
+    Client,
+    primitives::ByteStream,
+    types::{BucketVersioningStatus, Delete, ObjectIdentifier},
+};
+use reqwest::{Method, StatusCode};
 use serial_test::serial;
 use support::{
-    assertions::assert_error_contains,
+    assertions::{assert_error_contains, assert_status},
     fixtures::{bucket_name, create_bucket, get_object_bytes, put_bucket_versioning, put_object},
-    sdk,
+    raw_http, sdk,
     server::TestServer,
 };
 
@@ -141,6 +146,127 @@ async fn test_versioning_obj_create_read_remove() -> Result<()> {
     Ok(())
 }
 
+/// Verifies removing the latest object version reveals the prior version.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_versioning_obj_create_read_remove_head() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_versioning_obj_create_read_remove_head
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ver");
+    let key = "testobj";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    let versions = create_multiple_versions(&client, &bucket, key, 5).await?;
+
+    let removed = versions
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("missing latest version"))?;
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .version_id(&removed.version_id)
+        .send()
+        .await?;
+
+    assert_eq!(get_object_bytes(&client, &bucket, key).await?, b"content-3");
+
+    let delete_marker = client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+    assert_eq!(delete_marker.delete_marker(), Some(true));
+    let delete_marker_version = delete_marker
+        .version_id()
+        .ok_or_else(|| anyhow::anyhow!("delete marker response missing version ID"))?;
+
+    let response = client.list_object_versions().bucket(&bucket).send().await?;
+    assert_eq!(response.versions().len(), 4);
+    assert_eq!(response.delete_markers().len(), 1);
+    assert_eq!(
+        response
+            .delete_markers()
+            .first()
+            .and_then(|marker| marker.version_id()),
+        Some(delete_marker_version)
+    );
+
+    Ok(())
+}
+
+/// Verifies repeated deletes stack multiple delete markers.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_versioning_stack_delete_merkers() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_versioning_stack_delete_merkers
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ver");
+    let key = "test1/a";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    put_versioned_object(&client, &bucket, key, b"content").await?;
+    for _ in 0..3 {
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await?;
+    }
+
+    let response = client.list_object_versions().bucket(&bucket).send().await?;
+    assert_eq!(response.versions().len(), 1);
+    assert_eq!(response.delete_markers().len(), 3);
+
+    Ok(())
+}
+
+/// Verifies deleting the null version removes an unversioned object.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_versioning_obj_plain_null_version_removal() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_versioning_obj_plain_null_version_removal
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ver");
+    let key = "testobjfoo";
+
+    create_bucket(&client, &bucket).await?;
+    put_object(&client, &bucket, key, b"fooz").await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .version_id("null")
+        .send()
+        .await?;
+
+    let error = match client.get_object().bucket(&bucket).key(key).send().await {
+        Ok(_) => bail!("deleted null version should not be readable"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "NoSuchKey");
+    assert!(
+        client
+            .list_object_versions()
+            .bucket(&bucket)
+            .send()
+            .await?
+            .versions()
+            .is_empty()
+    );
+
+    Ok(())
+}
+
 /// Verifies suspended versioning overwrites the null version and delete marker.
 #[tokio::test]
 #[serial(conformance)]
@@ -197,6 +323,120 @@ async fn test_versioning_obj_plain_null_version_overwrite_suspended() -> Result<
     assert_eq!(
         get_object_version_bytes(&client, &bucket, key, &generated).await?,
         b"generated"
+    );
+
+    Ok(())
+}
+
+/// Verifies suspended versioning can delete and overwrite the null version repeatedly.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_versioning_obj_suspend_versions() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_versioning_obj_suspend_versions
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ver");
+    let key = "testobj";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    let mut versions = create_multiple_versions(&client, &bucket, key, 5).await?;
+
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Suspended).await?;
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+    put_object(&client, &bucket, key, b"null content 1").await?;
+    put_object(&client, &bucket, key, b"null content 2").await?;
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+    put_object(&client, &bucket, key, b"null content 3").await?;
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    versions.extend(create_multiple_versions(&client, &bucket, key, 3).await?);
+
+    for version in versions {
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(version.version_id)
+            .send()
+            .await?;
+    }
+    let listed = client.list_object_versions().bucket(&bucket).send().await?;
+    assert!(listed.versions().is_empty());
+
+    Ok(())
+}
+
+/// Verifies copying a suspended null version preserves the visible body.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_versioning_obj_suspended_copy() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_versioning_obj_suspended_copy
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ver");
+    let other_bucket = bucket_name("s3ite-ver-copy");
+    let source = "testobj1";
+    let same_bucket_target = "testobj2";
+
+    create_bucket(&client, &bucket).await?;
+    create_bucket(&client, &other_bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    put_versioned_object(&client, &bucket, source, b"generated").await?;
+
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Suspended).await?;
+    put_object(&client, &bucket, source, b"null content").await?;
+
+    client
+        .copy_object()
+        .bucket(&bucket)
+        .key(same_bucket_target)
+        .copy_source(format!("{bucket}/{source}"))
+        .send()
+        .await?;
+    client
+        .copy_object()
+        .bucket(&other_bucket)
+        .key(source)
+        .copy_source(format!("{bucket}/{source}"))
+        .send()
+        .await?;
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(source)
+        .send()
+        .await?;
+
+    assert_eq!(
+        get_object_bytes(&client, &bucket, same_bucket_target).await?,
+        b"null content"
+    );
+    assert_eq!(
+        get_object_bytes(&client, &other_bucket, source).await?,
+        b"null content"
     );
 
     Ok(())
@@ -284,6 +524,454 @@ async fn test_list_object_versions_for_unversioned_bucket() -> Result<()> {
     Ok(())
 }
 
+/// Verifies all object versions can be removed by exact version ID.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_versioning_obj_create_versions_remove_all() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_versioning_obj_create_versions_remove_all
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ver");
+    let key = "testobj";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    let versions = create_multiple_versions(&client, &bucket, key, 10).await?;
+
+    for version in versions {
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(version.version_id)
+            .send()
+            .await?;
+    }
+
+    assert!(
+        client
+            .list_object_versions()
+            .bucket(&bucket)
+            .send()
+            .await?
+            .versions()
+            .is_empty()
+    );
+
+    Ok(())
+}
+
+/// Verifies exact-version removal works for special key names.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_versioning_obj_create_versions_remove_special_names() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_versioning_obj_create_versions_remove_special_names
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ver");
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+
+    for key in ["_testobj", "_", ":", " "] {
+        let mut version_ids = Vec::new();
+        for index in 0..10 {
+            version_ids.push(
+                put_versioned_object_raw(&server, &bucket, key, format!("content-{index}")).await?,
+            );
+        }
+        for version_id in version_ids {
+            delete_object_version_raw(&server, &bucket, key, &version_id).await?;
+        }
+    }
+
+    let listed = client.list_object_versions().bucket(&bucket).send().await?;
+    assert!(listed.versions().is_empty());
+    assert!(listed.delete_markers().is_empty());
+
+    Ok(())
+}
+
+/// Verifies exact-version copy can copy old versions in and across buckets.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_versioning_copy_obj_version() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_versioning_copy_obj_version
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ver");
+    let other_bucket = bucket_name("s3ite-ver-copy");
+    let key = "testobj";
+
+    create_bucket(&client, &bucket).await?;
+    create_bucket(&client, &other_bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    let versions = create_multiple_versions(&client, &bucket, key, 3).await?;
+
+    for (index, version) in versions.iter().enumerate() {
+        let new_key = format!("key_{index}");
+        client
+            .copy_object()
+            .bucket(&bucket)
+            .key(&new_key)
+            .copy_source(format!("{bucket}/{key}?versionId={}", version.version_id))
+            .send()
+            .await?;
+        assert_eq!(
+            get_object_bytes(&client, &bucket, &new_key).await?,
+            version.content
+        );
+    }
+
+    for (index, version) in versions.iter().enumerate() {
+        let new_key = format!("key_{index}");
+        client
+            .copy_object()
+            .bucket(&other_bucket)
+            .key(&new_key)
+            .copy_source(format!("{bucket}/{key}?versionId={}", version.version_id))
+            .send()
+            .await?;
+        assert_eq!(
+            get_object_bytes(&client, &other_bucket, &new_key).await?,
+            version.content
+        );
+    }
+
+    client
+        .copy_object()
+        .bucket(&other_bucket)
+        .key("new_key")
+        .copy_source(format!("{bucket}/{key}"))
+        .send()
+        .await?;
+    assert_eq!(
+        get_object_bytes(&client, &other_bucket, "new_key").await?,
+        versions
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("missing latest source version"))?
+            .content
+    );
+
+    Ok(())
+}
+
+/// Verifies ListObjectVersions orders versions by key and newest version first.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_versioning_obj_list_marker() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_versioning_obj_list_marker
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ver");
+    let key = "testobj";
+    let key2 = "testobj-1";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    let versions = create_multiple_versions(&client, &bucket, key, 5).await?;
+    let versions2 = create_multiple_versions(&client, &bucket, key2, 5).await?;
+
+    let response = client.list_object_versions().bucket(&bucket).send().await?;
+    let listed = response
+        .versions()
+        .iter()
+        .map(|version| {
+            (
+                version.key().unwrap_or_default().to_string(),
+                version.version_id().unwrap_or_default().to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let expected = versions
+        .iter()
+        .rev()
+        .map(|version| (key.to_string(), version.version_id.clone()))
+        .chain(
+            versions2
+                .iter()
+                .rev()
+                .map(|version| (key2.to_string(), version.version_id.clone())),
+        )
+        .collect::<Vec<_>>();
+    assert_eq!(listed, expected);
+
+    Ok(())
+}
+
+/// Verifies PutObject returns VersionId only when bucket state creates generated versions.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_versioning_bucket_atomic_upload_return_version_id() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_versioning_bucket_atomic_upload_return_version_id
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let enabled_bucket = bucket_name("s3ite-ver");
+    let unversioned_bucket = bucket_name("s3ite-ver");
+    let suspended_bucket = bucket_name("s3ite-ver");
+
+    create_bucket(&client, &enabled_bucket).await?;
+    put_bucket_versioning(&client, &enabled_bucket, BucketVersioningStatus::Enabled).await?;
+    let enabled = client
+        .put_object()
+        .bucket(&enabled_bucket)
+        .key("bar")
+        .body(ByteStream::from_static(b""))
+        .send()
+        .await?;
+    let enabled_version_id = enabled
+        .version_id()
+        .ok_or_else(|| anyhow::anyhow!("enabled PutObject missing version ID"))?;
+    let listed = client
+        .list_object_versions()
+        .bucket(&enabled_bucket)
+        .send()
+        .await?;
+    assert!(
+        listed
+            .versions()
+            .iter()
+            .any(|version| version.version_id() == Some(enabled_version_id))
+    );
+
+    create_bucket(&client, &unversioned_bucket).await?;
+    let unversioned = client
+        .put_object()
+        .bucket(&unversioned_bucket)
+        .key("baz")
+        .body(ByteStream::from_static(b""))
+        .send()
+        .await?;
+    assert_eq!(unversioned.version_id(), None);
+
+    create_bucket(&client, &suspended_bucket).await?;
+    put_bucket_versioning(
+        &client,
+        &suspended_bucket,
+        BucketVersioningStatus::Suspended,
+    )
+    .await?;
+    let suspended = client
+        .put_object()
+        .bucket(&suspended_bucket)
+        .key("baz")
+        .body(ByteStream::from_static(b""))
+        .send()
+        .await?;
+    assert_eq!(suspended.version_id(), None);
+
+    Ok(())
+}
+
+/// Verifies DeleteObjects can remove exact object versions idempotently.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_versioning_multi_object_delete() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_versioning_multi_object_delete
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ver");
+    let key = "key";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    let versions = create_multiple_versions(&client, &bucket, key, 2).await?;
+
+    let delete = delete_for_versions(key, versions.iter().map(|version| &version.version_id))?;
+    client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(delete.clone())
+        .send()
+        .await?;
+    assert!(
+        client
+            .list_object_versions()
+            .bucket(&bucket)
+            .send()
+            .await?
+            .versions()
+            .is_empty()
+    );
+
+    client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(delete)
+        .send()
+        .await?;
+    assert!(
+        client
+            .list_object_versions()
+            .bucket(&bucket)
+            .send()
+            .await?
+            .versions()
+            .is_empty()
+    );
+
+    Ok(())
+}
+
+/// Verifies DeleteObjects can remove versions and delete markers idempotently.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_versioning_multi_object_delete_with_marker() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_versioning_multi_object_delete_with_marker
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ver");
+    let key = "key";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    let versions = create_multiple_versions(&client, &bucket, key, 2).await?;
+    let delete_marker = client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+    let marker_version_id = delete_marker
+        .version_id()
+        .ok_or_else(|| anyhow::anyhow!("delete marker response missing version ID"))?
+        .to_string();
+
+    let delete = delete_for_versions(
+        key,
+        versions
+            .iter()
+            .map(|version| &version.version_id)
+            .chain(std::iter::once(&marker_version_id)),
+    )?;
+    client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(delete.clone())
+        .send()
+        .await?;
+
+    let listed = client.list_object_versions().bucket(&bucket).send().await?;
+    assert!(listed.versions().is_empty());
+    assert!(listed.delete_markers().is_empty());
+
+    client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(delete)
+        .send()
+        .await?;
+    let listed = client.list_object_versions().bucket(&bucket).send().await?;
+    assert!(listed.versions().is_empty());
+    assert!(listed.delete_markers().is_empty());
+
+    Ok(())
+}
+
+/// Verifies DeleteObjects without a version creates a delete marker.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_versioning_multi_object_delete_with_marker_create() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_versioning_multi_object_delete_with_marker_create
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ver");
+    let key = "key";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+
+    let delete = Delete::builder()
+        .objects(ObjectIdentifier::builder().key(key).build()?)
+        .build()?;
+    let response = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(delete)
+        .send()
+        .await?;
+    let deleted = response.deleted();
+    assert_eq!(deleted.len(), 1);
+    assert_eq!(deleted[0].delete_marker(), Some(true));
+    let marker_version_id = deleted[0].delete_marker_version_id().ok_or_else(|| {
+        anyhow::anyhow!("DeleteObjects response missing delete marker version ID")
+    })?;
+
+    let listed = client.list_object_versions().bucket(&bucket).send().await?;
+    let markers = listed.delete_markers();
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0].version_id(), Some(marker_version_id));
+    assert_eq!(markers[0].key(), Some(key));
+
+    Ok(())
+}
+
+/// Verifies nonversioned delete misses expose the delete-marker header as false.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_delete_marker_nonversioned() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_delete_marker_nonversioned
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ver");
+    let key = "frodo.txt";
+
+    create_bucket(&client, &bucket).await?;
+    put_object(&client, &bucket, key, b"body").await?;
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+    assert_delete_marker_header(&server, &bucket, key, "false").await
+}
+
+/// Verifies versioned delete markers expose the delete-marker header as true.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_delete_marker_versioned() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_delete_marker_versioned
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ver");
+    let key = "bilbo.txt";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    put_object(&client, &bucket, key, b"body").await?;
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+    assert_delete_marker_header(&server, &bucket, key, "true").await
+}
+
+/// Verifies suspended delete markers expose the delete-marker header as true.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_delete_marker_suspended() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_delete_marker_suspended
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ver");
+    let key = "ringo.txt";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    put_object(&client, &bucket, key, b"body").await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Suspended).await?;
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+    assert_delete_marker_header(&server, &bucket, key, "true").await
+}
+
 /// Verifies deleted ListObjectVersions markers can still advance pagination.
 #[tokio::test]
 #[serial(conformance)]
@@ -357,8 +1045,123 @@ async fn test_list_object_versions_deleted_marker_continues_listing() -> Result<
     Ok(())
 }
 
+#[derive(Debug)]
+struct ObjectVersion {
+    version_id: String,
+    content: Vec<u8>,
+}
+
+async fn create_multiple_versions(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    count: usize,
+) -> Result<Vec<ObjectVersion>> {
+    let mut versions = Vec::with_capacity(count);
+    for index in 0..count {
+        let content = format!("content-{index}").into_bytes();
+        let version_id = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(content.clone()))
+            .send()
+            .await?
+            .version_id()
+            .ok_or_else(|| anyhow::anyhow!("enabled PutObject missing version ID"))?
+            .to_string();
+        versions.push(ObjectVersion {
+            version_id,
+            content,
+        });
+    }
+    Ok(versions)
+}
+
+fn delete_for_versions<'a>(
+    key: &str,
+    version_ids: impl IntoIterator<Item = &'a String>,
+) -> Result<Delete> {
+    let objects = version_ids
+        .into_iter()
+        .map(|version_id| {
+            Ok(ObjectIdentifier::builder()
+                .key(key)
+                .version_id(version_id)
+                .build()?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Delete::builder().set_objects(Some(objects)).build()?)
+}
+
+async fn assert_delete_marker_header(
+    server: &TestServer,
+    bucket: &str,
+    key: &str,
+    expected: &str,
+) -> Result<()> {
+    let response = raw_http::signed_request(
+        server,
+        Method::HEAD,
+        &format!("/{bucket}/{}", raw_http::path_segment(key)),
+        Vec::new(),
+    )
+    .await?;
+    assert_status(&response, StatusCode::NOT_FOUND);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-amz-delete-marker")
+            .and_then(|value| value.to_str().ok()),
+        Some(expected)
+    );
+    Ok(())
+}
+
+async fn put_versioned_object_raw(
+    server: &TestServer,
+    bucket: &str,
+    key: &str,
+    body: String,
+) -> Result<String> {
+    let response = raw_http::signed_request(
+        server,
+        Method::PUT,
+        &format!("/{bucket}/{}", raw_http::path_segment(key)),
+        body.into_bytes(),
+    )
+    .await?;
+    assert_status(&response, StatusCode::OK);
+    Ok(response
+        .headers()
+        .get("x-amz-version-id")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| anyhow::anyhow!("raw versioned PutObject missing version ID"))?
+        .to_string())
+}
+
+async fn delete_object_version_raw(
+    server: &TestServer,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> Result<()> {
+    let response = raw_http::signed_request(
+        server,
+        Method::DELETE,
+        &format!(
+            "/{bucket}/{}?versionId={version_id}",
+            raw_http::path_segment(key)
+        ),
+        Vec::new(),
+    )
+    .await?;
+    assert_status(&response, StatusCode::NO_CONTENT);
+    Ok(())
+}
+
 async fn put_versioned_object(
-    client: &aws_sdk_s3::Client,
+    client: &Client,
     bucket: &str,
     key: &str,
     body: &'static [u8],
