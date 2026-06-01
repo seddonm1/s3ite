@@ -121,6 +121,14 @@ struct ObjectDeleteConditions {
     size: Option<i64>,
 }
 
+impl ObjectDeleteConditions {
+    /// Returns whether the delete request supplied at least one precondition.
+    #[must_use]
+    fn has_any(&self) -> bool {
+        self.etag_matches.is_some() || self.last_modified_time.is_some() || self.size.is_some()
+    }
+}
+
 /// Converts S3 write condition headers into storage-neutral object conditions.
 #[must_use]
 fn object_write_conditions(

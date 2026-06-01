@@ -1,4 +1,6 @@
-use anyhow::Result;
+use std::{future::Future, time::SystemTime};
+
+use anyhow::{Context, Result};
 use aws_credential_types::Credentials;
 use aws_sigv4::{
     http_request::{
@@ -10,7 +12,6 @@ use aws_sigv4::{
 use bytes::Bytes;
 use futures::stream;
 use reqwest::{Client, Method, Response};
-use std::time::SystemTime;
 
 use super::server::TestServer;
 
@@ -105,6 +106,62 @@ pub async fn signed_chunked_request(
     }
 
     Ok(request.send().await?)
+}
+
+pub async fn signed_streaming_request_after_first_chunk<F, Fut>(
+    server: &TestServer,
+    method: Method,
+    path_and_query: &str,
+    body: Vec<u8>,
+    chunk_size: usize,
+    headers: &[(&str, &str)],
+    after_first_chunk: F,
+) -> Result<Response>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    let url = format!("{}{}", server.endpoint(), path_and_query);
+    let signing_headers = signing_headers(server, &method, &url, &body, headers)?;
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    let sender_task = tokio::spawn(async move {
+        let chunk_size = chunk_size.max(1);
+        let mut after_first_chunk = Some(after_first_chunk);
+        for (index, chunk) in body.chunks(chunk_size).enumerate() {
+            sender
+                .send(Ok::<_, std::io::Error>(Bytes::copy_from_slice(chunk)))
+                .await
+                .context("send streaming request chunk")?;
+            if index == 0
+                && let Some(after_first_chunk) = after_first_chunk.take()
+            {
+                after_first_chunk().await?;
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+    let stream = stream::unfold(receiver, |mut receiver| async {
+        receiver.recv().await.map(|item| (item, receiver))
+    });
+
+    let client = client()?;
+    let mut request = client
+        .request(method, &url)
+        .body(reqwest::Body::wrap_stream(stream));
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    for (name, value) in signing_headers {
+        request = request.header(name, value);
+    }
+
+    let response = request.send().await?;
+    if sender_task.is_finished() {
+        sender_task.await??;
+    } else {
+        sender_task.abort();
+    }
+    Ok(response)
 }
 
 fn signing_headers(

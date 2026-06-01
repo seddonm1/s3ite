@@ -44,10 +44,18 @@ pub(super) async fn delete_object(
                 Some(version_id) => {
                     Sqlite::try_get_version_metadata(&transaction, &key, version_id)?
                 }
-                None => Sqlite::try_get_latest_object_metadata(&transaction, &key)?,
+                None => Sqlite::try_get_current_metadata(&transaction, &key)?,
             };
             validate_delete_conditions(metadata.as_ref(), &conditions)?;
-            let outcome = Sqlite::try_delete_object(&transaction, &key, version_id.as_deref())?;
+            let outcome = if version_id.is_none() && metadata.is_none() && conditions.has_any() {
+                ObjectDeleteOutcome {
+                    version_id: None,
+                    is_delete_marker: false,
+                    delete_marker_version_id: None,
+                }
+            } else {
+                Sqlite::try_delete_object(&transaction, &key, version_id.as_deref())?
+            };
             transaction.commit()?;
             Ok(outcome)
         })
@@ -112,12 +120,22 @@ pub(super) async fn delete_objects(
                     Some(version_id) => {
                         Sqlite::try_get_version_metadata(&transaction, &key, version_id)?
                     }
-                    None => Sqlite::try_get_latest_object_metadata(&transaction, &key)?,
+                    None => Sqlite::try_get_current_metadata(&transaction, &key)?,
                 };
                 match validate_delete_conditions(metadata.as_ref(), &conditions) {
                     Ok(()) => {
-                        let outcome =
-                            Sqlite::try_delete_object(&transaction, &key, version_id.as_deref())?;
+                        let outcome = if version_id.is_none()
+                            && metadata.is_none()
+                            && conditions.has_any()
+                        {
+                            ObjectDeleteOutcome {
+                                version_id: None,
+                                is_delete_marker: false,
+                                delete_marker_version_id: None,
+                            }
+                        } else {
+                            Sqlite::try_delete_object(&transaction, &key, version_id.as_deref())?
+                        };
                         deleted_entries.push((key, outcome));
                     }
                     Err(SqliteError::PreconditionFailed) => errors.push(DeleteError {

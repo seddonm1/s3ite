@@ -282,6 +282,284 @@ async fn test_put_object_ifnonmatch_failed() -> Result<()> {
     Ok(())
 }
 
+/// Verifies versioned PutObject If-None-Match checks only the current object.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_put_current_object_if_none_match() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_current_object_if_none_match
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-cond");
+    let key = "obj";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    let response = client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_none_match("*")
+        .body(ByteStream::from_static(b"data1"))
+        .send()
+        .await?;
+    let etag = response
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("PutObject response missing ETag"))?
+        .to_string();
+    let response = client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"data2"))
+        .send()
+        .await?;
+    let latest_etag = response
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("PutObject response missing ETag"))?
+        .to_string();
+
+    let error = match client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_none_match("*")
+        .send()
+        .await
+    {
+        Ok(_) => bail!("If-None-Match=* should reject an existing current object"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "PreconditionFailed");
+    let error = match client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_none_match(latest_etag)
+        .send()
+        .await
+    {
+        Ok(_) => bail!("If-None-Match should reject the current ETag"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "PreconditionFailed");
+
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_none_match(etag)
+        .send()
+        .await?;
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_none_match("badetag")
+        .send()
+        .await?;
+
+    Ok(())
+}
+
+/// Verifies versioned PutObject If-Match checks only the current object.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_put_current_object_if_match() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_current_object_if_match
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-cond");
+    let key = "obj";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    let error = match client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match("*")
+        .send()
+        .await
+    {
+        Ok(_) => bail!("If-Match=* should fail for a missing current object"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "NoSuchKey");
+    let error = match client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match("badetag")
+        .send()
+        .await
+    {
+        Ok(_) => bail!("If-Match should fail for a missing current object"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "NoSuchKey");
+
+    let response = client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_none_match("deadbeef")
+        .body(ByteStream::from_static(b"data1"))
+        .send()
+        .await?;
+    let etag = response
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("PutObject response missing ETag"))?
+        .to_string();
+    let response = client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match("*")
+        .body(ByteStream::from_static(b"data2"))
+        .send()
+        .await?;
+    let latest_etag = response
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("PutObject response missing ETag"))?
+        .to_string();
+
+    let error = match client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match("badetag")
+        .send()
+        .await
+    {
+        Ok(_) => bail!("If-Match should reject a mismatched current ETag"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "PreconditionFailed");
+    let error = match client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match(etag)
+        .send()
+        .await
+    {
+        Ok(_) => bail!("If-Match should not match an older version ETag"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "PreconditionFailed");
+
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match(latest_etag)
+        .send()
+        .await?;
+
+    Ok(())
+}
+
+/// Verifies PutObject conditionals treat current delete markers as missing.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_put_object_current_if_match() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_object_current_if_match
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-cond");
+    let key = "obj";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    let response = client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_none_match("*")
+        .send()
+        .await?;
+    let etag = response
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("PutObject response missing ETag"))?
+        .to_string();
+
+    let error = match client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_none_match("*")
+        .send()
+        .await
+    {
+        Ok(_) => bail!("If-None-Match=* should reject an existing current object"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "PreconditionFailed");
+    let error = match client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_none_match(&etag)
+        .send()
+        .await
+    {
+        Ok(_) => bail!("If-None-Match should reject the current ETag"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "PreconditionFailed");
+
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match(&etag)
+        .send()
+        .await?;
+
+    let response = client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+    assert_eq!(response.delete_marker(), Some(true));
+
+    let error = match client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match("*")
+        .send()
+        .await
+    {
+        Ok(_) => bail!("If-Match=* should fail when current version is a delete marker"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "NoSuchKey");
+    let error = match client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match("badetag")
+        .send()
+        .await
+    {
+        Ok(_) => bail!("If-Match should fail when current version is a delete marker"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "NoSuchKey");
+
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_none_match(etag)
+        .send()
+        .await?;
+
+    Ok(())
+}
+
 /// Verifies CopyObject succeeds when source If-Match matches.
 #[tokio::test]
 #[serial(conformance)]
@@ -730,6 +1008,208 @@ async fn test_delete_object_if_match_last_modified_time() -> Result<()> {
     Ok(())
 }
 
+/// Verifies DeleteObject If-Match evaluates the current version row.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_delete_object_current_if_match() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_delete_object_current_if_match
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-cond");
+    let key = "obj";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match("*")
+        .send()
+        .await?;
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match("badetag")
+        .send()
+        .await?;
+
+    let response = client.put_object().bucket(&bucket).key(key).send().await?;
+    let version = response
+        .version_id()
+        .ok_or_else(|| anyhow::anyhow!("versioned PutObject missing version ID"))?
+        .to_string();
+    let etag = response
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("PutObject response missing ETag"))?
+        .to_string();
+
+    let error = match client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match("badetag")
+        .send()
+        .await
+    {
+        Ok(_) => bail!("If-Match should reject a mismatched current ETag"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "PreconditionFailed");
+
+    let response = client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match(etag)
+        .send()
+        .await?;
+    assert_eq!(response.delete_marker(), Some(true));
+
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match("*")
+        .send()
+        .await?;
+    let error = match client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match("badetag")
+        .send()
+        .await
+    {
+        Ok(_) => bail!("concrete If-Match should fail against a current delete marker"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "PreconditionFailed");
+
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .version_id(version)
+        .send()
+        .await?;
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match("*")
+        .send()
+        .await?;
+
+    Ok(())
+}
+
+/// Verifies DeleteObject Last-Modified conditions evaluate current delete markers.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_delete_object_current_if_match_last_modified_time() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_delete_object_current_if_match_last_modified_time
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-cond");
+    let key = "obj";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    client.put_object().bucket(&bucket).key(key).send().await?;
+    let state = head_state(&client, &bucket, key).await?;
+
+    let error = match client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match_last_modified_time(state.before)
+        .send()
+        .await
+    {
+        Ok(_) => bail!("mismatched current Last-Modified should fail"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "PreconditionFailed");
+
+    let response = client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match_last_modified_time(state.last_modified)
+        .send()
+        .await?;
+    assert_eq!(response.delete_marker(), Some(true));
+
+    let error = match client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match_last_modified_time(state.before)
+        .send()
+        .await
+    {
+        Ok(_) => bail!("current delete marker should still fail a mismatched Last-Modified"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "PreconditionFailed");
+
+    Ok(())
+}
+
+/// Verifies DeleteObject size conditions evaluate current delete markers.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_delete_object_current_if_match_size() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_delete_object_current_if_match_size
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-cond");
+    let key = "obj";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    client.put_object().bucket(&bucket).key(key).send().await?;
+
+    let error = match client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match_size(9999)
+        .send()
+        .await
+    {
+        Ok(_) => bail!("mismatched current size should fail"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "PreconditionFailed");
+
+    let response = client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match_size(0)
+        .send()
+        .await?;
+    assert_eq!(response.delete_marker(), Some(true));
+
+    let error = match client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match_size(9999)
+        .send()
+        .await
+    {
+        Ok(_) => bail!("current delete marker should still fail a mismatched size"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "PreconditionFailed");
+
+    Ok(())
+}
+
 /// Verifies DeleteObject enforces If-Match against an exact object version.
 #[tokio::test]
 #[serial(conformance)]
@@ -916,6 +1396,244 @@ async fn test_delete_objects_if_match() -> Result<()> {
     assert_eq!(output.errors()[0].code(), Some("PreconditionFailed"));
     assert_eq!(get_object_bytes(&client, &bucket, "keep").await?, b"keep");
     assert_deleted(&client, &bucket, "delete").await?;
+
+    Ok(())
+}
+
+/// Verifies DeleteObjects reports Last-Modified precondition failures.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_delete_objects_if_match_last_modified_time() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_delete_objects_if_match_last_modified_time
+    let (_server, client, bucket, state) = seeded_object_with_body(b"").await?;
+
+    let failed = ObjectIdentifier::builder()
+        .key(KEY)
+        .last_modified_time(state.before)
+        .build()?;
+    let response = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(Delete::builder().objects(failed).build()?)
+        .send()
+        .await?;
+    assert_eq!(response.errors()[0].code(), Some("PreconditionFailed"));
+
+    let matched = ObjectIdentifier::builder()
+        .key(KEY)
+        .last_modified_time(state.last_modified)
+        .build()?;
+    let response = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(Delete::builder().objects(matched).build()?)
+        .send()
+        .await?;
+    assert_eq!(response.deleted()[0].key(), Some(KEY));
+
+    let missing = ObjectIdentifier::builder()
+        .key(KEY)
+        .last_modified_time(state.before)
+        .build()?;
+    let response = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(Delete::builder().objects(missing).build()?)
+        .send()
+        .await?;
+    assert!(response.errors().is_empty());
+
+    Ok(())
+}
+
+/// Verifies DeleteObjects reports size precondition failures.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_delete_objects_if_match_size() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_delete_objects_if_match_size
+    let (_server, client, bucket, _state) = seeded_object_with_body(b"").await?;
+
+    let failed = ObjectIdentifier::builder().key(KEY).size(9999).build()?;
+    let response = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(Delete::builder().objects(failed).build()?)
+        .send()
+        .await?;
+    assert_eq!(response.errors()[0].code(), Some("PreconditionFailed"));
+
+    let matched = ObjectIdentifier::builder().key(KEY).size(0).build()?;
+    let response = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(Delete::builder().objects(matched).build()?)
+        .send()
+        .await?;
+    assert_eq!(response.deleted()[0].key(), Some(KEY));
+
+    let missing = ObjectIdentifier::builder().key(KEY).size(9999).build()?;
+    let response = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(Delete::builder().objects(missing).build()?)
+        .send()
+        .await?;
+    assert!(response.errors().is_empty());
+
+    Ok(())
+}
+
+/// Verifies DeleteObjects If-Match evaluates the current version row.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_delete_objects_current_if_match() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_delete_objects_current_if_match
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-cond");
+    let key = "obj";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    let response = client.put_object().bucket(&bucket).key(key).send().await?;
+    let etag = response
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("PutObject response missing ETag"))?
+        .to_string();
+
+    let failed = ObjectIdentifier::builder()
+        .key(key)
+        .e_tag("badetag")
+        .build()?;
+    let response = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(Delete::builder().objects(failed).build()?)
+        .send()
+        .await?;
+    assert_eq!(response.errors()[0].code(), Some("PreconditionFailed"));
+
+    let matched = ObjectIdentifier::builder().key(key).e_tag(etag).build()?;
+    let response = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(Delete::builder().objects(matched).build()?)
+        .send()
+        .await?;
+    assert_eq!(response.deleted()[0].key(), Some(key));
+    assert_eq!(response.deleted()[0].delete_marker(), Some(true));
+
+    let failed = ObjectIdentifier::builder()
+        .key(key)
+        .e_tag("badetag")
+        .build()?;
+    let response = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(Delete::builder().objects(failed).build()?)
+        .send()
+        .await?;
+    assert_eq!(response.errors()[0].code(), Some("PreconditionFailed"));
+
+    Ok(())
+}
+
+/// Verifies DeleteObjects Last-Modified conditions evaluate current delete markers.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_delete_objects_current_if_match_last_modified_time() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_delete_objects_current_if_match_last_modified_time
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-cond");
+    let key = "obj";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    client.put_object().bucket(&bucket).key(key).send().await?;
+    let state = head_state(&client, &bucket, key).await?;
+
+    let failed = ObjectIdentifier::builder()
+        .key(key)
+        .last_modified_time(state.before)
+        .build()?;
+    let response = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(Delete::builder().objects(failed).build()?)
+        .send()
+        .await?;
+    assert_eq!(response.errors()[0].code(), Some("PreconditionFailed"));
+
+    let matched = ObjectIdentifier::builder()
+        .key(key)
+        .last_modified_time(state.last_modified)
+        .build()?;
+    let response = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(Delete::builder().objects(matched).build()?)
+        .send()
+        .await?;
+    assert_eq!(response.deleted()[0].key(), Some(key));
+    assert_eq!(response.deleted()[0].delete_marker(), Some(true));
+
+    let failed = ObjectIdentifier::builder()
+        .key(key)
+        .last_modified_time(state.before)
+        .build()?;
+    let response = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(Delete::builder().objects(failed).build()?)
+        .send()
+        .await?;
+    assert_eq!(response.errors()[0].code(), Some("PreconditionFailed"));
+
+    Ok(())
+}
+
+/// Verifies DeleteObjects size conditions evaluate current delete markers.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_delete_objects_current_if_match_size() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_delete_objects_current_if_match_size
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-cond");
+    let key = "obj";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    client.put_object().bucket(&bucket).key(key).send().await?;
+
+    let failed = ObjectIdentifier::builder().key(key).size(9999).build()?;
+    let response = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(Delete::builder().objects(failed).build()?)
+        .send()
+        .await?;
+    assert_eq!(response.errors()[0].code(), Some("PreconditionFailed"));
+
+    let matched = ObjectIdentifier::builder().key(key).size(0).build()?;
+    let response = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(Delete::builder().objects(matched).build()?)
+        .send()
+        .await?;
+    assert_eq!(response.deleted()[0].key(), Some(key));
+    assert_eq!(response.deleted()[0].delete_marker(), Some(true));
+
+    let failed = ObjectIdentifier::builder().key(key).size(9999).build()?;
+    let response = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(Delete::builder().objects(failed).build()?)
+        .send()
+        .await?;
+    assert_eq!(response.errors()[0].code(), Some("PreconditionFailed"));
 
     Ok(())
 }

@@ -243,64 +243,6 @@ impl Sqlite {
         Self::try_get_metadata_internal(transaction, key, None, true)
     }
 
-    /// Fetches the newest non-delete-marker metadata for conditional deletes.
-    pub(crate) fn try_get_latest_object_metadata(
-        transaction: &Transaction,
-        key: &str,
-    ) -> SqliteResult<Option<KeyMetadata>> {
-        let mut stmt = transaction.prepare_cached(
-            "
-            SELECT
-                version_id,
-                size,
-                metadata,
-                content_type,
-                content_encoding,
-                cache_control,
-                expires,
-                last_modified,
-                md5,
-                checksum_algorithm,
-                checksum_type,
-                checksum_value,
-                is_latest,
-                is_delete_marker
-            FROM object_version
-            WHERE key = ?1 AND is_delete_marker = 0
-            ORDER BY sequence DESC
-            LIMIT 1;",
-        )?;
-
-        Ok(stmt
-            .query_row([key], |row| {
-                Ok(KeyMetadata {
-                    version_id: row.get(0)?,
-                    size: row_size(row, 1)?,
-                    metadata: row
-                        .get::<_, Option<String>>(2)?
-                        .map(|metadata| serde_json::from_str(&metadata))
-                        .transpose()
-                        .map_err(|err| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                2,
-                                rusqlite::types::Type::Text,
-                                Box::new(err),
-                            )
-                        })?,
-                    content_type: row.get(3)?,
-                    content_encoding: row.get(4)?,
-                    cache_control: row.get(5)?,
-                    expires: row.get(6)?,
-                    last_modified: row.get(7)?,
-                    md5: row.get(8)?,
-                    checksum: optional_stored_checksum(row.get(9)?, row.get(10)?, row.get(11)?)?,
-                    is_latest: row_bool(row, 12)?,
-                    is_delete_marker: row_bool(row, 13)?,
-                })
-            })
-            .optional()?)
-    }
-
     /// Fetches exact object metadata, including delete markers, by key and version ID.
     pub(crate) fn try_get_version_metadata(
         transaction: &Transaction,
