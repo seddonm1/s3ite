@@ -2923,6 +2923,58 @@ async fn test_default_crc64nvme_for_copy_object() -> Result<()> {
 
 #[tokio::test]
 #[tracing::instrument]
+async fn test_copy_object_inherits_source_checksum_algorithm() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+
+    let bucket = format!("test-copy-sha256-{}", Uuid::new_v4());
+    let source = "source-sha256.txt";
+    let target = "target-sha256.txt";
+    create_bucket(&context, &bucket).await?;
+
+    context
+        .put_object()
+        .bucket(&bucket)
+        .key(source)
+        .checksum_algorithm(ChecksumAlgorithm::Sha256)
+        .checksum_sha256(SHA256_1024_A)
+        .body(ByteStream::from(vec![b'A'; 1024]))
+        .send()
+        .await?;
+
+    let copy = context
+        .copy_object()
+        .bucket(&bucket)
+        .key(target)
+        .copy_source(format!("{bucket}/{source}"))
+        .send()
+        .await?;
+    let copy_result = copy
+        .copy_object_result()
+        .ok_or_else(|| anyhow::anyhow!("CopyObject response missing result"))?;
+    assert_eq!(copy_result.checksum_sha256(), Some(SHA256_1024_A));
+    assert!(copy_result.checksum_crc64_nvme().is_none());
+    assert_eq!(copy_result.checksum_type(), Some(&ChecksumType::FullObject));
+
+    let head = context
+        .head_object()
+        .bucket(&bucket)
+        .key(target)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(head.checksum_sha256(), Some(SHA256_1024_A));
+    assert!(head.checksum_crc64_nvme().is_none());
+    assert_eq!(
+        get_object_bytes(&context, &bucket, target).await?,
+        vec![b'A'; 1024]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
 async fn test_default_crc64nvme_for_multipart_completion() -> Result<()> {
     let _guard = serial().await;
     let context = TestContext::new(None).await?;

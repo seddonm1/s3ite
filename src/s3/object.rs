@@ -64,7 +64,7 @@ struct CopyObjectRequest {
     cache_control: Option<String>,
     expires: Option<OffsetDateTime>,
     source_conditions: ObjectReadConditions,
-    target_checksum_kind: ChecksumAlgorithmKind,
+    target_checksum_kind: Option<ChecksumAlgorithmKind>,
 }
 
 fn parse_copy_object_request(input: CopyObjectInput) -> S3Result<CopyObjectRequest> {
@@ -101,8 +101,7 @@ fn parse_copy_object_request(input: CopyObjectInput) -> S3Result<CopyObjectReque
     let replace_metadata = metadata_directive
         .as_ref()
         .is_some_and(|directive| directive.as_str() == MetadataDirective::REPLACE);
-    let target_checksum_kind = checksum_algorithm_from_request(checksum_algorithm)?
-        .unwrap_or(ChecksumAlgorithmKind::Crc64Nvme);
+    let target_checksum_kind = checksum_algorithm_from_request(checksum_algorithm)?;
 
     Ok(CopyObjectRequest {
         target_bucket,
@@ -173,7 +172,17 @@ fn prepare_copied_object(
             .clone_from(&request.cache_control);
         object.key_metadata.expires = request.expires;
     }
-    let checksum = object_write_checksum_from_value(request.target_checksum_kind, &object)?;
+    let checksum_kind = request
+        .target_checksum_kind
+        .or_else(|| {
+            object
+                .key_metadata
+                .checksum
+                .as_ref()
+                .map(StoredChecksum::algorithm)
+        })
+        .unwrap_or(ChecksumAlgorithmKind::Crc64Nvme);
+    let checksum = object_write_checksum_from_value(checksum_kind, &object)?;
     object.key_metadata.checksum = Some(checksum.clone());
     Ok((object, checksum))
 }
