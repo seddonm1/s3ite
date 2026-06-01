@@ -12,7 +12,7 @@ use reqwest::{Method, StatusCode};
 use serial_test::serial;
 use support::{
     assertions::{assert_error_contains, assert_status},
-    fixtures::{bucket_name, create_bucket, get_object_bytes, put_object},
+    fixtures::{bucket_name, create_bucket, get_object_bytes},
     raw_http, sdk,
     server::TestServer,
 };
@@ -257,26 +257,6 @@ async fn test_bucket_get_location() -> Result<()> {
             .map(aws_sdk_s3::types::BucketLocationConstraint::as_str),
         Some("")
     );
-
-    Ok(())
-}
-
-/// Verifies HeadBucket read-stats returns RGW-compatible bucket usage headers.
-#[tokio::test]
-#[serial(conformance)]
-async fn test_bucket_head_extended() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_bucket_head_extended
-    let server = TestServer::spawn().await?;
-    let client = sdk::client(&server);
-    let bucket = bucket_name("s3ite-conf");
-
-    create_bucket(&client, &bucket).await?;
-    assert_bucket_stats(&server, &bucket, "0", "0").await?;
-
-    put_object(&client, &bucket, "foo", b"foo").await?;
-    put_object(&client, &bucket, "bar", b"bar").await?;
-    put_object(&client, &bucket, "baz", b"baz").await?;
-    assert_bucket_stats(&server, &bucket, "3", "9").await?;
 
     Ok(())
 }
@@ -645,35 +625,4 @@ fn bucket_name_with_length(length: usize) -> String {
     }
     name.truncate(length);
     name
-}
-
-async fn assert_bucket_stats(
-    server: &TestServer,
-    bucket: &str,
-    expected_count: &str,
-    expected_bytes: &str,
-) -> Result<()> {
-    let response = raw_http::signed_request(
-        server,
-        Method::HEAD,
-        &format!("/{bucket}?read-stats=true"),
-        Vec::new(),
-    )
-    .await?;
-    assert_status(&response, StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get("x-rgw-object-count")
-            .and_then(|value| value.to_str().ok()),
-        Some(expected_count)
-    );
-    assert_eq!(
-        response
-            .headers()
-            .get("x-rgw-bytes-used")
-            .and_then(|value| value.to_str().ok()),
-        Some(expected_bytes)
-    );
-    Ok(())
 }

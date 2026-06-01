@@ -204,7 +204,7 @@ The repository includes a helper for running a local Ceph `s3-tests` environment
 scripts/run-s3-tests.sh
 ```
 
-The helper clones Ceph `s3-tests` if needed, installs `uv` if needed, creates the Python environment, builds and starts a local `s3ite` server, runs pytest, and stops the server before exiting. By default, it excludes tests marked `fails_on_rgw`; pass an explicit pytest marker expression with `-m` to override that filter. The checkout, virtual environment, Cargo target directory, generated configs, data root, and logs live under `${TMPDIR:-/tmp}/s3ite-s3-tests`.
+The helper clones Ceph `s3-tests` if needed, installs `uv` if needed, creates the Python environment, builds and starts a local `s3ite` server, runs pytest, and stops the server before exiting. By default, it excludes tests marked `fails_on_rgw` and `fails_on_aws`; the latter usually indicates Ceph/RGW-specific behavior rather than the S3 contract. Pass an explicit pytest marker expression with `-m` to override that filter. The checkout, virtual environment, Cargo target directory, generated configs, data root, and logs live under `${TMPDIR:-/tmp}/s3ite-s3-tests`.
 
 To run a specific test, pass pytest arguments directly:
 

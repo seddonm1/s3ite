@@ -34,7 +34,7 @@ for arg in "${pytest_args[@]}"; do
 done
 
 if [[ "$has_mark_expression" == false ]]; then
-  pytest_args=(-m "not fails_on_rgw" "${pytest_args[@]}")
+  pytest_args=(-m "not fails_on_rgw and not fails_on_aws" "${pytest_args[@]}")
 fi
 
 find_uv() {

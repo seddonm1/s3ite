@@ -128,7 +128,7 @@ row per upstream Ceph selector:
 - `ported`: implemented as a Rust conformance test.
 - `pending`: supported behavior that still needs a Rust port.
 - `unsupported`: outside s3ite's current scope, with a reason.
-- `rgw-specific`: Ceph/RGW-specific behavior that should not define s3ite's contract.
+- `rgw-specific`: Ceph/RGW-specific behavior, often marked `fails_on_aws`, that should not define s3ite's contract.
 - `blocked`: cannot be represented yet because the Rust harness lacks a raw HTTP/helper capability.
 
 Each ported test must include a source comment:

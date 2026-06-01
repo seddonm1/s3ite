@@ -121,16 +121,6 @@ pub(super) fn is_url_encoding(encoding_type: Option<&EncodingType>) -> bool {
     encoding_type.is_some_and(|encoding_type| encoding_type.as_str() == EncodingType::URL)
 }
 
-/// Returns whether a query string contains a specific key-value pair.
-pub(super) fn has_query_value(query: Option<&str>, name: &str, value: &str) -> bool {
-    query.is_some_and(|query| {
-        query.split('&').any(|pair| {
-            pair.split_once('=')
-                .is_some_and(|(key, found)| key == name && found == value)
-        })
-    })
-}
-
 /// Normalizes a delimiter echo for list output.
 pub(super) fn output_delimiter(delimiter: Option<String>) -> Option<String> {
     delimiter.and_then(|delimiter| delimiter.is_empty().not().then_some(delimiter))
@@ -475,7 +465,6 @@ pub(super) async fn list_objects(
     sqlite: &Sqlite,
     req: S3Request<ListObjectsInput>,
 ) -> S3Result<S3Response<ListObjectsOutput>> {
-    let allow_unordered = has_query_value(req.uri.query(), "allow-unordered", "true");
     let ListObjectsInput {
         bucket,
         mut prefix,
@@ -499,12 +488,6 @@ pub(super) async fn list_objects(
         .as_deref()
         .filter(|delimiter| delimiter.is_empty().not())
         .map(str::to_string);
-    if allow_unordered && delimiter_filter.is_some() {
-        return Err(s3_error_with_message(
-            S3ErrorCode::InvalidArgument,
-            "allow-unordered cannot be used with delimiter",
-        ));
-    }
     let delimiter = output_delimiter(delimiter);
     let owner = owner();
 
@@ -658,7 +641,6 @@ pub(super) async fn list_objects_v2(
     sqlite: &Sqlite,
     req: S3Request<ListObjectsV2Input>,
 ) -> S3Result<S3Response<ListObjectsV2Output>> {
-    let allow_unordered = has_query_value(req.uri.query(), "allow-unordered", "true");
     let ListObjectsV2Input {
         bucket,
         mut prefix,
@@ -684,12 +666,6 @@ pub(super) async fn list_objects_v2(
         .as_deref()
         .filter(|delimiter| delimiter.is_empty().not())
         .map(str::to_string);
-    if allow_unordered && delimiter_filter.is_some() {
-        return Err(s3_error_with_message(
-            S3ErrorCode::InvalidArgument,
-            "allow-unordered cannot be used with delimiter",
-        ));
-    }
     let delimiter = output_delimiter(delimiter);
     let owner = owner();
     let owner = fetch_owner.unwrap_or(false).then_some(owner);

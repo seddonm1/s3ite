@@ -5,7 +5,7 @@ use super::{
     HeadBucketOutput, InternalError, ListBucketsInput, ListBucketsOutput, MFADelete, Not,
     PutBucketVersioningInput, PutBucketVersioningOutput, S3Error, S3ErrorCode, S3Request,
     S3Response, S3Result, Sqlite, SqliteError, Timestamp, decode_continuation_token,
-    encode_continuation_token, fs, has_query_value, list_limit, s3_error, s3_error_from_sqlite,
+    encode_continuation_token, fs, list_limit, s3_error, s3_error_from_sqlite,
     s3_error_with_message, validate_bucket_acl,
 };
 
@@ -266,7 +266,6 @@ pub(super) async fn head_bucket(
     sqlite: &Sqlite,
     req: S3Request<HeadBucketInput>,
 ) -> S3Result<S3Response<HeadBucketOutput>> {
-    let read_stats = has_query_value(req.uri.query(), "read-stats", "true");
     let HeadBucketInput { bucket, .. } = req.input;
 
     if sqlite.buckets.read().await.contains_key(&bucket).not() {
@@ -287,38 +286,7 @@ pub(super) async fn head_bucket(
         bucket_region: None,
     };
 
-    if read_stats.not() {
-        return Ok(S3Response::new(output));
-    }
-
-    let connection = sqlite
-        .try_get_connection(&bucket)
-        .await
-        .map_err(s3_error_from_sqlite)?;
-    let (object_count, bytes_used) = connection
-        .read(|connection| {
-            let transaction = connection.transaction()?;
-            Sqlite::try_bucket_usage_summary(&transaction)
-        })
-        .await
-        .map_err(s3_error_from_sqlite)?;
-
-    let mut response = S3Response::new(output);
-    response.headers.insert(
-        "x-rgw-object-count",
-        object_count
-            .to_string()
-            .parse()
-            .map_err(S3Error::internal_error)?,
-    );
-    response.headers.insert(
-        "x-rgw-bytes-used",
-        bytes_used
-            .to_string()
-            .parse()
-            .map_err(S3Error::internal_error)?,
-    );
-    Ok(response)
+    Ok(S3Response::new(output))
 }
 
 /// Lists all open bucket databases.

@@ -6,8 +6,6 @@
 
 mod support;
 
-use std::ops::Not;
-
 use anyhow::Result;
 use aws_sdk_s3::{
     Client,
@@ -43,12 +41,6 @@ struct ListPageV2<'a> {
     expected_keys: &'a [&'a str],
     expected_prefixes: &'a [&'a str],
 }
-
-const UNORDERED_KEYS: &[&str] = &[
-    "ado", "bot", "cob", "dog", "emu", "fez", "gnu", "hex", "abc/ink", "abc/jet", "abc/kin",
-    "abc/lax", "abc/mux", "def/nim", "def/owl", "def/pie", "def/qed", "def/rye", "ghi/sew",
-    "ghi/tor", "ghi/uke", "ghi/via", "ghi/wit", "xix", "yak", "zoo",
-];
 
 macro_rules! validate_bucket_list_v1 {
     (
@@ -164,118 +156,6 @@ async fn test_bucket_listv2_many() -> Result<()> {
     assert_eq!(object_keys(second.contents()), vec!["foo"]);
     assert_eq!(second.is_truncated(), Some(false));
     assert_eq!(second.key_count(), Some(1));
-
-    Ok(())
-}
-
-/// Verifies ListObjects v1 supports RGW allow-unordered listing semantics.
-#[tokio::test]
-#[serial(conformance)]
-async fn test_bucket_list_unordered() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_unordered
-    let (server, _client, bucket) = seeded_bucket(UNORDERED_KEYS).await?;
-
-    let all = list_objects_raw(&server, &bucket, "allow-unordered=true").await?;
-    assert_eq!(sorted_values(all.keys), sorted_values(UNORDERED_KEYS));
-
-    let prefixed = list_objects_raw(&server, &bucket, "prefix=abc%2F&allow-unordered=true").await?;
-    assert_eq!(
-        sorted_values(prefixed.keys),
-        sorted_values(["abc/ink", "abc/jet", "abc/kin", "abc/lax", "abc/mux"])
-    );
-
-    let first = list_objects_raw(&server, &bucket, "max-keys=6&allow-unordered=true").await?;
-    assert_eq!(first.keys.len(), 6);
-    assert!(first.is_truncated);
-    let marker = first
-        .keys
-        .last()
-        .ok_or_else(|| anyhow::anyhow!("first unordered page missing last key"))?;
-    let second = list_objects_raw(
-        &server,
-        &bucket,
-        &format!(
-            "marker={}&max-keys=6&allow-unordered=true",
-            raw_http::path_segment(marker)
-        ),
-    )
-    .await?;
-    assert!(first.keys.iter().all(|key| second.keys.contains(key).not()));
-
-    let response = raw_http::signed_request(
-        &server,
-        Method::GET,
-        &format!("/{bucket}?delimiter=%2F&allow-unordered=true"),
-        Vec::new(),
-    )
-    .await?;
-    assert_status(&response, StatusCode::BAD_REQUEST);
-    let body = response.text().await?;
-    assert!(
-        body.contains("InvalidArgument"),
-        "expected InvalidArgument error, got {body}"
-    );
-
-    Ok(())
-}
-
-/// Verifies ListObjectsV2 supports RGW allow-unordered listing semantics.
-#[tokio::test]
-#[serial(conformance)]
-async fn test_bucket_listv2_unordered() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_bucket_listv2_unordered
-    let (server, _client, bucket) = seeded_bucket(UNORDERED_KEYS).await?;
-
-    let all = list_objects_raw(&server, &bucket, "list-type=2&allow-unordered=true").await?;
-    assert_eq!(sorted_values(all.keys), sorted_values(UNORDERED_KEYS));
-
-    let prefixed = list_objects_raw(
-        &server,
-        &bucket,
-        "list-type=2&prefix=abc%2F&allow-unordered=true",
-    )
-    .await?;
-    assert_eq!(
-        sorted_values(prefixed.keys),
-        sorted_values(["abc/ink", "abc/jet", "abc/kin", "abc/lax", "abc/mux"])
-    );
-
-    let first = list_objects_raw(
-        &server,
-        &bucket,
-        "list-type=2&max-keys=6&allow-unordered=true",
-    )
-    .await?;
-    assert_eq!(first.keys.len(), 6);
-    assert!(first.is_truncated);
-    let start_after = first
-        .keys
-        .last()
-        .ok_or_else(|| anyhow::anyhow!("first unordered v2 page missing last key"))?;
-    let second = list_objects_raw(
-        &server,
-        &bucket,
-        &format!(
-            "list-type=2&start-after={}&max-keys=6&allow-unordered=true",
-            raw_http::path_segment(start_after)
-        ),
-    )
-    .await?;
-    assert!(first.keys.iter().all(|key| second.keys.contains(key).not()));
-
-    let response = raw_http::signed_request(
-        &server,
-        Method::GET,
-        &format!("/{bucket}?list-type=2&delimiter=%2F&allow-unordered=true"),
-        Vec::new(),
-    )
-    .await?;
-    assert_status(&response, StatusCode::BAD_REQUEST);
-    let body = response.text().await?;
-    assert!(
-        body.contains("InvalidArgument"),
-        "expected InvalidArgument error, got {body}"
-    );
 
     Ok(())
 }
@@ -2124,55 +2004,6 @@ async fn validate_bucket_list_v2_page(
 
 fn object_keys(objects: &[Object]) -> Vec<&str> {
     objects.iter().filter_map(Object::key).collect()
-}
-
-struct RawListObjects {
-    keys: Vec<String>,
-    is_truncated: bool,
-}
-
-async fn list_objects_raw(
-    server: &TestServer,
-    bucket: &str,
-    query: &str,
-) -> Result<RawListObjects> {
-    let response = raw_http::signed_request(
-        server,
-        Method::GET,
-        &format!("/{bucket}?{query}"),
-        Vec::new(),
-    )
-    .await?;
-    assert_status(&response, StatusCode::OK);
-    let body = response.text().await?;
-    Ok(RawListObjects {
-        keys: xml_values(&body, "Key"),
-        is_truncated: xml_values(&body, "IsTruncated")
-            .first()
-            .is_some_and(|value| value == "true"),
-    })
-}
-
-fn xml_values(body: &str, tag: &str) -> Vec<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    body.split(&open)
-        .skip(1)
-        .filter_map(|part| part.split_once(&close).map(|(value, _)| value.to_string()))
-        .collect()
-}
-
-fn sorted_values<I, S>(values: I) -> Vec<String>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    let mut values = values
-        .into_iter()
-        .map(|value| value.as_ref().to_string())
-        .collect::<Vec<_>>();
-    values.sort_unstable();
-    values
 }
 
 fn prefixes(common_prefixes: &[CommonPrefix]) -> Vec<&str> {
