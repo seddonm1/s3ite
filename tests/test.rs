@@ -34,6 +34,14 @@ const REGION: &str = "us-west-2";
 const SHA256_1024_A: &str = "arcu6553sHVAiX4MjW0j7I7vD4w6R+Gz9Ok0Q9lTa+0=";
 const SHA256_5_MIB_A: &str = "275VF5loJr1YYawit0XSHREhkFXYkkPKGuoK0x9VKxI=";
 const SHA256_TAIL: &str = "DGL4du8d6oMN6fMsL0tG3W101Q0ViW4J71ovzUrH4dc=";
+const CRC32_5_MIB_A: &str = "JRTCyQ==";
+const CRC32_5_MIB_B: &str = "QoZTGg==";
+const CRC32_5_MIB_C: &str = "YAgjqw==";
+const CRC32_15_MIB_ABC: &str = "WgDhBQ==";
+const CRC32C_5_MIB_A: &str = "MDaLrw==";
+const CRC32C_5_MIB_B: &str = "TH4EZg==";
+const CRC32C_5_MIB_C: &str = "Z7mBIQ==";
+const CRC32C_15_MIB_ABC: &str = "xU+Krw==";
 
 static TRACING: LazyLock<()> = LazyLock::new(|| {
     use tracing_subscriber::EnvFilter;
@@ -262,6 +270,68 @@ async fn upload_part_body(
                 .ok_or_else(|| anyhow::anyhow!("upload part response missing ETag"))?,
         )
         .part_number(part_number)
+        .build())
+}
+
+async fn upload_crc32_part(
+    c: &Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: i32,
+    byte: u8,
+    checksum: &str,
+) -> Result<CompletedPart> {
+    let part = c
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(part_number)
+        .checksum_algorithm(ChecksumAlgorithm::Crc32)
+        .checksum_crc32(checksum)
+        .body(ByteStream::from(vec![byte; 5 * 1024 * 1024]))
+        .send()
+        .await?;
+
+    Ok(CompletedPart::builder()
+        .e_tag(
+            part.e_tag()
+                .ok_or_else(|| anyhow::anyhow!("upload part response missing ETag"))?,
+        )
+        .part_number(part_number)
+        .checksum_crc32(checksum)
+        .build())
+}
+
+async fn upload_crc32c_part(
+    c: &Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: i32,
+    byte: u8,
+    checksum: &str,
+) -> Result<CompletedPart> {
+    let part = c
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(part_number)
+        .checksum_algorithm(ChecksumAlgorithm::Crc32C)
+        .checksum_crc32_c(checksum)
+        .body(ByteStream::from(vec![byte; 5 * 1024 * 1024]))
+        .send()
+        .await?;
+
+    Ok(CompletedPart::builder()
+        .e_tag(
+            part.e_tag()
+                .ok_or_else(|| anyhow::anyhow!("upload part response missing ETag"))?,
+        )
+        .part_number(part_number)
+        .checksum_crc32_c(checksum)
         .build())
 }
 
@@ -3046,6 +3116,100 @@ async fn test_default_crc64nvme_for_multipart_completion() -> Result<()> {
         .await?;
     assert!(part.checksum_crc64_nvme().is_none());
     assert!(part.checksum_type().is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_multipart_crc32_full_object_completion_checksum() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+
+    let bucket = format!("test-multipart-crc32-full-{}", Uuid::new_v4());
+    let key = "multipart-crc32-full.txt";
+    create_bucket(&context, &bucket).await?;
+
+    let upload_id = context
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .checksum_algorithm(ChecksumAlgorithm::Crc32)
+        .checksum_type(ChecksumType::FullObject)
+        .send()
+        .await?
+        .upload_id
+        .ok_or_else(|| anyhow::anyhow!("create multipart response missing upload ID"))?;
+
+    let part1 =
+        upload_crc32_part(&context, &bucket, key, &upload_id, 1, b'A', CRC32_5_MIB_A).await?;
+    let part2 =
+        upload_crc32_part(&context, &bucket, key, &upload_id, 2, b'B', CRC32_5_MIB_B).await?;
+    let part3 =
+        upload_crc32_part(&context, &bucket, key, &upload_id, 3, b'C', CRC32_5_MIB_C).await?;
+    let upload = CompletedMultipartUpload::builder()
+        .set_parts(Some(vec![part1, part2, part3]))
+        .build();
+
+    let completed = context
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .checksum_crc32(CRC32_15_MIB_ABC)
+        .multipart_upload(upload)
+        .send()
+        .await?;
+    assert_eq!(completed.checksum_crc32(), Some(CRC32_15_MIB_ABC));
+    assert_eq!(completed.checksum_type(), Some(&ChecksumType::FullObject));
+    assert!(completed.checksum_crc32_c().is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_multipart_crc32c_full_object_completion_checksum() -> Result<()> {
+    let _guard = serial().await;
+    let context = TestContext::new(None).await?;
+
+    let bucket = format!("test-multipart-crc32c-full-{}", Uuid::new_v4());
+    let key = "multipart-crc32c-full.txt";
+    create_bucket(&context, &bucket).await?;
+
+    let upload_id = context
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .checksum_algorithm(ChecksumAlgorithm::Crc32C)
+        .checksum_type(ChecksumType::FullObject)
+        .send()
+        .await?
+        .upload_id
+        .ok_or_else(|| anyhow::anyhow!("create multipart response missing upload ID"))?;
+
+    let part1 =
+        upload_crc32c_part(&context, &bucket, key, &upload_id, 1, b'A', CRC32C_5_MIB_A).await?;
+    let part2 =
+        upload_crc32c_part(&context, &bucket, key, &upload_id, 2, b'B', CRC32C_5_MIB_B).await?;
+    let part3 =
+        upload_crc32c_part(&context, &bucket, key, &upload_id, 3, b'C', CRC32C_5_MIB_C).await?;
+    let upload = CompletedMultipartUpload::builder()
+        .set_parts(Some(vec![part1, part2, part3]))
+        .build();
+
+    let completed = context
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .checksum_crc32_c(CRC32C_15_MIB_ABC)
+        .multipart_upload(upload)
+        .send()
+        .await?;
+    assert_eq!(completed.checksum_crc32_c(), Some(CRC32C_15_MIB_ABC));
+    assert_eq!(completed.checksum_type(), Some(&ChecksumType::FullObject));
+    assert!(completed.checksum_crc32().is_none());
 
     Ok(())
 }

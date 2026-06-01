@@ -60,6 +60,7 @@ impl ChecksumAlgorithmKind {
     }
 
     /// Computes this checksum over a byte slice and base64-encodes the digest.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn checksum_value(self, value: &[u8]) -> String {
         match self {
@@ -466,40 +467,39 @@ impl MultipartChecksumConfig {
 /// Checksum fields supplied with a multipart completion request.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct MultipartCompletionChecksum {
+    /// Checksum algorithm named by the completion request, if any.
+    pub(crate) algorithm: Option<ChecksumAlgorithmKind>,
     /// Requested checksum type, even when no final checksum value was supplied.
     pub(crate) checksum_type: Option<ChecksumTypeKind>,
-    /// Client-supplied final checksum value.
-    pub(crate) checksum: Option<StoredChecksum>,
+    /// Client-supplied final checksum value, if any.
+    pub(crate) value: Option<String>,
 }
 
 impl MultipartCompletionChecksum {
     /// Returns the supplied checksum algorithm.
     #[must_use]
     pub(crate) fn algorithm(&self) -> Option<ChecksumAlgorithmKind> {
-        self.checksum.as_ref().map(StoredChecksum::algorithm)
+        self.algorithm
     }
 
     /// Returns the requested checksum type.
     #[must_use]
     pub(crate) fn checksum_type(&self) -> Option<ChecksumTypeKind> {
-        self.checksum
-            .as_ref()
-            .map(StoredChecksum::checksum_type)
-            .or(self.checksum_type)
+        self.checksum_type
     }
 
     /// Returns the checksum value for an algorithm when supplied.
     #[must_use]
     pub(crate) fn value_for(&self, algorithm: ChecksumAlgorithmKind) -> Option<&str> {
-        self.checksum
-            .as_ref()
-            .and_then(|checksum| checksum.value_for(algorithm))
+        (self.algorithm == Some(algorithm))
+            .then_some(self.value.as_deref())
+            .flatten()
     }
 
     /// Returns whether the request supplied a checksum value.
     #[must_use]
     pub(crate) fn has_value(&self) -> bool {
-        self.checksum.is_some()
+        self.value.is_some()
     }
 }
 
@@ -745,8 +745,8 @@ mod tests {
 
     use super::{
         ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKind, CompositeChecksum,
-        FullObjectChecksum, PartChecksum, StoredChecksum, decode_base64, decode_md5_hex,
-        encode_base64, encode_hex,
+        FullObjectChecksum, MultipartCompletionChecksum, PartChecksum, StoredChecksum,
+        decode_base64, decode_md5_hex, encode_base64, encode_hex,
     };
 
     #[test]
@@ -828,6 +828,24 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn multipart_completion_checksum_keeps_type_and_value_separate() {
+        let checksum = MultipartCompletionChecksum {
+            algorithm: Some(ChecksumAlgorithmKind::Crc32),
+            checksum_type: None,
+            value: Some("WgDhBQ==".to_string()),
+        };
+
+        assert_eq!(checksum.algorithm(), Some(ChecksumAlgorithmKind::Crc32));
+        assert_eq!(checksum.checksum_type(), None);
+        assert_eq!(
+            checksum.value_for(ChecksumAlgorithmKind::Crc32),
+            Some("WgDhBQ==")
+        );
+        assert_eq!(checksum.value_for(ChecksumAlgorithmKind::Crc32c), None);
+        assert!(checksum.has_value());
     }
 
     #[test]

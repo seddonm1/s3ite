@@ -252,15 +252,10 @@ impl Sqlite {
             .or(requested_checksum.algorithm())
             .unwrap_or(default_checksum.algorithm);
 
-        let checksum_type = if upload_checksum.is_some() || requested_checksum.algorithm().is_some()
-        {
-            requested_checksum
-                .checksum_type()
-                .or(upload_checksum.map(|checksum| checksum.checksum_type))
-                .unwrap_or(default_checksum.checksum_type)
-        } else {
-            default_checksum.checksum_type
-        };
+        let checksum_type = requested_checksum
+            .checksum_type()
+            .or(upload_checksum.map(|checksum| checksum.checksum_type))
+            .unwrap_or(default_checksum.checksum_type);
 
         MultipartChecksumConfig::new(algorithm, checksum_type)
     }
