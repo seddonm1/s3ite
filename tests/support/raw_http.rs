@@ -16,3 +16,12 @@ pub async fn unsigned_request(server: &TestServer, method: Method, path: &str) -
 pub async fn unsigned_get(server: &TestServer, path: &str) -> Result<Response> {
     unsigned_request(server, Method::GET, path).await
 }
+
+pub async fn request_url(method: Method, url: &str) -> Result<Response> {
+    let client = client()?;
+    Ok(client.request(method, url).send().await?)
+}
+
+pub async fn get_url(url: &str) -> Result<Response> {
+    request_url(Method::GET, url).await
+}
