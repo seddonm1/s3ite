@@ -623,6 +623,76 @@ async fn test_multipart_get_part() -> Result<()> {
     Ok(())
 }
 
+/// Verifies single-part multipart partNumber reads and out-of-range errors.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_multipart_single_get_part() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_multipart_single_get_part
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-mpu");
+    let key = "mymultipart";
+    let body = vec![b'a'; 5 * MIB];
+
+    create_bucket(&client, &bucket).await?;
+    let upload_id = create_upload(&client, &bucket, key).await?;
+    let parts = vec![upload_part(&client, &bucket, key, &upload_id, 1, body.clone()).await?];
+
+    let missing = match client
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .part_number(1)
+        .send()
+        .await
+    {
+        Ok(_) => bail!("partNumber before complete should fail"),
+        Err(error) => error,
+    };
+    assert_error_contains(&missing, "NoSuchKey");
+
+    let complete = complete_upload(&client, &bucket, key, &upload_id, parts).await?;
+    let head = client
+        .head_object()
+        .bucket(&bucket)
+        .key(key)
+        .part_number(1)
+        .send()
+        .await?;
+    assert_eq!(head.parts_count(), Some(1));
+    assert_eq!(head.e_tag(), complete.e_tag());
+
+    let part = client
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .part_number(1)
+        .send()
+        .await?;
+    assert_eq!(part.parts_count(), Some(1));
+    assert_eq!(part.e_tag(), complete.e_tag());
+    assert_eq!(part.content_length(), Some(body.len() as i64));
+    assert_eq!(
+        part.body.collect().await?.into_bytes().as_ref(),
+        body.as_slice()
+    );
+
+    let invalid = match client
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .part_number(5)
+        .send()
+        .await
+    {
+        Ok(_) => bail!("partNumber beyond multipart object should fail"),
+        Err(error) => error,
+    };
+    assert_error_contains(&invalid, "InvalidPart");
+
+    Ok(())
+}
+
 /// Verifies duplicate part entries complete with the final uploaded part.
 #[tokio::test]
 #[serial(conformance)]

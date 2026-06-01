@@ -48,6 +48,42 @@ async fn test_object_copy_same_bucket() -> Result<()> {
     Ok(())
 }
 
+/// Verifies CopyObject can copy a 16 MiB object.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_object_copy_16m() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_object_copy_16m
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-copy");
+
+    create_bucket(&client, &bucket).await?;
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key("obj1")
+        .body(ByteStream::from(vec![0; 16 * MIB]))
+        .send()
+        .await?;
+
+    client
+        .copy_object()
+        .bucket(&bucket)
+        .key("obj2")
+        .copy_source(format!("{bucket}/obj1"))
+        .send()
+        .await?;
+    let response = client
+        .get_object()
+        .bucket(&bucket)
+        .key("obj2")
+        .send()
+        .await?;
+    assert_eq!(response.content_length(), Some((16 * MIB) as i64));
+
+    Ok(())
+}
+
 /// Verifies CopyObject preserves the source content type by default.
 #[tokio::test]
 #[serial(conformance)]

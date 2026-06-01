@@ -44,6 +44,56 @@ async fn test_object_head_zero_bytes() -> Result<()> {
     Ok(())
 }
 
+/// Verifies partNumber=1 reads a normal object and higher parts fail.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_non_multipart_get_part() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_non_multipart_get_part
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-obj");
+
+    create_bucket(&client, &bucket).await?;
+    let put = client
+        .put_object()
+        .bucket(&bucket)
+        .key("singlepart")
+        .body(ByteStream::from_static(b"body"))
+        .send()
+        .await?;
+    let etag = put
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("PutObject response missing ETag"))?;
+
+    let error = match client
+        .get_object()
+        .bucket(&bucket)
+        .key("singlepart")
+        .part_number(2)
+        .send()
+        .await
+    {
+        Ok(_) => bail!("partNumber beyond normal object should fail"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "InvalidPart");
+
+    let response = client
+        .get_object()
+        .bucket(&bucket)
+        .key("singlepart")
+        .part_number(1)
+        .send()
+        .await?;
+    assert_eq!(response.e_tag(), Some(etag));
+    assert_eq!(
+        response.body.collect().await?.into_bytes().as_ref(),
+        b"body"
+    );
+
+    Ok(())
+}
+
 /// Verifies PutObject returns the MD5-based ETag for a small object.
 #[tokio::test]
 #[serial(conformance)]
