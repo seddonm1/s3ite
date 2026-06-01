@@ -77,7 +77,8 @@ anyhow = { version = "1.0.102", features = ["backtrace"] }
 aws-config = { version = "=1.8.13", default-features = false }
 aws-credential-types = { version = "=1.2.13", features = ["test-util"] }
 aws-sdk-s3 = { version = "=1.124.0", features = ["behavior-version-latest"] }
-reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls"] }
+aws-sigv4 = "1.4.1"
+reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls", "stream"] }
 serial_test = "3"
 tempfile = "3"
 

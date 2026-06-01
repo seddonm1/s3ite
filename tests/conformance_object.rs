@@ -12,11 +12,12 @@ use aws_sdk_s3::{
     primitives::{ByteStream, DateTime, DateTimeFormat},
     types::{Delete, ObjectIdentifier},
 };
+use reqwest::{Method, StatusCode};
 use serial_test::serial;
 use support::{
-    assertions::assert_error_contains,
+    assertions::{assert_error_contains, assert_status},
     fixtures::{bucket_name, create_bucket, get_object_bytes, put_object},
-    sdk,
+    raw_http, sdk,
     server::TestServer,
 };
 
@@ -380,6 +381,30 @@ async fn test_object_write_to_nonexist_bucket() -> Result<()> {
     Ok(())
 }
 
+/// Verifies PutObject accepts chunked transfer encoding.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_object_write_with_chunked_transfer_encoding() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_object_write_with_chunked_transfer_encoding
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-obj");
+
+    create_bucket(&client, &bucket).await?;
+    let response = raw_http::signed_chunked_request(
+        &server,
+        Method::PUT,
+        &format!("/{bucket}/foo"),
+        b"bar".to_vec(),
+    )
+    .await?;
+    assert_status(&response, StatusCode::OK);
+
+    assert_eq!(get_object_bytes(&client, &bucket, "foo").await?, b"bar");
+
+    Ok(())
+}
+
 /// Verifies GetObject reports NoSuchKey for a missing key.
 #[tokio::test]
 #[serial(conformance)]
@@ -396,6 +421,33 @@ async fn test_object_read_not_exist() -> Result<()> {
         Err(error) => error,
     };
     assert_error_contains(&error, "NoSuchKey");
+
+    Ok(())
+}
+
+/// Verifies error XML RequestId matches the response header.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_object_requestid_matches_header_on_error() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_object_requestid_matches_header_on_error
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-obj");
+
+    create_bucket(&client, &bucket).await?;
+    let response =
+        raw_http::signed_request(&server, Method::GET, &format!("/{bucket}/bar"), Vec::new())
+            .await?;
+    assert_status(&response, StatusCode::NOT_FOUND);
+
+    let header_request_id = response
+        .headers()
+        .get("x-amz-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let body = response.text().await?;
+    let body_request_id = xml_tag(&body, "RequestId");
+    assert_eq!(body_request_id, header_request_id.as_deref());
 
     Ok(())
 }
@@ -852,4 +904,12 @@ fn now_seconds() -> Result<i64> {
     Ok(std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs() as i64)
+}
+
+fn xml_tag<'a>(body: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = body.find(&open)? + open.len();
+    let end = body[start..].find(&close)? + start;
+    Some(&body[start..end])
 }

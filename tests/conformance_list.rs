@@ -12,10 +12,12 @@ use aws_sdk_s3::{
     primitives::ByteStream,
     types::{BucketVersioningStatus, CommonPrefix, EncodingType, Object},
 };
+use reqwest::{Method, StatusCode};
 use serial_test::serial;
 use support::{
+    assertions::assert_status,
     fixtures::{bucket_name, create_bucket, put_bucket_versioning},
-    sdk,
+    raw_http, sdk,
     server::TestServer,
 };
 
@@ -1324,6 +1326,30 @@ async fn test_bucket_list_maxkeys_none() -> Result<()> {
     Ok(())
 }
 
+/// Verifies ListObjects v1 rejects a non-numeric max-keys query value.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_list_maxkeys_invalid() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_list_maxkeys_invalid
+    let (server, _client, bucket) = seeded_bucket(&["bar", "baz", "foo", "quxx"]).await?;
+
+    let response = raw_http::signed_request(
+        &server,
+        Method::GET,
+        &format!("/{bucket}?max-keys=blah"),
+        Vec::new(),
+    )
+    .await?;
+    assert_status(&response, StatusCode::BAD_REQUEST);
+    let body = response.text().await?;
+    assert!(
+        body.contains("InvalidArgument"),
+        "expected InvalidArgument error, got {body}"
+    );
+
+    Ok(())
+}
+
 /// Verifies ListObjectsV2 default MaxKeys is 1000.
 #[tokio::test]
 #[serial(conformance)]
@@ -1637,6 +1663,39 @@ async fn test_bucket_list_return_data_versioning() -> Result<()> {
             acl.owner().and_then(|owner| owner.id())
         );
         assert_eq!(Some(version_id), head.version_id());
+    }
+
+    Ok(())
+}
+
+/// Verifies special S3 object key names can be listed and read.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_create_special_key_names() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_create_special_key_names
+    let keys = [
+        " ", "\"", "$", "%", "&", "'", "<", ">", "_", "_ ", "_ _", "__",
+    ];
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-list");
+    create_bucket(&client, &bucket).await?;
+
+    for key in keys {
+        let path = format!("/{bucket}/{}", raw_http::path_segment(key));
+        let response =
+            raw_http::signed_request(&server, Method::PUT, &path, key.as_bytes().to_vec()).await?;
+        assert_status(&response, StatusCode::OK);
+    }
+
+    let response = client.list_objects().bucket(&bucket).send().await?;
+    assert_eq!(object_keys(response.contents()), keys.to_vec());
+
+    for key in keys {
+        let path = format!("/{bucket}/{}", raw_http::path_segment(key));
+        let response = raw_http::signed_request(&server, Method::GET, &path, Vec::new()).await?;
+        assert_status(&response, StatusCode::OK);
+        assert_eq!(response.bytes().await?.as_ref(), key.as_bytes());
     }
 
     Ok(())

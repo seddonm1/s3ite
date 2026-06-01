@@ -8,7 +8,7 @@ mod support;
 
 use anyhow::{Result, bail};
 use aws_sdk_s3::primitives::{ByteStream, DateTime};
-use reqwest::StatusCode;
+use reqwest::{Method, StatusCode};
 use serial_test::serial;
 use support::{
     assertions::{assert_error_contains, assert_status},
@@ -405,6 +405,14 @@ async fn test_bucket_create_naming_good_long_63() -> Result<()> {
     create_valid_bucket(bucket_name_with_length(63)).await
 }
 
+/// Verifies the DNS-long bucket naming case remains accepted.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_create_naming_dns_long() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_create_naming_dns_long
+    create_valid_bucket(bucket_name_with_length(63)).await
+}
+
 /// Verifies long valid bucket names can be listed.
 #[tokio::test]
 #[serial(conformance)]
@@ -421,10 +429,95 @@ async fn test_bucket_list_long_name() -> Result<()> {
     Ok(())
 }
 
+/// Verifies bucket names cannot start with an underscore.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_create_naming_bad_starts_nonalpha() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_create_naming_bad_starts_nonalpha
+    assert_invalid_bucket_name(&format!("_{}", bucket_name("s3ite-conf"))).await
+}
+
+/// Verifies one-character bucket names are rejected.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_create_naming_bad_short_one() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_create_naming_bad_short_one
+    assert_invalid_bucket_name("a").await
+}
+
+/// Verifies two-character bucket names are rejected.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_create_naming_bad_short_two() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_create_naming_bad_short_two
+    assert_invalid_bucket_name("aa").await
+}
+
+/// Verifies IPv4-shaped bucket names are rejected.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_create_naming_bad_ip() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_create_naming_bad_ip
+    assert_invalid_bucket_name("192.168.5.123").await
+}
+
+/// Verifies bucket names cannot contain underscores.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_create_naming_dns_underscore() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_create_naming_dns_underscore
+    assert_invalid_bucket_name("foo_bar").await
+}
+
+/// Verifies bucket names cannot end in a dash.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_create_naming_dns_dash_at_end() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_create_naming_dns_dash_at_end
+    assert_invalid_bucket_name("foo-").await
+}
+
+/// Verifies bucket names cannot contain adjacent dots.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_create_naming_dns_dot_dot() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_create_naming_dns_dot_dot
+    assert_invalid_bucket_name("foo..bar").await
+}
+
+/// Verifies bucket names cannot contain dot-dash transitions.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_create_naming_dns_dot_dash() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_create_naming_dns_dot_dash
+    assert_invalid_bucket_name("foo.-bar").await
+}
+
+/// Verifies bucket names cannot contain dash-dot transitions.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_create_naming_dns_dash_dot() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_create_naming_dns_dash_dot
+    assert_invalid_bucket_name("foo-.bar").await
+}
+
 async fn create_valid_bucket(bucket: String) -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     client.create_bucket().bucket(bucket).send().await?;
+    Ok(())
+}
+
+async fn assert_invalid_bucket_name(bucket: &str) -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let response =
+        raw_http::signed_request(&server, Method::PUT, &format!("/{bucket}"), Vec::new()).await?;
+    assert_status(&response, StatusCode::BAD_REQUEST);
+    let body = response.text().await?;
+    assert!(
+        body.contains("InvalidBucketName"),
+        "expected InvalidBucketName error, got {body}"
+    );
     Ok(())
 }
 
