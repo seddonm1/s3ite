@@ -14,6 +14,7 @@ use aws_sdk_s3::{
         BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier,
     },
 };
+use futures::future::try_join_all;
 use reqwest::{Method, StatusCode};
 use serial_test::serial;
 use support::{
@@ -1017,6 +1018,117 @@ async fn test_versioning_multi_object_delete_with_marker_create() -> Result<()> 
     Ok(())
 }
 
+/// Verifies concurrent multi-delete requests can remove exact versions idempotently.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_versioning_concurrent_multi_object_delete() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_versioning_concurrent_multi_object_delete
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ver");
+    let keys = ["key-0", "key-1", "key-2", "key-3", "key-4"];
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    let mut objects = Vec::new();
+    for key in keys {
+        for version in create_multiple_versions(&client, &bucket, key, 3).await? {
+            objects.push(
+                ObjectIdentifier::builder()
+                    .key(key)
+                    .version_id(version.version_id)
+                    .build()?,
+            );
+        }
+    }
+    let expected_count = objects.len();
+    let delete = Delete::builder().set_objects(Some(objects)).build()?;
+
+    let deletes = (0..5).map(|_| {
+        let client = client.clone();
+        let bucket = bucket.clone();
+        let delete = delete.clone();
+        async move {
+            let response = client
+                .delete_objects()
+                .bucket(bucket)
+                .delete(delete)
+                .send()
+                .await?;
+            assert_eq!(response.deleted().len(), expected_count);
+            assert!(response.errors().is_empty());
+            Ok::<_, anyhow::Error>(())
+        }
+    });
+    try_join_all(deletes).await?;
+
+    let listed = client.list_object_versions().bucket(&bucket).send().await?;
+    assert!(listed.versions().is_empty());
+    assert!(listed.delete_markers().is_empty());
+
+    Ok(())
+}
+
+/// Verifies concurrent version creation and exact-version removal leave no residue.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_versioned_concurrent_object_create_concurrent_remove() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_versioned_concurrent_object_create_concurrent_remove
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ver");
+    let key = "testobj";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    for _ in 0..5 {
+        let versions = put_concurrent_versions(&client, &bucket, key, 5).await?;
+        assert_eq!(
+            client
+                .list_object_versions()
+                .bucket(&bucket)
+                .send()
+                .await?
+                .versions()
+                .len(),
+            versions.len()
+        );
+        delete_concurrent_versions(&client, &bucket, key, versions).await?;
+        let listed = client.list_object_versions().bucket(&bucket).send().await?;
+        assert!(listed.versions().is_empty());
+        assert!(listed.delete_markers().is_empty());
+    }
+
+    Ok(())
+}
+
+/// Verifies create and remove races on a versioned key can be drained by exact deletes.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_versioned_concurrent_object_create_and_remove() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_versioned_concurrent_object_create_and_remove
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ver");
+    let key = "testobj";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    for _ in 0..3 {
+        let created = put_concurrent_versions(&client, &bucket, key, 3);
+        let removed = clear_current_versions(&client, &bucket, key);
+        let (created, _) = tokio::try_join!(created, removed)?;
+        delete_concurrent_versions(&client, &bucket, key, created).await?;
+    }
+    clear_current_versions(&client, &bucket, key).await?;
+
+    let listed = client.list_object_versions().bucket(&bucket).send().await?;
+    assert!(listed.versions().is_empty());
+    assert!(listed.delete_markers().is_empty());
+
+    Ok(())
+}
+
 /// Verifies nonversioned delete misses expose the delete-marker header as false.
 #[tokio::test]
 #[serial(conformance)]
@@ -1352,6 +1464,86 @@ async fn multipart_upload(
         .multipart_upload(upload)
         .send()
         .await?)
+}
+
+async fn put_concurrent_versions(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    count: usize,
+) -> Result<Vec<ObjectVersion>> {
+    let writes = (0..count).map(|index| {
+        let client = client.clone();
+        let bucket = bucket.to_string();
+        let key = key.to_string();
+        async move {
+            let content = format!("content-{index}").into_bytes();
+            let version_id = client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from(content.clone()))
+                .send()
+                .await?
+                .version_id()
+                .ok_or_else(|| anyhow::anyhow!("enabled PutObject missing version ID"))?
+                .to_string();
+            Ok::<_, anyhow::Error>(ObjectVersion {
+                version_id,
+                content,
+            })
+        }
+    });
+    try_join_all(writes).await
+}
+
+async fn delete_concurrent_versions(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    versions: Vec<ObjectVersion>,
+) -> Result<()> {
+    let deletes = versions.into_iter().map(|version| {
+        let client = client.clone();
+        let bucket = bucket.to_string();
+        let key = key.to_string();
+        async move {
+            client
+                .delete_object()
+                .bucket(bucket)
+                .key(key)
+                .version_id(version.version_id)
+                .send()
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        }
+    });
+    try_join_all(deletes).await?;
+    Ok(())
+}
+
+async fn clear_current_versions(client: &Client, bucket: &str, key: &str) -> Result<()> {
+    let listed = client
+        .list_object_versions()
+        .bucket(bucket)
+        .prefix(key)
+        .send()
+        .await?;
+    let versions = listed
+        .versions()
+        .iter()
+        .filter(|version| version.key() == Some(key))
+        .map(|version| {
+            Ok(ObjectVersion {
+                version_id: version
+                    .version_id()
+                    .ok_or_else(|| anyhow::anyhow!("listed version missing version ID"))?
+                    .to_string(),
+                content: Vec::new(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    delete_concurrent_versions(client, bucket, key, versions).await
 }
 
 fn assert_ceph_shaped_version_id(version_id: &str) {

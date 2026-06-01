@@ -78,7 +78,7 @@ use self::{
     },
     list::{
         common_prefix_for_key, decode_continuation_token, decode_list_input_value,
-        encode_continuation_token, encode_list_value, is_url_encoding, list_limit,
+        encode_continuation_token, encode_list_value, has_query_value, is_url_encoding, list_limit,
         output_delimiter,
     },
     multipart::{requested_part_range, validate_part_number},

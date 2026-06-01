@@ -12,7 +12,7 @@ use reqwest::{Method, StatusCode};
 use serial_test::serial;
 use support::{
     assertions::{assert_error_contains, assert_status},
-    fixtures::{bucket_name, get_object_bytes},
+    fixtures::{bucket_name, create_bucket, get_object_bytes, put_object},
     raw_http, sdk,
     server::TestServer,
 };
@@ -239,6 +239,48 @@ async fn test_bucket_head_notexist() -> Result<()> {
     Ok(())
 }
 
+/// Verifies GetBucketLocation returns the default us-east-1-style empty location.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_get_location() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_get_location
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-conf");
+
+    create_bucket(&client, &bucket).await?;
+
+    let response = client.get_bucket_location().bucket(&bucket).send().await?;
+    assert_eq!(
+        response
+            .location_constraint()
+            .map(aws_sdk_s3::types::BucketLocationConstraint::as_str),
+        Some("")
+    );
+
+    Ok(())
+}
+
+/// Verifies HeadBucket read-stats returns RGW-compatible bucket usage headers.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_bucket_head_extended() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_head_extended
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-conf");
+
+    create_bucket(&client, &bucket).await?;
+    assert_bucket_stats(&server, &bucket, "0", "0").await?;
+
+    put_object(&client, &bucket, "foo", b"foo").await?;
+    put_object(&client, &bucket, "bar", b"bar").await?;
+    put_object(&client, &bucket, "baz", b"baz").await?;
+    assert_bucket_stats(&server, &bucket, "3", "9").await?;
+
+    Ok(())
+}
+
 /// Verifies bad credentials and unsigned ListBuckets requests are rejected.
 #[tokio::test]
 #[serial(conformance)]
@@ -300,6 +342,81 @@ async fn test_buckets_create_then_list() -> Result<()> {
     for bucket in &buckets {
         assert!(listed.contains(&bucket.as_str()));
     }
+
+    Ok(())
+}
+
+/// Verifies ListBuckets supports max-buckets pagination and continuation tokens.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_list_buckets_paginated() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_list_buckets_paginated
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let prefix = format!("s3ite-paged-{}-", Uuid::new_v4().simple());
+
+    let empty = client
+        .list_buckets()
+        .prefix(&prefix)
+        .max_buckets(1)
+        .send()
+        .await?;
+    assert!(empty.buckets().is_empty());
+    assert_eq!(empty.continuation_token(), None);
+
+    let bucket1 = format!("{prefix}a");
+    create_bucket(&client, &bucket1).await?;
+    let one = client
+        .list_buckets()
+        .prefix(&prefix)
+        .max_buckets(1)
+        .send()
+        .await?;
+    assert_eq!(
+        one.buckets()
+            .iter()
+            .filter_map(|bucket| bucket.name())
+            .collect::<Vec<_>>(),
+        vec![bucket1.as_str()]
+    );
+    assert_eq!(one.continuation_token(), None);
+
+    let bucket2 = format!("{prefix}b");
+    create_bucket(&client, &bucket2).await?;
+    let first = client
+        .list_buckets()
+        .prefix(&prefix)
+        .max_buckets(1)
+        .send()
+        .await?;
+    assert_eq!(
+        first
+            .buckets()
+            .iter()
+            .filter_map(|bucket| bucket.name())
+            .collect::<Vec<_>>(),
+        vec![bucket1.as_str()]
+    );
+    let token = first
+        .continuation_token()
+        .ok_or_else(|| anyhow::anyhow!("truncated ListBuckets response missing token"))?;
+
+    let second = client
+        .list_buckets()
+        .prefix(&prefix)
+        .continuation_token(token)
+        .max_buckets(1)
+        .send()
+        .await?;
+    assert_eq!(
+        second
+            .buckets()
+            .iter()
+            .filter_map(|bucket| bucket.name())
+            .collect::<Vec<_>>(),
+        vec![bucket2.as_str()]
+    );
+    assert_eq!(second.continuation_token(), None);
 
     Ok(())
 }
@@ -528,4 +645,35 @@ fn bucket_name_with_length(length: usize) -> String {
     }
     name.truncate(length);
     name
+}
+
+async fn assert_bucket_stats(
+    server: &TestServer,
+    bucket: &str,
+    expected_count: &str,
+    expected_bytes: &str,
+) -> Result<()> {
+    let response = raw_http::signed_request(
+        server,
+        Method::HEAD,
+        &format!("/{bucket}?read-stats=true"),
+        Vec::new(),
+    )
+    .await?;
+    assert_status(&response, StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-rgw-object-count")
+            .and_then(|value| value.to_str().ok()),
+        Some(expected_count)
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-rgw-bytes-used")
+            .and_then(|value| value.to_str().ok()),
+        Some(expected_bytes)
+    );
+    Ok(())
 }

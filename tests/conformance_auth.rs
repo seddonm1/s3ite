@@ -227,6 +227,44 @@ async fn test_presigned_put_with_private_acl() -> Result<()> {
     Ok(())
 }
 
+/// Verifies already-expired presigned PUT URLs are rejected before writing an object.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_object_raw_put_authenticated_expired() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_object_raw_put_authenticated_expired
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-auth");
+    let key = "expired-put.txt";
+
+    create_bucket(&client, &bucket).await?;
+    let presigned = client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .presigned(
+            PresigningConfig::builder()
+                .start_time(SystemTime::now() - Duration::from_secs(3600))
+                .expires_in(Duration::from_secs(1))
+                .build()?,
+        )
+        .await?;
+    let response = raw_http::client()?
+        .put(presigned.uri())
+        .body("blocked")
+        .send()
+        .await?;
+    assert_status(&response, StatusCode::FORBIDDEN);
+
+    let error = match client.head_object().bucket(&bucket).key(key).send().await {
+        Ok(_) => bail!("expired presigned PUT should not create an object"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "NotFound");
+
+    Ok(())
+}
+
 async fn shared_object() -> Result<(TestServer, Client, String)> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);

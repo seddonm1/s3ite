@@ -7,6 +7,17 @@ enum VersionMarker {
 }
 
 impl Sqlite {
+    /// Returns current visible object count and total bytes for bucket stats.
+    pub(crate) fn try_bucket_usage_summary(transaction: &Transaction) -> SqliteResult<(i64, i64)> {
+        let mut stmt = transaction.prepare_cached(
+            "
+            SELECT COUNT(*), COALESCE(SUM(size), 0)
+            FROM object_version
+            WHERE is_latest = 1 AND is_delete_marker = 0;",
+        )?;
+        Ok(stmt.query_row((), |row| Ok((row.get(0)?, row.get(1)?)))?)
+    }
+
     /// Lists object metadata ordered by key for keyset pagination.
     pub(crate) fn try_list_objects(
         transaction: &Transaction,

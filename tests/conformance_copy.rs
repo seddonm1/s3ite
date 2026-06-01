@@ -9,7 +9,7 @@ mod support;
 use anyhow::{Result, bail};
 use aws_sdk_s3::{
     primitives::ByteStream,
-    types::{BucketVersioningStatus, MetadataDirective},
+    types::{BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, MetadataDirective},
 };
 use serial_test::serial;
 use support::{
@@ -323,6 +323,109 @@ async fn test_object_copy_versioned_bucket() -> Result<()> {
     Ok(())
 }
 
+/// Verifies CopyObject can copy exact versions created by multipart upload.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_object_copy_versioning_multipart_upload() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_object_copy_versioning_multipart_upload
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-copy");
+    let versioned_target_bucket = bucket_name("s3ite-copy-versioned");
+    let plain_target_bucket = bucket_name("s3ite-copy-plain");
+    let source_key = "foo123bar";
+    let source_body = vec![b'a'; 6 * MIB];
+    let content_type = "text/bla";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    let completed =
+        multipart_upload_with_metadata(&client, &bucket, source_key, source_body.clone()).await?;
+    let source_version_id = completed
+        .version_id()
+        .ok_or_else(|| anyhow::anyhow!("multipart completion missing version ID"))?
+        .to_string();
+
+    let copied = client
+        .copy_object()
+        .bucket(&bucket)
+        .key("bar321foo")
+        .copy_source(format!(
+            "{bucket}/{source_key}?versionId={source_version_id}"
+        ))
+        .send()
+        .await?;
+    let copied_version_id = copied
+        .version_id()
+        .ok_or_else(|| anyhow::anyhow!("copy in versioned bucket missing version ID"))?
+        .to_string();
+    assert_copied_object(&client, &bucket, "bar321foo", &source_body, content_type).await?;
+
+    client
+        .copy_object()
+        .bucket(&bucket)
+        .key("bar321foo2")
+        .copy_source(format!("{bucket}/bar321foo?versionId={copied_version_id}"))
+        .send()
+        .await?;
+    assert_copied_object(&client, &bucket, "bar321foo2", &source_body, content_type).await?;
+
+    create_bucket(&client, &versioned_target_bucket).await?;
+    put_bucket_versioning(
+        &client,
+        &versioned_target_bucket,
+        BucketVersioningStatus::Enabled,
+    )
+    .await?;
+    client
+        .copy_object()
+        .bucket(&versioned_target_bucket)
+        .key("bar321foo3")
+        .copy_source(format!(
+            "{bucket}/{source_key}?versionId={source_version_id}"
+        ))
+        .send()
+        .await?;
+    assert_copied_object(
+        &client,
+        &versioned_target_bucket,
+        "bar321foo3",
+        &source_body,
+        content_type,
+    )
+    .await?;
+
+    create_bucket(&client, &plain_target_bucket).await?;
+    client
+        .copy_object()
+        .bucket(&plain_target_bucket)
+        .key("bar321foo4")
+        .copy_source(format!(
+            "{bucket}/{source_key}?versionId={source_version_id}"
+        ))
+        .send()
+        .await?;
+    assert_copied_object(
+        &client,
+        &plain_target_bucket,
+        "bar321foo4",
+        &source_body,
+        content_type,
+    )
+    .await?;
+
+    client
+        .copy_object()
+        .bucket(&bucket)
+        .key("foo123bar2")
+        .copy_source(format!("{plain_target_bucket}/bar321foo4"))
+        .send()
+        .await?;
+    assert_copied_object(&client, &bucket, "foo123bar2", &source_body, content_type).await?;
+
+    Ok(())
+}
+
 /// Verifies CopyObject source version parsing handles URL-encoded keys.
 #[tokio::test]
 #[serial(conformance)]
@@ -525,5 +628,80 @@ async fn test_object_copy_key_not_found() -> Result<()> {
     };
     assert_error_contains(&error, "NoSuchKey");
 
+    Ok(())
+}
+
+async fn multipart_upload_with_metadata(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    body: Vec<u8>,
+) -> Result<aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput> {
+    let upload_id = client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .metadata("foo", "bar")
+        .content_type("text/bla")
+        .send()
+        .await?
+        .upload_id()
+        .ok_or_else(|| anyhow::anyhow!("create multipart response missing upload ID"))?
+        .to_string();
+    let mut completed_parts = Vec::new();
+
+    for (index, chunk) in body.chunks(5 * MIB).enumerate() {
+        let part_number = i32::try_from(index + 1)?;
+        let response = client
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(part_number)
+            .body(ByteStream::from(chunk.to_vec()))
+            .send()
+            .await?;
+        completed_parts.push(
+            CompletedPart::builder()
+                .e_tag(
+                    response
+                        .e_tag()
+                        .ok_or_else(|| anyhow::anyhow!("upload part response missing ETag"))?,
+                )
+                .part_number(part_number)
+                .build(),
+        );
+    }
+
+    let upload = CompletedMultipartUpload::builder()
+        .set_parts(Some(completed_parts))
+        .build();
+    Ok(client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(upload)
+        .send()
+        .await?)
+}
+
+async fn assert_copied_object(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    expected_body: &[u8],
+    expected_content_type: &str,
+) -> Result<()> {
+    let response = client.get_object().bucket(bucket).key(key).send().await?;
+    assert_eq!(response.content_type(), Some(expected_content_type));
+    let metadata = response
+        .metadata()
+        .ok_or_else(|| anyhow::anyhow!("copied object missing metadata"))?;
+    assert_eq!(metadata.get("foo").map(String::as_str), Some("bar"));
+    assert_eq!(
+        response.body.collect().await?.into_bytes().as_ref(),
+        expected_body
+    );
     Ok(())
 }

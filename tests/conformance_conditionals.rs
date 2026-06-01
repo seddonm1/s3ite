@@ -282,6 +282,243 @@ async fn test_put_object_ifnonmatch_failed() -> Result<()> {
     Ok(())
 }
 
+/// Verifies PutObject If-Match star overwrites an existing object.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_put_object_ifmatch_overwrite_existed_good() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_object_ifmatch_overwrite_existed_good
+    let (_server, client, bucket, _state) = seeded_object().await?;
+
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .if_match("*")
+        .body(ByteStream::from_static(b"zar"))
+        .send()
+        .await?;
+    assert_eq!(get_object_bytes(&client, &bucket, KEY).await?, b"zar");
+
+    Ok(())
+}
+
+/// Verifies PutObject If-Match star fails when the object does not exist.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_put_object_ifmatch_nonexisted_failed() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_object_ifmatch_nonexisted_failed
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-cond");
+
+    create_bucket(&client, &bucket).await?;
+    let error = match client
+        .put_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .if_match("*")
+        .body(ByteStream::from_static(b"blocked"))
+        .send()
+        .await
+    {
+        Ok(_) => bail!("If-Match=* should fail for a missing object"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "NoSuchKey");
+
+    Ok(())
+}
+
+/// Verifies PutObject If-None-Match star creates a missing object.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_put_object_ifnonmatch_nonexisted_good() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_object_ifnonmatch_nonexisted_good
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-cond");
+
+    create_bucket(&client, &bucket).await?;
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .if_none_match("*")
+        .body(ByteStream::from_static(b"zar"))
+        .send()
+        .await?;
+    assert_eq!(get_object_bytes(&client, &bucket, KEY).await?, b"zar");
+
+    Ok(())
+}
+
+/// Verifies PutObject If-None-Match star refuses to overwrite an existing object.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_put_object_ifnonmatch_overwrite_existed_failed() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_object_ifnonmatch_overwrite_existed_failed
+    let (_server, client, bucket, _state) = seeded_object().await?;
+
+    let error = match client
+        .put_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .if_none_match("*")
+        .body(ByteStream::from_static(b"blocked"))
+        .send()
+        .await
+    {
+        Ok(_) => bail!("If-None-Match=* should reject an existing object"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "PreconditionFailed");
+    assert_eq!(get_object_bytes(&client, &bucket, KEY).await?, b"bar");
+
+    Ok(())
+}
+
+/// Verifies PutObject If-Match and If-None-Match follow current-object semantics.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_put_object_if_match() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_object_if_match
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-cond");
+
+    create_bucket(&client, &bucket).await?;
+    let first = client
+        .put_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .if_none_match("*")
+        .body(ByteStream::from_static(b"one"))
+        .send()
+        .await?;
+    let first_etag = first
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("PutObject response missing ETag"))?
+        .to_string();
+
+    for if_none_match in ["*", first_etag.as_str()] {
+        let error = match client
+            .put_object()
+            .bucket(&bucket)
+            .key(KEY)
+            .if_none_match(if_none_match)
+            .body(ByteStream::from_static(b"blocked"))
+            .send()
+            .await
+        {
+            Ok(_) => bail!("If-None-Match should reject a matching current object"),
+            Err(error) => error,
+        };
+        assert_error_contains(&error, "PreconditionFailed");
+    }
+
+    let second = client
+        .put_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .if_none_match("badetag")
+        .body(ByteStream::from_static(b"two"))
+        .send()
+        .await?;
+    let second_etag = second
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("PutObject response missing ETag"))?
+        .to_string();
+
+    let error = match client
+        .put_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .if_match(&first_etag)
+        .body(ByteStream::from_static(b"blocked"))
+        .send()
+        .await
+    {
+        Ok(_) => bail!("If-Match should reject a stale ETag"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "PreconditionFailed");
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .if_match(&second_etag)
+        .body(ByteStream::from_static(b"three"))
+        .send()
+        .await?;
+
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .send()
+        .await?;
+    for if_match in ["*", "badetag"] {
+        let error = match client
+            .put_object()
+            .bucket(&bucket)
+            .key(KEY)
+            .if_match(if_match)
+            .body(ByteStream::from_static(b"blocked"))
+            .send()
+            .await
+        {
+            Ok(_) => bail!("If-Match should fail after deleting the current object"),
+            Err(error) => error,
+        };
+        assert_error_contains(&error, "NoSuchKey");
+    }
+
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .if_none_match(&second_etag)
+        .body(ByteStream::from_static(b"four"))
+        .send()
+        .await?;
+    let current = client
+        .put_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .if_match("*")
+        .body(ByteStream::from_static(b"five"))
+        .send()
+        .await?;
+    let current_etag = current
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("PutObject response missing ETag"))?
+        .to_string();
+    let error = match client
+        .put_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .if_match("badetag")
+        .body(ByteStream::from_static(b"blocked"))
+        .send()
+        .await
+    {
+        Ok(_) => bail!("If-Match should reject a bad current ETag"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "PreconditionFailed");
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .if_match(current_etag)
+        .body(ByteStream::from_static(b"six"))
+        .send()
+        .await?;
+    assert_eq!(get_object_bytes(&client, &bucket, KEY).await?, b"six");
+
+    Ok(())
+}
+
 /// Verifies versioned PutObject If-None-Match checks only the current object.
 #[tokio::test]
 #[serial(conformance)]

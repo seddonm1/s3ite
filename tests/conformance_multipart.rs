@@ -181,6 +181,49 @@ async fn test_list_multipart_upload() -> Result<()> {
     Ok(())
 }
 
+/// Verifies multipart upload listings include the synthetic owner identity.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_list_multipart_upload_owner() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_list_multipart_upload_owner
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-mpu");
+
+    create_bucket(&client, &bucket).await?;
+    let upload_id = create_upload(&client, &bucket, "mymultipart").await?;
+
+    let response = client
+        .list_multipart_uploads()
+        .bucket(&bucket)
+        .send()
+        .await?;
+    let upload = response
+        .uploads()
+        .iter()
+        .find(|upload| upload.upload_id() == Some(upload_id.as_str()))
+        .ok_or_else(|| anyhow::anyhow!("multipart listing missing created upload"))?;
+    assert_eq!(upload.owner().and_then(|owner| owner.id()), Some("s3ite"));
+    assert_eq!(
+        upload.owner().and_then(|owner| owner.display_name()),
+        Some("s3ite")
+    );
+    assert_eq!(
+        upload.initiator().and_then(|initiator| initiator.id()),
+        Some("s3ite")
+    );
+    assert_eq!(
+        upload
+            .initiator()
+            .and_then(|initiator| initiator.display_name()),
+        Some("s3ite")
+    );
+
+    abort_upload(&client, &bucket, "mymultipart", &upload_id).await?;
+
+    Ok(())
+}
+
 /// Verifies completing with a missing part number fails with InvalidPart.
 #[tokio::test]
 #[serial(conformance)]
@@ -407,6 +450,48 @@ async fn test_multipart_copy_invalid_range() -> Result<()> {
         Err(error) => error,
     };
     assert_error_contains(&error, "InvalidRange");
+
+    Ok(())
+}
+
+/// Verifies multipart copy rejects malformed source range headers.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_multipart_copy_improper_range() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_multipart_copy_improper_range
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-mpu");
+
+    create_bucket(&client, &bucket).await?;
+    put_object(&client, &bucket, "source", b"12345").await?;
+
+    for copy_source_range in [
+        "0-2",
+        "bytes=0",
+        "bytes=hello-world",
+        "bytes=0-bar",
+        "bytes=hello-",
+        "bytes=0-2,3-5",
+    ] {
+        let upload_id = create_upload(&client, &bucket, "dest").await?;
+        let error = match upload_part_copy(
+            &client,
+            &bucket,
+            "dest",
+            &upload_id,
+            1,
+            &copy_source(CopySourceRef::new(&bucket, "source", None)),
+            Some(copy_source_range.to_string()),
+        )
+        .await
+        {
+            Ok(_) => bail!("multipart copy with malformed range should fail"),
+            Err(error) => error,
+        };
+        assert_error_contains(&error, "InvalidArgument");
+        abort_upload(&client, &bucket, "dest", &upload_id).await?;
+    }
 
     Ok(())
 }
@@ -712,6 +797,63 @@ async fn test_multipart_resend_first_finishes_last() -> Result<()> {
 
     let body = get_object_bytes(&client, &bucket, key).await?;
     assert_eq!(body, b"AAAAAAAA");
+
+    Ok(())
+}
+
+/// Verifies resending uploaded parts leaves completion with the final part data.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_multipart_upload_resend_part() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_multipart_upload_resend_part
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-mpu");
+    let resend_sets: &[&[usize]] = &[&[0], &[1], &[2], &[1, 2], &[0, 1, 2, 3, 4, 5]];
+    let chunks = (0..6)
+        .map(|index| Ok(vec![b'a' + u8::try_from(index)?; 5 * MIB]))
+        .collect::<Result<Vec<_>>>()?;
+    let expected = chunks.concat();
+
+    create_bucket(&client, &bucket).await?;
+    for (case_index, resend_parts) in resend_sets.iter().enumerate() {
+        let key = format!("mymultipart-{case_index}");
+        let upload_id = create_upload(&client, &bucket, &key).await?;
+        let mut parts = Vec::with_capacity(chunks.len());
+
+        for (index, chunk) in chunks.iter().enumerate() {
+            let part_number = i32::try_from(index + 1)?;
+            parts.push(
+                upload_part(
+                    &client,
+                    &bucket,
+                    &key,
+                    &upload_id,
+                    part_number,
+                    chunk.clone(),
+                )
+                .await?,
+            );
+        }
+        for index in resend_parts.iter().copied() {
+            let part_number = i32::try_from(index + 1)?;
+            parts[index] = upload_part(
+                &client,
+                &bucket,
+                &key,
+                &upload_id,
+                part_number,
+                chunks[index].clone(),
+            )
+            .await?;
+        }
+
+        complete_upload(&client, &bucket, &key, &upload_id, parts).await?;
+        assert_eq!(
+            get_object_bytes(&client, &bucket, &key).await?,
+            expected.as_slice()
+        );
+    }
 
     Ok(())
 }

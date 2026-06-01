@@ -152,6 +152,36 @@ async fn test_object_write_read_update_read_delete() -> Result<()> {
     Ok(())
 }
 
+/// Verifies a failed PutObject does not poison later successful writes.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_100_continue_error_retry() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_100_continue_error_retry
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let missing_bucket = bucket_name("s3ite-missing");
+    let bucket = bucket_name("s3ite-obj");
+
+    let error = match client
+        .put_object()
+        .bucket(&missing_bucket)
+        .key("foo")
+        .body(ByteStream::from_static(b"bar"))
+        .send()
+        .await
+    {
+        Ok(_) => bail!("PutObject to a missing bucket should fail"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "NoSuchBucket");
+
+    create_bucket(&client, &bucket).await?;
+    put_object(&client, &bucket, "foo", b"bar").await?;
+    assert_eq!(get_object_bytes(&client, &bucket, "foo").await?, b"bar");
+
+    Ok(())
+}
+
 /// Verifies a PUT without metadata replaces previous user metadata.
 #[tokio::test]
 #[serial(conformance)]
@@ -812,6 +842,40 @@ async fn test_object_raw_authenticated_object_gone() -> Result<()> {
         Err(error) => error,
     };
     assert_error_contains(&error, "NoSuchKey");
+
+    Ok(())
+}
+
+/// Verifies DeleteObject reports NoSuchBucket after the bucket is deleted.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_object_delete_key_bucket_gone() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_object_delete_key_bucket_gone
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-obj");
+
+    create_bucket(&client, &bucket).await?;
+    put_object(&client, &bucket, "foo", b"bar").await?;
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key("foo")
+        .send()
+        .await?;
+    client.delete_bucket().bucket(&bucket).send().await?;
+
+    let error = match client
+        .delete_object()
+        .bucket(&bucket)
+        .key("foo")
+        .send()
+        .await
+    {
+        Ok(_) => bail!("DeleteObject after bucket deletion should fail"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "NoSuchBucket");
 
     Ok(())
 }
