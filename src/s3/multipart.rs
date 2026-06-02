@@ -1089,3 +1089,217 @@ pub(super) async fn complete_multipart_upload(
     };
     Ok(S3Response::new(output))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::sqlite::{KeyMetadata, PartChecksum};
+
+    fn assert_error_code<T>(result: S3Result<T>, code: &S3ErrorCode) {
+        match result {
+            Ok(_) => panic!("expected {code:?}"),
+            Err(err) => assert_eq!(err.code(), code),
+        }
+    }
+
+    fn part(part_number: Option<i32>, e_tag: Option<ETag>) -> CompletedPart {
+        CompletedPart {
+            part_number,
+            e_tag,
+            ..CompletedPart::default()
+        }
+    }
+
+    fn key_value(value: Option<Vec<u8>>, size: i64) -> KeyValue {
+        KeyValue {
+            key: "key".to_string(),
+            value,
+            key_metadata: KeyMetadata {
+                version_id: "version".to_string(),
+                size,
+                metadata: None,
+                content_type: None,
+                content_encoding: None,
+                cache_control: None,
+                expires: None,
+                last_modified: OffsetDateTime::UNIX_EPOCH,
+                md5: Some("md5".to_string()),
+                checksum: None,
+                is_latest: true,
+                is_delete_marker: false,
+            },
+        }
+    }
+
+    fn assert_sqlite_ok<T>(result: SqliteResult<T>, expected: &T)
+    where
+        T: PartialEq + std::fmt::Debug,
+    {
+        match result {
+            Ok(value) => assert_eq!(&value, expected),
+            Err(err) => panic!("unexpected error: {err:?}"),
+        }
+    }
+
+    fn completed_part(part_number: i32, start: i64, size: i64) -> CompletedObjectPart {
+        CompletedObjectPart {
+            part_number,
+            start,
+            size,
+            md5: Some("md5".to_string()),
+            checksum: Some(PartChecksum::Sha256("sha".to_string())),
+        }
+    }
+
+    #[test]
+    fn validates_part_number_boundaries() {
+        assert_error_code(validate_part_number(0), &S3ErrorCode::InvalidArgument);
+        assert!(validate_part_number(1).is_ok());
+        assert!(validate_part_number(10_000).is_ok());
+        assert_error_code(validate_part_number(10_001), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn parses_upload_ids() {
+        let uuid = Uuid::new_v4();
+        assert_eq!(parse_upload_id(&uuid.to_string()).ok(), Some(uuid));
+        assert_error_code(parse_upload_id("not-a-uuid"), &S3ErrorCode::NoSuchUpload);
+    }
+
+    #[test]
+    fn normalizes_completion_parts_and_replaces_duplicate_part() {
+        let normalized = match normalize_completion_parts(vec![
+            CompletedPart {
+                checksum_sha256: Some("old".to_string()),
+                ..part(Some(1), Some(ETag::Strong("etag-1-old".to_string())))
+            },
+            CompletedPart {
+                checksum_sha256: Some("new".to_string()),
+                ..part(Some(1), Some(ETag::Strong("etag-1-new".to_string())))
+            },
+            part(Some(2), Some(ETag::Strong("etag-2".to_string()))),
+        ]) {
+            Ok(parts) => parts,
+            Err(err) => panic!("unexpected error: {err:?}"),
+        };
+
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[0].part_number, 1);
+        assert_eq!(normalized[0].md5, "etag-1-new");
+        assert_eq!(
+            normalized[0].checksum,
+            Some(PartChecksum::Sha256("new".to_string()))
+        );
+        assert_eq!(normalized[1].part_number, 2);
+        assert_eq!(normalized[1].md5, "etag-2");
+    }
+
+    #[test]
+    fn rejects_invalid_completion_parts() {
+        assert_error_code(
+            normalize_completion_parts(vec![part(None, Some(ETag::Strong("etag".to_string())))]),
+            &S3ErrorCode::InvalidPart,
+        );
+        assert_error_code(
+            normalize_completion_parts(vec![part(Some(1), None)]),
+            &S3ErrorCode::InvalidPart,
+        );
+        assert_error_code(
+            normalize_completion_parts(vec![part(Some(1), Some(ETag::Weak("etag".to_string())))]),
+            &S3ErrorCode::InvalidPart,
+        );
+        assert_error_code(
+            normalize_completion_parts(vec![
+                part(Some(2), Some(ETag::Strong("etag-2".to_string()))),
+                part(Some(1), Some(ETag::Strong("etag-1".to_string()))),
+            ]),
+            &S3ErrorCode::InvalidPartOrder,
+        );
+    }
+
+    #[test]
+    fn parses_and_checks_copy_source_ranges() {
+        assert_eq!(parse_copy_source_range(None).ok().flatten(), None);
+
+        let range = match parse_copy_source_range(Some("bytes=2-5".to_string())) {
+            Ok(Some(range)) => range,
+            Ok(None) => panic!("expected parsed range"),
+            Err(err) => panic!("unexpected error: {err:?}"),
+        };
+        assert_sqlite_ok(checked_copy_source_range(Some(range), 10), &(2..6));
+
+        let range = match parse_copy_source_range(Some("bytes=-4".to_string())) {
+            Ok(Some(range)) => range,
+            Ok(None) => panic!("expected parsed range"),
+            Err(err) => panic!("unexpected error: {err:?}"),
+        };
+        assert_sqlite_ok(checked_copy_source_range(Some(range), 10), &(6..10));
+
+        let range = match parse_copy_source_range(Some("bytes=8-20".to_string())) {
+            Ok(Some(range)) => range,
+            Ok(None) => panic!("expected parsed range"),
+            Err(err) => panic!("unexpected error: {err:?}"),
+        };
+        assert!(matches!(
+            checked_copy_source_range(Some(range), 10),
+            Err(SqliteError::InvalidObjectRange)
+        ));
+
+        let range = match parse_copy_source_range(Some("bytes=-0".to_string())) {
+            Ok(Some(range)) => range,
+            Ok(None) => panic!("expected parsed range"),
+            Err(err) => panic!("unexpected error: {err:?}"),
+        };
+        assert!(matches!(
+            checked_copy_source_range(Some(range), 10),
+            Err(SqliteError::InvalidObjectRange)
+        ));
+
+        assert_error_code(
+            parse_copy_source_range(Some("not-a-range".to_string())),
+            &S3ErrorCode::InvalidArgument,
+        );
+    }
+
+    #[test]
+    fn copies_part_byte_slices() {
+        let object = key_value(Some(b"abcdef".to_vec()), 6);
+        assert_sqlite_ok(copied_part_bytes(&object, 0..6), &b"abcdef".to_vec());
+        assert_sqlite_ok(copied_part_bytes(&object, 2..5), &b"cde".to_vec());
+        assert!(matches!(
+            copied_part_bytes(&object, 5..7),
+            Err(SqliteError::InvalidObjectRange)
+        ));
+
+        let empty = key_value(None, 0);
+        assert_sqlite_ok(copied_part_bytes(&empty, 0..0), &Vec::new());
+
+        let inconsistent = key_value(None, 1);
+        assert!(matches!(
+            copied_part_bytes(&inconsistent, 0..1),
+            Err(SqliteError::Configuration(_))
+        ));
+    }
+
+    #[test]
+    fn resolves_completed_part_ranges() {
+        let part = completed_part(2, 5, 3);
+        assert_eq!(completed_part_range(&part).ok(), Some(5..8));
+        assert_eq!(requested_part_range(2, Some(&part), 2, 9).ok(), Some(5..8));
+        assert_eq!(requested_part_range(1, None, 0, 9).ok(), Some(0..9));
+        assert_error_code(
+            requested_part_range(2, None, 2, 9),
+            &S3ErrorCode::InvalidPart,
+        );
+    }
+
+    #[test]
+    fn rejects_completed_part_range_invalid_boundaries() {
+        let part = completed_part(1, -1, 1);
+        assert_error_code(completed_part_range(&part), &S3ErrorCode::InternalError);
+
+        let part = completed_part(1, 0, -1);
+        assert_error_code(completed_part_range(&part), &S3ErrorCode::InternalError);
+    }
+}

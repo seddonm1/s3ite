@@ -732,3 +732,182 @@ pub(super) async fn list_objects_v2(
 
     Ok(S3Response::new(output))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use s3s::dto::ObjectVersionStorageClass;
+    use time::OffsetDateTime;
+
+    fn assert_error_code<T>(result: S3Result<T>, code: &S3ErrorCode) {
+        match result {
+            Ok(_) => panic!("expected {code:?}"),
+            Err(err) => assert_eq!(err.code(), code),
+        }
+    }
+
+    fn assert_s3_ok<T>(result: S3Result<T>, expected: &T)
+    where
+        T: PartialEq + std::fmt::Debug,
+    {
+        match result {
+            Ok(value) => assert_eq!(&value, expected),
+            Err(err) => panic!("unexpected error: {err:?}"),
+        }
+    }
+
+    fn summary(key: &str) -> ObjectSummary {
+        ObjectSummary {
+            key: key.to_string(),
+            version_id: "version".to_string(),
+            size: 7,
+            last_modified: OffsetDateTime::UNIX_EPOCH,
+            md5: Some("md5".to_string()),
+            is_latest: true,
+            is_delete_marker: false,
+        }
+    }
+
+    #[test]
+    fn extracts_common_prefixes() {
+        assert_eq!(
+            common_prefix_for_key("photos/2024/image.jpg", "photos/", Some("/")),
+            Some("photos/2024/".to_string())
+        );
+        assert_eq!(
+            common_prefix_for_key("photos/2024/image.jpg", "photos/", Some("")),
+            None
+        );
+        assert_eq!(
+            common_prefix_for_key("photos/2024/image.jpg", "videos/", Some("/")),
+            None
+        );
+        assert_eq!(
+            common_prefix_for_key("photos//image.jpg", "photos/", Some("/")),
+            Some("photos//".to_string())
+        );
+        assert_eq!(
+            common_prefix_for_key("prefix::child::leaf", "prefix", Some("::")),
+            Some("prefix::".to_string())
+        );
+    }
+
+    #[test]
+    fn continuation_tokens_round_trip_and_reject_invalid_input() {
+        for key in ["plain-key", "space and/slash", ""] {
+            let token = encode_continuation_token(key);
+            assert_s3_ok(decode_continuation_token(&token), &key.to_string());
+        }
+
+        assert_error_code(
+            decode_continuation_token("bad-prefix"),
+            &S3ErrorCode::InvalidToken,
+        );
+        assert_error_code(
+            decode_continuation_token(&format!("{CONTINUATION_TOKEN_PREFIX}0")),
+            &S3ErrorCode::InvalidToken,
+        );
+        assert_error_code(
+            decode_continuation_token(&format!("{CONTINUATION_TOKEN_PREFIX}zz")),
+            &S3ErrorCode::InvalidToken,
+        );
+        assert_error_code(
+            decode_continuation_token(&format!("{CONTINUATION_TOKEN_PREFIX}ff")),
+            &S3ErrorCode::InvalidToken,
+        );
+    }
+
+    #[test]
+    fn decodes_hex_strings() {
+        assert_eq!(decode_hex("0061ff"), Some(vec![0x00, 0x61, 0xff]));
+        assert_eq!(decode_hex("0061FF"), Some(vec![0x00, 0x61, 0xff]));
+        assert_eq!(decode_hex("0"), None);
+        assert_eq!(decode_hex("gg"), None);
+    }
+
+    #[test]
+    fn encodes_list_values_when_requested() {
+        assert_eq!(
+            encode_list_value("safe-_.~/AZaz09".to_string(), true),
+            "safe-_.~/AZaz09"
+        );
+        assert_eq!(
+            encode_list_value("space key\tline\nhash#".to_string(), true),
+            "space%20key%09line%0Ahash%23"
+        );
+        assert_eq!(
+            encode_list_value("space key".to_string(), false),
+            "space key"
+        );
+    }
+
+    #[test]
+    fn decodes_only_xml_safe_list_input_escapes() {
+        assert_eq!(
+            decode_list_input_value("%0A%0D%09%20%2F%ZZ".to_string()),
+            "\n\r\t%20%2F%ZZ"
+        );
+        assert_eq!(
+            decode_list_input_value("literal%41value".to_string()),
+            "literal%41value"
+        );
+    }
+
+    #[test]
+    fn normalizes_output_delimiters() {
+        assert_eq!(output_delimiter(None), None);
+        assert_eq!(output_delimiter(Some(String::new())), None);
+        assert_eq!(
+            output_delimiter(Some("/".to_string())),
+            Some("/".to_string())
+        );
+    }
+
+    #[test]
+    fn bounds_list_limits() {
+        assert_s3_ok(list_limit(None, 1000, 1000), &1000);
+        assert_s3_ok(list_limit(Some(25), 1000, 1000), &25);
+        assert_s3_ok(list_limit(Some(2000), 1000, 1000), &1000);
+        assert_error_code(
+            list_limit(Some(0), 1000, 1000),
+            &S3ErrorCode::InvalidArgument,
+        );
+        assert_error_code(
+            list_limit(Some(-1), 1000, 1000),
+            &S3ErrorCode::InvalidArgument,
+        );
+    }
+
+    #[test]
+    fn converts_object_summaries_to_list_outputs() {
+        let expected_owner = owner();
+        let object = object_from_summary(summary("a b"), true, Some(&expected_owner));
+        assert_eq!(object.key.as_deref(), Some("a%20b"));
+        assert_eq!(object.size, Some(7));
+        assert_eq!(object.e_tag, Some(ETag::Strong("md5".to_string())));
+        assert_eq!(object.owner, Some(expected_owner.clone()));
+
+        let version = object_version_from_summary(summary("a b"), false, Some(&expected_owner));
+        assert_eq!(version.key.as_deref(), Some("a b"));
+        assert_eq!(version.version_id.as_deref(), Some("version"));
+        assert_eq!(version.is_latest, Some(true));
+        assert_eq!(version.e_tag, Some(ETag::Strong("md5".to_string())));
+        assert_eq!(
+            version.storage_class,
+            Some(ObjectVersionStorageClass::from_static(
+                ObjectVersionStorageClass::STANDARD
+            ))
+        );
+        assert_eq!(version.owner, Some(expected_owner.clone()));
+
+        let mut marker_summary = summary("delete marker");
+        marker_summary.md5 = None;
+        marker_summary.is_delete_marker = true;
+        let marker = delete_marker_from_summary(marker_summary, true, Some(&expected_owner));
+        assert_eq!(marker.key.as_deref(), Some("delete%20marker"));
+        assert_eq!(marker.version_id.as_deref(), Some("version"));
+        assert_eq!(marker.is_latest, Some(true));
+        assert_eq!(marker.owner, Some(expected_owner));
+    }
+}
