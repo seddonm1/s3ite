@@ -83,12 +83,11 @@ uuid = { version = "1.23.2", features = ["v4"] }
 yaml_serde = { version = "0.10", optional = true }
 
 [dev-dependencies]
-s3s-aws = "0.13.0"
 anyhow = { version = "1.0.102", features = ["backtrace"] }
-aws-config = { version = "=1.8.13", default-features = false }
-aws-credential-types = { version = "=1.2.13", features = ["test-util"] }
-aws-sdk-s3 = { version = "=1.124.0", features = ["behavior-version-latest"] }
-aws-sigv4 = "1.4.1"
+aws-config = { version = "=1.8.15", default-features = false }
+aws-credential-types = { version = "=1.2.14", features = ["test-util"] }
+aws-sdk-s3 = { version = "=1.129.0", features = ["behavior-version-latest"] }
+aws-sigv4 = "=1.4.2"
 reqwest = { version = "0.12", default-features = false, features = [
     "http2",
     "rustls-tls",
