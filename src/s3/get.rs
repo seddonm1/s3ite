@@ -4,18 +4,26 @@ use std::ops::Range as ByteRange;
 
 use super::{
     ChecksumMode, CompletedObjectPart, ETag, GetObjectAttributesInput, GetObjectAttributesOutput,
-    GetObjectAttributesParts, GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput,
-    KeyMetadata, Not, ObjectAttributes, ObjectBodyReference, ObjectPart,
-    ObjectReadConditionFailure, ObjectReadConditions, S3Error, S3ErrorCode, S3Range, S3Request,
-    S3Response, S3Result, Sqlite, SqliteError, SqliteResult, StorageClass, StoredChecksum,
-    StreamExt, StreamingBlob, checksum_crc32, checksum_crc32c, checksum_crc64nvme,
-    checksum_mode_enabled, checksum_sha1, checksum_sha256, checksum_struct, checksum_type_output,
-    list_limit, not_found_delete_marker_error, not_modified_error, object_checksum_for_part,
-    requested_part_range, s3_error, s3_error_from_sqlite, s3_error_with_message, stream,
-    validate_part_number, validate_read_conditions,
+    GetObjectAttributesParts, GetObjectInput, GetObjectOutput, GetObjectTorrentInput,
+    GetObjectTorrentOutput, HeadObjectInput, HeadObjectOutput, KeyMetadata, Not, ObjectAttributes,
+    ObjectBodyReference, ObjectPart, ObjectReadConditionFailure, ObjectReadConditions, S3Error,
+    S3ErrorCode, S3Range, S3Request, S3Response, S3Result, Sqlite, SqliteError, SqliteResult,
+    StorageClass, StoredChecksum, StreamExt, StreamingBlob, checksum_crc32, checksum_crc32c,
+    checksum_crc64nvme, checksum_mode_enabled, checksum_sha1, checksum_sha256, checksum_struct,
+    checksum_type_output, list_limit, not_found_delete_marker_error, not_modified_error,
+    object_checksum_for_part, requested_part_range, s3_error, s3_error_from_sqlite,
+    s3_error_with_message, stream, validate_part_number, validate_read_conditions,
 };
 
 use crate::database::{BlobReadReceiver, BlobReadRequest, BucketConnection};
+
+/// Reports that `BitTorrent` metadata is unavailable for this object store.
+pub(super) fn get_object_torrent(
+    _sqlite: &Sqlite,
+    _req: S3Request<GetObjectTorrentInput>,
+) -> S3Result<S3Response<GetObjectTorrentOutput>> {
+    Err(s3_error(S3ErrorCode::NoSuchKey))
+}
 
 /// Hides the special S3 `null` version ID from response fields that omit it.
 fn visible_version_id(version_id: String) -> Option<String> {

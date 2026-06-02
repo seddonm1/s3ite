@@ -120,6 +120,29 @@ async fn test_object_write_check_etag() -> Result<()> {
     Ok(())
 }
 
+/// Verifies PutObject accepts a valid Content-MD5 header.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_object_write_valid_content_md5() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-obj");
+
+    create_bucket(&client, &bucket).await?;
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key("md5")
+        .content_md5("N7UdGUp1E+RbVvZSTy1R8g==")
+        .body(ByteStream::from_static(b"bar"))
+        .send()
+        .await?;
+
+    assert_eq!(get_object_bytes(&client, &bucket, "md5").await?, b"bar");
+
+    Ok(())
+}
+
 /// Verifies object writes, overwrites, reads, and deletes through HTTP.
 #[tokio::test]
 #[serial(conformance)]
@@ -327,6 +350,7 @@ async fn test_ranged_request_response_code() -> Result<()> {
         .send()
         .await?;
 
+    assert_eq!(response.accept_ranges(), Some("bytes"));
     assert_eq!(response.content_range(), Some("bytes 4-7/11"));
     assert_eq!(
         response.body.collect().await?.into_bytes().as_ref(),
@@ -461,6 +485,42 @@ async fn test_ranged_request_invalid_range() -> Result<()> {
         Err(error) => error,
     };
     assert_error_contains(&error, "InvalidRange");
+
+    Ok(())
+}
+
+/// Verifies objects whose key ends with a slash are ordinary objects.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_object_trailing_slash_round_trip() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-obj");
+
+    create_bucket(&client, &bucket).await?;
+    put_object(&client, &bucket, "folder/", b"folder/").await?;
+    assert_eq!(
+        get_object_bytes(&client, &bucket, "folder/").await?,
+        b"folder/"
+    );
+
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key("folder/")
+        .send()
+        .await?;
+    let error = match client
+        .get_object()
+        .bucket(&bucket)
+        .key("folder/")
+        .send()
+        .await
+    {
+        Ok(_) => bail!("deleted trailing-slash object should not be readable"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "NoSuchKey");
 
     Ok(())
 }

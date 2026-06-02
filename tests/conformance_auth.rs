@@ -13,13 +13,13 @@ use aws_sdk_s3::{
     Client,
     presigning::PresigningConfig,
     primitives::ByteStream,
-    types::{BucketCannedAcl, ObjectCannedAcl, Permission},
+    types::{BucketCannedAcl, BucketVersioningStatus, ObjectCannedAcl, Permission, Type},
 };
 use reqwest::StatusCode;
 use serial_test::serial;
 use support::{
     assertions::{assert_error_contains, assert_status},
-    fixtures::{bucket_name, create_bucket, put_object},
+    fixtures::{bucket_name, create_bucket, put_bucket_versioning, put_object},
     raw_http, sdk,
     server::TestServer,
 };
@@ -278,16 +278,31 @@ async fn shared_object() -> Result<(TestServer, Client, String)> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_get_bucket_acl_returns_owner_full_control() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_acl_default
     let (_server, client, bucket) = owner_bucket().await?;
     let bucket_acl = client.get_bucket_acl().bucket(&bucket).send().await?;
     assert_eq!(
         bucket_acl.owner().and_then(|owner| owner.id()),
         Some("s3ite")
     );
-    assert_eq!(bucket_acl.grants().len(), 1);
     assert_eq!(
-        bucket_acl.grants()[0].permission(),
-        Some(&Permission::FullControl)
+        bucket_acl.owner().and_then(|owner| owner.display_name()),
+        Some("s3ite")
+    );
+    assert_eq!(bucket_acl.grants().len(), 1);
+    let grant = &bucket_acl.grants()[0];
+    assert_eq!(grant.permission(), Some(&Permission::FullControl));
+    assert_eq!(
+        grant.grantee().and_then(|grantee| grantee.id()),
+        Some("s3ite")
+    );
+    assert_eq!(
+        grant.grantee().and_then(|grantee| grantee.display_name()),
+        Some("s3ite")
+    );
+    assert_eq!(
+        grant.grantee().map(|grantee| grantee.r#type()),
+        Some(&Type::CanonicalUser)
     );
 
     Ok(())
@@ -297,6 +312,7 @@ async fn test_get_bucket_acl_returns_owner_full_control() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_put_bucket_acl_private_is_noop() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_bucket_acl_canned_private_to_private
     let (_server, client, bucket) = owner_bucket().await?;
     client
         .put_bucket_acl()
@@ -388,6 +404,7 @@ async fn test_copy_object_bucket_owner_full_control_acl_is_noop() -> Result<()> 
 #[tokio::test]
 #[serial(conformance)]
 async fn test_get_object_acl_returns_owner_full_control() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_object_acl_default
     let (_server, client, bucket, key) = owner_object().await?;
     let object_acl = client
         .get_object_acl()
@@ -399,10 +416,86 @@ async fn test_get_object_acl_returns_owner_full_control() -> Result<()> {
         object_acl.owner().and_then(|owner| owner.id()),
         Some("s3ite")
     );
-    assert_eq!(object_acl.grants().len(), 1);
     assert_eq!(
-        object_acl.grants()[0].permission(),
-        Some(&Permission::FullControl)
+        object_acl.owner().and_then(|owner| owner.display_name()),
+        Some("s3ite")
+    );
+    assert_eq!(object_acl.grants().len(), 1);
+    let grant = &object_acl.grants()[0];
+    assert_eq!(grant.permission(), Some(&Permission::FullControl));
+    assert_eq!(
+        grant.grantee().and_then(|grantee| grantee.id()),
+        Some("s3ite")
+    );
+    assert_eq!(
+        grant.grantee().and_then(|grantee| grantee.display_name()),
+        Some("s3ite")
+    );
+    assert_eq!(
+        grant.grantee().map(|grantee| grantee.r#type()),
+        Some(&Type::CanonicalUser)
+    );
+
+    Ok(())
+}
+
+/// Verifies private PutObjectAcl is metadata-preserving owner-only no-op.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_object_put_acl_mtime() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_object_put_acl_mtime
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-auth");
+    let key = "foo";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    put_object(&client, &bucket, key, b"foooz").await?;
+
+    let created = client
+        .head_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?
+        .last_modified()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("HeadObject missing LastModified"))?;
+    assert_eq!(
+        list_current_mtime(&client, &bucket).await?.secs(),
+        created.secs()
+    );
+    assert_eq!(
+        list_version_mtime(&client, &bucket).await?.secs(),
+        created.secs()
+    );
+
+    client
+        .put_object_acl()
+        .bucket(&bucket)
+        .key(key)
+        .acl(ObjectCannedAcl::Private)
+        .send()
+        .await?;
+
+    let after_acl = client
+        .head_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?
+        .last_modified()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("HeadObject missing LastModified after ACL write"))?;
+    assert_eq!(after_acl.secs(), created.secs());
+    assert_eq!(
+        list_current_mtime(&client, &bucket).await?.secs(),
+        created.secs()
+    );
+    assert_eq!(
+        list_version_mtime(&client, &bucket).await?.secs(),
+        created.secs()
     );
 
     Ok(())
@@ -519,4 +612,34 @@ async fn owner_object() -> Result<(TestServer, Client, String, String)> {
     let key = "object.txt".to_string();
     put_object(&client, &bucket, &key, b"owner-only").await?;
     Ok((server, client, bucket, key))
+}
+
+async fn list_current_mtime(
+    client: &Client,
+    bucket: &str,
+) -> Result<aws_sdk_s3::primitives::DateTime> {
+    client
+        .list_objects()
+        .bucket(bucket)
+        .send()
+        .await?
+        .contents()
+        .first()
+        .and_then(|object| object.last_modified().cloned())
+        .ok_or_else(|| anyhow::anyhow!("ListObjects missing object LastModified"))
+}
+
+async fn list_version_mtime(
+    client: &Client,
+    bucket: &str,
+) -> Result<aws_sdk_s3::primitives::DateTime> {
+    client
+        .list_object_versions()
+        .bucket(bucket)
+        .send()
+        .await?
+        .versions()
+        .first()
+        .and_then(|version| version.last_modified().cloned())
+        .ok_or_else(|| anyhow::anyhow!("ListObjectVersions missing version LastModified"))
 }

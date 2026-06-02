@@ -110,3 +110,19 @@ pub(super) fn not_modified_error(md5: Option<&str>) -> S3Result<S3Error> {
     error.set_headers(headers);
     Ok(error)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bucket_read_only_maps_to_method_not_allowed_message() {
+        let error = s3_error_from_sqlite(SqliteError::BucketReadOnly);
+
+        assert_eq!(error.code(), &S3ErrorCode::MethodNotAllowed);
+        assert!(
+            format!("{error:?}").contains("database is in read-only mode"),
+            "read-only error should preserve the user-facing message"
+        );
+    }
+}

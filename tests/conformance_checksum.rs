@@ -22,7 +22,7 @@ use aws_sdk_s3::{
 use serial_test::serial;
 use support::{
     assertions::assert_error_contains,
-    fixtures::{bucket_name, create_bucket, get_object_bytes},
+    fixtures::{bucket_name, create_bucket, get_object_bytes, put_object},
     sdk,
     server::TestServer,
 };
@@ -106,6 +106,41 @@ async fn test_object_checksum_sha256() -> Result<()> {
         Err(error) => error,
     };
     assert_error_contains(&error, "BadDigest");
+
+    Ok(())
+}
+
+/// Verifies explicit SHA256 PutObject checksums suppress default CRC64NVME.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_explicit_sha256_put_suppresses_default_crc64nvme() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ck");
+
+    create_bucket(&client, &bucket).await?;
+    let put = client
+        .put_object()
+        .bucket(&bucket)
+        .key("sha256")
+        .checksum_algorithm(ChecksumAlgorithm::Sha256)
+        .checksum_sha256(SHA256_1024_A)
+        .body(ByteStream::from(vec![b'A'; 1024]))
+        .send()
+        .await?;
+    assert_eq!(put.checksum_sha256(), Some(SHA256_1024_A));
+    assert!(put.checksum_crc64_nvme().is_none());
+    assert_eq!(put.checksum_type(), Some(&ChecksumType::FullObject));
+
+    let head = client
+        .head_object()
+        .bucket(&bucket)
+        .key("sha256")
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(head.checksum_sha256(), Some(SHA256_1024_A));
+    assert!(head.checksum_crc64_nvme().is_none());
 
     Ok(())
 }
@@ -218,6 +253,48 @@ async fn test_default_crc64nvme_for_put_and_attributes() -> Result<()> {
     Ok(())
 }
 
+/// Verifies CopyObject gets a default CRC64NVME checksum when the source has no checksum.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_default_crc64nvme_for_copy_object() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ck");
+
+    create_bucket(&client, &bucket).await?;
+    put_object(&client, &bucket, "source", b"copy checksum").await?;
+
+    let copy = client
+        .copy_object()
+        .bucket(&bucket)
+        .key("target")
+        .copy_source(format!("{bucket}/source"))
+        .send()
+        .await?;
+    let copy_result = copy
+        .copy_object_result()
+        .ok_or_else(|| anyhow::anyhow!("CopyObject response missing result"))?;
+    let checksum = copy_result
+        .checksum_crc64_nvme()
+        .ok_or_else(|| anyhow::anyhow!("CopyObject response missing CRC64NVME"))?;
+    assert_eq!(copy_result.checksum_type(), Some(&ChecksumType::FullObject));
+
+    let head = client
+        .head_object()
+        .bucket(&bucket)
+        .key("target")
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(head.checksum_crc64_nvme(), Some(checksum));
+    assert_eq!(
+        get_object_bytes(&client, &bucket, "target").await?,
+        b"copy checksum"
+    );
+
+    Ok(())
+}
+
 /// Verifies CopyObject inherits the source checksum algorithm when unspecified.
 #[tokio::test]
 #[serial(conformance)]
@@ -264,6 +341,83 @@ async fn test_copy_object_inherits_source_checksum_algorithm() -> Result<()> {
         get_object_bytes(&client, &bucket, "target").await?,
         vec![b'A'; 1024]
     );
+
+    Ok(())
+}
+
+/// Verifies default multipart completion exposes a full-object CRC64NVME checksum.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_default_crc64nvme_for_multipart_completion() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ck");
+    let key = "multipart-default";
+
+    create_bucket(&client, &bucket).await?;
+    let upload_id = client
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?
+        .upload_id()
+        .ok_or_else(|| anyhow::anyhow!("create multipart response missing upload ID"))?
+        .to_string();
+    let part1 =
+        upload_plain_part(&client, &bucket, key, &upload_id, 1, vec![b'A'; 5 * MIB]).await?;
+    let part2 = upload_plain_part(&client, &bucket, key, &upload_id, 2, b"tail".to_vec()).await?;
+    let upload = CompletedMultipartUpload::builder()
+        .set_parts(Some(vec![part1, part2]))
+        .build();
+
+    let completed = client
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(upload)
+        .send()
+        .await?;
+    let checksum = completed
+        .checksum_crc64_nvme()
+        .ok_or_else(|| anyhow::anyhow!("CompleteMultipartUpload missing CRC64NVME"))?;
+    assert_eq!(completed.checksum_type(), Some(&ChecksumType::FullObject));
+    assert!(completed.checksum_sha256().is_none());
+
+    let head = client
+        .head_object()
+        .bucket(&bucket)
+        .key(key)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(head.checksum_crc64_nvme(), Some(checksum));
+    assert_eq!(head.checksum_type(), Some(&ChecksumType::FullObject));
+
+    let attrs = client
+        .get_object_attributes()
+        .bucket(&bucket)
+        .key(key)
+        .object_attributes(ObjectAttributes::Checksum)
+        .send()
+        .await?;
+    assert_eq!(
+        attrs
+            .checksum()
+            .and_then(|value| value.checksum_crc64_nvme()),
+        Some(checksum)
+    );
+
+    let part = client
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .part_number(1)
+        .send()
+        .await?;
+    assert!(part.checksum_crc64_nvme().is_none());
+    assert!(part.checksum_type().is_none());
 
     Ok(())
 }
@@ -573,7 +727,7 @@ async fn test_multipart_use_cksum_helper_sha256() -> Result<()> {
     let key = "mymultipart3";
 
     create_bucket(&client, &bucket).await?;
-    complete_three_part_checksum(
+    let completed = complete_three_part_checksum(
         &client,
         &bucket,
         key,
@@ -583,6 +737,11 @@ async fn test_multipart_use_cksum_helper_sha256() -> Result<()> {
         SHA256_15_MIB_ABC_COMPOSITE,
     )
     .await?;
+    assert_eq!(
+        completed.checksum_sha256(),
+        Some(SHA256_15_MIB_ABC_COMPOSITE)
+    );
+    assert!(completed.checksum_crc64_nvme().is_none());
 
     assert_checksum_outputs(
         &client,
@@ -594,6 +753,14 @@ async fn test_multipart_use_cksum_helper_sha256() -> Result<()> {
         [SHA256_5_MIB_A, SHA256_5_MIB_B, SHA256_5_MIB_C],
     )
     .await?;
+    let head = client
+        .head_object()
+        .bucket(&bucket)
+        .key(key)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert!(head.checksum_crc64_nvme().is_none());
 
     Ok(())
 }
@@ -1024,4 +1191,32 @@ fn get_object_checksum<'a>(
 
 fn unquoted_etag(etag: &str) -> &str {
     etag.trim_matches('"')
+}
+
+async fn upload_plain_part(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: i32,
+    body: Vec<u8>,
+) -> Result<CompletedPart> {
+    let response = client
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(part_number)
+        .body(ByteStream::from(body))
+        .send()
+        .await?;
+
+    Ok(CompletedPart::builder()
+        .e_tag(
+            response
+                .e_tag()
+                .ok_or_else(|| anyhow::anyhow!("upload part response missing ETag"))?,
+        )
+        .part_number(part_number)
+        .build())
 }

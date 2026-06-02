@@ -224,6 +224,174 @@ async fn test_list_multipart_upload_owner() -> Result<()> {
     Ok(())
 }
 
+/// Verifies ListParts paginates parts and rejects malformed or missing upload IDs.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_list_parts_pagination_etags_and_upload_id_errors() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-mpu");
+    let key = "parts";
+
+    create_bucket(&client, &bucket).await?;
+    let upload_id = create_upload(&client, &bucket, key).await?;
+    let part1 = upload_part(&client, &bucket, key, &upload_id, 1, b"one".to_vec()).await?;
+    let part2 = upload_part(&client, &bucket, key, &upload_id, 2, b"two".to_vec()).await?;
+    let part3 = upload_part(&client, &bucket, key, &upload_id, 3, b"three".to_vec()).await?;
+
+    let first = client
+        .list_parts()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .max_parts(2)
+        .send()
+        .await?;
+    assert_eq!(first.parts().len(), 2);
+    assert_eq!(first.is_truncated(), Some(true));
+    assert_eq!(first.next_part_number_marker(), Some("2"));
+    assert_eq!(first.parts()[0].part_number(), Some(1));
+    assert_eq!(first.parts()[0].e_tag(), part1.e_tag());
+    assert_eq!(first.parts()[1].part_number(), Some(2));
+    assert_eq!(first.parts()[1].e_tag(), part2.e_tag());
+
+    let second = client
+        .list_parts()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .part_number_marker("2")
+        .send()
+        .await?;
+    assert_eq!(second.parts().len(), 1);
+    assert_eq!(second.is_truncated(), Some(false));
+    assert_eq!(second.parts()[0].part_number(), Some(3));
+    assert_eq!(second.parts()[0].e_tag(), part3.e_tag());
+
+    let error = match client
+        .list_parts()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id("not-a-uuid")
+        .send()
+        .await
+    {
+        Ok(_) => bail!("malformed upload ID should fail"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "NoSuchUpload");
+
+    let error = match client
+        .list_parts()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(uuid::Uuid::new_v4().to_string())
+        .send()
+        .await
+    {
+        Ok(_) => bail!("missing upload ID should fail"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "NoSuchUpload");
+
+    Ok(())
+}
+
+/// Verifies ListMultipartUploads pagination, filtering, and delimiter grouping.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_list_multipart_uploads_prefix_delimiter_and_pagination() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-mpu");
+
+    create_bucket(&client, &bucket).await?;
+    let page_a = create_upload(&client, &bucket, "page/a").await?;
+    let _page_b = create_upload(&client, &bucket, "page/b").await?;
+    let aborted = create_upload(&client, &bucket, "page/aborted").await?;
+    abort_upload(&client, &bucket, "page/aborted", &aborted).await?;
+
+    let completed = create_upload(&client, &bucket, "page/completed").await?;
+    let completed_part = upload_part(
+        &client,
+        &bucket,
+        "page/completed",
+        &completed,
+        1,
+        b"done".to_vec(),
+    )
+    .await?;
+    complete_upload(
+        &client,
+        &bucket,
+        "page/completed",
+        &completed,
+        vec![completed_part],
+    )
+    .await?;
+
+    let first = client
+        .list_multipart_uploads()
+        .bucket(&bucket)
+        .prefix("page/")
+        .max_uploads(1)
+        .send()
+        .await?;
+    assert_eq!(first.uploads().len(), 1);
+    assert_eq!(first.uploads()[0].key(), Some("page/a"));
+    assert_eq!(first.uploads()[0].upload_id(), Some(page_a.as_str()));
+    assert_eq!(first.is_truncated(), Some(true));
+
+    let second = client
+        .list_multipart_uploads()
+        .bucket(&bucket)
+        .prefix("page/")
+        .key_marker(
+            first
+                .next_key_marker()
+                .ok_or_else(|| anyhow::anyhow!("first upload page missing key marker"))?,
+        )
+        .upload_id_marker(
+            first
+                .next_upload_id_marker()
+                .ok_or_else(|| anyhow::anyhow!("first upload page missing upload ID marker"))?,
+        )
+        .send()
+        .await?;
+    let second_keys = second
+        .uploads()
+        .iter()
+        .filter_map(|upload| upload.key())
+        .collect::<Vec<_>>();
+    assert_eq!(second_keys, vec!["page/b"]);
+    assert_eq!(second.is_truncated(), Some(false));
+
+    create_upload(&client, &bucket, "group/a/one").await?;
+    create_upload(&client, &bucket, "group/b/two").await?;
+    create_upload(&client, &bucket, "group/root").await?;
+    let grouped = client
+        .list_multipart_uploads()
+        .bucket(&bucket)
+        .prefix("group/")
+        .delimiter("/")
+        .send()
+        .await?;
+    let grouped_prefixes = grouped
+        .common_prefixes()
+        .iter()
+        .filter_map(|prefix| prefix.prefix())
+        .collect::<Vec<_>>();
+    let grouped_uploads = grouped
+        .uploads()
+        .iter()
+        .filter_map(|upload| upload.key())
+        .collect::<Vec<_>>();
+    assert_eq!(grouped_prefixes, vec!["group/a/", "group/b/"]);
+    assert_eq!(grouped_uploads, vec!["group/root"]);
+
+    Ok(())
+}
+
 /// Verifies completing with a missing part number fails with InvalidPart.
 #[tokio::test]
 #[serial(conformance)]
@@ -300,6 +468,71 @@ async fn test_multipart_upload_size_too_small() -> Result<()> {
         Err(error) => error,
     };
     assert_error_contains(&error, "EntityTooSmall");
+
+    Ok(())
+}
+
+/// Verifies multipart completion reports ETag part counts and rejects out-of-order parts.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_multipart_completion_etag_and_part_order() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-mpu");
+
+    create_bucket(&client, &bucket).await?;
+    let upload_id = create_upload(&client, &bucket, "valid").await?;
+    let part1 = upload_part(
+        &client,
+        &bucket,
+        "valid",
+        &upload_id,
+        1,
+        vec![b'a'; 5 * MIB],
+    )
+    .await?;
+    let part2 = upload_part(&client, &bucket, "valid", &upload_id, 2, b"tail".to_vec()).await?;
+    let completed =
+        complete_upload(&client, &bucket, "valid", &upload_id, vec![part1, part2]).await?;
+    assert!(
+        completed
+            .e_tag()
+            .map(|etag| etag.trim_matches('"').ends_with("-2"))
+            .unwrap_or(false)
+    );
+
+    let ordered_upload_id = create_upload(&client, &bucket, "out-of-order").await?;
+    let ordered_part1 = upload_part(
+        &client,
+        &bucket,
+        "out-of-order",
+        &ordered_upload_id,
+        1,
+        b"one".to_vec(),
+    )
+    .await?;
+    let ordered_part2 = upload_part(
+        &client,
+        &bucket,
+        "out-of-order",
+        &ordered_upload_id,
+        2,
+        b"two".to_vec(),
+    )
+    .await?;
+    let error = match complete_upload(
+        &client,
+        &bucket,
+        "out-of-order",
+        &ordered_upload_id,
+        vec![ordered_part2, ordered_part1],
+    )
+    .await
+    {
+        Ok(_) => bail!("out-of-order multipart completion should fail"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "InvalidPartOrder");
 
     Ok(())
 }
@@ -527,6 +760,98 @@ async fn test_multipart_copy_without_range() -> Result<()> {
 
     let body = get_object_bytes(&client, &target_bucket, target_key).await?;
     assert_eq!(body, b"0123456789");
+
+    Ok(())
+}
+
+/// Verifies UploadPartCopy source conditionals and missing upload errors.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_upload_part_copy_conditions_and_missing_upload() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let source_bucket = bucket_name("s3ite-mpu-src");
+    let target_bucket = bucket_name("s3ite-mpu-dst");
+
+    create_bucket(&client, &source_bucket).await?;
+    create_bucket(&client, &target_bucket).await?;
+    put_object(&client, &source_bucket, "source", b"0123456789abcdef").await?;
+    let source_etag = client
+        .head_object()
+        .bucket(&source_bucket)
+        .key("source")
+        .send()
+        .await?
+        .e_tag()
+        .ok_or_else(|| anyhow::anyhow!("source object missing ETag"))?
+        .to_string();
+    let copy_source = copy_source(CopySourceRef::new(&source_bucket, "source", None));
+
+    let upload_id = create_upload(&client, &target_bucket, "range-copy").await?;
+    let range_copy = client
+        .upload_part_copy()
+        .bucket(&target_bucket)
+        .key("range-copy")
+        .upload_id(&upload_id)
+        .part_number(1)
+        .copy_source(&copy_source)
+        .copy_source_range("bytes=2-5")
+        .copy_source_if_match(&source_etag)
+        .send()
+        .await?;
+    let range_part = CompletedPart::builder()
+        .part_number(1)
+        .e_tag(
+            range_copy
+                .copy_part_result()
+                .and_then(|result| result.e_tag())
+                .ok_or_else(|| anyhow::anyhow!("UploadPartCopy response missing ETag"))?,
+        )
+        .build();
+    complete_upload(
+        &client,
+        &target_bucket,
+        "range-copy",
+        &upload_id,
+        vec![range_part],
+    )
+    .await?;
+    assert_eq!(
+        get_object_bytes(&client, &target_bucket, "range-copy").await?,
+        b"2345"
+    );
+
+    let blocked_upload_id = create_upload(&client, &target_bucket, "blocked").await?;
+    let error = match client
+        .upload_part_copy()
+        .bucket(&target_bucket)
+        .key("blocked")
+        .upload_id(&blocked_upload_id)
+        .part_number(1)
+        .copy_source(&copy_source)
+        .copy_source_if_none_match(source_etag)
+        .send()
+        .await
+    {
+        Ok(_) => bail!("matching copy source If-None-Match should fail"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "PreconditionFailed");
+
+    let error = match client
+        .upload_part_copy()
+        .bucket(&target_bucket)
+        .key("missing-upload")
+        .upload_id(uuid::Uuid::new_v4().to_string())
+        .part_number(1)
+        .copy_source(copy_source)
+        .send()
+        .await
+    {
+        Ok(_) => bail!("copying into a missing upload should fail"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "NoSuchUpload");
 
     Ok(())
 }
@@ -809,6 +1134,82 @@ async fn test_multipart_single_get_part() -> Result<()> {
     Ok(())
 }
 
+/// Verifies overwrites clear completed multipart part boundaries.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_multipart_part_boundaries_are_cleared_by_put_and_copy() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-mpu");
+    let key = "multipart-object";
+
+    create_bucket(&client, &bucket).await?;
+    let upload_id = create_upload(&client, &bucket, key).await?;
+    let first = vec![b'a'; 5 * MIB];
+    let part1 = upload_part(&client, &bucket, key, &upload_id, 1, first.clone()).await?;
+    let part2 = upload_part(&client, &bucket, key, &upload_id, 2, b"tail".to_vec()).await?;
+    complete_upload(&client, &bucket, key, &upload_id, vec![part1, part2]).await?;
+
+    let part = client
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .part_number(1)
+        .send()
+        .await?;
+    assert_eq!(part.body.collect().await?.into_bytes().as_ref(), first);
+
+    put_object(&client, &bucket, key, b"plain").await?;
+    let error = match client
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .part_number(2)
+        .send()
+        .await
+    {
+        Ok(_) => bail!("PutObject should clear completed part boundaries"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "InvalidPart");
+
+    put_object(&client, &bucket, "copy-source", b"copied").await?;
+    client
+        .copy_object()
+        .bucket(&bucket)
+        .key(key)
+        .copy_source(format!("{bucket}/copy-source"))
+        .send()
+        .await?;
+    let copied = client
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .part_number(1)
+        .send()
+        .await?;
+    assert_eq!(
+        copied.body.collect().await?.into_bytes().as_ref(),
+        b"copied"
+    );
+
+    let error = match client
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .range("bytes=0-0")
+        .part_number(1)
+        .send()
+        .await
+    {
+        Ok(_) => bail!("Range and partNumber together should fail"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "InvalidRequest");
+
+    Ok(())
+}
+
 /// Verifies duplicate part entries complete with the final uploaded part.
 #[tokio::test]
 #[serial(conformance)]
@@ -885,6 +1286,68 @@ async fn test_multipart_upload_resend_part() -> Result<()> {
             expected.as_slice()
         );
     }
+
+    Ok(())
+}
+
+/// Verifies malformed upload IDs map to NoSuchUpload across multipart APIs.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_malformed_upload_ids_are_no_such_upload() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-mpu");
+
+    create_bucket(&client, &bucket).await?;
+    put_object(&client, &bucket, "source", b"source").await?;
+
+    let error = match client
+        .upload_part()
+        .bucket(&bucket)
+        .key("invalid-upload-part")
+        .upload_id("not-a-uuid")
+        .part_number(1)
+        .body(ByteStream::from_static(b"body"))
+        .send()
+        .await
+    {
+        Ok(_) => bail!("uploading with malformed upload ID should fail"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "NoSuchUpload");
+
+    let part = CompletedPart::builder()
+        .part_number(1)
+        .e_tag("00000000000000000000000000000000")
+        .build();
+    let error = match complete_upload(
+        &client,
+        &bucket,
+        "invalid-complete",
+        "not-a-uuid",
+        vec![part],
+    )
+    .await
+    {
+        Ok(_) => bail!("completing with malformed upload ID should fail"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "NoSuchUpload");
+
+    let error = match client
+        .upload_part_copy()
+        .bucket(&bucket)
+        .key("invalid-copy")
+        .upload_id("not-a-uuid")
+        .part_number(1)
+        .copy_source(copy_source(CopySourceRef::new(&bucket, "source", None)))
+        .send()
+        .await
+    {
+        Ok(_) => bail!("copying with malformed upload ID should fail"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "NoSuchUpload");
 
     Ok(())
 }

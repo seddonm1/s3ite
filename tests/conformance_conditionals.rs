@@ -192,6 +192,147 @@ async fn test_get_object_ifunmodifiedsince_failed() -> Result<()> {
     Ok(())
 }
 
+/// Verifies 304 conditional read errors preserve the object ETag header.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_get_object_not_modified_errors_include_etag() -> Result<()> {
+    let (_server, client, bucket, state) = seeded_object().await?;
+
+    let error = match client
+        .get_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .if_none_match(&state.etag)
+        .send()
+        .await
+    {
+        Ok(_) => bail!("matching If-None-Match should return 304"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "StatusCode(304)");
+    let response = error
+        .raw_response()
+        .ok_or_else(|| anyhow::anyhow!("304 response missing raw response"))?;
+    assert_eq!(response.headers().get("etag"), Some(state.etag.as_str()));
+
+    let error = match client
+        .get_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .if_modified_since(state.after)
+        .send()
+        .await
+    {
+        Ok(_) => bail!("unmodified object should return 304"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "StatusCode(304)");
+    let response = error
+        .raw_response()
+        .ok_or_else(|| anyhow::anyhow!("304 response missing raw response"))?;
+    assert_eq!(response.headers().get("etag"), Some(state.etag.as_str()));
+
+    Ok(())
+}
+
+/// Verifies HeadObject honors the same conditional outcomes as GetObject.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_head_object_conditionals() -> Result<()> {
+    let (_server, client, bucket, state) = seeded_object().await?;
+
+    client
+        .head_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .if_match(&state.etag)
+        .send()
+        .await?;
+
+    let error = match client
+        .head_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .if_match("\"ABCORZ\"")
+        .send()
+        .await
+    {
+        Ok(_) => bail!("mismatched HeadObject If-Match should fail"),
+        Err(error) => error,
+    };
+    let response = error
+        .raw_response()
+        .ok_or_else(|| anyhow::anyhow!("412 response missing raw response"))?;
+    assert_eq!(response.status().as_u16(), 412);
+
+    let error = match client
+        .head_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .if_none_match(&state.etag)
+        .send()
+        .await
+    {
+        Ok(_) => bail!("matching HeadObject If-None-Match should return 304"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "StatusCode(304)");
+    let response = error
+        .raw_response()
+        .ok_or_else(|| anyhow::anyhow!("304 response missing raw response"))?;
+    assert_eq!(response.headers().get("etag"), Some(state.etag.as_str()));
+
+    let error = match client
+        .head_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .if_modified_since(state.after)
+        .send()
+        .await
+    {
+        Ok(_) => bail!("unmodified HeadObject should return 304"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "StatusCode(304)");
+
+    let error = match client
+        .head_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .if_unmodified_since(state.before)
+        .send()
+        .await
+    {
+        Ok(_) => bail!("modified HeadObject should fail If-Unmodified-Since"),
+        Err(error) => error,
+    };
+    let response = error
+        .raw_response()
+        .ok_or_else(|| anyhow::anyhow!("412 response missing raw response"))?;
+    assert_eq!(response.status().as_u16(), 412);
+
+    Ok(())
+}
+
+/// Verifies a matching If-Match takes precedence over stale If-Unmodified-Since.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_get_object_if_match_allows_stale_if_unmodified_since() -> Result<()> {
+    let (_server, client, bucket, state) = seeded_object().await?;
+
+    let output = client
+        .get_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .if_match(&state.etag)
+        .if_unmodified_since(state.before)
+        .send()
+        .await?;
+    assert_eq!(output.body.collect().await?.into_bytes().as_ref(), b"bar");
+
+    Ok(())
+}
+
 /// Verifies PutObject succeeds when If-Match matches the current ETag.
 #[tokio::test]
 #[serial(conformance)]
@@ -885,6 +1026,41 @@ async fn test_copy_object_ifnonematch_failed() -> Result<()> {
     Ok(())
 }
 
+/// Verifies CopyObject source date conditionals and ETag precedence.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_copy_object_source_date_conditionals() -> Result<()> {
+    let (_server, client, bucket, state) = seeded_object().await?;
+    let copy_source = format!("{bucket}/{KEY}");
+
+    let error = match client
+        .copy_object()
+        .bucket(&bucket)
+        .key("after")
+        .copy_source(&copy_source)
+        .copy_source_if_modified_since(state.after)
+        .send()
+        .await
+    {
+        Ok(_) => bail!("unmodified copy source should fail If-Modified-Since"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "PreconditionFailed");
+
+    client
+        .copy_object()
+        .bucket(&bucket)
+        .key("before")
+        .copy_source(copy_source)
+        .copy_source_if_match(&state.etag)
+        .copy_source_if_unmodified_since(state.before)
+        .send()
+        .await?;
+    assert_eq!(get_object_bytes(&client, &bucket, "before").await?, b"bar");
+
+    Ok(())
+}
+
 /// Verifies multipart completion honors If-Match and If-None-Match.
 #[tokio::test]
 #[serial(conformance)]
@@ -1241,6 +1417,26 @@ async fn test_delete_object_if_match_last_modified_time() -> Result<()> {
         .send()
         .await?;
     assert_deleted(&client, &bucket, KEY).await?;
+
+    Ok(())
+}
+
+/// Verifies DeleteObject conditionals on missing objects remain idempotent.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_delete_object_if_match_missing_is_noop() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-cond");
+
+    create_bucket(&client, &bucket).await?;
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key("missing")
+        .if_match("\"ABCORZ\"")
+        .send()
+        .await?;
 
     Ok(())
 }

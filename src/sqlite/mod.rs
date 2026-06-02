@@ -710,9 +710,16 @@ impl Sqlite {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
+
     use rusqlite::Connection;
 
-    use super::{OffsetDateTime, Sqlite, SqliteResult, Uuid};
+    use crate::Config;
+
+    use super::{OffsetDateTime, Sqlite, SqliteError, SqliteResult, Uuid};
 
     fn open_schema() -> SqliteResult<Connection> {
         let mut connection = Connection::open_in_memory()?;
@@ -721,6 +728,91 @@ mod tests {
         Sqlite::try_create_tables(&transaction)?;
         transaction.commit()?;
         Ok(connection)
+    }
+
+    fn temp_root(name: &str) -> SqliteResult<PathBuf> {
+        let root = std::env::temp_dir().join(format!("s3ite-{name}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root)?;
+        Ok(root)
+    }
+
+    fn remove_root(root: &Path) {
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn old_bucket_schema_is_rejected() -> SqliteResult<()> {
+        let root = temp_root("old-schema")?;
+        let connection = Connection::open(root.join("old.sqlite3"))?;
+        connection.execute("CREATE TABLE data (key TEXT PRIMARY KEY, value BLOB);", ())?;
+        drop(connection);
+
+        let Err(err) = Sqlite::new(&Config {
+            root: root.clone(),
+            ..Default::default()
+        })
+        .await
+        else {
+            remove_root(&root);
+            panic!("old bucket schema should fail startup");
+        };
+        assert!(matches!(
+            err,
+            SqliteError::UnsupportedSchemaVersion {
+                found: 0,
+                expected: super::BUCKET_SCHEMA_VERSION
+            }
+        ));
+
+        remove_root(&root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zero_readers_fails_startup() -> SqliteResult<()> {
+        let root = temp_root("zero-readers")?;
+
+        let Err(err) = Sqlite::new(&Config {
+            root: root.clone(),
+            readers: 0,
+            ..Default::default()
+        })
+        .await
+        else {
+            remove_root(&root);
+            panic!("zero readers should fail startup");
+        };
+        assert!(matches!(
+            err,
+            SqliteError::Configuration(message) if message == "readers must be greater than zero"
+        ));
+
+        remove_root(&root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zero_blob_readers_fails_startup() -> SqliteResult<()> {
+        let root = temp_root("zero-blob-readers")?;
+
+        let Err(err) = Sqlite::new(&Config {
+            root: root.clone(),
+            blob_readers: 0,
+            ..Default::default()
+        })
+        .await
+        else {
+            remove_root(&root);
+            panic!("zero blob readers should fail startup");
+        };
+        assert!(matches!(
+            err,
+            SqliteError::Configuration(message)
+                if message == "blob_readers must be greater than zero"
+        ));
+
+        remove_root(&root);
+        Ok(())
     }
 
     #[test]

@@ -142,3 +142,62 @@ impl Sqlite {
         Ok(stmt.execute([state.as_sql()])?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::RwLock;
+
+    use crate::{Bucket, Config};
+
+    use super::*;
+
+    fn sqlite_with_config(config: Config) -> Sqlite {
+        Sqlite {
+            root: PathBuf::new(),
+            config,
+            buckets: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    #[test]
+    fn service_read_only_blocks_bucket_mutations() {
+        let sqlite = sqlite_with_config(Config {
+            read_only: true,
+            ..Default::default()
+        });
+
+        let err = match sqlite.validate_mutable_bucket("bucket") {
+            Ok(()) => panic!("service read-only config should block mutations"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, SqliteError::BucketReadOnly));
+    }
+
+    #[test]
+    fn bucket_read_only_override_blocks_only_that_bucket() {
+        let mut config = Config::default();
+        config.buckets.insert(
+            "locked".to_string(),
+            Bucket {
+                read_only: Some(true),
+                sqlite: None,
+            },
+        );
+        config.buckets.insert(
+            "writable".to_string(),
+            Bucket {
+                read_only: Some(false),
+                sqlite: None,
+            },
+        );
+        let sqlite = sqlite_with_config(config);
+
+        let err = match sqlite.validate_mutable_bucket("locked") {
+            Ok(()) => panic!("bucket read-only config should block mutations"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, SqliteError::BucketReadOnly));
+        assert!(sqlite.validate_mutable_bucket("writable").is_ok());
+        assert!(sqlite.validate_mutable_bucket("unconfigured").is_ok());
+    }
+}

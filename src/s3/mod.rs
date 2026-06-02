@@ -18,16 +18,16 @@ use s3s::{
         GetBucketAclInput, GetBucketAclOutput, GetBucketLocationInput, GetBucketLocationOutput,
         GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectAclInput, GetObjectAclOutput,
         GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectAttributesParts,
-        GetObjectInput, GetObjectOutput, Grant, Grantee, HeadBucketInput, HeadBucketOutput,
-        HeadObjectInput, HeadObjectOutput, Initiator, ListBucketsInput, ListBucketsOutput,
-        ListMultipartUploadsInput, ListMultipartUploadsOutput, ListObjectVersionsInput,
-        ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
-        ListObjectsV2Output, ListPartsInput, ListPartsOutput, MFADelete, MetadataDirective,
-        MultipartUpload, ObjectAttributes, ObjectCannedACL, ObjectPart, Owner, Part, Permission,
-        PutBucketAclInput, PutBucketAclOutput, PutBucketVersioningInput, PutBucketVersioningOutput,
-        PutObjectAclInput, PutObjectAclOutput, PutObjectInput, PutObjectOutput, Range as S3Range,
-        StorageClass, StreamingBlob, Timestamp, Type, UploadPartCopyInput, UploadPartCopyOutput,
-        UploadPartInput, UploadPartOutput,
+        GetObjectInput, GetObjectOutput, GetObjectTorrentInput, GetObjectTorrentOutput, Grant,
+        Grantee, HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, Initiator,
+        ListBucketsInput, ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput,
+        ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput,
+        ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput, MFADelete,
+        MetadataDirective, MultipartUpload, ObjectAttributes, ObjectCannedACL, ObjectPart, Owner,
+        Part, Permission, PutBucketAclInput, PutBucketAclOutput, PutBucketVersioningInput,
+        PutBucketVersioningOutput, PutObjectAclInput, PutObjectAclOutput, PutObjectInput,
+        PutObjectOutput, Range as S3Range, StorageClass, StreamingBlob, Timestamp, Type,
+        UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
     },
     header::{CONTENT_MD5, CONTENT_TYPE, ETAG, X_AMZ_DELETE_MARKER, X_AMZ_REQUEST_ID},
 };
@@ -396,6 +396,15 @@ impl S3 for Sqlite {
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
         get::get_object(self, req).await
+    }
+
+    /// Reports that `BitTorrent` metadata is not available for the object.
+    #[tracing::instrument]
+    async fn get_object_torrent(
+        &self,
+        req: S3Request<GetObjectTorrentInput>,
+    ) -> S3Result<S3Response<GetObjectTorrentOutput>> {
+        get::get_object_torrent(self, req)
     }
 
     /// Checks whether a bucket exists.
