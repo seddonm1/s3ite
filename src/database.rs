@@ -24,7 +24,10 @@ use crate::{
 
 /// Maximum number of queued commands per worker queue.
 const QUEUE_BOUND: usize = 100;
-/// Size of each chunk read from an incremental `SQLite` BLOB.
+/// Size of each incremental `SQLite` BLOB read chunk.
+///
+/// With the four-chunk response queue, this caps buffered BLOB data at roughly
+/// 512 KiB per active stream while keeping read/channel overhead modest.
 const BLOB_STREAM_CHUNK_SIZE: u64 = 128 * 1024;
 /// Number of BLOB chunks that may wait for the HTTP body consumer.
 const BLOB_STREAM_QUEUE_BOUND: usize = 4;
