@@ -126,7 +126,7 @@ fn load_copy_source_object(
     key: &str,
     version_id: Option<&str>,
 ) -> SqliteResult<KeyValue> {
-    Sqlite::try_get_copy_source_object(transaction, key, version_id)
+    Sqlite::get_copy_source_object(transaction, key, version_id)
 }
 
 /// Rewrites loaded source metadata for the destination object.
@@ -192,7 +192,7 @@ async fn copy_object_same_bucket(
     request: CopyObjectRequest,
 ) -> S3Result<(CopyObjectResult, Option<String>)> {
     let connection = sqlite
-        .try_get_connection(&request.target_bucket)
+        .get_connection(&request.target_bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
@@ -205,7 +205,7 @@ async fn copy_object_same_bucket(
             )?;
             validate_copy_source_conditions(&object.key_metadata, &request.source_conditions)?;
             let (object, checksum) = prepare_copied_object(object, &request)?;
-            let write_outcome = Sqlite::try_put_object(&transaction, object)?;
+            let write_outcome = Sqlite::put_object(&transaction, object)?;
             let result = copy_object_result(
                 &checksum,
                 write_outcome.md5.clone(),
@@ -224,7 +224,7 @@ async fn copy_object_cross_bucket(
     request: CopyObjectRequest,
 ) -> S3Result<(CopyObjectResult, Option<String>)> {
     let source_connection = sqlite
-        .try_get_connection(&request.source_bucket)
+        .get_connection(&request.source_bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
     let source_key = request.source_key.clone();
@@ -244,13 +244,13 @@ async fn copy_object_cross_bucket(
     let (object, checksum) =
         prepare_copied_object(object, &request).map_err(s3_error_from_sqlite)?;
     let target_connection = sqlite
-        .try_get_connection(&request.target_bucket)
+        .get_connection(&request.target_bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
     target_connection
         .write(move |connection| {
             let transaction = connection.transaction()?;
-            let write_outcome = Sqlite::try_put_object(&transaction, object)?;
+            let write_outcome = Sqlite::put_object(&transaction, object)?;
             let result = copy_object_result(
                 &checksum,
                 write_outcome.md5.clone(),

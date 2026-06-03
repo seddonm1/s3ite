@@ -8,7 +8,7 @@ enum VersionMarker {
 
 impl Sqlite {
     /// Lists object metadata ordered by key for keyset pagination.
-    pub(crate) fn try_list_objects(
+    pub(crate) fn list_objects(
         transaction: &Transaction,
         prefix: Option<&str>,
         after_key: Option<&str>,
@@ -63,7 +63,7 @@ impl Sqlite {
     }
 
     /// Lists object versions ordered by key and newest version first.
-    pub(crate) fn try_list_object_versions(
+    pub(crate) fn list_object_versions(
         transaction: &Transaction,
         prefix: Option<&str>,
         after_key: Option<&str>,
@@ -72,7 +72,7 @@ impl Sqlite {
     ) -> SqliteResult<Vec<ObjectSummary>> {
         let after_marker = match (after_key, after_version_id) {
             (Some(key), Some(version_id)) => Some(
-                match Self::try_find_version_sequence(transaction, key, version_id)? {
+                match Self::find_version_sequence(transaction, key, version_id)? {
                     Some(sequence) => VersionMarker::Existing(sequence),
                     None => VersionMarker::Deleted,
                 },
@@ -178,7 +178,7 @@ mod tests {
         let mut connection = must(Connection::open_in_memory());
         must(connection.execute_batch("PRAGMA foreign_keys=true;"));
         let transaction = must(connection.transaction());
-        must(Sqlite::try_create_tables(&transaction));
+        must(Sqlite::create_tables(&transaction));
         must(transaction.commit());
         connection
     }
@@ -211,7 +211,7 @@ mod tests {
     }
 
     fn put_object(transaction: &Transaction, key: &str, value: &[u8]) -> String {
-        must(Sqlite::try_put_object(transaction, key_value(key, value))).version_id
+        must(Sqlite::put_object(transaction, key_value(key, value))).version_id
     }
 
     fn create_loose_object_version_table(connection: &Connection) {
@@ -239,7 +239,7 @@ mod tests {
     fn lists_current_live_objects_with_keyset_bounds() {
         let mut connection = open_schema();
         let transaction = must(connection.transaction());
-        must(Sqlite::try_put_bucket_versioning_state(
+        must(Sqlite::put_bucket_versioning_state(
             &transaction,
             BucketVersioningState::Enabled,
         ));
@@ -248,14 +248,14 @@ mod tests {
         let beta_v1 = put_object(&transaction, "beta", b"old");
         let beta_v2 = put_object(&transaction, "beta", b"new");
         assert_ne!(beta_v1, beta_v2);
-        must(Sqlite::try_insert_delete_marker(
+        must(Sqlite::insert_delete_marker(
             &transaction,
             "deleted",
             "deleted-marker",
         ));
         put_object(&transaction, "gamma", b"g");
 
-        let all = must(Sqlite::try_list_objects(&transaction, None, None, 10));
+        let all = must(Sqlite::list_objects(&transaction, None, None, 10));
         assert_eq!(
             all.iter()
                 .map(|summary| summary.key.as_str())
@@ -267,12 +267,7 @@ mod tests {
         assert!(all[1].is_latest);
         assert!(all[1].is_delete_marker.not());
 
-        let page = must(Sqlite::try_list_objects(
-            &transaction,
-            None,
-            Some("alpha"),
-            1,
-        ));
+        let page = must(Sqlite::list_objects(&transaction, None, Some("alpha"), 1));
         assert_eq!(
             page.iter()
                 .map(|summary| summary.key.as_str())
@@ -280,12 +275,7 @@ mod tests {
             vec!["beta"]
         );
 
-        let prefix_floor = must(Sqlite::try_list_objects(
-            &transaction,
-            Some("beta"),
-            None,
-            2,
-        ));
+        let prefix_floor = must(Sqlite::list_objects(&transaction, Some("beta"), None, 2));
         assert_eq!(
             prefix_floor
                 .iter()
@@ -294,7 +284,7 @@ mod tests {
             vec!["beta", "gamma"]
         );
 
-        let prefix_after = must(Sqlite::try_list_objects(
+        let prefix_after = must(Sqlite::list_objects(
             &transaction,
             Some("alpha"),
             Some("beta"),
@@ -309,7 +299,7 @@ mod tests {
         );
 
         assert!(matches!(
-            Sqlite::try_list_objects(&transaction, None, None, -1),
+            Sqlite::list_objects(&transaction, None, None, -1),
             Err(SqliteError::Rusqlite(_))
         ));
     }
@@ -318,21 +308,21 @@ mod tests {
     fn lists_versions_in_key_and_newest_first_order() {
         let mut connection = open_schema();
         let transaction = must(connection.transaction());
-        must(Sqlite::try_put_bucket_versioning_state(
+        must(Sqlite::put_bucket_versioning_state(
             &transaction,
             BucketVersioningState::Enabled,
         ));
 
         let alpha_v1 = put_object(&transaction, "alpha", b"one");
         let alpha_v2 = put_object(&transaction, "alpha", b"two");
-        must(Sqlite::try_insert_delete_marker(
+        must(Sqlite::insert_delete_marker(
             &transaction,
             "alpha",
             "alpha-delete",
         ));
         let beta_v1 = put_object(&transaction, "beta", b"one");
 
-        let all = must(Sqlite::try_list_object_versions(
+        let all = must(Sqlite::list_object_versions(
             &transaction,
             None,
             None,
@@ -356,7 +346,7 @@ mod tests {
             ]
         );
 
-        let after_delete = Sqlite::try_list_object_versions(
+        let after_delete = Sqlite::list_object_versions(
             &transaction,
             None,
             Some("alpha"),
@@ -372,14 +362,9 @@ mod tests {
             Some(vec![alpha_v2.as_str(), alpha_v1.as_str(), beta_v1.as_str()])
         );
 
-        let after_middle = Sqlite::try_list_object_versions(
-            &transaction,
-            None,
-            Some("alpha"),
-            Some(&alpha_v2),
-            10,
-        )
-        .ok();
+        let after_middle =
+            Sqlite::list_object_versions(&transaction, None, Some("alpha"), Some(&alpha_v2), 10)
+                .ok();
         assert_eq!(
             after_middle.as_ref().map(|versions| versions
                 .iter()
@@ -393,7 +378,7 @@ mod tests {
     fn treats_missing_version_marker_as_deleted_marker_position() {
         let mut connection = open_schema();
         let transaction = must(connection.transaction());
-        must(Sqlite::try_put_bucket_versioning_state(
+        must(Sqlite::put_bucket_versioning_state(
             &transaction,
             BucketVersioningState::Enabled,
         ));
@@ -402,7 +387,7 @@ mod tests {
         let alpha_v2 = put_object(&transaction, "alpha", b"two");
         let beta_v1 = put_object(&transaction, "beta", b"one");
 
-        let after_deleted_marker = Sqlite::try_list_object_versions(
+        let after_deleted_marker = Sqlite::list_object_versions(
             &transaction,
             None,
             Some("alpha"),
@@ -418,7 +403,7 @@ mod tests {
             Some(vec![alpha_v2.as_str(), alpha_v1.as_str(), beta_v1.as_str()])
         );
 
-        let after_key_only = must(Sqlite::try_list_object_versions(
+        let after_key_only = must(Sqlite::list_object_versions(
             &transaction,
             None,
             Some("alpha"),
@@ -433,7 +418,7 @@ mod tests {
             vec![beta_v1.as_str()]
         );
 
-        let prefix_after_key_only = must(Sqlite::try_list_object_versions(
+        let prefix_after_key_only = must(Sqlite::list_object_versions(
             &transaction,
             Some("alpha"),
             Some("alpha"),
@@ -455,20 +440,20 @@ mod tests {
         let transaction = must(connection.transaction());
 
         for result in [
-            Sqlite::try_list_objects(&transaction, Some("a"), Some("b"), 1),
-            Sqlite::try_list_objects(&transaction, Some("a"), None, 1),
-            Sqlite::try_list_objects(&transaction, None, Some("b"), 1),
-            Sqlite::try_list_objects(&transaction, None, None, 1),
+            Sqlite::list_objects(&transaction, Some("a"), Some("b"), 1),
+            Sqlite::list_objects(&transaction, Some("a"), None, 1),
+            Sqlite::list_objects(&transaction, None, Some("b"), 1),
+            Sqlite::list_objects(&transaction, None, None, 1),
         ] {
             assert_rusqlite_error(&result);
         }
 
         for result in [
-            Sqlite::try_list_object_versions(&transaction, Some("a"), Some("b"), None, 1),
-            Sqlite::try_list_object_versions(&transaction, Some("a"), None, None, 1),
-            Sqlite::try_list_object_versions(&transaction, None, Some("b"), None, 1),
-            Sqlite::try_list_object_versions(&transaction, None, None, None, 1),
-            Sqlite::try_list_object_versions(&transaction, None, Some("b"), Some("v"), 1),
+            Sqlite::list_object_versions(&transaction, Some("a"), Some("b"), None, 1),
+            Sqlite::list_object_versions(&transaction, Some("a"), None, None, 1),
+            Sqlite::list_object_versions(&transaction, None, Some("b"), None, 1),
+            Sqlite::list_object_versions(&transaction, None, None, None, 1),
+            Sqlite::list_object_versions(&transaction, None, Some("b"), Some("v"), 1),
         ] {
             assert_rusqlite_error(&result);
         }
@@ -496,7 +481,7 @@ mod tests {
         ));
 
         let transaction = must(connection.transaction());
-        assert_rusqlite_error(&Sqlite::try_list_objects(&transaction, None, None, 1));
+        assert_rusqlite_error(&Sqlite::list_objects(&transaction, None, None, 1));
     }
 
     #[test]
@@ -521,14 +506,14 @@ mod tests {
         ));
 
         let transaction = must(connection.transaction());
-        assert_rusqlite_error(&Sqlite::try_list_object_versions(
+        assert_rusqlite_error(&Sqlite::list_object_versions(
             &transaction,
             None,
             None,
             None,
             1,
         ));
-        assert_rusqlite_error(&Sqlite::try_list_object_versions(
+        assert_rusqlite_error(&Sqlite::list_object_versions(
             &transaction,
             None,
             None,

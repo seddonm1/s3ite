@@ -7,7 +7,7 @@ use super::{BucketVersioningState, NULL_VERSION_ID, ObjectDeleteOutcome, Sqlite,
 
 impl Sqlite {
     /// Deletes one exact object version row.
-    pub(super) fn try_delete_version_row(
+    pub(super) fn delete_version_row(
         transaction: &Transaction,
         key: &str,
         version_id: &str,
@@ -21,7 +21,7 @@ impl Sqlite {
     }
 
     /// Promotes the newest remaining version for a key to latest.
-    pub(super) fn try_promote_latest_version(
+    pub(super) fn promote_latest_version(
         transaction: &Transaction,
         key: &str,
     ) -> SqliteResult<usize> {
@@ -41,12 +41,12 @@ impl Sqlite {
     }
 
     /// Creates a delete marker as the current latest version.
-    pub(super) fn try_insert_delete_marker(
+    pub(super) fn insert_delete_marker(
         transaction: &Transaction,
         key: &str,
         version_id: &str,
     ) -> SqliteResult<usize> {
-        Self::try_clear_latest(transaction, key)?;
+        Self::clear_latest(transaction, key)?;
         let mut stmt = transaction.prepare_cached(
             "
             INSERT INTO object_version (
@@ -69,20 +69,20 @@ impl Sqlite {
     }
 
     /// Deletes an object by key or permanently deletes an exact version.
-    pub(crate) fn try_delete_object(
+    pub(crate) fn delete_object(
         transaction: &Transaction,
         key: &str,
         version_id: Option<&str>,
     ) -> SqliteResult<ObjectDeleteOutcome> {
         if let Some(version_id) = version_id {
-            let deleted = Self::try_get_version_metadata(transaction, key, version_id)?;
+            let deleted = Self::get_version_metadata(transaction, key, version_id)?;
             let is_latest = deleted.as_ref().is_some_and(|metadata| metadata.is_latest);
             let is_delete_marker = deleted
                 .as_ref()
                 .is_some_and(|metadata| metadata.is_delete_marker);
-            Self::try_delete_version_row(transaction, key, version_id)?;
+            Self::delete_version_row(transaction, key, version_id)?;
             if is_latest {
-                Self::try_promote_latest_version(transaction, key)?;
+                Self::promote_latest_version(transaction, key)?;
             }
             return Ok(ObjectDeleteOutcome {
                 version_id: Some(version_id.to_string()),
@@ -91,10 +91,10 @@ impl Sqlite {
             });
         }
 
-        let state = Self::try_get_bucket_versioning_state(transaction)?;
+        let state = Self::get_bucket_versioning_state(transaction)?;
         match state {
             BucketVersioningState::NeverConfigured => {
-                Self::try_delete_version_row(transaction, key, NULL_VERSION_ID)?;
+                Self::delete_version_row(transaction, key, NULL_VERSION_ID)?;
                 Ok(ObjectDeleteOutcome {
                     version_id: None,
                     is_delete_marker: false,
@@ -102,8 +102,8 @@ impl Sqlite {
                 })
             }
             BucketVersioningState::Enabled => {
-                let version_id = Self::try_generate_unique_version_id(transaction, key)?;
-                Self::try_insert_delete_marker(transaction, key, &version_id)?;
+                let version_id = Self::generate_unique_version_id(transaction, key)?;
+                Self::insert_delete_marker(transaction, key, &version_id)?;
                 Ok(ObjectDeleteOutcome {
                     version_id: Some(version_id.clone()),
                     is_delete_marker: true,
@@ -111,8 +111,8 @@ impl Sqlite {
                 })
             }
             BucketVersioningState::Suspended => {
-                Self::try_delete_version_row(transaction, key, NULL_VERSION_ID)?;
-                Self::try_insert_delete_marker(transaction, key, NULL_VERSION_ID)?;
+                Self::delete_version_row(transaction, key, NULL_VERSION_ID)?;
+                Self::insert_delete_marker(transaction, key, NULL_VERSION_ID)?;
                 Ok(ObjectDeleteOutcome {
                     version_id: Some(NULL_VERSION_ID.to_string()),
                     is_delete_marker: true,

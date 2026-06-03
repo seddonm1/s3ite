@@ -160,7 +160,7 @@ pub(super) async fn put_object(
     };
 
     let connection = sqlite
-        .try_get_connection(&bucket)
+        .get_connection(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
 
@@ -192,8 +192,8 @@ pub(super) async fn put_object(
     let write_outcome = connection
         .write(move |connection| {
             let transaction = connection.transaction()?;
-            Sqlite::try_check_object_write_conditions(&transaction, &key, &write_conditions)?;
-            let outcome = Sqlite::try_put_object(
+            Sqlite::check_object_write_conditions(&transaction, &key, &write_conditions)?;
+            let outcome = Sqlite::put_object(
                 &transaction,
                 KeyValue {
                     key,

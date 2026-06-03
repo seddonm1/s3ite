@@ -81,7 +81,7 @@ pub(super) async fn create_bucket(
     })?;
 
     sqlite
-        .try_create_bucket(&bucket)
+        .create_bucket(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
 
@@ -104,13 +104,13 @@ pub(super) async fn delete_bucket(
         .map_err(s3_error_from_sqlite)?;
 
     let connection = sqlite
-        .try_get_connection(&bucket)
+        .get_connection(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
     let has_objects = connection
         .read(|connection| {
             let transaction = connection.transaction()?;
-            Sqlite::try_has_objects(&transaction)
+            Sqlite::has_objects(&transaction)
         })
         .await
         .map_err(s3_error_from_sqlite)?;
@@ -175,13 +175,13 @@ pub(super) async fn get_bucket_versioning(
 ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
     let GetBucketVersioningInput { bucket, .. } = req.input;
     let connection = sqlite
-        .try_get_connection(&bucket)
+        .get_connection(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
     let state = connection
         .read(|connection| {
             let transaction = connection.transaction()?;
-            Sqlite::try_get_bucket_versioning_state(&transaction)
+            Sqlite::get_bucket_versioning_state(&transaction)
         })
         .await
         .map_err(s3_error_from_sqlite)?;
@@ -245,13 +245,13 @@ pub(super) async fn put_bucket_versioning(
     };
 
     let connection = sqlite
-        .try_get_connection(&bucket)
+        .get_connection(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
         .write(move |connection| {
             let transaction = connection.transaction()?;
-            Sqlite::try_put_bucket_versioning_state(&transaction, state)?;
+            Sqlite::put_bucket_versioning_state(&transaction, state)?;
             Ok(transaction.commit()?)
         })
         .await

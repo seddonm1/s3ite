@@ -32,20 +32,20 @@ fn generate_version_id() -> SqliteResult<String> {
 
 impl Sqlite {
     /// Generates an unused opaque version ID for a key.
-    pub(super) fn try_generate_unique_version_id(
+    pub(super) fn generate_unique_version_id(
         transaction: &Transaction,
         key: &str,
     ) -> SqliteResult<String> {
         loop {
             let version_id = generate_version_id()?;
-            if Self::try_version_exists(transaction, key, &version_id)?.not() {
+            if Self::version_exists(transaction, key, &version_id)?.not() {
                 return Ok(version_id);
             }
         }
     }
 
     /// Returns whether an exact object version row exists.
-    pub(super) fn try_version_exists(
+    pub(super) fn version_exists(
         transaction: &Transaction,
         key: &str,
         version_id: &str,
@@ -62,7 +62,7 @@ impl Sqlite {
     }
 
     /// Clears the latest pointer for all versions of a key.
-    pub(super) fn try_clear_latest(transaction: &Transaction, key: &str) -> SqliteResult<usize> {
+    pub(super) fn clear_latest(transaction: &Transaction, key: &str) -> SqliteResult<usize> {
         let mut stmt = transaction.prepare_cached(
             "
             UPDATE object_version
@@ -73,7 +73,7 @@ impl Sqlite {
     }
 
     /// Checks object write preconditions against current metadata in the transaction.
-    pub(crate) fn try_check_object_write_conditions(
+    pub(crate) fn check_object_write_conditions(
         transaction: &Transaction,
         key: &str,
         conditions: &ObjectWriteConditions,
@@ -82,7 +82,7 @@ impl Sqlite {
             return Ok(());
         }
 
-        let current = Self::try_get_metadata(transaction, key)?;
+        let current = Self::get_metadata(transaction, key)?;
         // S3 reports a missing object before evaluating any If-Match tag.
         if current.is_none() && conditions.if_match.is_some() {
             return Err(SqliteError::ObjectNotFound);
@@ -121,7 +121,7 @@ impl Sqlite {
     }
 
     /// Inserts an object version or replaces the `null` version.
-    pub(crate) fn try_put_object(
+    pub(crate) fn put_object(
         transaction: &Transaction,
         kv: KeyValue,
     ) -> SqliteResult<ObjectWriteOutcome> {
@@ -132,11 +132,9 @@ impl Sqlite {
             ..
         } = kv;
         let value = value.ok_or(SqliteError::ObjectBodyInconsistent)?;
-        let state = Self::try_get_bucket_versioning_state(transaction)?;
+        let state = Self::get_bucket_versioning_state(transaction)?;
         let version_id = match state {
-            BucketVersioningState::Enabled => {
-                Self::try_generate_unique_version_id(transaction, &key)?
-            }
+            BucketVersioningState::Enabled => Self::generate_unique_version_id(transaction, &key)?,
             BucketVersioningState::NeverConfigured | BucketVersioningState::Suspended => {
                 NULL_VERSION_ID.to_string()
             }
@@ -144,9 +142,9 @@ impl Sqlite {
         let returned_version_id = state.returns_write_version_id().then(|| version_id.clone());
 
         if state.returns_write_version_id().not() {
-            Self::try_delete_version_row(transaction, &key, NULL_VERSION_ID)?;
+            Self::delete_version_row(transaction, &key, NULL_VERSION_ID)?;
         }
-        Self::try_clear_latest(transaction, &key)?;
+        Self::clear_latest(transaction, &key)?;
 
         let mut stmt = transaction.prepare_cached(
             "

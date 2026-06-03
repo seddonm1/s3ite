@@ -477,13 +477,13 @@ pub struct Sqlite {
 
 impl Sqlite {
     /// Reads the bucket schema version from `PRAGMA user_version`.
-    fn try_schema_version(transaction: &Transaction) -> SqliteResult<i32> {
+    fn schema_version(transaction: &Transaction) -> SqliteResult<i32> {
         let mut stmt = transaction.prepare_cached("PRAGMA user_version;")?;
         Ok(stmt.query_row((), |row| row.get(0))?)
     }
 
     /// Counts user-created schema objects in a bucket database.
-    fn try_user_table_count(transaction: &Transaction) -> SqliteResult<i64> {
+    fn user_table_count(transaction: &Transaction) -> SqliteResult<i64> {
         let mut stmt = transaction.prepare_cached(
             "
             SELECT COUNT(*)
@@ -495,13 +495,13 @@ impl Sqlite {
     }
 
     /// Ensures the bucket database schema exists at the supported version.
-    pub(crate) fn try_create_tables(transaction: &Transaction) -> SqliteResult<()> {
-        let version = Self::try_schema_version(transaction)?;
+    pub(crate) fn create_tables(transaction: &Transaction) -> SqliteResult<()> {
+        let version = Self::schema_version(transaction)?;
         if version == BUCKET_SCHEMA_VERSION {
             return Ok(());
         }
 
-        if version != 0 || Self::try_user_table_count(transaction)? > 0 {
+        if version != 0 || Self::user_table_count(transaction)? > 0 {
             return Err(SqliteError::UnsupportedSchemaVersion {
                 found: version,
                 expected: BUCKET_SCHEMA_VERSION,
@@ -532,7 +532,7 @@ impl Sqlite {
         }
 
         let root = env::current_dir()?.join(&config.root).canonicalize()?;
-        let buckets = Self::try_open_configured_buckets(&root, config).await?;
+        let buckets = Self::open_configured_buckets(&root, config).await?;
 
         // validate that any specified bucket configurations have existing bucket
         let difference = config
@@ -559,7 +559,7 @@ impl Sqlite {
     }
 
     /// Applies writable-bucket startup maintenance before serving requests.
-    pub(super) async fn try_prepare_existing_bucket(
+    pub(super) async fn prepare_existing_bucket(
         connection: &BucketConnection,
         config: &crate::Config,
         bucket: &str,
@@ -585,8 +585,8 @@ impl Sqlite {
                 )?;
 
                 let transaction = connection.transaction()?;
-                Self::try_create_tables(&transaction)?;
-                Self::try_delete_expired_multipart_uploads(
+                Self::create_tables(&transaction)?;
+                Self::delete_expired_multipart_uploads(
                     &transaction,
                     multipart_expire_before,
                     completed_multipart_expire_before,
@@ -624,7 +624,7 @@ impl Sqlite {
                     .collect::<Vec<_>>();
 
                 for connection in connections {
-                    Self::try_maintain_connection(
+                    Self::maintain_connection(
                         &connection,
                         multipart_expire_before,
                         completed_multipart_expire_before,
@@ -638,7 +638,7 @@ impl Sqlite {
     }
 
     /// Runs one maintenance pass for a writable bucket connection.
-    pub(super) async fn try_maintain_connection(
+    pub(super) async fn maintain_connection(
         connection: &BucketConnection,
         multipart_expire_before: Option<OffsetDateTime>,
         completed_multipart_expire_before: Option<OffsetDateTime>,
@@ -647,7 +647,7 @@ impl Sqlite {
         connection
             .write(move |connection| {
                 let transaction = connection.transaction()?;
-                Self::try_delete_expired_multipart_uploads(
+                Self::delete_expired_multipart_uploads(
                     &transaction,
                     multipart_expire_before,
                     completed_multipart_expire_before,
@@ -666,23 +666,23 @@ impl Sqlite {
     }
 
     /// Deletes incomplete and completed multipart records older than configured cutoffs.
-    pub(crate) fn try_delete_expired_multipart_uploads(
+    pub(crate) fn delete_expired_multipart_uploads(
         transaction: &Transaction,
         incomplete_expire_before: Option<OffsetDateTime>,
         completed_expire_before: Option<OffsetDateTime>,
     ) -> SqliteResult<()> {
         if let Some(expire_before) = incomplete_expire_before {
-            Self::try_delete_incomplete_multipart_uploads_expired(transaction, expire_before)?;
+            Self::delete_incomplete_multipart_uploads_expired(transaction, expire_before)?;
         }
         if let Some(expire_before) = completed_expire_before {
-            Self::try_delete_completed_multipart_uploads_expired(transaction, expire_before)?;
+            Self::delete_completed_multipart_uploads_expired(transaction, expire_before)?;
         }
 
         Ok(())
     }
 
     /// Deletes incomplete multipart uploads older than the expiration timestamp.
-    fn try_delete_incomplete_multipart_uploads_expired(
+    fn delete_incomplete_multipart_uploads_expired(
         transaction: &Transaction,
         expire_before: OffsetDateTime,
     ) -> SqliteResult<usize> {
@@ -695,7 +695,7 @@ impl Sqlite {
     }
 
     /// Deletes completed multipart idempotency records older than the expiration timestamp.
-    fn try_delete_completed_multipart_uploads_expired(
+    fn delete_completed_multipart_uploads_expired(
         transaction: &Transaction,
         expire_before: OffsetDateTime,
     ) -> SqliteResult<usize> {
@@ -731,7 +731,7 @@ mod tests {
         let mut connection = Connection::open_in_memory()?;
         connection.execute_batch("PRAGMA foreign_keys=true;")?;
         let transaction = connection.transaction()?;
-        Sqlite::try_create_tables(&transaction)?;
+        Sqlite::create_tables(&transaction)?;
         transaction.commit()?;
         Ok(connection)
     }
@@ -794,11 +794,11 @@ mod tests {
     fn schema_creation_is_idempotent_for_current_version() -> SqliteResult<()> {
         let mut connection = Connection::open_in_memory()?;
         let transaction = connection.transaction()?;
-        Sqlite::try_create_tables(&transaction)?;
+        Sqlite::create_tables(&transaction)?;
         transaction.commit()?;
 
         let transaction = connection.transaction()?;
-        Sqlite::try_create_tables(&transaction)?;
+        Sqlite::create_tables(&transaction)?;
         transaction.commit()?;
 
         let version: i32 = connection.query_row("PRAGMA user_version;", (), |row| row.get(0))?;
@@ -812,7 +812,7 @@ mod tests {
         connection.execute_batch("PRAGMA user_version = 4;")?;
         let transaction = connection.transaction()?;
 
-        let err = Sqlite::try_create_tables(&transaction).err();
+        let err = Sqlite::create_tables(&transaction).err();
         assert!(matches!(
             err,
             Some(SqliteError::UnsupportedSchemaVersion {
@@ -860,7 +860,7 @@ mod tests {
             ..Default::default()
         };
 
-        Sqlite::try_prepare_existing_bucket(&connection, &config, "bucket").await?;
+        Sqlite::prepare_existing_bucket(&connection, &config, "bucket").await?;
         let version: i32 = connection
             .read(|connection| {
                 Ok(connection.query_row("PRAGMA user_version;", (), |row| row.get(0))?)
@@ -879,7 +879,7 @@ mod tests {
         let path = root.join("bucket.sqlite3");
         let connection = BucketConnection::open(&path, &Config::default(), "bucket").await?;
 
-        Sqlite::try_prepare_existing_bucket(&connection, &Config::default(), "bucket").await?;
+        Sqlite::prepare_existing_bucket(&connection, &Config::default(), "bucket").await?;
         let version: i32 = connection
             .read(|connection| {
                 Ok(connection.query_row("PRAGMA user_version;", (), |row| row.get(0))?)
@@ -900,14 +900,14 @@ mod tests {
         connection
             .write(|connection| {
                 let transaction = connection.transaction()?;
-                Sqlite::try_create_tables(&transaction)?;
+                Sqlite::create_tables(&transaction)?;
                 transaction.commit()?;
                 Ok(())
             })
             .await?;
 
-        Sqlite::try_maintain_connection(&connection, None, None, 0).await?;
-        Sqlite::try_maintain_connection(&connection, None, None, 1).await?;
+        Sqlite::maintain_connection(&connection, None, None, 0).await?;
+        Sqlite::maintain_connection(&connection, None, None, 1).await?;
 
         connection.close().await?;
         remove_root(&root);
@@ -1121,9 +1121,9 @@ mod tests {
         connection
             .write(|connection| {
                 let transaction = connection.transaction()?;
-                Sqlite::try_create_tables(&transaction)?;
+                Sqlite::create_tables(&transaction)?;
                 let upload_id = Uuid::new_v4();
-                Sqlite::try_create_multipart_upload(
+                Sqlite::create_multipart_upload(
                     &transaction,
                     upload_id,
                     "bucket",
@@ -1202,10 +1202,10 @@ mod maintenance_tests {
     fn multipart_touch_keeps_active_upload_out_of_cleanup() -> SqliteResult<()> {
         let mut connection = open_test_connection()?;
         let transaction = connection.transaction()?;
-        Sqlite::try_create_tables(&transaction)?;
+        Sqlite::create_tables(&transaction)?;
 
         let upload_id = Uuid::new_v4();
-        Sqlite::try_create_multipart_upload(
+        Sqlite::create_multipart_upload(
             &transaction,
             upload_id,
             "bucket",
@@ -1228,15 +1228,14 @@ mod maintenance_tests {
             ),
         )?;
 
-        Sqlite::try_touch_multipart_upload(&transaction, upload_id)?;
-        Sqlite::try_delete_expired_multipart_uploads(
+        Sqlite::touch_multipart_upload(&transaction, upload_id)?;
+        Sqlite::delete_expired_multipart_uploads(
             &transaction,
             Some(OffsetDateTime::now_utc().saturating_sub(Duration::hours(1))),
             None,
         )?;
 
-        let state =
-            Sqlite::try_get_multipart_upload_state(&transaction, upload_id, "bucket", "key")?;
+        let state = Sqlite::get_multipart_upload_state(&transaction, upload_id, "bucket", "key")?;
         assert!(state.is_some());
 
         Ok(())
@@ -1246,10 +1245,10 @@ mod maintenance_tests {
     fn multipart_cleanup_keeps_completed_ledger_separate() -> SqliteResult<()> {
         let mut connection = open_test_connection()?;
         let transaction = connection.transaction()?;
-        Sqlite::try_create_tables(&transaction)?;
+        Sqlite::create_tables(&transaction)?;
 
         let upload_id = Uuid::new_v4();
-        Sqlite::try_create_multipart_upload(
+        Sqlite::create_multipart_upload(
             &transaction,
             upload_id,
             "bucket",
@@ -1264,7 +1263,7 @@ mod maintenance_tests {
                 checksum: None,
             },
         )?;
-        Sqlite::try_put_multipart(
+        Sqlite::put_multipart(
             &transaction,
             Multipart {
                 upload_id,
@@ -1286,7 +1285,7 @@ mod maintenance_tests {
 
         let completed_upload_id = Uuid::new_v4();
         let checksum = StoredChecksum::Full(FullObjectChecksum::Crc64Nvme("crc".to_string()));
-        Sqlite::try_put_completed_multipart_upload(
+        Sqlite::put_completed_multipart_upload(
             &transaction,
             CompletedMultipartUploadRecord {
                 upload_id: completed_upload_id,
@@ -1308,14 +1307,14 @@ mod maintenance_tests {
         )?;
 
         let expire_before = OffsetDateTime::now_utc().saturating_sub(Duration::hours(1));
-        Sqlite::try_delete_expired_multipart_uploads(&transaction, Some(expire_before), None)?;
+        Sqlite::delete_expired_multipart_uploads(&transaction, Some(expire_before), None)?;
 
         let upload_state =
-            Sqlite::try_get_multipart_upload_state(&transaction, upload_id, "bucket", "key")?;
+            Sqlite::get_multipart_upload_state(&transaction, upload_id, "bucket", "key")?;
         assert!(upload_state.is_none());
-        assert!(Sqlite::try_get_multiparts(&transaction, upload_id)?.is_empty());
+        assert!(Sqlite::get_multiparts(&transaction, upload_id)?.is_empty());
 
-        let completed = Sqlite::try_get_completed_multipart_upload(
+        let completed = Sqlite::get_completed_multipart_upload(
             &transaction,
             completed_upload_id,
             "bucket",
@@ -1323,8 +1322,8 @@ mod maintenance_tests {
         )?;
         assert!(completed.is_some());
 
-        Sqlite::try_delete_expired_multipart_uploads(&transaction, None, Some(expire_before))?;
-        let completed = Sqlite::try_get_completed_multipart_upload(
+        Sqlite::delete_expired_multipart_uploads(&transaction, None, Some(expire_before))?;
+        let completed = Sqlite::get_completed_multipart_upload(
             &transaction,
             completed_upload_id,
             "bucket",

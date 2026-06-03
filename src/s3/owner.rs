@@ -106,7 +106,7 @@ pub(super) async fn get_bucket_acl(
 ) -> S3Result<S3Response<GetBucketAclOutput>> {
     let GetBucketAclInput { bucket, .. } = req.input;
     sqlite
-        .try_get_connection(&bucket)
+        .get_connection(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
 
@@ -131,20 +131,19 @@ pub(super) async fn get_object_acl(
     } = req.input;
 
     let connection = sqlite
-        .try_get_connection(&bucket)
+        .get_connection(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
         .read(move |connection| {
             let transaction = connection.transaction()?;
             match version_id.as_deref() {
-                Some(version_id) => {
-                    Sqlite::try_get_version_metadata(&transaction, &key, version_id)?
-                        .filter(|metadata| metadata.is_delete_marker.not())
-                        .ok_or(SqliteError::ObjectVersionNotFound)?
+                Some(version_id) => Sqlite::get_version_metadata(&transaction, &key, version_id)?
+                    .filter(|metadata| metadata.is_delete_marker.not())
+                    .ok_or(SqliteError::ObjectVersionNotFound)?,
+                None => {
+                    Sqlite::get_metadata(&transaction, &key)?.ok_or(SqliteError::ObjectNotFound)?
                 }
-                None => Sqlite::try_get_metadata(&transaction, &key)?
-                    .ok_or(SqliteError::ObjectNotFound)?,
             };
             Ok(())
         })
@@ -180,7 +179,7 @@ pub(super) async fn put_bucket_acl(
     } = req.input;
 
     sqlite
-        .try_get_connection(&bucket)
+        .get_connection(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
     sqlite
@@ -225,7 +224,7 @@ pub(super) async fn put_object_acl(
     } = req.input;
 
     let connection = sqlite
-        .try_get_connection(&bucket)
+        .get_connection(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
     sqlite
@@ -235,13 +234,12 @@ pub(super) async fn put_object_acl(
         .read(move |connection| {
             let transaction = connection.transaction()?;
             match version_id.as_deref() {
-                Some(version_id) => {
-                    Sqlite::try_get_version_metadata(&transaction, &key, version_id)?
-                        .filter(|metadata| metadata.is_delete_marker.not())
-                        .ok_or(SqliteError::ObjectVersionNotFound)?
+                Some(version_id) => Sqlite::get_version_metadata(&transaction, &key, version_id)?
+                    .filter(|metadata| metadata.is_delete_marker.not())
+                    .ok_or(SqliteError::ObjectVersionNotFound)?,
+                None => {
+                    Sqlite::get_metadata(&transaction, &key)?.ok_or(SqliteError::ObjectNotFound)?
                 }
-                None => Sqlite::try_get_metadata(&transaction, &key)?
-                    .ok_or(SqliteError::ObjectNotFound)?,
             };
             Ok(())
         })

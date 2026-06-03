@@ -218,7 +218,7 @@ impl Sqlite {
         max_keys: usize,
     ) -> S3Result<KeyListing> {
         let connection = self
-            .try_get_connection(bucket)
+            .get_connection(bucket)
             .await
             .map_err(s3_error_from_sqlite)?;
         let mut keys = Vec::new();
@@ -237,7 +237,7 @@ impl Sqlite {
                 let summaries = connection
                     .read(move |connection| {
                         let transaction = connection.transaction()?;
-                        Self::try_list_objects(
+                        Self::list_objects(
                             &transaction,
                             Some(&prefix),
                             after_key_query.as_deref(),
@@ -327,7 +327,7 @@ impl Sqlite {
         max_keys: usize,
     ) -> S3Result<ObjectVersionListing> {
         let connection = self
-            .try_get_connection(bucket)
+            .get_connection(bucket)
             .await
             .map_err(s3_error_from_sqlite)?;
         let mut versions = Vec::new();
@@ -446,7 +446,7 @@ impl Sqlite {
         connection
             .read(move |connection| {
                 let transaction = connection.transaction()?;
-                Self::try_list_object_versions(
+                Self::list_object_versions(
                     &transaction,
                     Some(&prefix),
                     after_key.as_deref(),

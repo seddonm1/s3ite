@@ -11,7 +11,7 @@ use super::{
 
 impl Sqlite {
     /// Returns the storage sequence for an exact object version when present.
-    pub(super) fn try_find_version_sequence(
+    pub(super) fn find_version_sequence(
         transaction: &Transaction,
         key: &str,
         version_id: &str,
@@ -28,31 +28,31 @@ impl Sqlite {
     }
 
     /// Returns whether the bucket contains any objects.
-    pub(crate) fn try_has_objects(transaction: &Transaction) -> SqliteResult<bool> {
+    pub(crate) fn has_objects(transaction: &Transaction) -> SqliteResult<bool> {
         let mut stmt =
             transaction.prepare_cached("SELECT EXISTS(SELECT 1 FROM object_version);")?;
         Ok(stmt.query_row((), |row| row.get(0))?)
     }
 
     /// Fetches the current visible object body and metadata by key.
-    pub(crate) fn try_get_object(
+    pub(crate) fn get_object(
         transaction: &Transaction,
         key: &str,
     ) -> SqliteResult<Option<KeyValue>> {
-        Self::try_get_object_internal(transaction, key, None, false)
+        Self::get_object_internal(transaction, key, None, false)
     }
 
     /// Fetches an exact visible object body and metadata by key and version ID.
-    pub(crate) fn try_get_object_version(
+    pub(crate) fn get_object_version(
         transaction: &Transaction,
         key: &str,
         version_id: &str,
     ) -> SqliteResult<Option<KeyValue>> {
-        Self::try_get_object_internal(transaction, key, Some(version_id), false)
+        Self::get_object_internal(transaction, key, Some(version_id), false)
     }
 
     /// Fetches an object body and metadata by current or exact version selector.
-    fn try_get_object_internal(
+    fn get_object_internal(
         transaction: &Transaction,
         key: &str,
         version_id: Option<&str>,
@@ -140,24 +140,24 @@ impl Sqlite {
     }
 
     /// Fetches the current object metadata and body rowid by key.
-    pub(crate) fn try_get_current_object_body_reference(
+    pub(crate) fn get_current_object_body_reference(
         transaction: &Transaction,
         key: &str,
     ) -> SqliteResult<Option<ObjectBodyReference>> {
-        Self::try_get_object_body_reference_internal(transaction, key, None, true)
+        Self::get_object_body_reference_internal(transaction, key, None, true)
     }
 
     /// Fetches exact visible object metadata and body rowid by key and version ID.
-    pub(crate) fn try_get_object_version_body_reference(
+    pub(crate) fn get_object_version_body_reference(
         transaction: &Transaction,
         key: &str,
         version_id: &str,
     ) -> SqliteResult<Option<ObjectBodyReference>> {
-        Self::try_get_object_body_reference_internal(transaction, key, Some(version_id), false)
+        Self::get_object_body_reference_internal(transaction, key, Some(version_id), false)
     }
 
     /// Fetches metadata and rowid for opening an object body BLOB.
-    fn try_get_object_body_reference_internal(
+    fn get_object_body_reference_internal(
         transaction: &Transaction,
         key: &str,
         version_id: Option<&str>,
@@ -228,32 +228,32 @@ impl Sqlite {
     }
 
     /// Fetches current visible object metadata by key without reading the body.
-    pub(crate) fn try_get_metadata(
+    pub(crate) fn get_metadata(
         transaction: &Transaction,
         key: &str,
     ) -> SqliteResult<Option<KeyMetadata>> {
-        Self::try_get_metadata_internal(transaction, key, None, false)
+        Self::get_metadata_internal(transaction, key, None, false)
     }
 
     /// Fetches current object metadata including delete markers.
-    pub(crate) fn try_get_current_metadata(
+    pub(crate) fn get_current_metadata(
         transaction: &Transaction,
         key: &str,
     ) -> SqliteResult<Option<KeyMetadata>> {
-        Self::try_get_metadata_internal(transaction, key, None, true)
+        Self::get_metadata_internal(transaction, key, None, true)
     }
 
     /// Fetches exact object metadata, including delete markers, by key and version ID.
-    pub(crate) fn try_get_version_metadata(
+    pub(crate) fn get_version_metadata(
         transaction: &Transaction,
         key: &str,
         version_id: &str,
     ) -> SqliteResult<Option<KeyMetadata>> {
-        Self::try_get_metadata_internal(transaction, key, Some(version_id), true)
+        Self::get_metadata_internal(transaction, key, Some(version_id), true)
     }
 
     /// Fetches metadata by current or exact version selector.
-    fn try_get_metadata_internal(
+    fn get_metadata_internal(
         transaction: &Transaction,
         key: &str,
         version_id: Option<&str>,
@@ -330,7 +330,7 @@ mod tests {
         let mut connection = Connection::open_in_memory()?;
         connection.execute_batch("PRAGMA foreign_keys=true;")?;
         let transaction = connection.transaction()?;
-        Sqlite::try_create_tables(&transaction)?;
+        Sqlite::create_tables(&transaction)?;
         transaction.commit()?;
         Ok(connection)
     }
@@ -409,7 +409,7 @@ mod tests {
             metadata.insert("color".to_string(), "blue".to_string());
             metadata
         };
-        let object = Sqlite::try_get_object(&transaction, "key")?;
+        let object = Sqlite::get_object(&transaction, "key")?;
         assert_eq!(
             object.as_ref().map(|object| object.value.as_deref()),
             Some(Some(&b"body"[..]))
@@ -435,7 +435,7 @@ mod tests {
             )))
         );
 
-        let reference = Sqlite::try_get_current_object_body_reference(&transaction, "key")?;
+        let reference = Sqlite::get_current_object_body_reference(&transaction, "key")?;
         assert_eq!(
             reference.as_ref().map(|reference| reference.sequence),
             Some(1)
@@ -447,7 +447,7 @@ mod tests {
             Some(&expected_metadata)
         );
 
-        let metadata = Sqlite::try_get_metadata(&transaction, "key")?;
+        let metadata = Sqlite::get_metadata(&transaction, "key")?;
         assert_eq!(
             metadata
                 .as_ref()
@@ -465,7 +465,7 @@ mod tests {
         let transaction = connection.transaction()?;
 
         assert!(matches!(
-            Sqlite::try_get_object(&transaction, "key"),
+            Sqlite::get_object(&transaction, "key"),
             Err(SqliteError::ObjectBodyInconsistent)
         ));
         Ok(())
@@ -484,12 +484,12 @@ mod tests {
         )?;
         let transaction = connection.transaction()?;
 
-        assert_conversion_error(&Sqlite::try_get_object(&transaction, "key"));
-        assert_conversion_error(&Sqlite::try_get_current_object_body_reference(
+        assert_conversion_error(&Sqlite::get_object(&transaction, "key"));
+        assert_conversion_error(&Sqlite::get_current_object_body_reference(
             &transaction,
             "key",
         ));
-        assert_conversion_error(&Sqlite::try_get_metadata(&transaction, "key"));
+        assert_conversion_error(&Sqlite::get_metadata(&transaction, "key"));
         Ok(())
     }
 }

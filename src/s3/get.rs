@@ -217,10 +217,10 @@ async fn load_get_object(
         .read_blob(move |transaction| {
             let object = match version_id.as_deref() {
                 Some(version_id) => Some(
-                    Sqlite::try_get_object_version_body_reference(transaction, &key, version_id)?
+                    Sqlite::get_object_version_body_reference(transaction, &key, version_id)?
                         .ok_or(SqliteError::ObjectVersionNotFound)?,
                 ),
-                None => Sqlite::try_get_current_object_body_reference(transaction, &key)?,
+                None => Sqlite::get_current_object_body_reference(transaction, &key)?,
             };
             let Some(object) = object else {
                 return Ok((ObjectBodyReadStart::Missing, None));
@@ -303,11 +303,11 @@ async fn load_head_object(
             let transaction = connection.transaction()?;
             let metadata = match version_id.as_deref() {
                 Some(version_id) => Some(
-                    Sqlite::try_get_version_metadata(&transaction, &key, version_id)?
+                    Sqlite::get_version_metadata(&transaction, &key, version_id)?
                         .filter(|metadata| metadata.is_delete_marker.not())
                         .ok_or(SqliteError::ObjectVersionNotFound)?,
                 ),
-                None => Sqlite::try_get_current_metadata(&transaction, &key)?,
+                None => Sqlite::get_current_metadata(&transaction, &key)?,
             };
             let Some(metadata) = metadata else {
                 return Ok((None, None, 0));
@@ -343,8 +343,8 @@ fn load_completed_part_info(
 ) -> SqliteResult<(Option<CompletedObjectPart>, i32)> {
     match part_number {
         Some(part_number) => Ok((
-            Sqlite::try_get_completed_object_part(transaction, key, version_id, part_number)?,
-            Sqlite::try_count_completed_object_parts(transaction, key, version_id)?,
+            Sqlite::get_completed_object_part(transaction, key, version_id, part_number)?,
+            Sqlite::count_completed_object_parts(transaction, key, version_id)?,
         )),
         None => Ok((None, 0)),
     }
@@ -523,7 +523,7 @@ pub(super) async fn get_object(
     validate_range_request(range.as_ref(), part_number)?;
 
     let connection = sqlite
-        .try_get_connection(&bucket)
+        .get_connection(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
     let read = load_get_object(
@@ -566,7 +566,7 @@ pub(super) async fn head_object(
     validate_range_request(range.as_ref(), part_number)?;
 
     let connection = sqlite
-        .try_get_connection(&bucket)
+        .get_connection(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
     let read = load_head_object(&connection, key, version_id, part_number).await?;
@@ -660,7 +660,7 @@ pub(super) async fn get_object_attributes(
         has_object_attribute(&object_attributes, ObjectAttributes::STORAGE_CLASS);
 
     let connection = sqlite
-        .try_get_connection(&bucket)
+        .get_connection(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
     let (object, parts, total_parts_count) = connection
@@ -668,11 +668,11 @@ pub(super) async fn get_object_attributes(
             let transaction = connection.transaction()?;
             let object = match version_id.as_deref() {
                 Some(version_id) => Some(
-                    Sqlite::try_get_version_metadata(&transaction, &key, version_id)?
+                    Sqlite::get_version_metadata(&transaction, &key, version_id)?
                         .filter(|metadata| metadata.is_delete_marker.not())
                         .ok_or(SqliteError::ObjectVersionNotFound)?,
                 ),
-                None => Sqlite::try_get_current_metadata(&transaction, &key)?,
+                None => Sqlite::get_current_metadata(&transaction, &key)?,
             };
             let Some(object) = object else {
                 return Ok((None, Vec::new(), 0));
@@ -682,9 +682,9 @@ pub(super) async fn get_object_attributes(
             }
 
             let total_parts_count =
-                Sqlite::try_count_completed_object_parts(&transaction, &key, &object.version_id)?;
+                Sqlite::count_completed_object_parts(&transaction, &key, &object.version_id)?;
             let parts = if wants_object_parts && total_parts_count > 0 {
-                Sqlite::try_list_completed_object_parts(
+                Sqlite::list_completed_object_parts(
                     &transaction,
                     &key,
                     &object.version_id,

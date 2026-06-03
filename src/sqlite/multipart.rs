@@ -36,27 +36,8 @@ fn part_checksum_value(checksum: Option<&PartChecksum>) -> Option<&str> {
 }
 
 impl Sqlite {
-    /// Completes a multipart upload and records the completed object.
-    pub(crate) async fn try_complete_multipart_upload(
-        &self,
-        request: MultipartCompletionRequest,
-    ) -> SqliteResult<CompletedMultipartUploadOutcome> {
-        self.validate_mutable_bucket(&request.bucket)?;
-
-        let connection = self.try_get_connection(&request.bucket).await?;
-        connection
-            .write(move |connection| {
-                let transaction = connection.transaction()?;
-                let outcome =
-                    Self::try_complete_multipart_upload_transaction(&transaction, &request)?;
-                transaction.commit()?;
-                Ok(outcome)
-            })
-            .await
-    }
-
     /// Validates and materializes multipart completion inside one transaction.
-    fn try_complete_multipart_upload_transaction(
+    pub(crate) fn complete_multipart_upload_transaction(
         transaction: &Transaction,
         request: &MultipartCompletionRequest,
     ) -> SqliteResult<CompletedMultipartUploadOutcome> {
@@ -64,21 +45,21 @@ impl Sqlite {
             return Err(SqliteError::InvalidMultipartPart);
         }
 
-        let Some(upload_state) = Self::try_get_multipart_upload_state(
+        let Some(upload_state) = Self::get_multipart_upload_state(
             transaction,
             request.upload_id,
             &request.bucket,
             &request.key,
         )?
         else {
-            let completed = Self::try_get_completed_multipart_upload(
+            let completed = Self::get_completed_multipart_upload(
                 transaction,
                 request.upload_id,
                 &request.bucket,
                 &request.key,
             )?
             .ok_or(SqliteError::MultipartUploadNotFound)?;
-            Self::try_validate_multipart_access(
+            Self::validate_multipart_access(
                 completed.access_key.as_ref(),
                 request.access_key.as_deref(),
             )?;
@@ -89,12 +70,12 @@ impl Sqlite {
                 checksum: completed.checksum,
             });
         };
-        Self::try_validate_multipart_access(
+        Self::validate_multipart_access(
             upload_state.access_key.as_ref(),
             request.access_key.as_deref(),
         )?;
 
-        let completed_object = Self::try_materialize_multipart_object(
+        let completed_object = Self::materialize_multipart_object(
             transaction,
             request.upload_id,
             &request.requested_parts,
@@ -103,12 +84,8 @@ impl Sqlite {
             request.default_checksum,
         )?;
 
-        Self::try_check_object_write_conditions(
-            transaction,
-            &request.key,
-            &request.write_conditions,
-        )?;
-        let write_outcome = Self::try_put_object(
+        Self::check_object_write_conditions(transaction, &request.key, &request.write_conditions)?;
+        let write_outcome = Self::put_object(
             transaction,
             KeyValue {
                 key: request.key.clone(),
@@ -129,15 +106,15 @@ impl Sqlite {
                 },
             },
         )?;
-        Self::try_put_completed_object_parts(
+        Self::put_completed_object_parts(
             transaction,
             &request.key,
             &write_outcome.version_id,
             &completed_object.parts,
         )?;
 
-        Self::try_delete_multipart(transaction, request.upload_id)?;
-        Self::try_put_completed_multipart_upload(
+        Self::delete_multipart(transaction, request.upload_id)?;
+        Self::put_completed_multipart_upload(
             transaction,
             CompletedMultipartUploadRecord {
                 upload_id: request.upload_id,
@@ -160,7 +137,7 @@ impl Sqlite {
     }
 
     /// Validates requested multipart parts and concatenates their bytes.
-    fn try_materialize_multipart_object(
+    fn materialize_multipart_object(
         transaction: &Transaction,
         upload_id: Uuid,
         requested_parts: &[MultipartCompletionPart],
@@ -168,17 +145,17 @@ impl Sqlite {
         requested_checksum: &MultipartCompletionChecksum,
         default_checksum: MultipartChecksumConfig,
     ) -> SqliteResult<CompletedMultipartObject> {
-        let parts = Self::try_get_multiparts(transaction, upload_id)?;
+        let parts = Self::get_multiparts(transaction, upload_id)?;
         if parts.len() != requested_parts.len() {
             return Err(SqliteError::InvalidMultipartPart);
         }
 
-        let checksum_config = Self::try_completed_multipart_checksum_config(
+        let checksum_config = Self::completed_multipart_checksum_config(
             upload_checksum,
             requested_checksum,
             default_checksum,
         );
-        let mut value = Vec::with_capacity(Self::try_total_multipart_size(&parts)?);
+        let mut value = Vec::with_capacity(Self::total_multipart_size(&parts)?);
         let mut completed_parts = Vec::with_capacity(parts.len());
         let mut md5_hash = Md5::new();
         let mut full_object_checksum = (checksum_config.checksum_type
@@ -190,7 +167,7 @@ impl Sqlite {
         let require_requested_part_checksums = requested_checksum.has_value();
         for (index, (requested_part, part)) in requested_parts.iter().zip(parts.iter()).enumerate()
         {
-            Self::try_validate_completion_part(
+            Self::validate_completion_part(
                 index,
                 final_part_number,
                 requested_part,
@@ -225,7 +202,7 @@ impl Sqlite {
             requested_parts.len()
         );
         let size = i64::try_from(value.len()).map_err(|_| SqliteError::MultipartObjectTooLarge)?;
-        let checksum = Self::try_completed_multipart_checksum(
+        let checksum = Self::completed_multipart_checksum(
             checksum_config,
             requested_checksum,
             full_object_checksum,
@@ -241,7 +218,7 @@ impl Sqlite {
     }
 
     /// Resolves the final checksum algorithm and type for multipart completion.
-    fn try_completed_multipart_checksum_config(
+    fn completed_multipart_checksum_config(
         upload_checksum: Option<MultipartChecksumConfig>,
         requested_checksum: &MultipartCompletionChecksum,
         default_checksum: MultipartChecksumConfig,
@@ -260,7 +237,7 @@ impl Sqlite {
     }
 
     /// Returns the total body size for uploaded multipart parts.
-    fn try_total_multipart_size(parts: &[Multipart]) -> SqliteResult<usize> {
+    fn total_multipart_size(parts: &[Multipart]) -> SqliteResult<usize> {
         parts.iter().try_fold(0usize, |total, part| {
             let part_size =
                 usize::try_from(part.size).map_err(|_| SqliteError::InvalidMultipartPart)?;
@@ -271,7 +248,7 @@ impl Sqlite {
     }
 
     /// Validates one requested completion part against the stored part row.
-    fn try_validate_completion_part(
+    fn validate_completion_part(
         index: usize,
         final_part_number: usize,
         requested_part: &MultipartCompletionPart,
@@ -309,7 +286,7 @@ impl Sqlite {
     }
 
     /// Computes and validates the final checksum for a completed multipart object.
-    fn try_completed_multipart_checksum(
+    fn completed_multipart_checksum(
         checksum_config: MultipartChecksumConfig,
         requested_checksum: &MultipartCompletionChecksum,
         full_object_checksum: Option<ChecksumAccumulator>,
@@ -346,7 +323,7 @@ impl Sqlite {
         Ok(checksum)
     }
     /// Creates multipart upload state for an upload ID.
-    pub(crate) fn try_create_multipart_upload(
+    pub(crate) fn create_multipart_upload(
         transaction: &Transaction,
         upload_id: Uuid,
         bucket: &str,
@@ -398,7 +375,7 @@ impl Sqlite {
     }
 
     /// Fetches multipart upload state for validation and completion.
-    pub(crate) fn try_get_multipart_upload_state(
+    pub(crate) fn get_multipart_upload_state(
         transaction: &Transaction,
         upload_id: Uuid,
         bucket: &str,
@@ -450,7 +427,7 @@ impl Sqlite {
     }
 
     /// Refreshes multipart upload activity after a successful part upload.
-    pub(crate) fn try_touch_multipart_upload(
+    pub(crate) fn touch_multipart_upload(
         transaction: &Transaction,
         upload_id: Uuid,
     ) -> SqliteResult<usize> {
@@ -464,7 +441,7 @@ impl Sqlite {
     }
 
     /// Records a completed multipart upload for idempotent retries.
-    pub(crate) fn try_put_completed_multipart_upload(
+    pub(crate) fn put_completed_multipart_upload(
         transaction: &Transaction,
         record: CompletedMultipartUploadRecord<'_>,
     ) -> SqliteResult<usize> {
@@ -504,7 +481,7 @@ impl Sqlite {
     }
 
     /// Fetches completed multipart upload state by upload ID.
-    pub(crate) fn try_get_completed_multipart_upload(
+    pub(crate) fn get_completed_multipart_upload(
         transaction: &Transaction,
         upload_id: Uuid,
         bucket: &str,
@@ -538,7 +515,7 @@ impl Sqlite {
     }
 
     /// Inserts or replaces a multipart upload part.
-    pub(crate) fn try_put_multipart(
+    pub(crate) fn put_multipart(
         transaction: &Transaction,
         multipart: Multipart,
     ) -> SqliteResult<usize> {
@@ -575,7 +552,7 @@ impl Sqlite {
     }
 
     /// Lists multipart upload part metadata ordered by part number.
-    pub(crate) fn try_list_multipart(
+    pub(crate) fn list_multipart(
         transaction: &Transaction,
         upload_id: Uuid,
         after_part_number: i32,
@@ -616,7 +593,7 @@ impl Sqlite {
     }
 
     /// Lists active multipart uploads ordered by key and upload ID.
-    pub(crate) fn try_list_multipart_uploads(
+    pub(crate) fn list_multipart_uploads(
         transaction: &Transaction,
         prefix: Option<&str>,
         after_key: Option<&str>,
@@ -693,7 +670,7 @@ impl Sqlite {
     }
 
     /// Fetches one completed multipart object part boundary.
-    pub(crate) fn try_get_completed_object_part(
+    pub(crate) fn get_completed_object_part(
         transaction: &Transaction,
         key: &str,
         version_id: &str,
@@ -727,7 +704,7 @@ impl Sqlite {
     }
 
     /// Lists completed multipart object part boundaries ordered by part number.
-    pub(crate) fn try_list_completed_object_parts(
+    pub(crate) fn list_completed_object_parts(
         transaction: &Transaction,
         key: &str,
         version_id: &str,
@@ -767,7 +744,7 @@ impl Sqlite {
     }
 
     /// Counts recorded completed multipart object part boundaries.
-    pub(crate) fn try_count_completed_object_parts(
+    pub(crate) fn count_completed_object_parts(
         transaction: &Transaction,
         key: &str,
         version_id: &str,
@@ -780,7 +757,7 @@ impl Sqlite {
     }
 
     /// Inserts completed multipart object part boundaries.
-    fn try_put_completed_object_parts(
+    fn put_completed_object_parts(
         transaction: &Transaction,
         key: &str,
         version_id: &str,
@@ -820,7 +797,7 @@ impl Sqlite {
     }
 
     /// Fetches multipart upload parts with bodies ordered by part number.
-    pub(crate) fn try_get_multiparts(
+    pub(crate) fn get_multiparts(
         transaction: &Transaction,
         upload_id: Uuid,
     ) -> SqliteResult<Vec<Multipart>> {
@@ -859,7 +836,7 @@ impl Sqlite {
     }
 
     /// Deletes multipart upload state and cascading parts.
-    pub(crate) fn try_delete_multipart(
+    pub(crate) fn delete_multipart(
         transaction: &Transaction,
         upload_id: Uuid,
     ) -> SqliteResult<usize> {
@@ -872,7 +849,7 @@ impl Sqlite {
     }
 
     /// Validates that stored multipart state belongs to a request access key.
-    pub(crate) fn try_validate_multipart_access(
+    pub(crate) fn validate_multipart_access(
         stored_access_key: Option<&String>,
         request_access_key: Option<&str>,
     ) -> SqliteResult<()> {
@@ -906,7 +883,7 @@ mod tests {
         let mut connection = Connection::open_in_memory()?;
         connection.execute_batch("PRAGMA foreign_keys=true;")?;
         let transaction = connection.transaction()?;
-        Sqlite::try_create_tables(&transaction)?;
+        Sqlite::create_tables(&transaction)?;
         transaction.commit()?;
         Ok(connection)
     }
@@ -949,7 +926,7 @@ mod tests {
         let request = completion_request(Uuid::new_v4(), Vec::new());
 
         assert!(matches!(
-            Sqlite::try_complete_multipart_upload_transaction(&transaction, &request),
+            Sqlite::complete_multipart_upload_transaction(&transaction, &request),
             Err(SqliteError::InvalidMultipartPart)
         ));
         Ok(())
@@ -961,7 +938,7 @@ mod tests {
         let transaction = connection.transaction()?;
         let upload_id = Uuid::new_v4();
         let checksum = StoredChecksum::Full(FullObjectChecksum::Crc64Nvme("crc".to_string()));
-        Sqlite::try_put_completed_multipart_upload(
+        Sqlite::put_completed_multipart_upload(
             &transaction,
             CompletedMultipartUploadRecord {
                 upload_id,
@@ -975,7 +952,7 @@ mod tests {
             },
         )?;
 
-        let outcome = Sqlite::try_complete_multipart_upload_transaction(
+        let outcome = Sqlite::complete_multipart_upload_transaction(
             &transaction,
             &completion_request(
                 upload_id,
@@ -1000,7 +977,7 @@ mod tests {
         let upload_id = Uuid::new_v4();
         let mut metadata = HashMap::new();
         metadata.insert("color".to_string(), "blue".to_string());
-        Sqlite::try_create_multipart_upload(
+        Sqlite::create_multipart_upload(
             &transaction,
             upload_id,
             "bucket",
@@ -1016,7 +993,7 @@ mod tests {
         )?;
 
         assert!(matches!(
-            Sqlite::try_get_multipart_upload_state(&transaction, upload_id, "bucket", "key"),
+            Sqlite::get_multipart_upload_state(&transaction, upload_id, "bucket", "key"),
             Err(SqliteError::Rusqlite(
                 rusqlite::Error::FromSqlConversionFailure(..)
             ))
@@ -1036,7 +1013,7 @@ mod tests {
             (alpha_second, "alpha"),
             (beta, "beta"),
         ] {
-            Sqlite::try_create_multipart_upload(
+            Sqlite::create_multipart_upload(
                 &transaction,
                 upload_id,
                 "bucket",
@@ -1045,13 +1022,8 @@ mod tests {
             )?;
         }
 
-        let prefix_after_key = Sqlite::try_list_multipart_uploads(
-            &transaction,
-            Some("alpha"),
-            Some("alpha"),
-            None,
-            10,
-        )?;
+        let prefix_after_key =
+            Sqlite::list_multipart_uploads(&transaction, Some("alpha"), Some("alpha"), None, 10)?;
         assert_eq!(
             prefix_after_key
                 .iter()
@@ -1060,7 +1032,7 @@ mod tests {
             vec!["beta"]
         );
 
-        let after_key_and_upload = Sqlite::try_list_multipart_uploads(
+        let after_key_and_upload = Sqlite::list_multipart_uploads(
             &transaction,
             None,
             Some("alpha"),
@@ -1076,7 +1048,7 @@ mod tests {
         );
 
         let after_key_only =
-            Sqlite::try_list_multipart_uploads(&transaction, None, Some("alpha"), None, 10)?;
+            Sqlite::list_multipart_uploads(&transaction, None, Some("alpha"), None, 10)?;
         assert_eq!(
             after_key_only
                 .iter()
@@ -1092,7 +1064,7 @@ mod tests {
         let mut connection = open_schema()?;
         let transaction = connection.transaction()?;
         assert!(matches!(
-            Sqlite::try_put_completed_object_parts(
+            Sqlite::put_completed_object_parts(
                 &transaction,
                 "key",
                 "version",
@@ -1109,7 +1081,7 @@ mod tests {
             ))
         ));
         assert!(matches!(
-            Sqlite::try_put_completed_object_parts(
+            Sqlite::put_completed_object_parts(
                 &transaction,
                 "key",
                 "version",
@@ -1131,13 +1103,13 @@ mod tests {
     #[test]
     fn multipart_access_requires_matching_owner_key() {
         let stored = "owner".to_string();
-        assert!(Sqlite::try_validate_multipart_access(Some(&stored), Some("owner")).is_ok());
+        assert!(Sqlite::validate_multipart_access(Some(&stored), Some("owner")).is_ok());
         assert!(matches!(
-            Sqlite::try_validate_multipart_access(Some(&stored), Some("other")),
+            Sqlite::validate_multipart_access(Some(&stored), Some("other")),
             Err(SqliteError::MultipartAccessDenied)
         ));
         assert!(matches!(
-            Sqlite::try_validate_multipart_access(None, Some("owner")),
+            Sqlite::validate_multipart_access(None, Some("owner")),
             Err(SqliteError::MultipartAccessDenied)
         ));
     }

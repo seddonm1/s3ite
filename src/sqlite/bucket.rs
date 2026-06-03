@@ -14,7 +14,7 @@ use super::{BucketConnection, BucketVersioningState, Sqlite, SqliteError, Sqlite
 
 impl Sqlite {
     /// Opens all existing bucket databases under the configured root.
-    pub(super) async fn try_open_configured_buckets(
+    pub(super) async fn open_configured_buckets(
         root: &Path,
         config: &crate::Config,
     ) -> SqliteResult<HashMap<String, Arc<BucketConnection>>> {
@@ -43,7 +43,7 @@ impl Sqlite {
             };
 
             let connection = BucketConnection::open(path, config, &bucket).await?;
-            Self::try_prepare_existing_bucket(&connection, config, &bucket).await?;
+            Self::prepare_existing_bucket(&connection, config, &bucket).await?;
             buckets.insert(bucket, Arc::new(connection));
         }
 
@@ -62,10 +62,7 @@ impl Sqlite {
     }
 
     /// Returns an open database connection for a bucket.
-    pub(crate) async fn try_get_connection(
-        &self,
-        bucket: &str,
-    ) -> SqliteResult<Arc<BucketConnection>> {
+    pub(crate) async fn get_connection(&self, bucket: &str) -> SqliteResult<Arc<BucketConnection>> {
         Ok(self
             .buckets
             .read()
@@ -76,7 +73,7 @@ impl Sqlite {
     }
 
     /// Creates or opens a bucket database and registers its connection.
-    pub(crate) async fn try_create_bucket(&self, bucket: &str) -> SqliteResult<()> {
+    pub(crate) async fn create_bucket(&self, bucket: &str) -> SqliteResult<()> {
         self.validate_mutable_bucket(bucket)?;
 
         if self.buckets.read().await.contains_key(bucket) {
@@ -93,7 +90,7 @@ impl Sqlite {
                 connection.execute_batch(&config.to_sql(None))?;
 
                 let transaction = connection.transaction()?;
-                Self::try_create_tables(&transaction)?;
+                Self::create_tables(&transaction)?;
                 Ok(transaction.commit()?)
             })
             .await?;
@@ -116,7 +113,7 @@ impl Sqlite {
     }
 
     /// Returns the current bucket versioning state.
-    pub(crate) fn try_get_bucket_versioning_state(
+    pub(crate) fn get_bucket_versioning_state(
         transaction: &Transaction,
     ) -> SqliteResult<BucketVersioningState> {
         let mut stmt = transaction
@@ -129,7 +126,7 @@ impl Sqlite {
     }
 
     /// Updates the bucket versioning state.
-    pub(crate) fn try_put_bucket_versioning_state(
+    pub(crate) fn put_bucket_versioning_state(
         transaction: &Transaction,
         state: BucketVersioningState,
     ) -> SqliteResult<usize> {
@@ -216,7 +213,7 @@ mod tests {
         fs::write(root.join("ignored.txt"), b"not a bucket")?;
         fs::File::create(root.join("bucket.sqlite3"))?;
 
-        let buckets = Sqlite::try_open_configured_buckets(&root, &Config::default()).await?;
+        let buckets = Sqlite::open_configured_buckets(&root, &Config::default()).await?;
         assert_eq!(buckets.len(), 1);
         assert!(buckets.contains_key("bucket"));
         for connection in buckets.values() {
