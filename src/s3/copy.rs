@@ -292,3 +292,336 @@ pub(super) async fn copy_object(
     };
     Ok(S3Response::new(output))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::{
+        checksum::{ChecksumAlgorithmKind, FullObjectChecksum},
+        sqlite::KeyMetadata,
+    };
+    use s3s::dto::{ChecksumAlgorithm, ETagCondition, ObjectCannedACL, Timestamp};
+
+    fn assert_error_code<T>(result: S3Result<T>, code: &S3ErrorCode) {
+        match result {
+            Ok(_) => panic!("expected {code:?}"),
+            Err(err) => assert_eq!(err.code(), code),
+        }
+    }
+
+    fn source(bucket: &str, key: &str, version_id: Option<&str>) -> CopySource {
+        CopySource::Bucket {
+            bucket: bucket.into(),
+            key: key.into(),
+            version_id: version_id.map(Into::into),
+        }
+    }
+
+    fn access_point_source() -> CopySource {
+        CopySource::AccessPoint {
+            region: "us-east-1".into(),
+            account_id: "123456789012".into(),
+            access_point_name: "ap".into(),
+            key: "key".into(),
+        }
+    }
+
+    fn copy_input() -> CopyObjectInput {
+        match CopyObjectInput::builder()
+            .bucket("target-bucket".to_string())
+            .key("target-key".to_string())
+            .copy_source(source(
+                "source-bucket",
+                "source-key",
+                Some("source-version"),
+            ))
+            .build()
+        {
+            Ok(input) => input,
+            Err(err) => panic!("unexpected build error: {err:?}"),
+        }
+    }
+
+    fn object(value: Vec<u8>, checksum: Option<StoredChecksum>) -> KeyValue {
+        KeyValue {
+            key: "source-key".to_string(),
+            value: Some(value),
+            key_metadata: KeyMetadata {
+                version_id: "source-version".to_string(),
+                size: 7,
+                metadata: Some(HashMap::from([("old".to_string(), "value".to_string())])),
+                content_type: Some("text/plain".to_string()),
+                content_encoding: Some("gzip".to_string()),
+                cache_control: Some("old-cache".to_string()),
+                expires: Some(OffsetDateTime::UNIX_EPOCH),
+                last_modified: OffsetDateTime::UNIX_EPOCH,
+                md5: Some("md5".to_string()),
+                checksum,
+                is_latest: true,
+                is_delete_marker: false,
+            },
+        }
+    }
+
+    #[test]
+    fn parses_copy_object_request_defaults() {
+        let request = match parse_copy_object_request(copy_input()) {
+            Ok(request) => request,
+            Err(err) => panic!("unexpected error: {err:?}"),
+        };
+
+        assert_eq!(request.target_bucket, "target-bucket");
+        assert_eq!(request.target_key, "target-key");
+        assert_eq!(request.source_bucket, "source-bucket");
+        assert_eq!(request.source_key, "source-key");
+        assert_eq!(request.source_version_id.as_deref(), Some("source-version"));
+        assert!(!request.replace_metadata);
+        assert!(request.metadata.is_none());
+        assert!(request.content_type.is_none());
+        assert!(request.content_encoding.is_none());
+        assert!(request.cache_control.is_none());
+        assert!(request.expires.is_none());
+        assert!(request.target_checksum_kind.is_none());
+        assert!(request.source_conditions.etag_matches.is_none());
+        assert!(request.source_conditions.modified_since.is_none());
+        assert!(request.source_conditions.etag_none_matches.is_none());
+        assert!(request.source_conditions.unmodified_since.is_none());
+    }
+
+    #[test]
+    fn parses_copy_object_replace_metadata_and_conditions() {
+        let expires = Timestamp::from(OffsetDateTime::UNIX_EPOCH);
+        let input = match CopyObjectInput::builder()
+            .bucket("target-bucket".to_string())
+            .key("target-key".to_string())
+            .copy_source(source("source-bucket", "source-key", None))
+            .metadata_directive(Some(MetadataDirective::from_static(
+                MetadataDirective::REPLACE,
+            )))
+            .metadata(Some(HashMap::from([(
+                "new".to_string(),
+                "value".to_string(),
+            )])))
+            .content_type(Some("application/json".to_string()))
+            .content_encoding(Some("gzip, aws-chunked".to_string()))
+            .cache_control(Some("max-age=60".to_string()))
+            .expires(Some(expires))
+            .checksum_algorithm(Some(ChecksumAlgorithm::from_static(
+                ChecksumAlgorithm::SHA256,
+            )))
+            .copy_source_if_match(Some(ETagCondition::ETag(ETag::Strong("md5".to_string()))))
+            .copy_source_if_none_match(Some(ETagCondition::ETag(ETag::Weak("other".to_string()))))
+            .copy_source_if_modified_since(Some(Timestamp::from(OffsetDateTime::UNIX_EPOCH)))
+            .copy_source_if_unmodified_since(Some(Timestamp::from(OffsetDateTime::UNIX_EPOCH)))
+            .build()
+        {
+            Ok(input) => input,
+            Err(err) => panic!("unexpected build error: {err:?}"),
+        };
+
+        let request = match parse_copy_object_request(input) {
+            Ok(request) => request,
+            Err(err) => panic!("unexpected error: {err:?}"),
+        };
+
+        assert!(request.replace_metadata);
+        assert_eq!(
+            request
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("new")),
+            Some(&"value".to_string())
+        );
+        assert_eq!(request.content_type.as_deref(), Some("application/json"));
+        assert_eq!(request.content_encoding.as_deref(), Some("gzip"));
+        assert_eq!(request.cache_control.as_deref(), Some("max-age=60"));
+        assert_eq!(request.expires, Some(OffsetDateTime::UNIX_EPOCH));
+        assert_eq!(
+            request.target_checksum_kind,
+            Some(ChecksumAlgorithmKind::Sha256)
+        );
+        assert!(matches!(
+            request.source_conditions.etag_matches,
+            Some(ETagCondition::ETag(ETag::Strong(value))) if value == "md5"
+        ));
+        assert!(request.source_conditions.modified_since.is_some());
+        assert!(matches!(
+            request.source_conditions.etag_none_matches,
+            Some(ETagCondition::ETag(ETag::Weak(value))) if value == "other"
+        ));
+        assert!(request.source_conditions.unmodified_since.is_some());
+    }
+
+    #[test]
+    fn rejects_unsupported_copy_inputs() {
+        let access_point = match CopyObjectInput::builder()
+            .bucket("target-bucket".to_string())
+            .key("target-key".to_string())
+            .copy_source(access_point_source())
+            .build()
+        {
+            Ok(input) => input,
+            Err(err) => panic!("unexpected build error: {err:?}"),
+        };
+        assert_error_code(
+            parse_copy_object_request(access_point),
+            &S3ErrorCode::NotImplemented,
+        );
+
+        let public_acl = match CopyObjectInput::builder()
+            .bucket("target-bucket".to_string())
+            .key("target-key".to_string())
+            .copy_source(source("source-bucket", "source-key", None))
+            .acl(Some(ObjectCannedACL::from_static(
+                ObjectCannedACL::PUBLIC_READ,
+            )))
+            .build()
+        {
+            Ok(input) => input,
+            Err(err) => panic!("unexpected build error: {err:?}"),
+        };
+        assert_error_code(
+            parse_copy_object_request(public_acl),
+            &S3ErrorCode::AccessControlListNotSupported,
+        );
+
+        let grant_header = match CopyObjectInput::builder()
+            .bucket("target-bucket".to_string())
+            .key("target-key".to_string())
+            .copy_source(source("source-bucket", "source-key", None))
+            .grant_read(Some("id=owner".to_string()))
+            .build()
+        {
+            Ok(input) => input,
+            Err(err) => panic!("unexpected build error: {err:?}"),
+        };
+        assert_error_code(
+            parse_copy_object_request(grant_header),
+            &S3ErrorCode::AccessControlListNotSupported,
+        );
+    }
+
+    #[test]
+    fn validates_copy_target_collisions() {
+        let mut request = match parse_copy_object_request(copy_input()) {
+            Ok(request) => request,
+            Err(err) => panic!("unexpected error: {err:?}"),
+        };
+
+        assert!(validate_copy_target(&request).is_ok());
+        request.source_bucket.clone_from(&request.target_bucket);
+        request.source_key.clone_from(&request.target_key);
+        assert_error_code(validate_copy_target(&request), &S3ErrorCode::InvalidRequest);
+
+        request.replace_metadata = true;
+        assert!(validate_copy_target(&request).is_ok());
+    }
+
+    #[test]
+    fn prepares_copied_object_with_inherited_metadata_and_source_checksum_algorithm() {
+        let mut request = match parse_copy_object_request(copy_input()) {
+            Ok(request) => request,
+            Err(err) => panic!("unexpected error: {err:?}"),
+        };
+        request.target_key = "target-key".to_string();
+        let source_checksum = StoredChecksum::Full(FullObjectChecksum::Sha256("old".to_string()));
+
+        let (copied, checksum) = match prepare_copied_object(
+            object(b"payload".to_vec(), Some(source_checksum)),
+            &request,
+        ) {
+            Ok(result) => result,
+            Err(err) => panic!("unexpected error: {err:?}"),
+        };
+
+        assert_eq!(copied.key, "target-key");
+        assert_eq!(
+            copied
+                .key_metadata
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("old")),
+            Some(&"value".to_string())
+        );
+        assert_eq!(
+            copied.key_metadata.content_type.as_deref(),
+            Some("text/plain")
+        );
+        assert_eq!(checksum.algorithm(), ChecksumAlgorithmKind::Sha256);
+        assert_eq!(copied.key_metadata.checksum.as_ref(), Some(&checksum));
+    }
+
+    #[test]
+    fn prepares_copied_object_with_replaced_metadata_and_default_checksum() {
+        let input = match CopyObjectInput::builder()
+            .bucket("target-bucket".to_string())
+            .key("target-key".to_string())
+            .copy_source(source("source-bucket", "source-key", None))
+            .metadata_directive(Some(MetadataDirective::from_static(
+                MetadataDirective::REPLACE,
+            )))
+            .metadata(Some(HashMap::from([(
+                "new".to_string(),
+                "value".to_string(),
+            )])))
+            .content_type(Some("application/json".to_string()))
+            .content_encoding(Some("gzip, aws-chunked".to_string()))
+            .cache_control(Some("max-age=60".to_string()))
+            .build()
+        {
+            Ok(input) => input,
+            Err(err) => panic!("unexpected build error: {err:?}"),
+        };
+        let request = match parse_copy_object_request(input) {
+            Ok(request) => request,
+            Err(err) => panic!("unexpected error: {err:?}"),
+        };
+
+        let (copied, checksum) =
+            match prepare_copied_object(object(b"payload".to_vec(), None), &request) {
+                Ok(result) => result,
+                Err(err) => panic!("unexpected error: {err:?}"),
+            };
+
+        assert_eq!(copied.key, "target-key");
+        assert_eq!(
+            copied
+                .key_metadata
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("new")),
+            Some(&"value".to_string())
+        );
+        assert_eq!(
+            copied.key_metadata.content_type.as_deref(),
+            Some("application/json")
+        );
+        assert_eq!(
+            copied.key_metadata.content_encoding.as_deref(),
+            Some("gzip")
+        );
+        assert_eq!(
+            copied.key_metadata.cache_control.as_deref(),
+            Some("max-age=60")
+        );
+        assert_eq!(checksum.algorithm(), ChecksumAlgorithmKind::Crc64Nvme);
+        assert_eq!(copied.key_metadata.checksum.as_ref(), Some(&checksum));
+    }
+
+    #[test]
+    fn builds_copy_object_result_checksum_fields() {
+        let checksum = StoredChecksum::Full(FullObjectChecksum::Crc64Nvme("crc64".to_string()));
+        let result = copy_object_result(
+            &checksum,
+            Some("md5".to_string()),
+            OffsetDateTime::UNIX_EPOCH,
+        );
+
+        assert_eq!(result.e_tag, Some(ETag::Strong("md5".to_string())));
+        assert_eq!(result.checksum_crc64nvme.as_deref(), Some("crc64"));
+        assert!(result.checksum_sha256.is_none());
+        assert!(result.checksum_type.is_some());
+        assert!(result.last_modified.is_some());
+    }
+}

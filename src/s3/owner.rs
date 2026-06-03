@@ -265,3 +265,147 @@ pub(super) async fn put_object_acl(
 
     Ok(S3Response::new(PutObjectAclOutput::default()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_error_code<T>(result: S3Result<T>, code: &S3ErrorCode) {
+        match result {
+            Ok(_) => panic!("expected {code:?}"),
+            Err(err) => assert_eq!(err.code(), code),
+        }
+    }
+
+    #[test]
+    fn returns_canonical_owner_and_full_control_grant() {
+        let expected_owner = owner();
+        assert_eq!(
+            expected_owner.display_name.as_deref(),
+            Some(OWNER_DISPLAY_NAME)
+        );
+        assert_eq!(expected_owner.id.as_deref(), Some(OWNER_ID));
+
+        let grant = owner_full_control_grant();
+        let Some(grantee) = grant.grantee else {
+            panic!("expected grantee");
+        };
+        assert_eq!(grantee.display_name.as_deref(), Some(OWNER_DISPLAY_NAME));
+        assert_eq!(grantee.id.as_deref(), Some(OWNER_ID));
+        assert_eq!(grantee.type_.as_str(), Type::CANONICAL_USER);
+        assert_eq!(
+            grant.permission.as_ref().map(Permission::as_str),
+            Some(Permission::FULL_CONTROL)
+        );
+    }
+
+    #[test]
+    fn validates_owner_only_bucket_acls() {
+        assert!(
+            validate_bucket_acl(&BucketAclRequest {
+                acl: None,
+                has_access_control_policy: false,
+                grant_header_count: 0,
+            })
+            .is_ok()
+        );
+
+        let private = BucketCannedACL::from_static(BucketCannedACL::PRIVATE);
+        assert!(
+            validate_bucket_acl(&BucketAclRequest {
+                acl: Some(&private),
+                has_access_control_policy: false,
+                grant_header_count: 0,
+            })
+            .is_ok()
+        );
+
+        let public = BucketCannedACL::from_static(BucketCannedACL::PUBLIC_READ);
+        assert_error_code(
+            validate_bucket_acl(&BucketAclRequest {
+                acl: Some(&public),
+                has_access_control_policy: false,
+                grant_header_count: 0,
+            }),
+            &S3ErrorCode::AccessControlListNotSupported,
+        );
+        assert_error_code(
+            validate_bucket_acl(&BucketAclRequest {
+                acl: None,
+                has_access_control_policy: true,
+                grant_header_count: 0,
+            }),
+            &S3ErrorCode::AccessControlListNotSupported,
+        );
+        assert_error_code(
+            validate_bucket_acl(&BucketAclRequest {
+                acl: None,
+                has_access_control_policy: false,
+                grant_header_count: 1,
+            }),
+            &S3ErrorCode::AccessControlListNotSupported,
+        );
+    }
+
+    #[test]
+    fn validates_owner_only_object_acls() {
+        assert!(
+            validate_object_acl(&ObjectAclRequest {
+                acl: None,
+                has_access_control_policy: false,
+                grant_header_count: 0,
+            })
+            .is_ok()
+        );
+
+        for canned_acl in [
+            ObjectCannedACL::PRIVATE,
+            ObjectCannedACL::BUCKET_OWNER_FULL_CONTROL,
+            ObjectCannedACL::BUCKET_OWNER_READ,
+        ] {
+            let acl = ObjectCannedACL::from_static(canned_acl);
+            assert!(
+                validate_object_acl(&ObjectAclRequest {
+                    acl: Some(&acl),
+                    has_access_control_policy: false,
+                    grant_header_count: 0,
+                })
+                .is_ok(),
+                "{canned_acl}"
+            );
+        }
+
+        for canned_acl in [
+            ObjectCannedACL::PUBLIC_READ,
+            ObjectCannedACL::AUTHENTICATED_READ,
+            ObjectCannedACL::AWS_EXEC_READ,
+        ] {
+            let acl = ObjectCannedACL::from_static(canned_acl);
+            assert_error_code(
+                validate_object_acl(&ObjectAclRequest {
+                    acl: Some(&acl),
+                    has_access_control_policy: false,
+                    grant_header_count: 0,
+                }),
+                &S3ErrorCode::AccessControlListNotSupported,
+            );
+        }
+
+        assert_error_code(
+            validate_object_acl(&ObjectAclRequest {
+                acl: None,
+                has_access_control_policy: true,
+                grant_header_count: 0,
+            }),
+            &S3ErrorCode::AccessControlListNotSupported,
+        );
+        assert_error_code(
+            validate_object_acl(&ObjectAclRequest {
+                acl: None,
+                has_access_control_policy: false,
+                grant_header_count: 1,
+            }),
+            &S3ErrorCode::AccessControlListNotSupported,
+        );
+    }
+}

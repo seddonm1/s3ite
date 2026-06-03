@@ -729,3 +729,247 @@ pub(super) async fn get_object_attributes(
     };
     Ok(S3Response::new(output))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::checksum::{FullObjectChecksum, PartChecksum};
+
+    fn assert_error_code<T>(result: S3Result<T>, code: &S3ErrorCode) {
+        match result {
+            Ok(_) => panic!("expected {code:?}"),
+            Err(err) => assert_eq!(err.code(), code),
+        }
+    }
+
+    fn assert_s3_ok<T>(result: S3Result<T>, expected: &T)
+    where
+        T: PartialEq + std::fmt::Debug,
+    {
+        match result {
+            Ok(value) => assert_eq!(&value, expected),
+            Err(err) => panic!("unexpected error: {err:?}"),
+        }
+    }
+
+    fn assert_sqlite_ok<T>(result: SqliteResult<T>, expected: &T)
+    where
+        T: PartialEq + std::fmt::Debug,
+    {
+        match result {
+            Ok(value) => assert_eq!(&value, expected),
+            Err(err) => panic!("unexpected error: {err:?}"),
+        }
+    }
+
+    fn range(header: &str) -> S3Range {
+        match S3Range::parse(header) {
+            Ok(range) => range,
+            Err(err) => panic!("unexpected range parse error: {err:?}"),
+        }
+    }
+
+    fn completed_part(part_number: i32, start: i64, size: i64) -> CompletedObjectPart {
+        CompletedObjectPart {
+            part_number,
+            start,
+            size,
+            md5: Some("md5".to_string()),
+            checksum: Some(PartChecksum::Sha256("part-sha256".to_string())),
+        }
+    }
+
+    fn object_checksum() -> StoredChecksum {
+        StoredChecksum::Full(FullObjectChecksum::Crc64Nvme("object-crc64".to_string()))
+    }
+
+    #[test]
+    fn hides_null_version_ids() {
+        assert_eq!(visible_version_id("null".to_string()), None);
+        assert_eq!(
+            visible_version_id("version-1".to_string()),
+            Some("version-1".to_string())
+        );
+    }
+
+    #[test]
+    fn matches_requested_object_attributes_by_exact_trimmed_token() {
+        let attributes = vec![
+            ObjectAttributes::from("Checksum, ObjectParts".to_string()),
+            ObjectAttributes::from_static(ObjectAttributes::OBJECT_SIZE),
+        ];
+
+        assert!(has_object_attribute(
+            &attributes,
+            ObjectAttributes::CHECKSUM
+        ));
+        assert!(has_object_attribute(
+            &attributes,
+            ObjectAttributes::OBJECT_PARTS
+        ));
+        assert!(has_object_attribute(
+            &attributes,
+            ObjectAttributes::OBJECT_SIZE
+        ));
+        assert!(!has_object_attribute(&attributes, ObjectAttributes::ETAG));
+        assert!(!has_object_attribute(&attributes, "Object"));
+    }
+
+    #[test]
+    fn validates_range_and_part_number_inputs() {
+        let parsed_range = range("bytes=1-3");
+
+        assert!(validate_range_request(None, None).is_ok());
+        assert!(validate_range_request(Some(&parsed_range), None).is_ok());
+        assert!(validate_range_request(None, Some(1)).is_ok());
+        assert_error_code(
+            validate_range_request(Some(&parsed_range), Some(1)),
+            &S3ErrorCode::InvalidRequest,
+        );
+        assert_error_code(
+            validate_range_request(None, Some(0)),
+            &S3ErrorCode::InvalidArgument,
+        );
+    }
+
+    #[test]
+    fn resolves_requested_object_ranges() {
+        assert_s3_ok(requested_object_range(None, None, None, 0, 10), &(0..10));
+        assert_s3_ok(
+            requested_object_range(None, Some(&range("bytes=2-5")), None, 0, 10),
+            &(2..6),
+        );
+        assert_s3_ok(
+            requested_object_range(None, Some(&range("bytes=3-")), None, 0, 10),
+            &(3..10),
+        );
+        assert_s3_ok(
+            requested_object_range(None, Some(&range("bytes=-4")), None, 0, 10),
+            &(6..10),
+        );
+        assert_error_code(
+            requested_object_range(None, Some(&range("bytes=20-30")), None, 0, 10),
+            &S3ErrorCode::InvalidRange,
+        );
+        assert_error_code(
+            requested_object_range(None, Some(&range("bytes=-0")), None, 0, 10),
+            &S3ErrorCode::InvalidRange,
+        );
+
+        let part = completed_part(2, 4, 3);
+        assert_s3_ok(
+            requested_object_range(Some(2), None, Some(&part), 2, 10),
+            &(4..7),
+        );
+        assert_s3_ok(requested_object_range(Some(1), None, None, 0, 10), &(0..10));
+        assert_error_code(
+            requested_object_range(Some(2), None, None, 2, 10),
+            &S3ErrorCode::InvalidPart,
+        );
+    }
+
+    #[test]
+    fn resolves_requested_object_ranges_for_sqlite_reader_path() {
+        assert_sqlite_ok(
+            requested_object_range_sqlite(None, None, None, 0, 10),
+            &(0..10),
+        );
+        assert_sqlite_ok(
+            requested_object_range_sqlite(None, Some(&range("bytes=2-5")), None, 0, 10),
+            &(2..6),
+        );
+        assert_sqlite_ok(
+            requested_object_range_sqlite(None, Some(&range("bytes=3-")), None, 0, 10),
+            &(3..10),
+        );
+        assert_sqlite_ok(
+            requested_object_range_sqlite(None, Some(&range("bytes=-4")), None, 0, 10),
+            &(6..10),
+        );
+        assert!(matches!(
+            requested_object_range_sqlite(None, Some(&range("bytes=20-30")), None, 0, 10),
+            Err(SqliteError::InvalidObjectRange)
+        ));
+        assert!(matches!(
+            requested_object_range_sqlite(None, Some(&range("bytes=-0")), None, 0, 10),
+            Err(SqliteError::InvalidObjectRange)
+        ));
+
+        let part = completed_part(2, 4, 3);
+        assert_sqlite_ok(
+            requested_object_range_sqlite(Some(2), None, Some(&part), 2, 10),
+            &(4..7),
+        );
+        assert_sqlite_ok(
+            requested_object_range_sqlite(Some(1), None, None, 0, 10),
+            &(0..10),
+        );
+        assert!(matches!(
+            requested_object_range_sqlite(Some(2), None, None, 2, 10),
+            Err(SqliteError::InvalidMultipartPart)
+        ));
+
+        let invalid_part = completed_part(1, -1, 1);
+        assert!(matches!(
+            requested_object_range_sqlite(Some(1), None, Some(&invalid_part), 1, 10),
+            Err(SqliteError::ObjectBodyInconsistent)
+        ));
+    }
+
+    #[test]
+    fn formats_content_range_headers() {
+        assert_eq!(content_range_header(false, false, &(2..6), 10), None);
+        assert_eq!(
+            content_range_header(true, false, &(2..6), 10),
+            Some("bytes 2-5/10".to_string())
+        );
+        assert_eq!(
+            content_range_header(false, true, &(2..6), 10),
+            Some("bytes 2-5/10".to_string())
+        );
+        assert_eq!(content_range_header(true, false, &(0..0), 10), None);
+    }
+
+    #[test]
+    fn selects_response_checksums_for_requested_response_shape() {
+        let object_checksum = object_checksum();
+        let part = completed_part(1, 0, 5);
+        let checksum_mode = ChecksumMode::from_static(ChecksumMode::ENABLED);
+
+        assert_eq!(
+            response_checksum(Some(&object_checksum), None, false, None, false),
+            None
+        );
+        assert_eq!(
+            response_checksum(
+                Some(&object_checksum),
+                None,
+                false,
+                Some(&checksum_mode),
+                false
+            ),
+            Some(object_checksum.clone())
+        );
+        assert_eq!(
+            response_checksum(
+                Some(&object_checksum),
+                None,
+                false,
+                Some(&checksum_mode),
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            response_checksum(Some(&object_checksum), None, true, None, false),
+            Some(object_checksum.clone())
+        );
+        assert_eq!(
+            response_checksum(Some(&object_checksum), Some(&part), true, None, false),
+            Some(StoredChecksum::Full(FullObjectChecksum::Sha256(
+                "part-sha256".to_string()
+            )))
+        );
+    }
+}

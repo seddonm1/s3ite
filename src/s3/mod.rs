@@ -569,3 +569,315 @@ impl S3 for Sqlite {
         multipart::complete_multipart_upload(self, req).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use time::Duration;
+
+    fn metadata(md5: Option<&str>, last_modified: OffsetDateTime, size: i64) -> KeyMetadata {
+        KeyMetadata {
+            version_id: "version".to_string(),
+            size,
+            metadata: None,
+            content_type: None,
+            content_encoding: None,
+            cache_control: None,
+            expires: None,
+            last_modified,
+            md5: md5.map(str::to_string),
+            checksum: None,
+            is_latest: true,
+            is_delete_marker: false,
+        }
+    }
+
+    fn read_conditions(
+        etag_matches: Option<ETagCondition>,
+        modified_since: Option<OffsetDateTime>,
+        etag_none_matches: Option<ETagCondition>,
+        unmodified_since: Option<OffsetDateTime>,
+    ) -> ObjectReadConditions {
+        ObjectReadConditions {
+            etag_matches,
+            modified_since,
+            etag_none_matches,
+            unmodified_since,
+        }
+    }
+
+    fn delete_conditions(
+        etag_matches: Option<ETagCondition>,
+        last_modified_time: Option<OffsetDateTime>,
+        size: Option<i64>,
+    ) -> ObjectDeleteConditions {
+        ObjectDeleteConditions {
+            etag_matches,
+            last_modified_time,
+            size,
+        }
+    }
+
+    fn assert_precondition_failed(result: &Result<(), SqliteError>) {
+        assert!(matches!(result, Err(SqliteError::PreconditionFailed)));
+    }
+
+    #[test]
+    fn normalizes_content_encoding_values() {
+        assert_eq!(normalize_content_encoding(None), None);
+        assert_eq!(
+            normalize_content_encoding(Some("gzip, aws-chunked, br".to_string())),
+            Some("gzip, br".to_string())
+        );
+        assert_eq!(
+            normalize_content_encoding(Some(" gzip , , br ".to_string())),
+            Some("gzip, br".to_string())
+        );
+        assert_eq!(
+            normalize_content_encoding(Some("AWS-CHUNKED, aws-chunked".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn matches_strong_and_weak_etag_conditions() {
+        let strong = ETagCondition::ETag(ETag::Strong("md5".to_string()));
+        let strong_mismatch = ETagCondition::ETag(ETag::Strong("other".to_string()));
+        let weak = ETagCondition::ETag(ETag::Weak("md5".to_string()));
+
+        assert!(strong_etag_condition_matches(&strong, Some("md5")));
+        assert!(!strong_etag_condition_matches(
+            &strong_mismatch,
+            Some("md5")
+        ));
+        assert!(!strong_etag_condition_matches(&weak, Some("md5")));
+        assert!(strong_etag_condition_matches(
+            &ETagCondition::Any,
+            Some("md5")
+        ));
+        assert!(!strong_etag_condition_matches(&ETagCondition::Any, None));
+
+        assert!(weak_etag_condition_matches(&strong, Some("md5")));
+        assert!(weak_etag_condition_matches(&weak, Some("md5")));
+        assert!(!weak_etag_condition_matches(&strong_mismatch, Some("md5")));
+        assert!(weak_etag_condition_matches(
+            &ETagCondition::Any,
+            Some("md5")
+        ));
+        assert!(!weak_etag_condition_matches(&ETagCondition::Any, None));
+    }
+
+    #[test]
+    fn maps_write_conditions_to_storage_conditions() {
+        let conditions = object_write_conditions(
+            Some(ETagCondition::ETag(ETag::Strong("md5".to_string()))),
+            Some(ETagCondition::ETag(ETag::Weak("none".to_string()))),
+        );
+        assert!(matches!(
+            conditions.if_match,
+            Some(ObjectTagCondition::Md5(value)) if value == "md5"
+        ));
+        assert!(matches!(
+            conditions.if_none_match,
+            Some(ObjectTagCondition::Md5(value)) if value == "none"
+        ));
+
+        let conditions = object_write_conditions(
+            Some(ETagCondition::ETag(ETag::Weak("md5".to_string()))),
+            Some(ETagCondition::Any),
+        );
+        assert!(matches!(
+            conditions.if_match,
+            Some(ObjectTagCondition::Never)
+        ));
+        assert!(matches!(
+            conditions.if_none_match,
+            Some(ObjectTagCondition::Any)
+        ));
+
+        let conditions = object_write_conditions(Some(ETagCondition::Any), None);
+        assert!(matches!(conditions.if_match, Some(ObjectTagCondition::Any)));
+        assert!(conditions.if_none_match.is_none());
+    }
+
+    #[test]
+    fn applies_read_condition_precedence() {
+        let last_modified = OffsetDateTime::UNIX_EPOCH + Duration::seconds(10);
+        let before = last_modified - Duration::seconds(1);
+        let after = last_modified + Duration::seconds(1);
+        let object = metadata(Some("md5"), last_modified, 5);
+
+        let result = validate_read_conditions(
+            &object,
+            &read_conditions(
+                Some(ETagCondition::ETag(ETag::Strong("other".to_string()))),
+                None,
+                Some(ETagCondition::ETag(ETag::Strong("md5".to_string()))),
+                None,
+            ),
+        );
+        assert!(matches!(
+            result,
+            Err(ObjectReadConditionFailure::PreconditionFailed)
+        ));
+
+        let result = validate_read_conditions(
+            &object,
+            &read_conditions(
+                None,
+                None,
+                Some(ETagCondition::ETag(ETag::Weak("md5".to_string()))),
+                None,
+            ),
+        );
+        assert!(matches!(
+            result,
+            Err(ObjectReadConditionFailure::NotModified)
+        ));
+
+        assert!(
+            validate_read_conditions(
+                &object,
+                &read_conditions(
+                    None,
+                    Some(after),
+                    Some(ETagCondition::ETag(ETag::Strong("other".to_string()))),
+                    None,
+                ),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_read_conditions(
+                &object,
+                &read_conditions(
+                    Some(ETagCondition::ETag(ETag::Strong("md5".to_string()))),
+                    None,
+                    None,
+                    Some(before),
+                ),
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            validate_read_conditions(&object, &read_conditions(None, Some(after), None, None),),
+            Err(ObjectReadConditionFailure::NotModified)
+        ));
+        assert!(matches!(
+            validate_read_conditions(&object, &read_conditions(None, None, None, Some(before)),),
+            Err(ObjectReadConditionFailure::PreconditionFailed)
+        ));
+    }
+
+    #[test]
+    fn applies_copy_source_condition_precedence() {
+        let last_modified = OffsetDateTime::UNIX_EPOCH + Duration::seconds(10);
+        let before = last_modified - Duration::seconds(1);
+        let after = last_modified + Duration::seconds(1);
+        let object = metadata(Some("md5"), last_modified, 5);
+
+        assert_precondition_failed(&validate_copy_source_conditions(
+            &object,
+            &read_conditions(
+                Some(ETagCondition::ETag(ETag::Strong("other".to_string()))),
+                None,
+                Some(ETagCondition::ETag(ETag::Strong("md5".to_string()))),
+                None,
+            ),
+        ));
+        assert_precondition_failed(&validate_copy_source_conditions(
+            &object,
+            &read_conditions(
+                None,
+                None,
+                Some(ETagCondition::ETag(ETag::Weak("md5".to_string()))),
+                None,
+            ),
+        ));
+        assert!(
+            validate_copy_source_conditions(
+                &object,
+                &read_conditions(
+                    None,
+                    Some(after),
+                    Some(ETagCondition::ETag(ETag::Strong("other".to_string()))),
+                    None,
+                ),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_copy_source_conditions(
+                &object,
+                &read_conditions(
+                    Some(ETagCondition::ETag(ETag::Strong("md5".to_string()))),
+                    None,
+                    None,
+                    Some(before),
+                ),
+            )
+            .is_ok()
+        );
+        assert_precondition_failed(&validate_copy_source_conditions(
+            &object,
+            &read_conditions(None, Some(after), None, None),
+        ));
+        assert_precondition_failed(&validate_copy_source_conditions(
+            &object,
+            &read_conditions(None, None, None, Some(before)),
+        ));
+    }
+
+    #[test]
+    fn applies_delete_conditions() {
+        let last_modified = OffsetDateTime::UNIX_EPOCH + Duration::seconds(10);
+        let object = metadata(Some("md5"), last_modified, 5);
+
+        assert!(
+            validate_delete_conditions(
+                None,
+                &delete_conditions(
+                    Some(ETagCondition::ETag(ETag::Strong("other".to_string()))),
+                    Some(last_modified + Duration::seconds(1)),
+                    Some(9),
+                ),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_delete_conditions(
+                Some(&object),
+                &delete_conditions(
+                    Some(ETagCondition::ETag(ETag::Strong("md5".to_string()))),
+                    Some(last_modified),
+                    Some(5),
+                ),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_delete_conditions(
+                Some(&object),
+                &delete_conditions(Some(ETagCondition::Any), None, None),
+            )
+            .is_ok()
+        );
+        assert_precondition_failed(&validate_delete_conditions(
+            Some(&object),
+            &delete_conditions(
+                Some(ETagCondition::ETag(ETag::Strong("other".to_string()))),
+                None,
+                None,
+            ),
+        ));
+        assert_precondition_failed(&validate_delete_conditions(
+            Some(&object),
+            &delete_conditions(None, Some(last_modified + Duration::seconds(1)), None),
+        ));
+        assert_precondition_failed(&validate_delete_conditions(
+            Some(&object),
+            &delete_conditions(None, None, Some(9)),
+        ));
+    }
+}
