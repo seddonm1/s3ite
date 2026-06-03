@@ -42,8 +42,8 @@ impl Sqlite {
                 continue;
             };
 
+            Self::prepare_bucket_file(path.clone(), config, &bucket).await?;
             let connection = BucketConnection::open(path, config, &bucket).await?;
-            Self::prepare_existing_bucket(&connection, config, &bucket).await?;
             buckets.insert(bucket, Arc::new(connection));
         }
 
@@ -82,22 +82,14 @@ impl Sqlite {
 
         let file_path = self.get_bucket_path(bucket)?;
         let config = self.config.clone();
+        Self::prepare_bucket_file(file_path.clone(), &config, bucket).await?;
 
         let connection = BucketConnection::open(file_path, &config, bucket).await?;
-
-        connection
-            .write(move |connection| {
-                connection.execute_batch(&super::connection_pragmas(&config, None))?;
-
-                let transaction = connection.transaction()?;
-                Self::create_tables(&transaction)?;
-                Ok(transaction.commit()?)
-            })
-            .await?;
+        let bucket = bucket.to_string();
 
         let mut buckets = self.buckets.write().await;
-        if buckets.contains_key(bucket).not() {
-            buckets.insert(bucket.to_string(), Arc::new(connection));
+        if buckets.contains_key(&bucket).not() {
+            buckets.insert(bucket.clone(), Arc::new(connection));
             debug!(bucket = %bucket, "created bucket");
         }
 

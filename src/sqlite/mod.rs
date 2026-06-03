@@ -263,26 +263,51 @@ fn expiration_threshold(ttl_seconds: u64) -> Option<OffsetDateTime> {
     Some(OffsetDateTime::now_utc().saturating_sub(Duration::seconds(seconds)))
 }
 
-/// Renders the `SQLite` PRAGMA statements for a bucket connection.
+/// Renders the `SQLite` PRAGMA statements for a writable bucket connection.
 ///
 /// `SQLite` interprets negative `cache_size` values as kibibytes, so the
 /// configured positive KiB value is emitted as `PRAGMA cache_size=-N`.
-pub(crate) fn connection_pragmas(config: &crate::Config, bucket: Option<&str>) -> String {
+pub(crate) fn writer_connection_pragmas(config: &crate::Config, bucket: Option<&str>) -> String {
     format!(
         "
         PRAGMA journal_mode={};
         PRAGMA synchronous={};
         PRAGMA temp_store={};
         PRAGMA cache_size=-{};
+        PRAGMA busy_timeout={};
+        PRAGMA journal_size_limit={};
         PRAGMA query_only={};
         PRAGMA foreign_keys=true;
+        PRAGMA trusted_schema=false;
         PRAGMA auto_vacuum=INCREMENTAL;
         ",
         pragma_value(&config.journal_mode(bucket)),
         pragma_value(&config.synchronous(bucket)),
         pragma_value(&config.temp_store(bucket)),
         config.cache_size(bucket),
+        config.busy_timeout_milliseconds(bucket),
+        config.journal_size_limit(bucket),
         config.read_only(bucket),
+    )
+}
+
+/// Renders the `SQLite` PRAGMA statements for read-only bucket connections.
+///
+/// These pragmas are connection-local and safe for read-only metadata and BLOB
+/// readers. Write-oriented settings such as `journal_mode` are applied by the
+/// writer connection only.
+pub(crate) fn reader_connection_pragmas(config: &crate::Config, bucket: Option<&str>) -> String {
+    format!(
+        "
+        PRAGMA temp_store={};
+        PRAGMA cache_size=-{};
+        PRAGMA busy_timeout={};
+        PRAGMA foreign_keys=true;
+        PRAGMA trusted_schema=false;
+        ",
+        pragma_value(&config.temp_store(bucket)),
+        config.cache_size(bucket),
+        config.busy_timeout_milliseconds(bucket),
     )
 }
 
@@ -600,6 +625,31 @@ impl Sqlite {
         Ok(())
     }
 
+    /// Prepares a writable bucket database before long-lived worker pools open it.
+    ///
+    /// This creates or validates schema, removes expired multipart state, and
+    /// refreshes planner statistics before read-only worker connections cache a
+    /// schema view.
+    pub(super) async fn prepare_bucket_file(
+        path: PathBuf,
+        config: &crate::Config,
+        bucket: &str,
+    ) -> SqliteResult<()> {
+        if config.read_only(Some(bucket)) {
+            return Ok(());
+        }
+
+        let config = config.clone();
+        let bucket = bucket.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = rusqlite::Connection::open(path)?;
+            connection.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
+            Self::prepare_writable_bucket_connection(&mut connection, &config, &bucket)
+        })
+        .await
+        .map_err(|_| SqliteError::ThreadJoin)?
+    }
+
     /// Opens configured bucket databases and starts background maintenance.
     ///
     /// # Errors
@@ -645,42 +695,28 @@ impl Sqlite {
         })
     }
 
-    /// Applies writable-bucket startup maintenance before serving requests.
-    pub(super) async fn prepare_existing_bucket(
-        connection: &BucketConnection,
+    /// Prepares an already opened writable bucket connection.
+    fn prepare_writable_bucket_connection(
+        connection: &mut rusqlite::Connection,
         config: &crate::Config,
         bucket: &str,
     ) -> SqliteResult<()> {
-        if config.read_only(Some(bucket)) {
-            return Ok(());
-        }
-
-        let bucket = bucket.to_string();
-        let config = config.clone();
         let multipart_expire_before = expiration_threshold(config.multipart_upload_ttl_seconds);
         let completed_multipart_expire_before =
             expiration_threshold(config.completed_multipart_upload_ttl_seconds);
 
-        connection
-            .write(move |connection| {
-                connection.execute_batch(&connection_pragmas(&config, Some(&bucket)))?;
-                connection.execute_batch(
-                    "
-                    PRAGMA analysis_limit=1000;
-                    PRAGMA optimize;
-                    ",
-                )?;
+        connection.execute_batch(&writer_connection_pragmas(config, Some(bucket)))?;
 
-                let transaction = connection.transaction()?;
-                Self::create_tables(&transaction)?;
-                Self::delete_expired_multipart_uploads(
-                    &transaction,
-                    multipart_expire_before,
-                    completed_multipart_expire_before,
-                )?;
-                Ok(transaction.commit()?)
-            })
-            .await
+        let transaction = connection.transaction()?;
+        Self::create_tables(&transaction)?;
+        Self::delete_expired_multipart_uploads(
+            &transaction,
+            multipart_expire_before,
+            completed_multipart_expire_before,
+        )?;
+        transaction.commit()?;
+        connection.execute_batch("PRAGMA optimize=0x10002;")?;
+        Ok(())
     }
 
     /// Starts periodic database maintenance for writable bucket connections.
@@ -746,6 +782,7 @@ impl Sqlite {
                     connection
                         .execute_batch(&format!("PRAGMA incremental_vacuum({vacuum_pages});"))?;
                 }
+                connection.execute_batch("PRAGMA optimize;")?;
 
                 Ok(())
             })
@@ -815,8 +852,8 @@ mod tests {
 
     use super::{
         BucketVersioningState, Duration, MultipartUploadState, OffsetDateTime, Sqlite, SqliteError,
-        SqliteResult, Uuid, connection_pragmas, expiration_threshold, row_size, sql_limit,
-        sql_size,
+        SqliteResult, Uuid, expiration_threshold, reader_connection_pragmas, row_size, sql_limit,
+        sql_size, writer_connection_pragmas,
     };
 
     fn open_schema() -> SqliteResult<Connection> {
@@ -919,17 +956,22 @@ mod tests {
                 synchronous: Synchronous::Full,
                 temp_store: TempStore::File,
                 cache_size: 1024,
+                busy_timeout_milliseconds: 250,
+                journal_size_limit: 4096,
             },
             ..Config::default()
         };
 
-        let service_sql = connection_pragmas(&config, None);
+        let service_sql = writer_connection_pragmas(&config, None);
         assert!(service_sql.contains("PRAGMA journal_mode=delete;"));
         assert!(service_sql.contains("PRAGMA synchronous=full;"));
         assert!(service_sql.contains("PRAGMA temp_store=file;"));
         assert!(service_sql.contains("PRAGMA cache_size=-1024;"));
+        assert!(service_sql.contains("PRAGMA busy_timeout=250;"));
+        assert!(service_sql.contains("PRAGMA journal_size_limit=4096;"));
         assert!(service_sql.contains("PRAGMA query_only=true;"));
         assert!(service_sql.contains("PRAGMA foreign_keys=true;"));
+        assert!(service_sql.contains("PRAGMA trusted_schema=false;"));
         assert!(service_sql.contains("PRAGMA auto_vacuum=INCREMENTAL;"));
 
         config.buckets.insert(
@@ -941,16 +983,30 @@ mod tests {
                     synchronous: Some(Synchronous::Normal),
                     temp_store: Some(TempStore::Memory),
                     cache_size: Some(512),
+                    busy_timeout_milliseconds: Some(100),
+                    journal_size_limit: Some(2048),
                 }),
             },
         );
 
-        let bucket_sql = connection_pragmas(&config, Some("bucket"));
+        let bucket_sql = writer_connection_pragmas(&config, Some("bucket"));
         assert!(bucket_sql.contains("PRAGMA journal_mode=wal;"));
         assert!(bucket_sql.contains("PRAGMA synchronous=normal;"));
         assert!(bucket_sql.contains("PRAGMA temp_store=memory;"));
         assert!(bucket_sql.contains("PRAGMA cache_size=-512;"));
+        assert!(bucket_sql.contains("PRAGMA busy_timeout=100;"));
+        assert!(bucket_sql.contains("PRAGMA journal_size_limit=2048;"));
         assert!(bucket_sql.contains("PRAGMA query_only=false;"));
+
+        let reader_sql = reader_connection_pragmas(&config, Some("bucket"));
+        assert!(reader_sql.contains("PRAGMA temp_store=memory;"));
+        assert!(reader_sql.contains("PRAGMA cache_size=-512;"));
+        assert!(reader_sql.contains("PRAGMA busy_timeout=100;"));
+        assert!(reader_sql.contains("PRAGMA foreign_keys=true;"));
+        assert!(reader_sql.contains("PRAGMA trusted_schema=false;"));
+        assert!(!reader_sql.contains("PRAGMA journal_mode"));
+        assert!(!reader_sql.contains("PRAGMA journal_size_limit"));
+        assert!(!reader_sql.contains("PRAGMA query_only"));
     }
 
     #[test]
@@ -1198,35 +1254,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_existing_bucket_skips_read_only_buckets() -> SqliteResult<()> {
+    async fn prepare_bucket_file_skips_read_only_buckets() -> SqliteResult<()> {
         let root = temp_root("prepare-read-only")?;
         let path = root.join("bucket.sqlite3");
-        let connection = BucketConnection::open(&path, &Config::default(), "bucket").await?;
+        Connection::open(&path)?.close().map_err(|(_, err)| err)?;
         let config = Config {
             read_only: true,
             ..Default::default()
         };
 
-        Sqlite::prepare_existing_bucket(&connection, &config, "bucket").await?;
-        let version: i32 = connection
-            .read(|connection| {
-                Ok(connection.query_row("PRAGMA user_version;", (), |row| row.get(0))?)
-            })
-            .await?;
+        Sqlite::prepare_bucket_file(path.clone(), &config, "bucket").await?;
+        let connection = Connection::open(&path)?;
+        let version: i32 = connection.query_row("PRAGMA user_version;", (), |row| row.get(0))?;
         assert_eq!(version, 0);
 
-        connection.close().await?;
         remove_root(&root);
         Ok(())
     }
 
     #[tokio::test]
-    async fn prepare_existing_bucket_creates_schema_for_writable_buckets() -> SqliteResult<()> {
+    async fn prepare_bucket_file_creates_schema_before_readers_open() -> SqliteResult<()> {
         let root = temp_root("prepare-writable")?;
         let path = root.join("bucket.sqlite3");
-        let connection = BucketConnection::open(&path, &Config::default(), "bucket").await?;
 
-        Sqlite::prepare_existing_bucket(&connection, &Config::default(), "bucket").await?;
+        Sqlite::prepare_bucket_file(path.clone(), &Config::default(), "bucket").await?;
+        let connection = BucketConnection::open(&path, &Config::default(), "bucket").await?;
         let version: i32 = connection
             .read(|connection| {
                 Ok(connection.query_row("PRAGMA user_version;", (), |row| row.get(0))?)

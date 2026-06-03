@@ -19,7 +19,7 @@ use tracing::{debug, error};
 
 use crate::{
     Config,
-    sqlite::{SqliteError, SqliteResult, connection_pragmas},
+    sqlite::{SqliteError, SqliteResult, reader_connection_pragmas, writer_connection_pragmas},
 };
 
 /// Maximum number of queued commands per worker queue.
@@ -159,6 +159,8 @@ impl BucketConnection {
 
         let config = config.to_owned();
         let bucket = bucket.to_string();
+        let reader_config = config.clone();
+        let reader_bucket = bucket.clone();
         let readers = config.readers;
         let blob_readers = config.blob_readers;
         let blob_read_timeout = (config.blob_read_timeout_seconds > 0)
@@ -178,7 +180,7 @@ impl BucketConnection {
             move || {
                 let mut writer = rusqlite::Connection::open(path)?;
                 writer.set_transaction_behavior(TransactionBehavior::Immediate);
-                writer.execute_batch(&connection_pragmas(&config, Some(&bucket)))?;
+                writer.execute_batch(&writer_connection_pragmas(&config, Some(&bucket)))?;
 
                 Ok(writer)
             },
@@ -188,6 +190,10 @@ impl BucketConnection {
                     OpenFlags::SQLITE_OPEN_READ_ONLY,
                 )?;
                 reader.set_transaction_behavior(TransactionBehavior::Deferred);
+                reader.execute_batch(&reader_connection_pragmas(
+                    &reader_config,
+                    Some(&reader_bucket),
+                ))?;
 
                 Ok(reader)
             }),
@@ -784,6 +790,22 @@ mod tests {
 
     async fn open_blob_test_connection() -> SqliteResult<(std::path::PathBuf, BucketConnection)> {
         let path = temp_path();
+        {
+            let setup = rusqlite::Connection::open(&path)?;
+            setup.execute_batch(
+                "
+                CREATE TABLE blob_source (
+                    sequence INTEGER PRIMARY KEY,
+                    body BLOB NOT NULL
+                ) STRICT;
+                ",
+            )?;
+            setup.execute(
+                "INSERT INTO blob_source (sequence, body) VALUES (1, ?1);",
+                [vec![7; 1024 * 1024]],
+            )?;
+        }
+
         let config = Config {
             readers: 1,
             blob_readers: 1,
@@ -791,25 +813,6 @@ mod tests {
             ..Default::default()
         };
         let connection = BucketConnection::open(&path, &config, "bucket").await?;
-        connection
-            .write(|connection| {
-                let created = connection.execute_batch(
-                    "
-                    CREATE TABLE blob_source (
-                        sequence INTEGER PRIMARY KEY,
-                        body BLOB NOT NULL
-                    ) STRICT;
-                    ",
-                );
-                assert!(created.is_ok(), "{created:?}");
-                let inserted = connection.execute(
-                    "INSERT INTO blob_source (sequence, body) VALUES (1, ?1);",
-                    [vec![7; 1024 * 1024]],
-                );
-                assert!(inserted.is_ok(), "{inserted:?}");
-                Ok(())
-            })
-            .await?;
         Ok((path, connection))
     }
 

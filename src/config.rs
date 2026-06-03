@@ -94,6 +94,14 @@ struct ConfigArgs {
     #[clap(long)]
     cache_size: Option<u32>,
 
+    /// Controls the `SQLite` `busy_timeout` pragma in milliseconds.
+    #[clap(long)]
+    busy_timeout_milliseconds: Option<u64>,
+
+    /// Controls the `SQLite` `journal_size_limit` pragma in bytes.
+    #[clap(long)]
+    journal_size_limit: Option<i64>,
+
     /// Controls the number of reader connections to `SQLite`.
     #[clap(long)]
     readers: Option<usize>,
@@ -369,6 +377,12 @@ impl Config {
         if let Some(cache_size) = args.cache_size {
             self.sqlite.cache_size = cache_size;
         }
+        if let Some(busy_timeout_milliseconds) = args.busy_timeout_milliseconds {
+            self.sqlite.busy_timeout_milliseconds = busy_timeout_milliseconds;
+        }
+        if let Some(journal_size_limit) = args.journal_size_limit {
+            self.sqlite.journal_size_limit = journal_size_limit;
+        }
     }
 
     /// Returns the effective `CORS` mode, including deprecated aliases.
@@ -471,6 +485,42 @@ impl Config {
                     .and_then(|bucket| bucket.sqlite.as_ref().and_then(|sqlite| sqlite.cache_size))
             })
             .unwrap_or(self.sqlite.cache_size)
+    }
+
+    /// Returns the effective `SQLite` busy timeout in milliseconds.
+    ///
+    /// A bucket-level pragma override wins when present; otherwise the
+    /// service-level pragma is used.
+    #[must_use]
+    pub fn busy_timeout_milliseconds(&self, bucket: Option<&str>) -> u64 {
+        bucket
+            .and_then(|bucket| {
+                self.buckets.get(bucket).and_then(|bucket| {
+                    bucket
+                        .sqlite
+                        .as_ref()
+                        .and_then(|sqlite| sqlite.busy_timeout_milliseconds)
+                })
+            })
+            .unwrap_or(self.sqlite.busy_timeout_milliseconds)
+    }
+
+    /// Returns the effective `SQLite` journal/WAL size limit in bytes.
+    ///
+    /// A bucket-level pragma override wins when present; otherwise the
+    /// service-level pragma is used.
+    #[must_use]
+    pub fn journal_size_limit(&self, bucket: Option<&str>) -> i64 {
+        bucket
+            .and_then(|bucket| {
+                self.buckets.get(bucket).and_then(|bucket| {
+                    bucket
+                        .sqlite
+                        .as_ref()
+                        .and_then(|sqlite| sqlite.journal_size_limit)
+                })
+            })
+            .unwrap_or(self.sqlite.journal_size_limit)
     }
 }
 
@@ -694,6 +744,14 @@ pub struct Pragmas {
     /// Controls the `SQLite` `cache_size` pragma in kilobytes.
     #[serde(default = "default_cache_size")]
     pub cache_size: u32,
+
+    /// Controls the `SQLite` `busy_timeout` pragma in milliseconds.
+    #[serde(default = "default_busy_timeout_milliseconds")]
+    pub busy_timeout_milliseconds: u64,
+
+    /// Controls the `SQLite` `journal_size_limit` pragma in bytes.
+    #[serde(default = "default_journal_size_limit")]
+    pub journal_size_limit: i64,
 }
 
 impl Default for Pragmas {
@@ -703,6 +761,8 @@ impl Default for Pragmas {
             synchronous: Synchronous::Normal,
             temp_store: TempStore::Memory,
             cache_size: default_cache_size(),
+            busy_timeout_milliseconds: default_busy_timeout_milliseconds(),
+            journal_size_limit: default_journal_size_limit(),
         }
     }
 }
@@ -731,6 +791,12 @@ pub struct BucketPragmas {
 
     /// Controls the `SQLite` `cache_size` pragma in kilobytes.
     pub cache_size: Option<u32>,
+
+    /// Controls the `SQLite` `busy_timeout` pragma in milliseconds.
+    pub busy_timeout_milliseconds: Option<u64>,
+
+    /// Controls the `SQLite` `journal_size_limit` pragma in bytes.
+    pub journal_size_limit: Option<i64>,
 }
 
 /// `SQLite` `journal_mode` values supported by configuration.
@@ -940,6 +1006,14 @@ fn default_cache_size() -> u32 {
     65_536
 }
 
+fn default_busy_timeout_milliseconds() -> u64 {
+    5_000
+}
+
+fn default_journal_size_limit() -> i64 {
+    64 * 1024 * 1024
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -947,14 +1021,18 @@ mod tests {
     type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
     #[test]
-    fn default_sqlite_cache_size_is_kib() {
+    fn default_sqlite_pragmas_are_storage_friendly() {
         let config = Config::default();
         assert_eq!(config.sqlite.cache_size, 65_536);
         assert_eq!(config.cache_size(None), 65_536);
+        assert_eq!(config.sqlite.busy_timeout_milliseconds, 5_000);
+        assert_eq!(config.busy_timeout_milliseconds(None), 5_000);
+        assert_eq!(config.sqlite.journal_size_limit, 64 * 1024 * 1024);
+        assert_eq!(config.journal_size_limit(None), 64 * 1024 * 1024);
     }
 
     #[test]
-    fn bucket_cache_size_overrides_service_default() {
+    fn bucket_sqlite_pragmas_override_service_defaults() {
         let mut config = Config::default();
         config.buckets.insert(
             "bucket".to_string(),
@@ -965,11 +1043,15 @@ mod tests {
                     synchronous: None,
                     temp_store: None,
                     cache_size: Some(512),
+                    busy_timeout_milliseconds: Some(250),
+                    journal_size_limit: Some(4096),
                 }),
             },
         );
 
         assert_eq!(config.cache_size(Some("bucket")), 512);
+        assert_eq!(config.busy_timeout_milliseconds(Some("bucket")), 250);
+        assert_eq!(config.journal_size_limit(Some("bucket")), 4096);
     }
 
     #[test]
@@ -981,11 +1063,15 @@ mod tests {
             journal_mode: wal
             synchronous: normal
             temp_store: memory
+            busy_timeout_milliseconds: 1234
+            journal_size_limit: 8192
             ",
         )?;
         assert_eq!(lower.sqlite.journal_mode, JournalMode::Wal);
         assert_eq!(lower.sqlite.synchronous, Synchronous::Normal);
         assert_eq!(lower.sqlite.temp_store, TempStore::Memory);
+        assert_eq!(lower.sqlite.busy_timeout_milliseconds, 1234);
+        assert_eq!(lower.sqlite.journal_size_limit, 8192);
 
         let upper: Config = yaml_serde::from_str(
             "
@@ -1006,11 +1092,17 @@ mod tests {
             "extra",
             "--temp-store",
             "default",
+            "--busy-timeout-milliseconds",
+            "5678",
+            "--journal-size-limit",
+            "16384",
         ])?;
         let cli = Config::from_config_args(args)?;
         assert_eq!(cli.sqlite.journal_mode, JournalMode::Truncate);
         assert_eq!(cli.sqlite.synchronous, Synchronous::Extra);
         assert_eq!(cli.sqlite.temp_store, TempStore::Default);
+        assert_eq!(cli.sqlite.busy_timeout_milliseconds, 5678);
+        assert_eq!(cli.sqlite.journal_size_limit, 16384);
 
         Ok(())
     }
