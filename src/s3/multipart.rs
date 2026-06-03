@@ -20,7 +20,8 @@ use super::{
     default_crc64nvme_full_object_checksum, encode_list_value, finish_part_checksum, hex,
     is_url_encoding, multipart_checksum_config, normalize_content_encoding,
     object_write_conditions, output_delimiter, owner, part_checksum_accumulator, s3_error,
-    s3_error_from_sqlite, s3_error_with_message, validate_content_md5, validate_object_acl,
+    s3_error_from_sqlite, s3_error_with_message, validate_content_md5, validate_no_sse_headers,
+    validate_object_acl,
 };
 
 /// Normalizes a completed multipart part list while preserving S3 ordering rules.
@@ -754,6 +755,7 @@ pub(super) async fn create_multipart_upload(
     sqlite: &Sqlite,
     req: S3Request<CreateMultipartUploadInput>,
 ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+    validate_no_sse_headers(&req.headers)?;
     let CreateMultipartUploadInput {
         acl,
         bucket,
@@ -844,6 +846,7 @@ pub(super) async fn upload_part(
         credentials,
         ..
     } = req;
+    validate_no_sse_headers(&headers)?;
     let access_key = credentials.map(|credentials| credentials.access_key);
     let UploadPartInput {
         body,
@@ -945,8 +948,12 @@ pub(super) async fn upload_part_copy(
     req: S3Request<UploadPartCopyInput>,
 ) -> S3Result<S3Response<UploadPartCopyOutput>> {
     let S3Request {
-        input, credentials, ..
+        input,
+        headers,
+        credentials,
+        ..
     } = req;
+    validate_no_sse_headers(&headers)?;
     let access_key = credentials.map(|credentials| credentials.access_key);
     let request = parse_upload_part_copy_request(input, access_key)?;
     sqlite
@@ -1120,6 +1127,7 @@ pub(super) async fn complete_multipart_upload(
     sqlite: &Sqlite,
     req: S3Request<CompleteMultipartUploadInput>,
 ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+    validate_no_sse_headers(&req.headers)?;
     let CompleteMultipartUploadInput {
         multipart_upload,
         bucket,

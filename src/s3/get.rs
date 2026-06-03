@@ -12,7 +12,8 @@ use super::{
     checksum_crc64nvme, checksum_mode_enabled, checksum_sha1, checksum_sha256, checksum_struct,
     checksum_type_output, list_limit, not_found_delete_marker_error, not_modified_error,
     object_checksum_for_part, requested_part_range, s3_error, s3_error_from_sqlite,
-    s3_error_with_message, stream, validate_part_number, validate_read_conditions,
+    s3_error_with_message, stream, validate_no_sse_headers, validate_part_number,
+    validate_read_conditions,
 };
 
 use crate::database::{BlobReadReceiver, BlobReadRequest, BucketConnection};
@@ -506,6 +507,7 @@ pub(super) async fn get_object(
     sqlite: &Sqlite,
     req: S3Request<GetObjectInput>,
 ) -> S3Result<S3Response<GetObjectOutput>> {
+    validate_no_sse_headers(&req.headers)?;
     let GetObjectInput {
         bucket,
         key,
@@ -548,6 +550,7 @@ pub(super) async fn head_object(
     sqlite: &Sqlite,
     req: S3Request<HeadObjectInput>,
 ) -> S3Result<S3Response<HeadObjectOutput>> {
+    validate_no_sse_headers(&req.headers)?;
     let HeadObjectInput {
         bucket,
         key,
@@ -629,6 +632,7 @@ pub(super) async fn get_object_attributes(
     sqlite: &Sqlite,
     req: S3Request<GetObjectAttributesInput>,
 ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
+    validate_no_sse_headers(&req.headers)?;
     let GetObjectAttributesInput {
         bucket,
         key,

@@ -2,6 +2,7 @@ use std::ops::{Not, Range as ByteRange};
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
+use hyper::http::HeaderMap;
 use md5::{Digest, Md5};
 use s3s::{
     S3, S3Error, S3ErrorCode,
@@ -52,6 +53,18 @@ const LIST_BATCH_SIZE: i64 = 1024;
 const CONTINUATION_TOKEN_PREFIX: &str = "s3ite:v1:";
 const OWNER_DISPLAY_NAME: &str = "s3ite";
 const OWNER_ID: &str = "s3ite";
+const UNSUPPORTED_SSE_HEADERS: &[&str] = &[
+    "x-amz-server-side-encryption",
+    "x-amz-server-side-encryption-aws-kms-key-id",
+    "x-amz-server-side-encryption-context",
+    "x-amz-server-side-encryption-bucket-key-enabled",
+    "x-amz-server-side-encryption-customer-algorithm",
+    "x-amz-server-side-encryption-customer-key",
+    "x-amz-server-side-encryption-customer-key-md5",
+    "x-amz-copy-source-server-side-encryption-customer-algorithm",
+    "x-amz-copy-source-server-side-encryption-customer-key",
+    "x-amz-copy-source-server-side-encryption-customer-key-md5",
+];
 
 mod bucket;
 mod checksum;
@@ -99,6 +112,24 @@ pub(super) fn normalize_content_encoding(content_encoding: Option<String>) -> Op
         .collect::<Vec<_>>();
 
     values.is_empty().not().then(|| values.join(", "))
+}
+
+/// Rejects server-side-encryption headers until encrypted storage is implemented.
+///
+/// Accepting these headers while persisting plaintext would be misleading, so
+/// every operation that could otherwise observe or mutate object data rejects
+/// the request before touching storage.
+fn validate_no_sse_headers(headers: &HeaderMap) -> S3Result<()> {
+    if UNSUPPORTED_SSE_HEADERS
+        .iter()
+        .any(|header| headers.contains_key(*header))
+    {
+        return Err(s3_error_with_message(
+            S3ErrorCode::NotImplemented,
+            "server-side encryption is not supported",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -685,6 +716,26 @@ mod tests {
             normalize_content_encoding(Some("AWS-CHUNKED, aws-chunked".to_string())),
             None
         );
+    }
+
+    #[test]
+    fn rejects_server_side_encryption_headers() {
+        let mut headers = HeaderMap::new();
+        assert!(validate_no_sse_headers(&headers).is_ok());
+
+        for header in UNSUPPORTED_SSE_HEADERS {
+            headers.clear();
+            headers.insert(*header, hyper::http::HeaderValue::from_static("AES256"));
+            let error = validate_no_sse_headers(&headers).err();
+            assert!(matches!(
+                error.as_ref().map(S3Error::code),
+                Some(&S3ErrorCode::NotImplemented)
+            ));
+            assert!(
+                format!("{error:?}").contains("server-side encryption is not supported"),
+                "error should explain unsupported SSE header {header}"
+            );
+        }
     }
 
     #[test]

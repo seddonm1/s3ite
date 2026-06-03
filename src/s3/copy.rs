@@ -9,8 +9,8 @@ use super::{
     SqliteResult, StoredChecksum, checksum_algorithm_from_request, checksum_crc32, checksum_crc32c,
     checksum_crc64nvme, checksum_sha1, checksum_sha256, checksum_type_output, http_date_time,
     normalize_content_encoding, object_write_checksum_from_value, s3_error, s3_error_from_sqlite,
-    s3_error_with_message, strong_etag_condition_matches, validate_object_acl,
-    weak_etag_condition_matches,
+    s3_error_with_message, strong_etag_condition_matches, validate_no_sse_headers,
+    validate_object_acl, weak_etag_condition_matches,
 };
 
 /// Parsed copy request with source, destination, metadata, and checksum intent.
@@ -307,7 +307,9 @@ pub(super) async fn copy_object(
     sqlite: &Sqlite,
     req: S3Request<CopyObjectInput>,
 ) -> S3Result<S3Response<CopyObjectOutput>> {
-    let request = parse_copy_object_request(req.input)?;
+    let S3Request { input, headers, .. } = req;
+    validate_no_sse_headers(&headers)?;
+    let request = parse_copy_object_request(input)?;
 
     sqlite
         .validate_mutable_bucket(&request.target_bucket)
