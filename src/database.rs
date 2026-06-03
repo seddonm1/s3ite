@@ -9,12 +9,15 @@ use std::{
     },
     thread,
     thread::JoinHandle,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use bytes::Bytes;
 use rusqlite::{MAIN_DB, OpenFlags, Transaction, TransactionBehavior};
-use tokio::sync::{mpsc as tokio_mpsc, oneshot};
+use tokio::{
+    runtime::Handle,
+    sync::{mpsc as tokio_mpsc, oneshot},
+};
 use tracing::{debug, error};
 
 use crate::{
@@ -31,8 +34,6 @@ const QUEUE_BOUND: usize = 100;
 const BLOB_STREAM_CHUNK_SIZE: u64 = 128 * 1024;
 /// Number of BLOB chunks that may wait for the HTTP body consumer.
 const BLOB_STREAM_QUEUE_BOUND: usize = 4;
-/// Sleep interval while waiting for BLOB response backpressure to clear.
-const BLOB_STREAM_SEND_RETRY: Duration = Duration::from_millis(10);
 
 /// Receiver side of a streamed `SQLite` BLOB read.
 pub(crate) struct BlobReadReceiver {
@@ -394,6 +395,7 @@ impl BucketConnectionInner {
         let timed_out = Arc::new(AtomicBool::new(false));
         let worker_timed_out = timed_out.clone();
         let blob_read_timeout = self.blob_read_timeout;
+        let runtime = Handle::current();
 
         if self.closed.load(Ordering::Acquire) {
             return Err(SqliteError::DatabaseQueueClosed);
@@ -408,6 +410,7 @@ impl BucketConnectionInner {
                     &chunk_sender,
                     blob_read_timeout,
                     &worker_timed_out,
+                    &runtime,
                 );
             })))
             .map_err(Self::queue_send_error)?;
@@ -436,6 +439,7 @@ impl BucketConnectionInner {
         chunk_sender: &tokio_mpsc::Sender<SqliteResult<Bytes>>,
         timeout: Option<Duration>,
         timed_out: &AtomicBool,
+        runtime: &Handle,
     ) where
         F: FnOnce(&Transaction<'_>) -> SqliteResult<(R, Option<BlobReadRequest>)>,
     {
@@ -488,7 +492,14 @@ impl BucketConnectionInner {
             return;
         }
 
-        Self::stream_blob_chunks(&mut blob, request.length, chunk_sender, timeout, timed_out);
+        Self::stream_blob_chunks(
+            &mut blob,
+            request.length,
+            chunk_sender,
+            timeout,
+            timed_out,
+            runtime,
+        );
     }
 
     /// Validates that the requested byte span fits inside the opened BLOB.
@@ -518,6 +529,7 @@ impl BucketConnectionInner {
         chunk_sender: &tokio_mpsc::Sender<SqliteResult<Bytes>>,
         timeout: Option<Duration>,
         timed_out: &AtomicBool,
+        runtime: &Handle,
     ) {
         while remaining > 0 {
             let chunk_len = remaining.min(BLOB_STREAM_CHUNK_SIZE);
@@ -536,13 +548,19 @@ impl BucketConnectionInner {
                 } else {
                     SqliteError::Io(error)
                 };
-                _ = Self::send_blob_chunk(chunk_sender, Err(error), timeout, timed_out);
+                _ = Self::send_blob_chunk(chunk_sender, Err(error), timeout, timed_out, runtime);
                 return;
             }
             remaining -= chunk_len_u64;
 
-            if Self::send_blob_chunk(chunk_sender, Ok(Bytes::from(chunk)), timeout, timed_out)
-                .is_err()
+            if Self::send_blob_chunk(
+                chunk_sender,
+                Ok(Bytes::from(chunk)),
+                timeout,
+                timed_out,
+                runtime,
+            )
+            .is_err()
             {
                 return;
             }
@@ -552,31 +570,20 @@ impl BucketConnectionInner {
     /// Sends one BLOB chunk, timing out if response backpressure stays full.
     fn send_blob_chunk(
         chunk_sender: &tokio_mpsc::Sender<SqliteResult<Bytes>>,
-        mut chunk: SqliteResult<Bytes>,
+        chunk: SqliteResult<Bytes>,
         timeout: Option<Duration>,
         timed_out: &AtomicBool,
+        runtime: &Handle,
     ) -> Result<(), ()> {
-        let started = Instant::now();
-        loop {
-            match chunk_sender.try_send(chunk) {
-                Ok(()) => return Ok(()),
-                Err(tokio_mpsc::error::TrySendError::Closed(_)) => return Err(()),
-                Err(tokio_mpsc::error::TrySendError::Full(value)) => {
-                    chunk = value;
-                }
-            }
-
-            if let Some(timeout) = timeout {
-                let elapsed = started.elapsed();
-                if elapsed >= timeout {
-                    timed_out.store(true, Ordering::Release);
-                    return Err(());
-                }
-                let remaining = timeout.checked_sub(elapsed).unwrap_or_default();
-                thread::sleep(remaining.min(BLOB_STREAM_SEND_RETRY));
-            } else {
-                thread::sleep(BLOB_STREAM_SEND_RETRY);
-            }
+        match timeout {
+            Some(timeout) => runtime
+                .block_on(chunk_sender.send_timeout(chunk, timeout))
+                .map_err(|error| {
+                    if matches!(error, tokio_mpsc::error::SendTimeoutError::Timeout(_)) {
+                        timed_out.store(true, Ordering::Release);
+                    }
+                }),
+            None => chunk_sender.blocking_send(chunk).map_err(|_| ()),
         }
     }
 
@@ -989,6 +996,7 @@ mod tests {
             &chunk_sender,
             None,
             &timed_out,
+            &Handle::current(),
         );
         let err = result_receiver
             .await
@@ -1000,7 +1008,11 @@ mod tests {
     }
 
     #[test]
-    fn send_blob_chunk_waits_without_timeout_for_capacity() {
+    fn send_blob_chunk_waits_without_timeout_for_capacity() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()?;
         let (sender, mut receiver) = tokio_mpsc::channel(1);
         assert!(sender.try_send(Ok(Bytes::from_static(b"first"))).is_ok());
         let drain = thread::spawn(move || {
@@ -1016,12 +1028,14 @@ mod tests {
                 Ok(Bytes::from_static(b"second")),
                 None,
                 &timed_out,
+                runtime.handle(),
             ),
             Ok(())
         );
         assert!(!timed_out.load(Ordering::Acquire));
         drop(sender);
         assert!(drain.join().is_ok());
+        Ok(())
     }
 
     #[tokio::test]
