@@ -16,7 +16,6 @@ use hyper_util::{
 use s3s::{auth::SimpleAuth, host::MultiDomain, service::S3ServiceBuilder};
 use tokio::net::TcpListener;
 use tower::limit::ConcurrencyLimitLayer;
-use tower_http::cors::CorsLayer;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
 
@@ -58,6 +57,7 @@ async fn main() -> MainResult<()> {
 
     let config = Config::from_args()?;
     let auth_compat = HeaderAuthCompatLayer::new(config.secret_key.clone());
+    let cors_layer = config.cors_layer()?;
 
     // Setup S3 provider
     let sqlite = Sqlite::new(&config).await?;
@@ -67,7 +67,9 @@ async fn main() -> MainResult<()> {
         let mut s3 = S3ServiceBuilder::new(sqlite);
 
         // Enable authentication
-        if let (Some(access_key), Some(secret_key)) = (config.access_key, config.secret_key) {
+        if let (Some(access_key), Some(secret_key)) =
+            (config.access_key.clone(), config.secret_key.clone())
+        {
             s3.set_auth(SimpleAuth::from_single(access_key, secret_key));
         }
 
@@ -110,13 +112,12 @@ async fn main() -> MainResult<()> {
 
         let io = TokioIo::new(stream);
 
-        // Add CorsLayer if defined
-        if config.permissive_cors {
+        if let Some(cors_layer) = cors_layer.clone() {
             let conn = http_server.serve_connection(
                 io,
                 TowerToHyperService::new(
                     tower::ServiceBuilder::new()
-                        .layer(CorsLayer::very_permissive())
+                        .layer(cors_layer)
                         .layer(auth_compat.clone())
                         .layer(ChunkedBodyCompatLayer)
                         .layer(ConcurrencyLimitLayer::new(config.concurrency_limit.into()))

@@ -35,9 +35,14 @@ jobs:
           rustup default ${{ matrix.rust }}
           rustup component add rustfmt
           rustup component add clippy
-      - name: Run tests
-        run: |
-          cargo test
+          rustup component add llvm-tools-preview
+      - name: Install coverage tool
+        run: cargo install cargo-llvm-cov --version 0.8.7 --locked
+      - name: Run tests with coverage limits
+        run: >
+          cargo llvm-cov --all-targets --workspace
+          --fail-under-lines 95
+          --fail-under-file-lines 95
       - name: Run format
         run: cargo fmt --all -- --check
       - name: Run clippy

@@ -2,10 +2,13 @@ use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
+    time::Duration,
 };
 
 use clap::{Parser, ValueEnum};
-use serde::Deserialize;
+use hyper::http::{HeaderName, HeaderValue, Method};
+use serde::{Deserialize, de};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 /// Result type returned by binary configuration loading.
 pub type ConfigResult<T> = std::result::Result<T, ConfigError>;
@@ -19,6 +22,9 @@ pub enum ConfigError {
     /// A configuration file could not be parsed as YAML.
     #[error("Yaml {0}")]
     Yaml(#[from] yaml_serde::Error),
+    /// A configuration value is not valid.
+    #[error("configuration error: {0}")]
+    Configuration(String),
 }
 
 /// Command-line arguments that override YAML or default configuration.
@@ -42,9 +48,13 @@ struct ConfigArgs {
     #[clap(long)]
     port: Option<u16>,
 
+    /// Configures Cross-Origin Resource Sharing (`CORS`) handling.
+    #[clap(long, value_enum, conflicts_with = "permissive_cors")]
+    cors: Option<CliCorsMode>,
+
     /// Allow permissive Cross-Origin Resource Sharing (`CORS`) requests.
     /// This can be enabled to allow users to access this service from a web service running on a different host.
-    #[clap(long)]
+    #[clap(long, conflicts_with = "cors")]
     permissive_cors: Option<bool>,
 
     /// The access key ID that is used to authenticate for this service.
@@ -113,10 +123,28 @@ struct ConfigArgs {
     completed_multipart_upload_ttl_seconds: Option<u64>,
 }
 
+/// CLI-accessible `CORS` modes.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum CliCorsMode {
+    /// Disable CORS response handling.
+    Disabled,
+    /// Mirror request origins, methods, and headers and allow credentials.
+    Permissive,
+}
+
+impl From<CliCorsMode> for CorsMode {
+    fn from(mode: CliCorsMode) -> Self {
+        match mode {
+            CliCorsMode::Disabled => Self::Disabled,
+            CliCorsMode::Permissive => Self::Permissive,
+        }
+    }
+}
+
 /// Runtime configuration for the s3ite service.
 ///
-/// Values can be loaded from YAML and, when the `binary` feature is enabled,
-/// selectively overridden by command-line arguments.
+/// Values can be loaded from YAML and selectively overridden by command-line
+/// arguments.
 #[derive(Clone, Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -183,10 +211,13 @@ pub struct Config {
     #[serde(default = "default_completed_upload_ttl_seconds")]
     pub completed_multipart_upload_ttl_seconds: u64,
 
-    /// Allow permissive Cross-Origin Resource Sharing (CORS) requests.
-    /// This can be enabled to allow users to access this service from a web service running on a different host.
-    #[serde(default = "default_permissive_cors")]
-    pub permissive_cors: bool,
+    /// Cross-Origin Resource Sharing (`CORS`) handling.
+    #[serde(default = "default_cors")]
+    pub cors: CorsMode,
+
+    /// Deprecated compatibility alias for `cors.mode`.
+    #[serde(default)]
+    pub(crate) permissive_cors: Option<bool>,
 
     /// The domain to use to allow parsing virtual-hosted-style requests.
     pub domain_name: Option<String>,
@@ -220,7 +251,8 @@ impl Default for Config {
             maintenance_vacuum_pages: default_maintenance_vacuum_pages(),
             multipart_upload_ttl_seconds: default_multipart_upload_ttl_seconds(),
             completed_multipart_upload_ttl_seconds: default_completed_upload_ttl_seconds(),
-            permissive_cors: default_permissive_cors(),
+            cors: default_cors(),
+            permissive_cors: None,
             read_only: default_read_only(),
             domain_name: None,
             sqlite: default_pragmas(),
@@ -259,6 +291,7 @@ impl Config {
             .unwrap_or_default();
 
         config.apply_args(args);
+        config.validate()?;
 
         Ok(config)
     }
@@ -280,8 +313,17 @@ impl Config {
         if let Some(secret_key) = args.secret_key {
             self.secret_key = Some(secret_key);
         }
+        if let Some(cors) = args.cors {
+            self.cors = cors.into();
+            self.permissive_cors = None;
+        }
         if let Some(permissive_cors) = args.permissive_cors {
-            self.permissive_cors = permissive_cors;
+            self.cors = if permissive_cors {
+                CorsMode::Permissive
+            } else {
+                CorsMode::Disabled
+            };
+            self.permissive_cors = None;
         }
         if let Some(domain_name) = args.domain_name {
             self.domain_name = Some(domain_name);
@@ -327,6 +369,34 @@ impl Config {
         if let Some(cache_size) = args.cache_size {
             self.sqlite.cache_size = cache_size;
         }
+    }
+
+    /// Returns the effective `CORS` mode, including deprecated aliases.
+    #[must_use]
+    pub(crate) fn cors_mode(&self) -> CorsMode {
+        self.permissive_cors.map_or_else(
+            || self.cors.clone(),
+            |permissive| {
+                if permissive {
+                    CorsMode::Permissive
+                } else {
+                    CorsMode::Disabled
+                }
+            },
+        )
+    }
+
+    /// Validates semantic configuration constraints.
+    fn validate(&self) -> ConfigResult<()> {
+        self.cors_mode()
+            .validate()
+            .map_err(ConfigError::Configuration)?;
+        self.cors_layer().map(|_| ())
+    }
+
+    /// Builds the configured `CORS` middleware layer.
+    pub(crate) fn cors_layer(&self) -> ConfigResult<Option<CorsLayer>> {
+        self.cors_mode().cors_layer()
     }
 
     /// Returns whether a bucket should reject write operations.
@@ -425,6 +495,208 @@ impl Config {
             self.cache_size(bucket),
             self.read_only(bucket),
         )
+    }
+}
+
+/// Cross-Origin Resource Sharing behavior.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum CorsMode {
+    /// Do not add CORS response headers.
+    Disabled,
+    /// Mirror request origins, methods, and headers and allow credentials.
+    #[default]
+    Permissive,
+    /// Apply explicit CORS rules from configuration.
+    Custom(CorsConfig),
+}
+
+impl<'de> Deserialize<'de> for CorsMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Mode {
+            Disabled,
+            Permissive,
+            Custom,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawCorsMode {
+            mode: Mode,
+            allow_origins: Option<Vec<String>>,
+            allow_methods: Option<Vec<String>>,
+            allow_headers: Option<Vec<String>>,
+            expose_headers: Option<Vec<String>>,
+            allow_credentials: Option<bool>,
+            allow_private_network: Option<bool>,
+            max_age_seconds: Option<u64>,
+        }
+
+        let raw = RawCorsMode::deserialize(deserializer)?;
+        let has_custom_fields = raw.allow_origins.is_some()
+            || raw.allow_methods.is_some()
+            || raw.allow_headers.is_some()
+            || raw.expose_headers.is_some()
+            || raw.allow_credentials.is_some()
+            || raw.allow_private_network.is_some()
+            || raw.max_age_seconds.is_some();
+
+        match raw.mode {
+            Mode::Disabled | Mode::Permissive if has_custom_fields => Err(de::Error::custom(
+                "custom CORS fields require `cors.mode: custom`",
+            )),
+            Mode::Disabled => Ok(Self::Disabled),
+            Mode::Permissive => Ok(Self::Permissive),
+            Mode::Custom => Ok(Self::Custom(CorsConfig {
+                allow_origins: raw
+                    .allow_origins
+                    .ok_or_else(|| de::Error::missing_field("allow_origins"))?,
+                allow_methods: raw.allow_methods.unwrap_or_else(default_cors_allow_methods),
+                allow_headers: raw.allow_headers.unwrap_or_else(default_cors_allow_headers),
+                expose_headers: raw
+                    .expose_headers
+                    .unwrap_or_else(default_cors_expose_headers),
+                allow_credentials: raw.allow_credentials.unwrap_or(false),
+                allow_private_network: raw.allow_private_network.unwrap_or(false),
+                max_age_seconds: raw.max_age_seconds,
+            })),
+        }
+    }
+}
+
+impl CorsMode {
+    /// Checks whether the selected CORS configuration can be served safely.
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Disabled | Self::Permissive => Ok(()),
+            Self::Custom(config) => config.validate(),
+        }
+    }
+
+    /// Builds the `tower-http` CORS layer represented by this mode.
+    fn cors_layer(&self) -> ConfigResult<Option<CorsLayer>> {
+        match self {
+            Self::Disabled => Ok(None),
+            Self::Permissive => Ok(Some(CorsLayer::very_permissive())),
+            Self::Custom(config) => config.cors_layer().map(Some),
+        }
+    }
+}
+
+/// Explicit Cross-Origin Resource Sharing rules.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CorsConfig {
+    /// Origins allowed to access this service. Use `*` to allow any origin.
+    pub allow_origins: Vec<String>,
+    /// HTTP methods allowed by preflight responses.
+    #[serde(default = "default_cors_allow_methods")]
+    pub allow_methods: Vec<String>,
+    /// Request headers allowed by preflight responses.
+    #[serde(default = "default_cors_allow_headers")]
+    pub allow_headers: Vec<String>,
+    /// Response headers exposed to browser clients.
+    #[serde(default = "default_cors_expose_headers")]
+    pub expose_headers: Vec<String>,
+    /// Whether browser credentials are allowed.
+    #[serde(default)]
+    pub allow_credentials: bool,
+    /// Whether private-network preflight requests are allowed.
+    #[serde(default)]
+    pub allow_private_network: bool,
+    /// Browser preflight cache duration in seconds.
+    pub max_age_seconds: Option<u64>,
+}
+
+impl CorsConfig {
+    /// Checks for invalid wildcard and required-field combinations.
+    fn validate(&self) -> Result<(), String> {
+        if self.allow_origins.is_empty() {
+            return Err("custom CORS requires at least one allowed origin".to_string());
+        }
+        if self.allow_methods.is_empty() {
+            return Err("custom CORS requires at least one allowed method".to_string());
+        }
+
+        for (field, values) in [
+            ("allow_origins", self.allow_origins.as_slice()),
+            ("allow_methods", self.allow_methods.as_slice()),
+            ("allow_headers", self.allow_headers.as_slice()),
+            ("expose_headers", self.expose_headers.as_slice()),
+        ] {
+            if has_mixed_wildcard(values) {
+                return Err(format!(
+                    "custom CORS `{field}` cannot mix `*` with explicit values"
+                ));
+            }
+        }
+
+        if self.allow_credentials {
+            for (field, values) in [
+                ("allow_origins", self.allow_origins.as_slice()),
+                ("allow_methods", self.allow_methods.as_slice()),
+                ("allow_headers", self.allow_headers.as_slice()),
+                ("expose_headers", self.expose_headers.as_slice()),
+            ] {
+                if is_wildcard_list(values) {
+                    return Err(format!(
+                        "custom CORS `{field}` cannot be `*` when credentials are allowed"
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Builds the explicit `tower-http` CORS layer.
+    fn cors_layer(&self) -> ConfigResult<CorsLayer> {
+        let mut layer = CorsLayer::new()
+            .allow_credentials(self.allow_credentials)
+            .allow_private_network(self.allow_private_network);
+
+        if is_wildcard_list(&self.allow_origins) {
+            layer = layer.allow_origin(Any);
+        } else {
+            layer = layer.allow_origin(AllowOrigin::list(parse_header_values(
+                &self.allow_origins,
+                "cors.allow_origins",
+            )?));
+        }
+
+        if is_wildcard_list(&self.allow_methods) {
+            layer = layer.allow_methods(Any);
+        } else {
+            layer = layer.allow_methods(parse_methods(&self.allow_methods)?);
+        }
+
+        if is_wildcard_list(&self.allow_headers) {
+            layer = layer.allow_headers(Any);
+        } else if !self.allow_headers.is_empty() {
+            layer = layer.allow_headers(parse_header_names(
+                &self.allow_headers,
+                "cors.allow_headers",
+            )?);
+        }
+
+        if is_wildcard_list(&self.expose_headers) {
+            layer = layer.expose_headers(Any);
+        } else if !self.expose_headers.is_empty() {
+            layer = layer.expose_headers(parse_header_names(
+                &self.expose_headers,
+                "cors.expose_headers",
+            )?);
+        }
+
+        if let Some(max_age_seconds) = self.max_age_seconds {
+            layer = layer.max_age(Duration::from_secs(max_age_seconds));
+        }
+
+        Ok(layer)
     }
 }
 
@@ -576,8 +848,83 @@ fn default_completed_upload_ttl_seconds() -> u64 {
     86_400
 }
 
-fn default_permissive_cors() -> bool {
-    true
+fn default_cors() -> CorsMode {
+    CorsMode::default()
+}
+
+fn default_cors_allow_methods() -> Vec<String> {
+    ["GET", "HEAD", "PUT", "POST", "DELETE"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn default_cors_allow_headers() -> Vec<String> {
+    ["*"].into_iter().map(str::to_string).collect()
+}
+
+fn default_cors_expose_headers() -> Vec<String> {
+    [
+        "ETag",
+        "x-amz-checksum-crc32",
+        "x-amz-checksum-crc32c",
+        "x-amz-checksum-crc64nvme",
+        "x-amz-checksum-sha1",
+        "x-amz-checksum-sha256",
+        "x-amz-delete-marker",
+        "x-amz-request-id",
+        "x-amz-version-id",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn is_wildcard_list(values: &[String]) -> bool {
+    values.len() == 1 && values[0] == "*"
+}
+
+fn has_mixed_wildcard(values: &[String]) -> bool {
+    values.len() > 1 && values.iter().any(|value| value == "*")
+}
+
+fn parse_header_values(values: &[String], field: &str) -> ConfigResult<Vec<HeaderValue>> {
+    values
+        .iter()
+        .map(|value| {
+            HeaderValue::from_str(value).map_err(|err| {
+                ConfigError::Configuration(format!(
+                    "{field} contains invalid value `{value}`: {err}"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn parse_header_names(values: &[String], field: &str) -> ConfigResult<Vec<HeaderName>> {
+    values
+        .iter()
+        .map(|value| {
+            HeaderName::from_bytes(value.as_bytes()).map_err(|err| {
+                ConfigError::Configuration(format!(
+                    "{field} contains invalid header `{value}`: {err}"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn parse_methods(values: &[String]) -> ConfigResult<Vec<Method>> {
+    values
+        .iter()
+        .map(|value| {
+            Method::from_bytes(value.as_bytes()).map_err(|err| {
+                ConfigError::Configuration(format!(
+                    "cors.allow_methods contains invalid method `{value}`: {err}"
+                ))
+            })
+        })
+        .collect()
 }
 
 fn default_read_only() -> bool {
@@ -717,6 +1064,259 @@ mod tests {
     }
 
     #[test]
+    fn cors_defaults_and_yaml_modes_are_parsed() -> TestResult {
+        assert_eq!(Config::default().cors_mode(), CorsMode::Permissive);
+
+        let config: Config = yaml_serde::from_str("permissive_cors: false\n")?;
+        assert_eq!(config.cors_mode(), CorsMode::Disabled);
+
+        let config: Config = yaml_serde::from_str(
+            "
+            cors:
+              mode: disabled
+            ",
+        )?;
+        assert_eq!(config.cors_mode(), CorsMode::Disabled);
+
+        let config: Config = yaml_serde::from_str(
+            "
+            cors:
+              mode: custom
+              allow_origins:
+                - https://app.example.test
+              allow_credentials: false
+              allow_private_network: true
+              max_age_seconds: 600
+            ",
+        )?;
+        let CorsMode::Custom(cors) = config.cors_mode() else {
+            panic!("expected custom CORS mode");
+        };
+        assert_eq!(cors.allow_origins, ["https://app.example.test"]);
+        assert_eq!(cors.allow_methods, default_cors_allow_methods());
+        assert_eq!(cors.allow_headers, ["*"]);
+        assert_eq!(cors.expose_headers, default_cors_expose_headers());
+        assert!(!cors.allow_credentials);
+        assert!(cors.allow_private_network);
+        assert_eq!(cors.max_age_seconds, Some(600));
+        assert!(config.cors_layer()?.is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn custom_cors_rejects_invalid_combinations() -> TestResult {
+        let config: Config = yaml_serde::from_str(
+            "
+            cors:
+              mode: custom
+              allow_origins:
+                - '*'
+                - https://app.example.test
+            ",
+        )?;
+        assert!(config.validate().is_err());
+
+        let config: Config = yaml_serde::from_str(
+            "
+            cors:
+              mode: custom
+              allow_origins:
+                - '*'
+              allow_credentials: true
+            ",
+        )?;
+        assert!(config.validate().is_err());
+
+        let custom_field_on_disabled = yaml_serde::from_str::<Config>(
+            "
+            cors:
+              mode: disabled
+              allow_origins:
+                - https://app.example.test
+            ",
+        );
+        assert!(custom_field_on_disabled.is_err());
+
+        let config: Config = yaml_serde::from_str(
+            "
+            cors:
+              mode: custom
+              allow_origins:
+                - https://app.example.test
+              allow_methods:
+                - 'BAD METHOD'
+            ",
+        )?;
+        assert!(config.cors_layer().is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_permissive_cors_aliases_override_explicit_mode() -> TestResult {
+        use clap::Parser as _;
+
+        let args = ConfigArgs::try_parse_from(["s3ite", "--permissive-cors", "true"])?;
+        let config = Config::from_config_args(args)?;
+        assert_eq!(config.cors_mode(), CorsMode::Permissive);
+
+        let args = ConfigArgs::try_parse_from(["s3ite", "--permissive-cors", "false"])?;
+        let config = Config::from_config_args(args)?;
+        assert_eq!(config.cors_mode(), CorsMode::Disabled);
+
+        let config = Config {
+            cors: CorsMode::Disabled,
+            permissive_cors: Some(true),
+            ..Config::default()
+        };
+        assert_eq!(config.cors_mode(), CorsMode::Permissive);
+
+        Ok(())
+    }
+
+    #[test]
+    fn custom_cors_layers_cover_wildcard_and_explicit_rules() -> TestResult {
+        let wildcard = Config {
+            cors: CorsMode::Custom(CorsConfig {
+                allow_origins: vec!["*".to_string()],
+                allow_methods: vec!["*".to_string()],
+                allow_headers: Vec::new(),
+                expose_headers: vec!["*".to_string()],
+                allow_credentials: false,
+                allow_private_network: true,
+                max_age_seconds: Some(30),
+            }),
+            ..Config::default()
+        };
+        assert!(wildcard.cors_layer()?.is_some());
+
+        let explicit = Config {
+            cors: CorsMode::Custom(CorsConfig {
+                allow_origins: vec!["https://app.example.test".to_string()],
+                allow_methods: vec!["GET".to_string(), "PUT".to_string()],
+                allow_headers: vec!["x-amz-meta-test".to_string()],
+                expose_headers: vec!["ETag".to_string()],
+                allow_credentials: true,
+                allow_private_network: false,
+                max_age_seconds: None,
+            }),
+            ..Config::default()
+        };
+        assert!(explicit.cors_layer()?.is_some());
+
+        let disabled = Config {
+            cors: CorsMode::Disabled,
+            ..Config::default()
+        };
+        assert!(disabled.cors_layer()?.is_none());
+
+        let permissive = Config {
+            cors: CorsMode::Permissive,
+            ..Config::default()
+        };
+        assert!(permissive.cors_layer()?.is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn custom_cors_validation_covers_required_fields_and_header_parsing() {
+        let missing_origins = CorsConfig {
+            allow_origins: Vec::new(),
+            allow_methods: vec!["GET".to_string()],
+            allow_headers: Vec::new(),
+            expose_headers: Vec::new(),
+            allow_credentials: false,
+            allow_private_network: false,
+            max_age_seconds: None,
+        };
+        assert!(missing_origins.validate().is_err());
+
+        let missing_methods = CorsConfig {
+            allow_origins: vec!["https://app.example.test".to_string()],
+            allow_methods: Vec::new(),
+            allow_headers: Vec::new(),
+            expose_headers: Vec::new(),
+            allow_credentials: false,
+            allow_private_network: false,
+            max_age_seconds: None,
+        };
+        assert!(missing_methods.validate().is_err());
+
+        for config in [
+            CorsConfig {
+                allow_origins: vec!["https://app.example.test".to_string()],
+                allow_methods: vec!["*".to_string()],
+                allow_headers: vec!["x-amz-meta-test".to_string()],
+                expose_headers: vec!["ETag".to_string()],
+                allow_credentials: true,
+                allow_private_network: false,
+                max_age_seconds: None,
+            },
+            CorsConfig {
+                allow_origins: vec!["https://app.example.test".to_string()],
+                allow_methods: vec!["GET".to_string()],
+                allow_headers: vec!["*".to_string()],
+                expose_headers: vec!["ETag".to_string()],
+                allow_credentials: true,
+                allow_private_network: false,
+                max_age_seconds: None,
+            },
+            CorsConfig {
+                allow_origins: vec!["https://app.example.test".to_string()],
+                allow_methods: vec!["GET".to_string()],
+                allow_headers: vec!["x-amz-meta-test".to_string()],
+                expose_headers: vec!["*".to_string()],
+                allow_credentials: true,
+                allow_private_network: false,
+                max_age_seconds: None,
+            },
+        ] {
+            assert!(config.validate().is_err());
+        }
+
+        for config in [
+            CorsConfig {
+                allow_origins: vec!["https://bad\n.example".to_string()],
+                allow_methods: vec!["GET".to_string()],
+                allow_headers: Vec::new(),
+                expose_headers: Vec::new(),
+                allow_credentials: false,
+                allow_private_network: false,
+                max_age_seconds: None,
+            },
+            CorsConfig {
+                allow_origins: vec!["https://app.example.test".to_string()],
+                allow_methods: vec!["GET".to_string()],
+                allow_headers: vec!["bad header".to_string()],
+                expose_headers: Vec::new(),
+                allow_credentials: false,
+                allow_private_network: false,
+                max_age_seconds: None,
+            },
+            CorsConfig {
+                allow_origins: vec!["https://app.example.test".to_string()],
+                allow_methods: vec!["GET".to_string()],
+                allow_headers: Vec::new(),
+                expose_headers: vec!["bad header".to_string()],
+                allow_credentials: false,
+                allow_private_network: false,
+                max_age_seconds: None,
+            },
+        ] {
+            let config = Config {
+                cors: CorsMode::Custom(config),
+                ..Config::default()
+            };
+            assert!(matches!(
+                config.cors_layer(),
+                Err(ConfigError::Configuration(_))
+            ));
+        }
+    }
+
+    #[test]
     fn cli_args_override_yaml_config() -> TestResult {
         use clap::Parser as _;
 
@@ -733,6 +1333,8 @@ mod tests {
             cache_size: 512
             multipart_upload_ttl_seconds: 100
             completed_multipart_upload_ttl_seconds: 200
+            cors:
+              mode: permissive
             ",
         )?;
 
@@ -754,8 +1356,8 @@ mod tests {
             "access",
             "--secret-key",
             "secret",
-            "--permissive-cors",
-            "false",
+            "--cors",
+            "disabled",
             "--domain-name",
             "s3.example.test",
             "--concurrency-limit",
@@ -792,7 +1394,7 @@ mod tests {
         assert_eq!(config.port, 9001);
         assert_eq!(config.access_key.as_deref(), Some("access"));
         assert_eq!(config.secret_key.as_deref(), Some("secret"));
-        assert!(!config.permissive_cors);
+        assert_eq!(config.cors_mode(), CorsMode::Disabled);
         assert_eq!(config.domain_name.as_deref(), Some("s3.example.test"));
         assert_eq!(config.concurrency_limit, 32);
         assert_eq!(config.readers, 3);

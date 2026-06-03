@@ -1001,6 +1001,13 @@ mod tests {
         }
     }
 
+    fn require_prepared(completion: MultipartCompletion) -> SqliteResult<PreparedMultipartUpload> {
+        match completion {
+            MultipartCompletion::Prepared(prepared) => Ok(prepared),
+            MultipartCompletion::AlreadyCompleted(_) => Err(SqliteError::InvalidMultipartPart),
+        }
+    }
+
     #[test]
     fn completion_prepare_rejects_empty_requested_parts() -> SqliteResult<()> {
         let mut connection = open_schema()?;
@@ -1082,6 +1089,80 @@ mod tests {
             Err(SqliteError::Rusqlite(
                 rusqlite::Error::FromSqlConversionFailure(..)
             ))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn completion_put_persists_object_parts_and_retries_from_completed_ledger() -> SqliteResult<()>
+    {
+        let mut connection = open_schema()?;
+        let transaction = connection.transaction()?;
+        let upload_id = Uuid::new_v4();
+        let part_md5 = "900150983cd24fb0d6963f7d28e17f72";
+        Sqlite::create_multipart_upload(
+            &transaction,
+            upload_id,
+            "bucket",
+            "key",
+            MultipartUploadState {
+                access_key: Some("owner".to_string()),
+                ..upload_state()
+            },
+        )?;
+        Sqlite::put_multipart(
+            &transaction,
+            Multipart {
+                upload_id,
+                part_number: 1,
+                last_modified: time::OffsetDateTime::now_utc(),
+                value: b"abc".to_vec(),
+                size: 3,
+                md5: Some(part_md5.to_string()),
+                checksum: None,
+            },
+        )?;
+        let mut request = completion_request(
+            upload_id,
+            vec![MultipartCompletionPart {
+                part_number: 1,
+                md5: part_md5.to_string(),
+                checksum: None,
+            }],
+        );
+        request.access_key = Some("owner".to_string());
+        let prepared = require_prepared(Sqlite::prepare_multipart_upload_completion(
+            &transaction,
+            &request,
+        )?)?;
+        let retry_prepared = require_prepared(Sqlite::prepare_multipart_upload_completion(
+            &transaction,
+            &request,
+        )?)?;
+
+        let outcome = Sqlite::put_prepared_multipart_upload(&transaction, &request, prepared)?;
+        assert!(
+            Sqlite::get_multipart_upload_state(&transaction, upload_id, "bucket", "key")?.is_none()
+        );
+        assert!(Sqlite::get_multiparts(&transaction, upload_id)?.is_empty());
+        let object = Sqlite::get_object(&transaction, "key")?.ok_or(SqliteError::ObjectNotFound)?;
+        assert_eq!(object.value.as_deref(), Some(b"abc".as_slice()));
+        let completed_part =
+            Sqlite::get_completed_object_part(&transaction, "key", &outcome.version_id, 1)?
+                .ok_or(SqliteError::InvalidMultipartPart)?;
+        assert_eq!(completed_part.start, 0);
+        assert_eq!(completed_part.size, 3);
+
+        let retry = Sqlite::put_prepared_multipart_upload(&transaction, &request, retry_prepared)?;
+        assert_eq!(retry.md5, outcome.md5);
+        assert_eq!(retry.version_id, outcome.version_id);
+        assert_eq!(retry.returned_version_id, outcome.returned_version_id);
+        assert_eq!(retry.checksum, outcome.checksum);
+
+        request.access_key = Some("other".to_string());
+        assert!(matches!(
+            Sqlite::prepare_multipart_upload_completion(&transaction, &request),
+            Err(SqliteError::MultipartAccessDenied)
         ));
         Ok(())
     }

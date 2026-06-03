@@ -38,7 +38,7 @@ async fn test_bucket_list_empty() -> Result<()> {
 async fn test_server_domain_and_cors_startup_smoke() -> Result<()> {
     let server = TestServer::spawn_with(TestServerOptions {
         domain_name: Some("localhost".to_string()),
-        permissive_cors: Some(true),
+        cors: Some("permissive".to_string()),
         ..Default::default()
     })
     .await?;
@@ -55,7 +55,7 @@ async fn test_server_domain_and_cors_startup_smoke() -> Result<()> {
 #[serial(conformance)]
 async fn test_server_without_cors_startup_smoke() -> Result<()> {
     let server = TestServer::spawn_with(TestServerOptions {
-        permissive_cors: Some(false),
+        cors: Some("disabled".to_string()),
         ..Default::default()
     })
     .await?;
@@ -63,6 +63,94 @@ async fn test_server_without_cors_startup_smoke() -> Result<()> {
 
     let output = client.list_buckets().send().await?;
     assert!(output.buckets().is_empty());
+
+    Ok(())
+}
+
+/// Verifies custom CORS settings are applied to preflight and S3 responses.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_server_custom_cors_headers() -> Result<()> {
+    let server = TestServer::spawn_with(TestServerOptions {
+        config: Some(
+            "
+            cors:
+              mode: custom
+              allow_origins:
+                - https://app.example.test
+              allow_methods:
+                - GET
+              allow_headers:
+                - authorization
+                - x-amz-date
+              expose_headers:
+                - ETag
+                - x-amz-request-id
+              allow_private_network: true
+              max_age_seconds: 600
+            "
+            .to_string(),
+        ),
+        ..Default::default()
+    })
+    .await?;
+    let client = raw_http::client()?;
+
+    let preflight = client
+        .request(Method::OPTIONS, server.endpoint())
+        .header("Origin", "https://app.example.test")
+        .header("Access-Control-Request-Method", "GET")
+        .header("Access-Control-Request-Headers", "authorization,x-amz-date")
+        .header("Access-Control-Request-Private-Network", "true")
+        .send()
+        .await?;
+    assert_status(&preflight, StatusCode::OK);
+    assert_eq!(
+        preflight
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|header| header.to_str().ok()),
+        Some("https://app.example.test")
+    );
+    assert_eq!(
+        preflight
+            .headers()
+            .get("access-control-allow-private-network")
+            .and_then(|header| header.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        preflight
+            .headers()
+            .get("access-control-max-age")
+            .and_then(|header| header.to_str().ok()),
+        Some("600")
+    );
+
+    let response = raw_http::signed_request_with_headers(
+        &server,
+        Method::GET,
+        "/",
+        Vec::new(),
+        &[("Origin", "https://app.example.test")],
+    )
+    .await?;
+    assert_status(&response, StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|header| header.to_str().ok()),
+        Some("https://app.example.test")
+    );
+    let exposed = response
+        .headers()
+        .get("access-control-expose-headers")
+        .and_then(|header| header.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(exposed.contains("etag"));
+    assert!(exposed.contains("x-amz-request-id"));
 
     Ok(())
 }

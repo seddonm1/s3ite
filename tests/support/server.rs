@@ -29,6 +29,8 @@ pub struct TestServer {
 
 #[derive(Debug, Default)]
 pub struct TestServerOptions {
+    pub config: Option<String>,
+    pub cors: Option<String>,
     pub domain_name: Option<String>,
     pub permissive_cors: Option<bool>,
     pub rust_log: Option<String>,
@@ -56,6 +58,11 @@ impl TestServer {
         });
 
         let mut command = Command::new(&binary);
+        if let Some(config) = options.config {
+            let config_path = root.path().join("s3ite.yaml");
+            fs::write(&config_path, config).context("write s3ite test config")?;
+            command.arg("--config").arg(config_path);
+        }
         command
             .arg("--root")
             .arg(&data_root)
@@ -71,6 +78,9 @@ impl TestServer {
             .arg("0");
         if let Some(domain_name) = options.domain_name {
             command.arg("--domain-name").arg(domain_name);
+        }
+        if let Some(cors) = options.cors {
+            command.arg("--cors").arg(cors);
         }
         if let Some(permissive_cors) = options.permissive_cors {
             command

@@ -58,13 +58,13 @@ async fn bucket_versioning_write_persists_bucket_state() -> Result<()> {
 
     create_bucket(&client, &bucket).await?;
     let connection = open_bucket_db(&server, &bucket)?;
-    assert_eq!(bucket_versioning_state(&connection)?, "never_configured");
+    assert_eq!(bucket_versioning_state(&connection)?, 0);
 
     put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
-    assert_eq!(bucket_versioning_state(&connection)?, "enabled");
+    assert_eq!(bucket_versioning_state(&connection)?, 1);
 
     put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Suspended).await?;
-    assert_eq!(bucket_versioning_state(&connection)?, "suspended");
+    assert_eq!(bucket_versioning_state(&connection)?, 2);
 
     Ok(())
 }
@@ -457,7 +457,7 @@ fn bucket_path(server: &TestServer, bucket: &str) -> PathBuf {
     server.data_root().join(format!("{bucket}.sqlite3"))
 }
 
-fn bucket_versioning_state(connection: &Connection) -> Result<String> {
+fn bucket_versioning_state(connection: &Connection) -> Result<i64> {
     Ok(connection.query_row(
         "SELECT versioning_state FROM bucket_state WHERE id = 1;",
         [],

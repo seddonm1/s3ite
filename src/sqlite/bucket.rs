@@ -118,10 +118,7 @@ impl Sqlite {
     ) -> SqliteResult<BucketVersioningState> {
         let mut stmt = transaction
             .prepare_cached("SELECT versioning_state FROM bucket_state WHERE id = 1;")?;
-        let state = stmt.query_row((), |row| {
-            let value = row.get::<_, String>(0)?;
-            BucketVersioningState::from_sql(&value)
-        })?;
+        let state = stmt.query_row((), |row| row.get(0))?;
         Ok(state)
     }
 
@@ -136,7 +133,7 @@ impl Sqlite {
             SET versioning_state = ?1
             WHERE id = 1;",
         )?;
-        Ok(stmt.execute([state.as_sql()])?)
+        Ok(stmt.execute([state])?)
     }
 }
 

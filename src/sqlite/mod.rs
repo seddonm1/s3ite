@@ -6,7 +6,11 @@ use std::{
     sync::Arc,
 };
 
-use rusqlite::{Error::ToSqlConversionFailure, Transaction};
+use rusqlite::{
+    Error::ToSqlConversionFailure,
+    ToSql, Transaction,
+    types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef},
+};
 use time::{Duration, OffsetDateTime};
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -35,11 +39,11 @@ pub use self::error::{SqliteError, SqliteResult};
 
 pub(crate) const NULL_VERSION_ID: &str = "null";
 
-const BUCKET_SCHEMA_VERSION: i32 = 5;
+const BUCKET_SCHEMA_VERSION: i32 = 6;
 const BUCKET_SCHEMA_SQL: &str = "
 CREATE TABLE bucket_state (
     id INTEGER PRIMARY KEY CHECK(id = 1),
-    versioning_state TEXT NOT NULL CHECK(versioning_state IN ('never_configured', 'enabled', 'suspended'))
+    versioning_state INTEGER NOT NULL CHECK(versioning_state IN (0, 1, 2))
 ) STRICT;
 
 CREATE TABLE object_version (
@@ -125,7 +129,7 @@ CREATE TABLE completed_object_part (
             AND checksum_value IS NOT NULL
         )
     )
-) WITHOUT ROWID, STRICT;
+) STRICT;
 
 CREATE TABLE multipart_upload (
     upload_id BLOB NOT NULL PRIMARY KEY,
@@ -158,6 +162,11 @@ CREATE TABLE multipart_upload (
     )
 ) STRICT;
 
+CREATE INDEX multipart_upload_list
+    ON multipart_upload(key, upload_id);
+CREATE INDEX multipart_upload_expiry
+    ON multipart_upload(DATETIME(last_modified));
+
 CREATE TABLE multipart_upload_part (
     upload_id BLOB NOT NULL,
     last_modified TEXT NOT NULL,
@@ -183,7 +192,7 @@ CREATE TABLE multipart_upload_part (
             AND checksum_value IS NOT NULL
         )
     )
-) WITHOUT ROWID, STRICT;
+) STRICT;
 
 CREATE TABLE completed_multipart_upload (
     upload_id BLOB NOT NULL PRIMARY KEY,
@@ -200,10 +209,13 @@ CREATE TABLE completed_multipart_upload (
     UNIQUE(upload_id, bucket, key)
 ) STRICT;
 
-INSERT INTO bucket_state (id, versioning_state)
-VALUES (1, 'never_configured');
+CREATE INDEX completed_multipart_upload_expiry
+    ON completed_multipart_upload(DATETIME(last_modified));
 
-PRAGMA user_version = 5;
+INSERT INTO bucket_state (id, versioning_state)
+VALUES (1, 0);
+
+PRAGMA user_version = 6;
 ";
 
 /// Reads a nonnegative object size column from a row.
@@ -252,33 +264,36 @@ fn expiration_threshold(ttl_seconds: u64) -> Option<OffsetDateTime> {
 
 /// Bucket-level S3 object versioning state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(i64)]
 pub(crate) enum BucketVersioningState {
     /// Versioning has never been configured on this bucket.
-    NeverConfigured,
+    NeverConfigured = 0,
     /// New object writes create generated version IDs.
-    Enabled,
+    Enabled = 1,
     /// New object writes replace the special `null` version.
-    Suspended,
+    Suspended = 2,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("invalid bucket versioning state: {0}")]
+struct InvalidBucketVersioningState(i64);
+
 impl BucketVersioningState {
-    /// Returns the serialized database representation.
+    /// Returns the serialized `SQLite` representation.
     #[must_use]
-    fn as_sql(self) -> &'static str {
-        match self {
-            Self::NeverConfigured => "never_configured",
-            Self::Enabled => "enabled",
-            Self::Suspended => "suspended",
-        }
+    fn sql_code(self) -> i64 {
+        self as i64
     }
 
-    /// Parses a database representation.
-    fn from_sql(value: &str) -> rusqlite::Result<Self> {
+    /// Parses a `SQLite` representation.
+    fn from_sql_code(value: i64) -> FromSqlResult<Self> {
         match value {
-            "never_configured" => Ok(Self::NeverConfigured),
-            "enabled" => Ok(Self::Enabled),
-            "suspended" => Ok(Self::Suspended),
-            _ => Err(rusqlite::Error::InvalidQuery),
+            value if value == Self::NeverConfigured.sql_code() => Ok(Self::NeverConfigured),
+            value if value == Self::Enabled.sql_code() => Ok(Self::Enabled),
+            value if value == Self::Suspended.sql_code() => Ok(Self::Suspended),
+            _ => Err(FromSqlError::Other(Box::new(InvalidBucketVersioningState(
+                value,
+            )))),
         }
     }
 
@@ -286,6 +301,23 @@ impl BucketVersioningState {
     #[must_use]
     fn returns_write_version_id(self) -> bool {
         self == Self::Enabled
+    }
+}
+
+impl ToSql for BucketVersioningState {
+    /// Serializes a bucket versioning state as its stable database code.
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.sql_code()))
+    }
+}
+
+impl FromSql for BucketVersioningState {
+    /// Deserializes a bucket versioning state from its database code.
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let ValueRef::Integer(value) = value else {
+            return Err(FromSqlError::InvalidType);
+        };
+        Self::from_sql_code(value)
     }
 }
 
@@ -734,7 +766,7 @@ impl Sqlite {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
         fs,
         path::{Path, PathBuf},
         sync::Arc,
@@ -769,6 +801,64 @@ mod tests {
         fs::remove_dir_all(root).ok();
     }
 
+    fn index_columns(connection: &Connection, index: &str) -> SqliteResult<Vec<String>> {
+        let mut stmt = connection.prepare(&format!("PRAGMA index_info('{index}');"))?;
+        Ok(stmt
+            .query_map((), |row| row.get(2))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn index_sql(connection: &Connection, index: &str) -> SqliteResult<String> {
+        Ok(connection.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?1;",
+            [index],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn query_plan_uses_index(connection: &Connection, sql: &str, index: &str) -> SqliteResult<()> {
+        let mut stmt = connection.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+        let details = stmt
+            .query_map((), |row| row.get::<_, String>(3))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert!(
+            details.iter().any(|detail| detail.contains(index)),
+            "expected query plan to use {index}, got {details:?}"
+        );
+        Ok(())
+    }
+
+    #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
+    struct ForeignKeyColumn {
+        id: i64,
+        seq: i64,
+        table: String,
+        from: String,
+        to: String,
+        on_delete: String,
+    }
+
+    fn foreign_key_columns(
+        connection: &Connection,
+        table: &str,
+    ) -> SqliteResult<Vec<ForeignKeyColumn>> {
+        let mut stmt = connection.prepare(&format!("PRAGMA foreign_key_list('{table}');"))?;
+        let mut columns = stmt
+            .query_map((), |row| {
+                Ok(ForeignKeyColumn {
+                    id: row.get(0)?,
+                    seq: row.get(1)?,
+                    table: row.get(2)?,
+                    from: row.get(3)?,
+                    to: row.get(4)?,
+                    on_delete: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        columns.sort();
+        Ok(columns)
+    }
+
     #[test]
     fn size_and_limit_helpers_reject_negative_values() -> SqliteResult<()> {
         let connection = Connection::open_in_memory()?;
@@ -785,19 +875,29 @@ mod tests {
 
     #[test]
     fn versioning_state_sql_roundtrips_and_rejects_unknown_values() -> SqliteResult<()> {
-        assert_eq!(
-            BucketVersioningState::from_sql(BucketVersioningState::NeverConfigured.as_sql())?,
-            BucketVersioningState::NeverConfigured
-        );
-        assert_eq!(
-            BucketVersioningState::from_sql(BucketVersioningState::Enabled.as_sql())?,
-            BucketVersioningState::Enabled
-        );
-        assert_eq!(
-            BucketVersioningState::from_sql(BucketVersioningState::Suspended.as_sql())?,
-            BucketVersioningState::Suspended
-        );
-        assert!(BucketVersioningState::from_sql("bad").is_err());
+        let connection = Connection::open_in_memory()?;
+        for state in [
+            BucketVersioningState::NeverConfigured,
+            BucketVersioningState::Enabled,
+            BucketVersioningState::Suspended,
+        ] {
+            let expected_sql = state.sql_code();
+            let encoded =
+                connection.query_row("SELECT ?1;", [state], |row| row.get::<_, i64>(0))?;
+            let decoded = connection.query_row("SELECT ?1;", [expected_sql], |row| {
+                row.get::<_, BucketVersioningState>(0)
+            })?;
+            assert_eq!(encoded, expected_sql);
+            assert_eq!(decoded, state);
+        }
+        let invalid_state = connection.query_row("SELECT 99;", (), |row| {
+            row.get::<_, BucketVersioningState>(0)
+        });
+        let invalid_type = connection.query_row("SELECT 'enabled';", (), |row| {
+            row.get::<_, BucketVersioningState>(0)
+        });
+        assert!(invalid_state.is_err());
+        assert!(invalid_type.is_err());
         assert!(!BucketVersioningState::NeverConfigured.returns_write_version_id());
         assert!(BucketVersioningState::Enabled.returns_write_version_id());
         assert!(!BucketVersioningState::Suspended.returns_write_version_id());
@@ -826,6 +926,150 @@ mod tests {
 
         let version: i32 = connection.query_row("PRAGMA user_version;", (), |row| row.get(0))?;
         assert_eq!(version, super::BUCKET_SCHEMA_VERSION);
+        Ok(())
+    }
+
+    #[test]
+    fn schema_tables_are_strict_rowid_tables() -> SqliteResult<()> {
+        let connection = open_schema()?;
+        let mut stmt = connection.prepare("PRAGMA table_list;")?;
+        let mut seen = HashSet::new();
+        let rows = stmt.query_map((), |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i32>(4)?,
+                row.get::<_, i32>(5)?,
+            ))
+        })?;
+
+        for row in rows {
+            let (name, table_type, without_rowid, strict) = row?;
+            if table_type != "table" || name.starts_with("sqlite_") {
+                continue;
+            }
+
+            assert_eq!(without_rowid, 0, "{name} must keep a rowid");
+            assert_eq!(strict, 1, "{name} must be STRICT");
+            seen.insert(name);
+        }
+
+        for table in [
+            "bucket_state",
+            "object_version",
+            "object_body",
+            "completed_object_part",
+            "multipart_upload",
+            "multipart_upload_part",
+            "completed_multipart_upload",
+        ] {
+            assert!(seen.contains(table), "missing schema table {table}");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn schema_foreign_keys_cover_dependent_rows() -> SqliteResult<()> {
+        let connection = open_schema()?;
+
+        assert_eq!(
+            foreign_key_columns(&connection, "object_body")?,
+            vec![ForeignKeyColumn {
+                id: 0,
+                seq: 0,
+                table: "object_version".to_string(),
+                from: "sequence".to_string(),
+                to: "sequence".to_string(),
+                on_delete: "CASCADE".to_string(),
+            }]
+        );
+        assert_eq!(
+            foreign_key_columns(&connection, "completed_object_part")?,
+            vec![
+                ForeignKeyColumn {
+                    id: 0,
+                    seq: 0,
+                    table: "object_version".to_string(),
+                    from: "key".to_string(),
+                    to: "key".to_string(),
+                    on_delete: "CASCADE".to_string(),
+                },
+                ForeignKeyColumn {
+                    id: 0,
+                    seq: 1,
+                    table: "object_version".to_string(),
+                    from: "version_id".to_string(),
+                    to: "version_id".to_string(),
+                    on_delete: "CASCADE".to_string(),
+                },
+            ]
+        );
+        assert_eq!(
+            foreign_key_columns(&connection, "multipart_upload_part")?,
+            vec![ForeignKeyColumn {
+                id: 0,
+                seq: 0,
+                table: "multipart_upload".to_string(),
+                from: "upload_id".to_string(),
+                to: "upload_id".to_string(),
+                on_delete: "CASCADE".to_string(),
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn schema_indexes_cover_list_and_cleanup_queries() -> SqliteResult<()> {
+        let connection = open_schema()?;
+
+        assert_eq!(
+            index_columns(&connection, "object_version_latest_one")?,
+            ["key"]
+        );
+        assert_eq!(
+            index_columns(&connection, "object_version_current_list")?,
+            ["key"]
+        );
+        assert_eq!(
+            index_columns(&connection, "object_version_list")?,
+            ["key", "sequence"]
+        );
+        assert_eq!(
+            index_columns(&connection, "multipart_upload_list")?,
+            ["key", "upload_id"]
+        );
+        assert!(
+            index_sql(&connection, "multipart_upload_expiry")?.contains("DATETIME(last_modified)")
+        );
+        assert!(
+            index_sql(&connection, "completed_multipart_upload_expiry")?
+                .contains("DATETIME(last_modified)")
+        );
+
+        query_plan_uses_index(
+            &connection,
+            "SELECT key, upload_id, initiated, checksum_algorithm, checksum_type, checksum_value \
+             FROM multipart_upload \
+             WHERE key >= 'prefix' \
+             ORDER BY key, upload_id \
+             LIMIT 10;",
+            "multipart_upload_list",
+        )?;
+        query_plan_uses_index(
+            &connection,
+            "DELETE FROM multipart_upload \
+             WHERE DATETIME(last_modified) < DATETIME('2026-01-01 00:00:00Z');",
+            "multipart_upload_expiry",
+        )?;
+        query_plan_uses_index(
+            &connection,
+            "DELETE FROM completed_multipart_upload \
+             WHERE DATETIME(last_modified) < DATETIME('2026-01-01 00:00:00Z');",
+            "completed_multipart_upload_expiry",
+        )?;
+
         Ok(())
     }
 
