@@ -146,7 +146,7 @@ mod tests {
 
     use tokio::sync::RwLock;
 
-    use crate::{Bucket, Config};
+    use crate::{Config, config::Bucket};
 
     use super::*;
 

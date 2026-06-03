@@ -9,35 +9,18 @@ repository = "https://github.com/seddonm1/s3ite"
 keywords = ["s3", "sqlite"]
 categories = ["database"]
 
-[features]
-default = ["binary"]
-binary = [
-    "clap",
-    "hyper",
-    "hyper-util",
-    "http-body-util",
-    "tokio/macros",
-    "tokio/net",
-    "tokio/rt-multi-thread",
-    "tokio/signal",
-    "tower",
-    "tower-http",
-    "tracing-subscriber",
-    "yaml_serde",
-]
-
 [dependencies]
 async-trait = "0.1.89"
 bytes = "1.11.1"
-clap = { version = "4.6.1", optional = true, features = ["derive"] }
+clap = { version = "4.6.1", features = ["derive"] }
 futures = "0.3.32"
 getrandom = "0.3.3"
-hyper = { version = "1.10.1", optional = true, default-features = false, features = [
+hyper = { version = "1.10.1", default-features = false, features = [
     "http1",
     "http2",
     "server",
 ] }
-hyper-util = { version = "0.1.20", optional = true, default-features = false, features = [
+hyper-util = { version = "0.1.20", default-features = false, features = [
     "http1",
     "http2",
     "server-auto",
@@ -45,7 +28,7 @@ hyper-util = { version = "0.1.20", optional = true, default-features = false, fe
     "service",
     "tokio",
 ] }
-http-body-util = { version = "0.1.3", optional = true }
+http-body-util = { version = "0.1.3" }
 md-5 = "0.11.0-rc.5"
 mime = "0.3.17"
 path-absolutize = "3.1.1"
@@ -63,24 +46,28 @@ time = "0.3.47"
 tokio = { version = "1.52.3", features = [
     "fs",
     "io-util",
+    "macros",
+    "net",
     "rt",
+    "rt-multi-thread",
+    "signal",
     "sync",
     "time",
 ] }
-tower = { version = "0.5.3", optional = true, default-features = false, features = [
+tower = { version = "0.5.3", default-features = false, features = [
     "limit",
     "util",
 ] }
-tower-http = { version = "0.6.11", optional = true, default-features = false, features = [
+tower-http = { version = "0.6.11", default-features = false, features = [
     "cors",
 ] }
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", optional = true, features = [
+tracing-subscriber = { version = "0.3.23", features = [
     "env-filter",
     "time",
 ] }
 uuid = { version = "1.23.2", features = ["v4"] }
-yaml_serde = { version = "0.10", optional = true }
+yaml_serde = { version = "0.10" }
 
 [dev-dependencies]
 anyhow = { version = "1.0.102", features = ["backtrace"] }

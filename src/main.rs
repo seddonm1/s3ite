@@ -13,7 +13,6 @@ use hyper_util::{
     server::conn::auto,
     service::TowerToHyperService,
 };
-use s3ite::{Config, ConfigError, Sqlite, SqliteError};
 use s3s::{auth::SimpleAuth, host::MultiDomain, service::S3ServiceBuilder};
 use tokio::net::TcpListener;
 use tower::limit::ConcurrencyLimitLayer;
@@ -21,9 +20,18 @@ use tower_http::cors::CorsLayer;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
 
+mod checksum;
 mod compat;
+mod config;
+mod database;
+mod s3;
+mod sqlite;
 
 use self::compat::{ChunkedBodyCompatLayer, HeaderAuthCompatLayer};
+pub(crate) use self::{
+    config::{Config, ConfigError},
+    sqlite::{Sqlite, SqliteError},
+};
 
 type MainResult<T> = std::result::Result<T, MainError>;
 

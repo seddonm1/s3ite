@@ -743,7 +743,7 @@ mod tests {
     use rusqlite::Connection;
     use tokio::sync::RwLock;
 
-    use crate::{Bucket, Config, database::BucketConnection};
+    use crate::{Config, config::Bucket, database::BucketConnection};
 
     use super::{
         BucketVersioningState, Duration, MultipartUploadState, OffsetDateTime, Sqlite, SqliteError,

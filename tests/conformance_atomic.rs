@@ -1,7 +1,7 @@
 //! Real-binary HTTP atomic read/write conformance tests.
 //!
 //! These tests require the `s3ite` binary. Run them with
-//! `cargo test --features binary --test conformance_atomic`, or set
+//! `cargo test --test conformance_atomic`, or set
 //! `S3ITE_TEST_BIN` to an existing binary path.
 
 mod support;

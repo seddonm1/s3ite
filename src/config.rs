@@ -4,16 +4,13 @@ use std::{
     path::PathBuf,
 };
 
-#[cfg(feature = "binary")]
 use clap::{Parser, ValueEnum};
 use serde::Deserialize;
 
 /// Result type returned by binary configuration loading.
-#[cfg(feature = "binary")]
 pub type ConfigResult<T> = std::result::Result<T, ConfigError>;
 
 /// Errors raised while loading binary configuration.
-#[cfg(feature = "binary")]
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     /// A configuration file could not be read.
@@ -25,7 +22,6 @@ pub enum ConfigError {
 }
 
 /// Command-line arguments that override YAML or default configuration.
-#[cfg(feature = "binary")]
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct ConfigArgs {
@@ -239,7 +235,6 @@ impl Config {
     /// # Errors
     ///
     /// Returns an error if the configured YAML file cannot be read or parsed.
-    #[cfg(feature = "binary")]
     pub fn from_args() -> ConfigResult<Self> {
         Self::from_config_args(ConfigArgs::parse())
     }
@@ -252,7 +247,6 @@ impl Config {
     /// # Errors
     ///
     /// Returns an error if the YAML file cannot be read or parsed.
-    #[cfg(feature = "binary")]
     fn from_config_args(args: ConfigArgs) -> ConfigResult<Self> {
         let mut config = args
             .config
@@ -270,7 +264,6 @@ impl Config {
     }
 
     /// Applies command-line values over the current configuration.
-    #[cfg(feature = "binary")]
     fn apply_args(&mut self, args: ConfigArgs) {
         if let Some(root) = args.root {
             self.root = root;
@@ -493,8 +486,8 @@ pub struct BucketPragmas {
 }
 
 /// `SQLite` `journal_mode` values supported by configuration.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
-#[cfg_attr(feature = "binary", derive(ValueEnum))]
+#[allow(clippy::upper_case_acronyms)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, ValueEnum)]
 pub enum JournalMode {
     /// Use `SQLite`'s rollback journal and delete it after each transaction.
     DELETE,
@@ -512,8 +505,8 @@ pub enum JournalMode {
 }
 
 /// `SQLite` `synchronous` values supported by configuration.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
-#[cfg_attr(feature = "binary", derive(ValueEnum))]
+#[allow(clippy::upper_case_acronyms)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, ValueEnum)]
 pub enum Synchronous {
     /// Let `SQLite` skip sync calls for maximum throughput and lowest durability.
     OFF,
@@ -527,8 +520,8 @@ pub enum Synchronous {
 }
 
 /// `SQLite` `temp_store` values supported by configuration.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
-#[cfg_attr(feature = "binary", derive(ValueEnum))]
+#[allow(clippy::upper_case_acronyms)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, ValueEnum)]
 pub enum TempStore {
     /// Let `SQLite` choose the temporary storage location.
     DEFAULT,
@@ -723,7 +716,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "binary")]
     #[test]
     fn cli_args_override_yaml_config() -> TestResult {
         use clap::Parser as _;

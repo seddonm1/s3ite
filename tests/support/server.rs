@@ -204,7 +204,7 @@ fn s3ite_binary() -> Result<PathBuf> {
     }
 
     bail!(
-        "CARGO_BIN_EXE_s3ite is unavailable; run `cargo test --features binary --test conformance_bucket` or set S3ITE_TEST_BIN"
+        "CARGO_BIN_EXE_s3ite is unavailable; run `cargo test --test conformance_bucket` or set S3ITE_TEST_BIN"
     );
 }
 
