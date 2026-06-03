@@ -29,6 +29,7 @@ const CHECKSUM_TYPE_COMPOSITE: i64 = 1;
 const CHECKSUM_TYPE_FULL_OBJECT: i64 = 2;
 
 impl ToSql for ChecksumAlgorithmKind {
+    /// Serializes a checksum algorithm as its compact database code.
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         let code = match self {
             Self::Crc32 => CHECKSUM_ALGORITHM_CRC32,
@@ -42,6 +43,7 @@ impl ToSql for ChecksumAlgorithmKind {
 }
 
 impl FromSql for ChecksumAlgorithmKind {
+    /// Deserializes a checksum algorithm from its compact database code.
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
         let ValueRef::Integer(code) = value else {
             return Err(FromSqlError::InvalidType);
@@ -58,6 +60,7 @@ impl FromSql for ChecksumAlgorithmKind {
 }
 
 impl ToSql for ChecksumTypeKind {
+    /// Serializes a checksum type as its compact database code.
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         let code = match self {
             Self::Composite => CHECKSUM_TYPE_COMPOSITE,
@@ -68,6 +71,7 @@ impl ToSql for ChecksumTypeKind {
 }
 
 impl FromSql for ChecksumTypeKind {
+    /// Deserializes a checksum type from its compact database code.
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
         let ValueRef::Integer(code) = value else {
             return Err(FromSqlError::InvalidType);

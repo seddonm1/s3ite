@@ -115,21 +115,6 @@ enum ObjectReadConditionFailure {
     PreconditionFailed,
 }
 
-#[derive(Clone, Debug)]
-struct ObjectDeleteConditions {
-    etag_matches: Option<ETagCondition>,
-    last_modified_time: Option<OffsetDateTime>,
-    size: Option<i64>,
-}
-
-impl ObjectDeleteConditions {
-    /// Returns whether the delete request supplied at least one precondition.
-    #[must_use]
-    fn has_any(&self) -> bool {
-        self.etag_matches.is_some() || self.last_modified_time.is_some() || self.size.is_some()
-    }
-}
-
 /// Converts S3 write condition headers into storage-neutral object conditions.
 #[must_use]
 fn object_write_conditions(
@@ -221,73 +206,6 @@ fn validate_read_conditions(
     Ok(())
 }
 
-/// Applies copy-source conditional request semantics to loaded source metadata.
-fn validate_copy_source_conditions(
-    metadata: &KeyMetadata,
-    conditions: &ObjectReadConditions,
-) -> Result<(), SqliteError> {
-    let md5 = metadata.md5.as_deref();
-    if let Some(condition) = conditions.etag_matches.as_ref()
-        && strong_etag_condition_matches(condition, md5).not()
-    {
-        return Err(SqliteError::PreconditionFailed);
-    }
-
-    if let Some(condition) = conditions.etag_none_matches.as_ref() {
-        if weak_etag_condition_matches(condition, md5) {
-            return Err(SqliteError::PreconditionFailed);
-        }
-    } else if let Some(since) = conditions.modified_since
-        && http_date_time(metadata.last_modified) <= http_date_time(since)
-    {
-        return Err(SqliteError::PreconditionFailed);
-    }
-
-    if conditions.etag_matches.is_none()
-        && let Some(since) = conditions.unmodified_since
-        && http_date_time(metadata.last_modified) > http_date_time(since)
-    {
-        return Err(SqliteError::PreconditionFailed);
-    }
-
-    Ok(())
-}
-
-/// Applies delete conditional request semantics inside a write transaction.
-fn validate_delete_conditions(
-    metadata: Option<&KeyMetadata>,
-    conditions: &ObjectDeleteConditions,
-) -> Result<(), SqliteError> {
-    let Some(metadata) = metadata else {
-        return Ok(());
-    };
-
-    if let Some(condition) = conditions.etag_matches.as_ref()
-        && match condition {
-            ETagCondition::Any => false,
-            ETagCondition::ETag(_) => {
-                strong_etag_condition_matches(condition, metadata.md5.as_deref()).not()
-            }
-        }
-    {
-        return Err(SqliteError::PreconditionFailed);
-    }
-
-    if let Some(last_modified_time) = conditions.last_modified_time
-        && http_date_time(metadata.last_modified) != http_date_time(last_modified_time)
-    {
-        return Err(SqliteError::PreconditionFailed);
-    }
-
-    if let Some(size) = conditions.size
-        && metadata.size != size
-    {
-        return Err(SqliteError::PreconditionFailed);
-    }
-
-    Ok(())
-}
-
 /// Copies a streaming S3 request body into an async writer.
 async fn copy_bytes<S, W>(mut stream: S, writer: &mut W) -> S3Result<u64>
 where
@@ -310,7 +228,7 @@ where
 #[async_trait::async_trait]
 impl S3 for Sqlite {
     /// Creates a bucket database if it does not already exist.
-    #[tracing::instrument]
+    #[tracing::instrument(skip_all, fields(bucket = %req.input.bucket))]
     async fn create_bucket(
         &self,
         req: S3Request<CreateBucketInput>,
@@ -319,7 +237,7 @@ impl S3 for Sqlite {
     }
 
     /// Copies an object between buckets while applying S3 metadata-directive rules.
-    #[tracing::instrument]
+    #[tracing::instrument(skip_all, fields(bucket = %req.input.bucket, key = %req.input.key))]
     async fn copy_object(
         &self,
         req: S3Request<CopyObjectInput>,
@@ -328,7 +246,7 @@ impl S3 for Sqlite {
     }
 
     /// Deletes an empty bucket database and its `SQLite` sidecar files.
-    #[tracing::instrument]
+    #[tracing::instrument(skip_all, fields(bucket = %req.input.bucket))]
     async fn delete_bucket(
         &self,
         req: S3Request<DeleteBucketInput>,
@@ -337,7 +255,14 @@ impl S3 for Sqlite {
     }
 
     /// Deletes an object by key.
-    #[tracing::instrument]
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            version_id = %req.input.version_id.as_deref().unwrap_or("")
+        )
+    )]
     async fn delete_object(
         &self,
         req: S3Request<DeleteObjectInput>,
@@ -346,7 +271,10 @@ impl S3 for Sqlite {
     }
 
     /// Deletes a batch of objects and returns S3 multi-delete results.
-    #[tracing::instrument]
+    #[tracing::instrument(
+        skip_all,
+        fields(bucket = %req.input.bucket, key_count = req.input.delete.objects.len())
+    )]
     async fn delete_objects(
         &self,
         req: S3Request<DeleteObjectsInput>,
@@ -355,7 +283,7 @@ impl S3 for Sqlite {
     }
 
     /// Returns the default bucket location for an existing bucket.
-    #[tracing::instrument]
+    #[tracing::instrument(skip_all, fields(bucket = %req.input.bucket))]
     async fn get_bucket_location(
         &self,
         req: S3Request<GetBucketLocationInput>,
@@ -364,7 +292,7 @@ impl S3 for Sqlite {
     }
 
     /// Returns the fixed owner ACL for an existing bucket.
-    #[tracing::instrument]
+    #[tracing::instrument(skip_all, fields(bucket = %req.input.bucket))]
     async fn get_bucket_acl(
         &self,
         req: S3Request<GetBucketAclInput>,
@@ -373,7 +301,7 @@ impl S3 for Sqlite {
     }
 
     /// Returns the bucket versioning state.
-    #[tracing::instrument]
+    #[tracing::instrument(skip_all, fields(bucket = %req.input.bucket))]
     async fn get_bucket_versioning(
         &self,
         req: S3Request<GetBucketVersioningInput>,
@@ -382,7 +310,7 @@ impl S3 for Sqlite {
     }
 
     /// Updates the bucket versioning state.
-    #[tracing::instrument]
+    #[tracing::instrument(skip_all, fields(bucket = %req.input.bucket))]
     async fn put_bucket_versioning(
         &self,
         req: S3Request<PutBucketVersioningInput>,
@@ -391,7 +319,16 @@ impl S3 for Sqlite {
     }
 
     /// Returns an object body and metadata, applying byte-range requests when present.
-    #[tracing::instrument]
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            version_id = %req.input.version_id.as_deref().unwrap_or(""),
+            part_number = ?req.input.part_number,
+            range = ?req.input.range
+        )
+    )]
     async fn get_object(
         &self,
         req: S3Request<GetObjectInput>,
@@ -400,7 +337,7 @@ impl S3 for Sqlite {
     }
 
     /// Reports that `BitTorrent` metadata is not available for the object.
-    #[tracing::instrument]
+    #[tracing::instrument(skip_all, fields(bucket = %req.input.bucket, key = %req.input.key))]
     async fn get_object_torrent(
         &self,
         req: S3Request<GetObjectTorrentInput>,
@@ -409,7 +346,7 @@ impl S3 for Sqlite {
     }
 
     /// Checks whether a bucket exists.
-    #[tracing::instrument]
+    #[tracing::instrument(skip_all, fields(bucket = %req.input.bucket))]
     async fn head_bucket(
         &self,
         req: S3Request<HeadBucketInput>,
@@ -418,7 +355,15 @@ impl S3 for Sqlite {
     }
 
     /// Returns object metadata without reading the object body.
-    #[tracing::instrument]
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            version_id = %req.input.version_id.as_deref().unwrap_or(""),
+            part_number = ?req.input.part_number
+        )
+    )]
     async fn head_object(
         &self,
         req: S3Request<HeadObjectInput>,
@@ -427,7 +372,16 @@ impl S3 for Sqlite {
     }
 
     /// Returns selected object attributes without returning the object body.
-    #[tracing::instrument]
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            version_id = %req.input.version_id.as_deref().unwrap_or(""),
+            max_parts = ?req.input.max_parts,
+            part_number_marker = ?req.input.part_number_marker
+        )
+    )]
     async fn get_object_attributes(
         &self,
         req: S3Request<GetObjectAttributesInput>,
@@ -436,7 +390,14 @@ impl S3 for Sqlite {
     }
 
     /// Returns the fixed owner ACL for an existing object.
-    #[tracing::instrument]
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            version_id = %req.input.version_id.as_deref().unwrap_or("")
+        )
+    )]
     async fn get_object_acl(
         &self,
         req: S3Request<GetObjectAclInput>,
@@ -445,7 +406,7 @@ impl S3 for Sqlite {
     }
 
     /// Accepts owner-equivalent bucket ACL writes as no-ops.
-    #[tracing::instrument]
+    #[tracing::instrument(skip_all, fields(bucket = %req.input.bucket))]
     async fn put_bucket_acl(
         &self,
         req: S3Request<PutBucketAclInput>,
@@ -454,7 +415,14 @@ impl S3 for Sqlite {
     }
 
     /// Lists all open bucket databases.
-    #[tracing::instrument]
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            prefix = %req.input.prefix.as_deref().unwrap_or(""),
+            continuation_token = %req.input.continuation_token.as_deref().unwrap_or(""),
+            max_buckets = ?req.input.max_buckets
+        )
+    )]
     async fn list_buckets(
         &self,
         req: S3Request<ListBucketsInput>,
@@ -463,7 +431,16 @@ impl S3 for Sqlite {
     }
 
     /// Lists objects using the original `ListObjects` marker protocol.
-    #[tracing::instrument]
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            bucket = %req.input.bucket,
+            prefix = %req.input.prefix.as_deref().unwrap_or(""),
+            delimiter = %req.input.delimiter.as_deref().unwrap_or(""),
+            marker = %req.input.marker.as_deref().unwrap_or(""),
+            max_keys = ?req.input.max_keys
+        )
+    )]
     async fn list_objects(
         &self,
         req: S3Request<ListObjectsInput>,
@@ -472,7 +449,17 @@ impl S3 for Sqlite {
     }
 
     /// Lists all object versions and delete markers.
-    #[tracing::instrument]
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            bucket = %req.input.bucket,
+            prefix = %req.input.prefix.as_deref().unwrap_or(""),
+            delimiter = %req.input.delimiter.as_deref().unwrap_or(""),
+            key_marker = %req.input.key_marker.as_deref().unwrap_or(""),
+            version_id_marker = %req.input.version_id_marker.as_deref().unwrap_or(""),
+            max_keys = ?req.input.max_keys
+        )
+    )]
     async fn list_object_versions(
         &self,
         req: S3Request<ListObjectVersionsInput>,
@@ -481,7 +468,17 @@ impl S3 for Sqlite {
     }
 
     /// Lists objects using the `ListObjectsV2` continuation-token protocol.
-    #[tracing::instrument]
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            bucket = %req.input.bucket,
+            prefix = %req.input.prefix.as_deref().unwrap_or(""),
+            delimiter = %req.input.delimiter.as_deref().unwrap_or(""),
+            continuation_token = %req.input.continuation_token.as_deref().unwrap_or(""),
+            start_after = %req.input.start_after.as_deref().unwrap_or(""),
+            max_keys = ?req.input.max_keys
+        )
+    )]
     async fn list_objects_v2(
         &self,
         req: S3Request<ListObjectsV2Input>,
@@ -490,7 +487,17 @@ impl S3 for Sqlite {
     }
 
     /// Lists active multipart uploads in a bucket.
-    #[tracing::instrument]
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            bucket = %req.input.bucket,
+            prefix = %req.input.prefix.as_deref().unwrap_or(""),
+            delimiter = %req.input.delimiter.as_deref().unwrap_or(""),
+            key_marker = %req.input.key_marker.as_deref().unwrap_or(""),
+            upload_id_marker = %req.input.upload_id_marker.as_deref().unwrap_or(""),
+            max_uploads = ?req.input.max_uploads
+        )
+    )]
     async fn list_multipart_uploads(
         &self,
         req: S3Request<ListMultipartUploadsInput>,
@@ -499,7 +506,14 @@ impl S3 for Sqlite {
     }
 
     /// Stores an object body and metadata.
-    #[tracing::instrument]
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            content_length = ?req.input.content_length
+        )
+    )]
     async fn put_object(
         &self,
         req: S3Request<PutObjectInput>,
@@ -508,7 +522,14 @@ impl S3 for Sqlite {
     }
 
     /// Accepts owner-equivalent object ACL writes as no-ops.
-    #[tracing::instrument]
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            version_id = %req.input.version_id.as_deref().unwrap_or("")
+        )
+    )]
     async fn put_object_acl(
         &self,
         req: S3Request<PutObjectAclInput>,
@@ -517,7 +538,7 @@ impl S3 for Sqlite {
     }
 
     /// Creates multipart upload state for a future object.
-    #[tracing::instrument]
+    #[tracing::instrument(skip_all, fields(bucket = %req.input.bucket, key = %req.input.key))]
     async fn create_multipart_upload(
         &self,
         req: S3Request<CreateMultipartUploadInput>,
@@ -526,7 +547,16 @@ impl S3 for Sqlite {
     }
 
     /// Stores or replaces a multipart upload part.
-    #[tracing::instrument]
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            upload_id = %req.input.upload_id,
+            part_number = req.input.part_number,
+            content_length = ?req.input.content_length
+        )
+    )]
     async fn upload_part(
         &self,
         req: S3Request<UploadPartInput>,
@@ -535,7 +565,16 @@ impl S3 for Sqlite {
     }
 
     /// Copies an existing object byte range into a multipart upload part.
-    #[tracing::instrument]
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            upload_id = %req.input.upload_id,
+            part_number = req.input.part_number,
+            source_range = %req.input.copy_source_range.as_deref().unwrap_or("")
+        )
+    )]
     async fn upload_part_copy(
         &self,
         req: S3Request<UploadPartCopyInput>,
@@ -544,7 +583,16 @@ impl S3 for Sqlite {
     }
 
     /// Lists parts uploaded for an active multipart upload.
-    #[tracing::instrument]
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            upload_id = %req.input.upload_id,
+            part_number_marker = ?req.input.part_number_marker,
+            max_parts = ?req.input.max_parts
+        )
+    )]
     async fn list_parts(
         &self,
         req: S3Request<ListPartsInput>,
@@ -553,7 +601,14 @@ impl S3 for Sqlite {
     }
 
     /// Aborts an active multipart upload and deletes its parts.
-    #[tracing::instrument]
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            upload_id = %req.input.upload_id
+        )
+    )]
     async fn abort_multipart_upload(
         &self,
         req: S3Request<AbortMultipartUploadInput>,
@@ -562,7 +617,14 @@ impl S3 for Sqlite {
     }
 
     /// Completes a multipart upload and records the result for idempotent retries.
-    #[tracing::instrument]
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            upload_id = %req.input.upload_id
+        )
+    )]
     async fn complete_multipart_upload(
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
@@ -606,22 +668,6 @@ mod tests {
             etag_none_matches,
             unmodified_since,
         }
-    }
-
-    fn delete_conditions(
-        etag_matches: Option<ETagCondition>,
-        last_modified_time: Option<OffsetDateTime>,
-        size: Option<i64>,
-    ) -> ObjectDeleteConditions {
-        ObjectDeleteConditions {
-            etag_matches,
-            last_modified_time,
-            size,
-        }
-    }
-
-    fn assert_precondition_failed(result: &Result<(), SqliteError>) {
-        assert!(matches!(result, Err(SqliteError::PreconditionFailed)));
     }
 
     #[test]
@@ -768,117 +814,6 @@ mod tests {
         assert!(matches!(
             validate_read_conditions(&object, &read_conditions(None, None, None, Some(before)),),
             Err(ObjectReadConditionFailure::PreconditionFailed)
-        ));
-    }
-
-    #[test]
-    fn applies_copy_source_condition_precedence() {
-        let last_modified = OffsetDateTime::UNIX_EPOCH + Duration::seconds(10);
-        let before = last_modified - Duration::seconds(1);
-        let after = last_modified + Duration::seconds(1);
-        let object = metadata(Some("md5"), last_modified, 5);
-
-        assert_precondition_failed(&validate_copy_source_conditions(
-            &object,
-            &read_conditions(
-                Some(ETagCondition::ETag(ETag::Strong("other".to_string()))),
-                None,
-                Some(ETagCondition::ETag(ETag::Strong("md5".to_string()))),
-                None,
-            ),
-        ));
-        assert_precondition_failed(&validate_copy_source_conditions(
-            &object,
-            &read_conditions(
-                None,
-                None,
-                Some(ETagCondition::ETag(ETag::Weak("md5".to_string()))),
-                None,
-            ),
-        ));
-        assert!(
-            validate_copy_source_conditions(
-                &object,
-                &read_conditions(
-                    None,
-                    Some(after),
-                    Some(ETagCondition::ETag(ETag::Strong("other".to_string()))),
-                    None,
-                ),
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_copy_source_conditions(
-                &object,
-                &read_conditions(
-                    Some(ETagCondition::ETag(ETag::Strong("md5".to_string()))),
-                    None,
-                    None,
-                    Some(before),
-                ),
-            )
-            .is_ok()
-        );
-        assert_precondition_failed(&validate_copy_source_conditions(
-            &object,
-            &read_conditions(None, Some(after), None, None),
-        ));
-        assert_precondition_failed(&validate_copy_source_conditions(
-            &object,
-            &read_conditions(None, None, None, Some(before)),
-        ));
-    }
-
-    #[test]
-    fn applies_delete_conditions() {
-        let last_modified = OffsetDateTime::UNIX_EPOCH + Duration::seconds(10);
-        let object = metadata(Some("md5"), last_modified, 5);
-
-        assert!(
-            validate_delete_conditions(
-                None,
-                &delete_conditions(
-                    Some(ETagCondition::ETag(ETag::Strong("other".to_string()))),
-                    Some(last_modified + Duration::seconds(1)),
-                    Some(9),
-                ),
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_delete_conditions(
-                Some(&object),
-                &delete_conditions(
-                    Some(ETagCondition::ETag(ETag::Strong("md5".to_string()))),
-                    Some(last_modified),
-                    Some(5),
-                ),
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_delete_conditions(
-                Some(&object),
-                &delete_conditions(Some(ETagCondition::Any), None, None),
-            )
-            .is_ok()
-        );
-        assert_precondition_failed(&validate_delete_conditions(
-            Some(&object),
-            &delete_conditions(
-                Some(ETagCondition::ETag(ETag::Strong("other".to_string()))),
-                None,
-                None,
-            ),
-        ));
-        assert_precondition_failed(&validate_delete_conditions(
-            Some(&object),
-            &delete_conditions(None, Some(last_modified + Duration::seconds(1)), None),
-        ));
-        assert_precondition_failed(&validate_delete_conditions(
-            Some(&object),
-            &delete_conditions(None, None, Some(9)),
         ));
     }
 }

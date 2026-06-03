@@ -39,6 +39,7 @@ async fn test_server_domain_and_cors_startup_smoke() -> Result<()> {
     let server = TestServer::spawn_with(TestServerOptions {
         domain_name: Some("localhost".to_string()),
         permissive_cors: Some(true),
+        ..Default::default()
     })
     .await?;
     let client = sdk::client(&server);

@@ -26,6 +26,7 @@ struct CompletionPartMetadata<'a> {
 }
 
 impl<'a> From<&'a Multipart> for CompletionPartMetadata<'a> {
+    /// Builds completion validation metadata from a stored multipart part.
     fn from(part: &'a Multipart) -> Self {
         Self {
             part_number: part.part_number,
@@ -37,6 +38,7 @@ impl<'a> From<&'a Multipart> for CompletionPartMetadata<'a> {
 }
 
 impl<'a> From<&'a MultipartMetadata> for CompletionPartMetadata<'a> {
+    /// Builds completion validation metadata from listed multipart part metadata.
     fn from(part: &'a MultipartMetadata) -> Self {
         Self {
             part_number: part.part_number,
@@ -158,6 +160,7 @@ impl Sqlite {
         })
     }
 
+    /// Loads a previously completed upload result for idempotent completion retry.
     fn completed_multipart_upload_outcome(
         transaction: &Transaction,
         request: &MultipartCompletionRequest,
@@ -263,6 +266,7 @@ impl Sqlite {
         })
     }
 
+    /// Revalidates multipart completion metadata inside the writer transaction.
     fn validate_multipart_completion_metadata(
         transaction: &Transaction,
         request: &MultipartCompletionRequest,

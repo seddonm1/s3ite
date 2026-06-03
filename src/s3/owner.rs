@@ -99,7 +99,6 @@ pub(super) fn validate_object_acl(request: &ObjectAclRequest<'_>) -> S3Result<()
 }
 
 /// Returns the fixed owner ACL for an existing bucket.
-#[tracing::instrument]
 pub(super) async fn get_bucket_acl(
     sqlite: &Sqlite,
     req: S3Request<GetBucketAclInput>,
@@ -118,7 +117,6 @@ pub(super) async fn get_bucket_acl(
 }
 
 /// Returns the fixed owner ACL for an existing object.
-#[tracing::instrument]
 pub(super) async fn get_object_acl(
     sqlite: &Sqlite,
     req: S3Request<GetObjectAclInput>,
@@ -161,7 +159,6 @@ pub(super) async fn get_object_acl(
 }
 
 /// Accepts owner-equivalent bucket ACL writes as no-ops.
-#[tracing::instrument]
 pub(super) async fn put_bucket_acl(
     sqlite: &Sqlite,
     req: S3Request<PutBucketAclInput>,
@@ -204,7 +201,6 @@ pub(super) async fn put_bucket_acl(
 }
 
 /// Accepts owner-equivalent object ACL writes as no-ops.
-#[tracing::instrument]
 pub(super) async fn put_object_acl(
     sqlite: &Sqlite,
     req: S3Request<PutObjectAclInput>,

@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use crate::database::BucketConnection;
 
+use super::copy::validate_copy_source_conditions;
 use super::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, ByteRange, CONTENT_MD5, ChecksumInput,
     CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CompletedObjectPart,
@@ -19,8 +20,7 @@ use super::{
     default_crc64nvme_full_object_checksum, encode_list_value, finish_part_checksum, hex,
     is_url_encoding, multipart_checksum_config, normalize_content_encoding,
     object_write_conditions, output_delimiter, owner, part_checksum_accumulator, s3_error,
-    s3_error_from_sqlite, s3_error_with_message, validate_content_md5,
-    validate_copy_source_conditions, validate_object_acl,
+    s3_error_from_sqlite, s3_error_with_message, validate_content_md5, validate_object_acl,
 };
 
 /// Normalizes a completed multipart part list while preserving S3 ordering rules.
@@ -175,6 +175,7 @@ pub(super) fn part_md5(value: &[u8]) -> String {
     hex(md5_hash.finalize())
 }
 
+/// Buffers an uploaded part body while validating MD5 and explicit checksums.
 async fn read_upload_part_body(
     body: StreamingBlob,
     checksum_input: &ChecksumInput,
@@ -201,6 +202,7 @@ async fn read_upload_part_body(
     Ok((value, size, md5, explicit_checksum))
 }
 
+/// Loads an active upload checksum configuration after validating upload ownership.
 async fn read_multipart_checksum_config(
     connection: &BucketConnection,
     upload_id: Uuid,
@@ -272,6 +274,7 @@ struct UploadPartCopyRequest {
     access_key: Option<String>,
 }
 
+/// Normalizes an `UploadPartCopy` input into the local copy-part request shape.
 fn parse_upload_part_copy_request(
     input: UploadPartCopyInput,
     access_key: Option<String>,
@@ -325,6 +328,7 @@ fn parse_upload_part_copy_request(
     })
 }
 
+/// Loads, condition-checks, and slices the source object for `UploadPartCopy`.
 fn load_upload_part_copy_source(
     transaction: &rusqlite::Transaction<'_>,
     request: &UploadPartCopyRequest,
@@ -344,6 +348,7 @@ fn load_upload_part_copy_source(
     Ok(CopiedPart { value, size, md5 })
 }
 
+/// Stores a copied multipart part after revalidating upload state.
 fn store_upload_part_copy(
     transaction: &rusqlite::Transaction<'_>,
     request: &UploadPartCopyRequest,
@@ -398,6 +403,7 @@ fn store_upload_part_copy(
     })
 }
 
+/// Builds the S3 `UploadPart` response from stored part identity and checksum.
 fn upload_part_output(md5: String, checksum: Option<&PartChecksum>) -> UploadPartOutput {
     let checksum = checksum.cloned();
     UploadPartOutput {
@@ -411,6 +417,7 @@ fn upload_part_output(md5: String, checksum: Option<&PartChecksum>) -> UploadPar
     }
 }
 
+/// Copies a part within one bucket while keeping source reads out of the writer.
 async fn upload_part_copy_same_bucket(
     sqlite: &Sqlite,
     request: UploadPartCopyRequest,
@@ -455,6 +462,7 @@ async fn upload_part_copy_same_bucket(
         .map_err(s3_error_from_sqlite)
 }
 
+/// Copies a part across buckets by reading source state before writing the target.
 async fn upload_part_copy_cross_bucket(
     sqlite: &Sqlite,
     request: UploadPartCopyRequest,
@@ -643,7 +651,6 @@ impl Sqlite {
 }
 
 /// Lists active multipart uploads in a bucket.
-#[tracing::instrument]
 pub(super) async fn list_multipart_uploads(
     sqlite: &Sqlite,
     req: S3Request<ListMultipartUploadsInput>,
@@ -743,7 +750,6 @@ pub(super) async fn list_multipart_uploads(
 }
 
 /// Creates multipart upload state for a future object.
-#[tracing::instrument]
 pub(super) async fn create_multipart_upload(
     sqlite: &Sqlite,
     req: S3Request<CreateMultipartUploadInput>,
@@ -828,7 +834,6 @@ pub(super) async fn create_multipart_upload(
 }
 
 /// Stores or replaces a multipart upload part.
-#[tracing::instrument]
 pub(super) async fn upload_part(
     sqlite: &Sqlite,
     req: S3Request<UploadPartInput>,
@@ -935,7 +940,6 @@ pub(super) async fn upload_part(
 }
 
 /// Copies an existing object byte range into a multipart upload part.
-#[tracing::instrument]
 pub(super) async fn upload_part_copy(
     sqlite: &Sqlite,
     req: S3Request<UploadPartCopyInput>,
@@ -963,7 +967,6 @@ pub(super) async fn upload_part_copy(
 }
 
 /// Lists parts uploaded for an active multipart upload.
-#[tracing::instrument]
 pub(super) async fn list_parts(
     sqlite: &Sqlite,
     req: S3Request<ListPartsInput>,
@@ -1064,7 +1067,6 @@ pub(super) async fn list_parts(
 }
 
 /// Aborts an active multipart upload and deletes its parts.
-#[tracing::instrument]
 pub(super) async fn abort_multipart_upload(
     sqlite: &Sqlite,
     req: S3Request<AbortMultipartUploadInput>,
@@ -1114,7 +1116,6 @@ pub(super) async fn abort_multipart_upload(
 }
 
 /// Completes a multipart upload and records the result for idempotent retries.
-#[tracing::instrument]
 pub(super) async fn complete_multipart_upload(
     sqlite: &Sqlite,
     req: S3Request<CompleteMultipartUploadInput>,

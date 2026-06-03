@@ -42,6 +42,7 @@ pub(super) fn encode_continuation_token(key: &str) -> String {
 
 /// Decodes a hexadecimal string into bytes.
 pub(super) fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    /// Converts one ASCII hexadecimal digit into its numeric nibble.
     fn nibble(byte: u8) -> Option<u8> {
         match byte {
             b'0'..=b'9' => Some(byte - b'0'),
@@ -460,7 +461,6 @@ impl Sqlite {
 }
 
 /// Lists objects using the original `ListObjects` marker protocol.
-#[tracing::instrument]
 pub(super) async fn list_objects(
     sqlite: &Sqlite,
     req: S3Request<ListObjectsInput>,
@@ -543,7 +543,6 @@ pub(super) async fn list_objects(
 }
 
 /// Lists all object versions and delete markers.
-#[tracing::instrument]
 pub(super) async fn list_object_versions(
     sqlite: &Sqlite,
     req: S3Request<ListObjectVersionsInput>,
@@ -636,7 +635,6 @@ pub(super) async fn list_object_versions(
 }
 
 /// Lists objects using the `ListObjectsV2` continuation-token protocol.
-#[tracing::instrument]
 pub(super) async fn list_objects_v2(
     sqlite: &Sqlite,
     req: S3Request<ListObjectsV2Input>,

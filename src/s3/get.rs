@@ -502,7 +502,6 @@ fn head_object_output(
 }
 
 /// Returns an object body and metadata, applying byte-range requests when present.
-#[tracing::instrument]
 pub(super) async fn get_object(
     sqlite: &Sqlite,
     req: S3Request<GetObjectInput>,
@@ -545,7 +544,6 @@ pub(super) async fn get_object(
 }
 
 /// Returns object metadata without reading the object body.
-#[tracing::instrument]
 pub(super) async fn head_object(
     sqlite: &Sqlite,
     req: S3Request<HeadObjectInput>,
@@ -627,7 +625,6 @@ fn object_attributes_parts(
 }
 
 /// Returns selected object attributes without returning the object body.
-#[tracing::instrument]
 pub(super) async fn get_object_attributes(
     sqlite: &Sqlite,
     req: S3Request<GetObjectAttributesInput>,

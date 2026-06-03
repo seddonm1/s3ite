@@ -31,6 +31,7 @@ pub struct TestServer {
 pub struct TestServerOptions {
     pub domain_name: Option<String>,
     pub permissive_cors: Option<bool>,
+    pub rust_log: Option<String>,
 }
 
 impl TestServer {
@@ -50,8 +51,9 @@ impl TestServer {
         let port = allocate_port().context("allocate local s3ite port")?;
         let endpoint = format!("http://127.0.0.1:{port}");
         let binary = s3ite_binary()?;
-        let rust_log =
-            std::env::var("S3ITE_TEST_LOG").unwrap_or_else(|_| DEFAULT_RUST_LOG.to_string());
+        let rust_log = options.rust_log.unwrap_or_else(|| {
+            std::env::var("S3ITE_TEST_LOG").unwrap_or_else(|_| DEFAULT_RUST_LOG.to_string())
+        });
 
         let mut command = Command::new(&binary);
         command
@@ -96,6 +98,22 @@ impl TestServer {
 
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    pub fn data_root(&self) -> &Path {
+        &self.data_root
+    }
+
+    pub fn log_path(&self) -> &Path {
+        &self.log_path
+    }
+
+    pub fn shutdown_and_read_log(mut self) -> Result<String> {
+        request_graceful_shutdown(&self.child).context("request graceful s3ite shutdown")?;
+        wait_for_child_exit(&mut self.child, COVERAGE_SHUTDOWN_TIMEOUT)
+            .context("wait for graceful s3ite shutdown")?;
+        fs::read_to_string(&self.log_path)
+            .with_context(|| format!("read {}", self.log_path.display()))
     }
 
     pub fn access_key(&self) -> &str {

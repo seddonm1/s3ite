@@ -206,6 +206,7 @@ VALUES (1, 'never_configured');
 PRAGMA user_version = 5;
 ";
 
+/// Reads a nonnegative object size column from a row.
 fn row_size(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<i64> {
     let value = row.get::<_, i64>(idx)?;
     if value < 0 {
@@ -218,6 +219,7 @@ fn row_size(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<i64> {
     Ok(value)
 }
 
+/// Validates an object size before binding it to SQL.
 fn sql_size(value: i64) -> rusqlite::Result<i64> {
     if value < 0 {
         return Err(ToSqlConversionFailure(Box::new(NegativeObjectSize)));
@@ -225,6 +227,7 @@ fn sql_size(value: i64) -> rusqlite::Result<i64> {
     Ok(value)
 }
 
+/// Validates a SQL query limit before binding it.
 fn sql_limit(value: i64) -> rusqlite::Result<i64> {
     if value < 0 {
         return Err(ToSqlConversionFailure(Box::new(NegativeSqlLimit)));
@@ -232,10 +235,12 @@ fn sql_limit(value: i64) -> rusqlite::Result<i64> {
     Ok(value)
 }
 
+/// Reads an integer row column as a `SQLite` boolean.
 fn row_bool(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<bool> {
     Ok(row.get::<_, i32>(idx)? != 0)
 }
 
+/// Converts a configured TTL into an expiration cutoff timestamp.
 fn expiration_threshold(ttl_seconds: u64) -> Option<OffsetDateTime> {
     if ttl_seconds == 0 {
         return None;

@@ -19,7 +19,7 @@ use tokio::net::TcpListener;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::cors::CorsLayer;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
 
 mod compat;
 
@@ -43,7 +43,10 @@ enum MainError {
 #[allow(clippy::too_many_lines)]
 async fn main() -> MainResult<()> {
     let env_filter = EnvFilter::from_default_env();
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_span_events(FmtSpan::CLOSE)
+        .init();
 
     let config = Config::from_args()?;
     let auth_compat = HeaderAuthCompatLayer::new(config.secret_key.clone());

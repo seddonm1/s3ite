@@ -2,13 +2,62 @@
 
 use super::{
     DeleteError, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput,
-    DeletedObject, ETagCondition, Not, ObjectDeleteConditions, ObjectDeleteOutcome, S3ErrorCode,
-    S3Request, S3Response, S3Result, Sqlite, SqliteError, s3_error_from_sqlite,
-    s3_error_with_message, validate_delete_conditions,
+    DeletedObject, ETagCondition, KeyMetadata, Not, ObjectDeleteOutcome, OffsetDateTime,
+    S3ErrorCode, S3Request, S3Response, S3Result, Sqlite, SqliteError, http_date_time,
+    s3_error_from_sqlite, s3_error_with_message, strong_etag_condition_matches,
 };
 
+#[derive(Clone, Debug)]
+struct ObjectDeleteConditions {
+    etag_matches: Option<ETagCondition>,
+    last_modified_time: Option<OffsetDateTime>,
+    size: Option<i64>,
+}
+
+impl ObjectDeleteConditions {
+    /// Returns whether the delete request supplied at least one precondition.
+    #[must_use]
+    fn has_any(&self) -> bool {
+        self.etag_matches.is_some() || self.last_modified_time.is_some() || self.size.is_some()
+    }
+}
+
+/// Applies delete conditional request semantics inside a write transaction.
+fn validate_delete_conditions(
+    metadata: Option<&KeyMetadata>,
+    conditions: &ObjectDeleteConditions,
+) -> Result<(), SqliteError> {
+    let Some(metadata) = metadata else {
+        return Ok(());
+    };
+
+    if let Some(condition) = conditions.etag_matches.as_ref()
+        && match condition {
+            ETagCondition::Any => false,
+            ETagCondition::ETag(_) => {
+                strong_etag_condition_matches(condition, metadata.md5.as_deref()).not()
+            }
+        }
+    {
+        return Err(SqliteError::PreconditionFailed);
+    }
+
+    if let Some(last_modified_time) = conditions.last_modified_time
+        && http_date_time(metadata.last_modified) != http_date_time(last_modified_time)
+    {
+        return Err(SqliteError::PreconditionFailed);
+    }
+
+    if let Some(size) = conditions.size
+        && metadata.size != size
+    {
+        return Err(SqliteError::PreconditionFailed);
+    }
+
+    Ok(())
+}
+
 /// Deletes an object by key.
-#[tracing::instrument]
 pub(super) async fn delete_object(
     sqlite: &Sqlite,
     req: S3Request<DeleteObjectInput>,
@@ -68,7 +117,6 @@ pub(super) async fn delete_object(
 }
 
 /// Deletes a batch of objects and returns S3 multi-delete results.
-#[tracing::instrument]
 pub(super) async fn delete_objects(
     sqlite: &Sqlite,
     req: S3Request<DeleteObjectsInput>,
@@ -168,4 +216,97 @@ pub(super) async fn delete_objects(
         ..Default::default()
     };
     Ok(S3Response::new(output))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use s3s::dto::{ETag, ETagCondition};
+    use time::Duration;
+
+    fn metadata(md5: Option<&str>, last_modified: OffsetDateTime, size: i64) -> KeyMetadata {
+        KeyMetadata {
+            version_id: "version".to_string(),
+            size,
+            metadata: None,
+            content_type: None,
+            content_encoding: None,
+            cache_control: None,
+            expires: None,
+            last_modified,
+            md5: md5.map(str::to_string),
+            checksum: None,
+            is_latest: true,
+            is_delete_marker: false,
+        }
+    }
+
+    fn delete_conditions(
+        etag_matches: Option<ETagCondition>,
+        last_modified_time: Option<OffsetDateTime>,
+        size: Option<i64>,
+    ) -> ObjectDeleteConditions {
+        ObjectDeleteConditions {
+            etag_matches,
+            last_modified_time,
+            size,
+        }
+    }
+
+    fn assert_precondition_failed(result: &Result<(), SqliteError>) {
+        assert!(matches!(result, Err(SqliteError::PreconditionFailed)));
+    }
+
+    #[test]
+    fn applies_delete_conditions() {
+        let last_modified = OffsetDateTime::UNIX_EPOCH + Duration::seconds(10);
+        let object = metadata(Some("md5"), last_modified, 5);
+
+        assert!(
+            validate_delete_conditions(
+                None,
+                &delete_conditions(
+                    Some(ETagCondition::ETag(ETag::Strong("other".to_string()))),
+                    Some(last_modified + Duration::seconds(1)),
+                    Some(9),
+                ),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_delete_conditions(
+                Some(&object),
+                &delete_conditions(
+                    Some(ETagCondition::ETag(ETag::Strong("md5".to_string()))),
+                    Some(last_modified),
+                    Some(5),
+                ),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_delete_conditions(
+                Some(&object),
+                &delete_conditions(Some(ETagCondition::Any), None, None),
+            )
+            .is_ok()
+        );
+        assert_precondition_failed(&validate_delete_conditions(
+            Some(&object),
+            &delete_conditions(
+                Some(ETagCondition::ETag(ETag::Strong("other".to_string()))),
+                None,
+                None,
+            ),
+        ));
+        assert_precondition_failed(&validate_delete_conditions(
+            Some(&object),
+            &delete_conditions(None, Some(last_modified + Duration::seconds(1)), None),
+        ));
+        assert_precondition_failed(&validate_delete_conditions(
+            Some(&object),
+            &delete_conditions(None, None, Some(9)),
+        ));
+    }
 }

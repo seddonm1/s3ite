@@ -46,7 +46,6 @@ fn looks_like_ipv4_address(bucket: &str) -> bool {
 }
 
 /// Creates a bucket database if it does not already exist.
-#[tracing::instrument]
 pub(super) async fn create_bucket(
     sqlite: &Sqlite,
     req: S3Request<CreateBucketInput>,
@@ -92,7 +91,6 @@ pub(super) async fn create_bucket(
 }
 
 /// Deletes an empty bucket database and its `SQLite` sidecar files.
-#[tracing::instrument]
 pub(super) async fn delete_bucket(
     sqlite: &Sqlite,
     req: S3Request<DeleteBucketInput>,
@@ -145,7 +143,6 @@ pub(super) async fn delete_bucket(
 }
 
 /// Returns the default bucket location for an existing bucket.
-#[tracing::instrument]
 pub(super) async fn get_bucket_location(
     sqlite: &Sqlite,
     req: S3Request<GetBucketLocationInput>,
@@ -168,7 +165,6 @@ pub(super) async fn get_bucket_location(
 }
 
 /// Returns the bucket versioning state.
-#[tracing::instrument]
 pub(super) async fn get_bucket_versioning(
     sqlite: &Sqlite,
     req: S3Request<GetBucketVersioningInput>,
@@ -203,7 +199,6 @@ pub(super) async fn get_bucket_versioning(
 }
 
 /// Updates the bucket versioning state.
-#[tracing::instrument]
 pub(super) async fn put_bucket_versioning(
     sqlite: &Sqlite,
     req: S3Request<PutBucketVersioningInput>,
@@ -261,7 +256,6 @@ pub(super) async fn put_bucket_versioning(
 }
 
 /// Checks whether a bucket exists.
-#[tracing::instrument]
 pub(super) async fn head_bucket(
     sqlite: &Sqlite,
     req: S3Request<HeadBucketInput>,
@@ -290,7 +284,6 @@ pub(super) async fn head_bucket(
 }
 
 /// Lists all open bucket databases.
-#[tracing::instrument]
 pub(super) async fn list_buckets(
     sqlite: &Sqlite,
     req: S3Request<ListBucketsInput>,

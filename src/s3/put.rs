@@ -120,7 +120,6 @@ fn put_object_output(
 }
 
 /// Stores an object body and metadata.
-#[tracing::instrument]
 pub(super) async fn put_object(
     sqlite: &Sqlite,
     req: S3Request<PutObjectInput>,

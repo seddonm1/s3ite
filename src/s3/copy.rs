@@ -4,12 +4,13 @@ use std::collections::HashMap;
 
 use super::{
     ChecksumAlgorithmKind, CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource, ETag,
-    KeyValue, MetadataDirective, Not, ObjectAclRequest, ObjectReadConditions, OffsetDateTime,
-    S3ErrorCode, S3Request, S3Response, S3Result, Sqlite, SqliteResult, StoredChecksum,
-    checksum_algorithm_from_request, checksum_crc32, checksum_crc32c, checksum_crc64nvme,
-    checksum_sha1, checksum_sha256, checksum_type_output, normalize_content_encoding,
-    object_write_checksum_from_value, s3_error, s3_error_from_sqlite, s3_error_with_message,
-    validate_copy_source_conditions, validate_object_acl,
+    KeyMetadata, KeyValue, MetadataDirective, Not, ObjectAclRequest, ObjectReadConditions,
+    OffsetDateTime, S3ErrorCode, S3Request, S3Response, S3Result, Sqlite, SqliteError,
+    SqliteResult, StoredChecksum, checksum_algorithm_from_request, checksum_crc32, checksum_crc32c,
+    checksum_crc64nvme, checksum_sha1, checksum_sha256, checksum_type_output, http_date_time,
+    normalize_content_encoding, object_write_checksum_from_value, s3_error, s3_error_from_sqlite,
+    s3_error_with_message, strong_etag_condition_matches, validate_object_acl,
+    weak_etag_condition_matches,
 };
 
 /// Parsed copy request with source, destination, metadata, and checksum intent.
@@ -27,6 +28,38 @@ struct CopyObjectRequest {
     expires: Option<OffsetDateTime>,
     source_conditions: ObjectReadConditions,
     target_checksum_kind: Option<ChecksumAlgorithmKind>,
+}
+
+/// Applies copy-source conditional request semantics to loaded source metadata.
+pub(super) fn validate_copy_source_conditions(
+    metadata: &KeyMetadata,
+    conditions: &ObjectReadConditions,
+) -> Result<(), SqliteError> {
+    let md5 = metadata.md5.as_deref();
+    if let Some(condition) = conditions.etag_matches.as_ref()
+        && strong_etag_condition_matches(condition, md5).not()
+    {
+        return Err(SqliteError::PreconditionFailed);
+    }
+
+    if let Some(condition) = conditions.etag_none_matches.as_ref() {
+        if weak_etag_condition_matches(condition, md5) {
+            return Err(SqliteError::PreconditionFailed);
+        }
+    } else if let Some(since) = conditions.modified_since
+        && http_date_time(metadata.last_modified) <= http_date_time(since)
+    {
+        return Err(SqliteError::PreconditionFailed);
+    }
+
+    if conditions.etag_matches.is_none()
+        && let Some(since) = conditions.unmodified_since
+        && http_date_time(metadata.last_modified) > http_date_time(since)
+    {
+        return Err(SqliteError::PreconditionFailed);
+    }
+
+    Ok(())
 }
 
 /// Normalizes an S3 `CopyObject` input into the local copy operation shape.
@@ -270,7 +303,6 @@ async fn copy_object_cross_bucket(
 }
 
 /// Copies an object between buckets while applying S3 metadata-directive rules.
-#[tracing::instrument]
 pub(super) async fn copy_object(
     sqlite: &Sqlite,
     req: S3Request<CopyObjectInput>,
@@ -308,6 +340,7 @@ mod tests {
         sqlite::KeyMetadata,
     };
     use s3s::dto::{ChecksumAlgorithm, ETagCondition, ObjectCannedACL, Timestamp};
+    use time::Duration;
 
     fn assert_error_code<T>(result: S3Result<T>, code: &S3ErrorCode) {
         match result {
@@ -368,6 +401,32 @@ mod tests {
                 is_delete_marker: false,
             },
         }
+    }
+
+    fn metadata(md5: Option<&str>, last_modified: OffsetDateTime) -> KeyMetadata {
+        let mut metadata = object(Vec::new(), None).key_metadata;
+        metadata.md5 = md5.map(str::to_string);
+        metadata.last_modified = last_modified;
+        metadata.size = 5;
+        metadata
+    }
+
+    fn source_conditions(
+        etag_matches: Option<ETagCondition>,
+        modified_since: Option<OffsetDateTime>,
+        etag_none_matches: Option<ETagCondition>,
+        unmodified_since: Option<OffsetDateTime>,
+    ) -> ObjectReadConditions {
+        ObjectReadConditions {
+            etag_matches,
+            modified_since,
+            etag_none_matches,
+            unmodified_since,
+        }
+    }
+
+    fn assert_precondition_failed(result: &SqliteResult<()>) {
+        assert!(matches!(result, Err(SqliteError::PreconditionFailed)));
     }
 
     #[test]
@@ -522,6 +581,65 @@ mod tests {
 
         request.replace_metadata = true;
         assert!(validate_copy_target(&request).is_ok());
+    }
+
+    #[test]
+    fn applies_copy_source_condition_precedence() {
+        let last_modified = OffsetDateTime::UNIX_EPOCH + Duration::seconds(10);
+        let before = last_modified - Duration::seconds(1);
+        let after = last_modified + Duration::seconds(1);
+        let object = metadata(Some("md5"), last_modified);
+
+        assert_precondition_failed(&validate_copy_source_conditions(
+            &object,
+            &source_conditions(
+                Some(ETagCondition::ETag(ETag::Strong("other".to_string()))),
+                None,
+                Some(ETagCondition::ETag(ETag::Strong("md5".to_string()))),
+                None,
+            ),
+        ));
+        assert_precondition_failed(&validate_copy_source_conditions(
+            &object,
+            &source_conditions(
+                None,
+                None,
+                Some(ETagCondition::ETag(ETag::Weak("md5".to_string()))),
+                None,
+            ),
+        ));
+        assert!(
+            validate_copy_source_conditions(
+                &object,
+                &source_conditions(
+                    None,
+                    Some(after),
+                    Some(ETagCondition::ETag(ETag::Strong("other".to_string()))),
+                    None,
+                ),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_copy_source_conditions(
+                &object,
+                &source_conditions(
+                    Some(ETagCondition::ETag(ETag::Strong("md5".to_string()))),
+                    None,
+                    None,
+                    Some(before),
+                ),
+            )
+            .is_ok()
+        );
+        assert_precondition_failed(&validate_copy_source_conditions(
+            &object,
+            &source_conditions(None, Some(after), None, None),
+        ));
+        assert_precondition_failed(&validate_copy_source_conditions(
+            &object,
+            &source_conditions(None, None, None, Some(before)),
+        ));
     }
 
     #[test]
