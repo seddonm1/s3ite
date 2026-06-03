@@ -87,7 +87,7 @@ impl Sqlite {
 
         connection
             .write(move |connection| {
-                connection.execute_batch(&config.to_sql(None))?;
+                connection.execute_batch(&super::connection_pragmas(&config, None))?;
 
                 let transaction = connection.transaction()?;
                 Self::create_tables(&transaction)?;

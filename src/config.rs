@@ -472,30 +472,6 @@ impl Config {
             })
             .unwrap_or(self.sqlite.cache_size)
     }
-
-    /// Renders the `SQLite` PRAGMA statements for a bucket connection.
-    ///
-    /// `SQLite` interprets negative `cache_size` values as kibibytes, so the
-    /// configured positive KiB value is emitted as `PRAGMA cache_size=-N`.
-    #[must_use]
-    pub fn to_sql(&self, bucket: Option<&str>) -> String {
-        format!(
-            "
-            PRAGMA journal_mode={:?};
-            PRAGMA synchronous={:?};
-            PRAGMA temp_store={:?};
-            PRAGMA cache_size=-{};
-            PRAGMA query_only={};
-            PRAGMA foreign_keys=true;
-            PRAGMA auto_vacuum=INCREMENTAL;
-        ",
-            self.journal_mode(bucket),
-            self.synchronous(bucket),
-            self.temp_store(bucket),
-            self.cache_size(bucket),
-            self.read_only(bucket),
-        )
-    }
 }
 
 /// Cross-Origin Resource Sharing behavior.
@@ -723,9 +699,9 @@ pub struct Pragmas {
 impl Default for Pragmas {
     fn default() -> Self {
         Self {
-            journal_mode: JournalMode::WAL,
-            synchronous: Synchronous::NORMAL,
-            temp_store: TempStore::MEMORY,
+            journal_mode: JournalMode::Wal,
+            synchronous: Synchronous::Normal,
+            temp_store: TempStore::Memory,
             cache_size: default_cache_size(),
         }
     }
@@ -758,50 +734,63 @@ pub struct BucketPragmas {
 }
 
 /// `SQLite` `journal_mode` values supported by configuration.
-#[allow(clippy::upper_case_acronyms)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
 pub enum JournalMode {
     /// Use `SQLite`'s rollback journal and delete it after each transaction.
-    DELETE,
+    #[serde(alias = "DELETE")]
+    Delete,
     /// Use `SQLite`'s rollback journal and truncate it after each transaction.
-    TRUNCATE,
+    #[serde(alias = "TRUNCATE")]
+    Truncate,
     /// Use `SQLite`'s rollback journal and keep it after each transaction.
-    PERSIST,
+    #[serde(alias = "PERSIST")]
+    Persist,
     /// Store the rollback journal in memory.
-    MEMORY,
+    #[serde(alias = "MEMORY")]
+    Memory,
     /// Use `SQLite` write-ahead logging.
     #[default]
-    WAL,
+    #[serde(alias = "WAL")]
+    Wal,
     /// Disable rollback journaling.
-    OFF,
+    #[serde(alias = "OFF")]
+    Off,
 }
 
 /// `SQLite` `synchronous` values supported by configuration.
-#[allow(clippy::upper_case_acronyms)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
 pub enum Synchronous {
     /// Let `SQLite` skip sync calls for maximum throughput and lowest durability.
-    OFF,
+    #[serde(alias = "OFF")]
+    Off,
     /// Sync at critical moments while avoiding the extra checks of `FULL`.
     #[default]
-    NORMAL,
+    #[serde(alias = "NORMAL")]
+    Normal,
     /// Sync after each critical write for stronger durability guarantees.
-    FULL,
+    #[serde(alias = "FULL")]
+    Full,
     /// Use `SQLite`'s strongest sync setting with additional directory syncs.
-    EXTRA,
+    #[serde(alias = "EXTRA")]
+    Extra,
 }
 
 /// `SQLite` `temp_store` values supported by configuration.
-#[allow(clippy::upper_case_acronyms)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
 pub enum TempStore {
     /// Let `SQLite` choose the temporary storage location.
-    DEFAULT,
+    #[serde(alias = "DEFAULT")]
+    Default,
     /// Store temporary tables and indexes in files.
-    FILE,
+    #[serde(alias = "FILE")]
+    File,
     /// Store temporary tables and indexes in memory.
     #[default]
-    MEMORY,
+    #[serde(alias = "MEMORY")]
+    Memory,
 }
 
 fn default_root() -> PathBuf {
@@ -961,7 +950,7 @@ mod tests {
     fn default_sqlite_cache_size_is_kib() {
         let config = Config::default();
         assert_eq!(config.sqlite.cache_size, 65_536);
-        assert!(config.to_sql(None).contains("PRAGMA cache_size=-65536;"));
+        assert_eq!(config.cache_size(None), 65_536);
     }
 
     #[test]
@@ -980,11 +969,50 @@ mod tests {
             },
         );
 
-        assert!(
-            config
-                .to_sql(Some("bucket"))
-                .contains("PRAGMA cache_size=-512;")
-        );
+        assert_eq!(config.cache_size(Some("bucket")), 512);
+    }
+
+    #[test]
+    fn sqlite_pragma_modes_parse_cli_and_yaml_names() -> TestResult {
+        use clap::Parser as _;
+
+        let lower: Config = yaml_serde::from_str(
+            "
+            journal_mode: wal
+            synchronous: normal
+            temp_store: memory
+            ",
+        )?;
+        assert_eq!(lower.sqlite.journal_mode, JournalMode::Wal);
+        assert_eq!(lower.sqlite.synchronous, Synchronous::Normal);
+        assert_eq!(lower.sqlite.temp_store, TempStore::Memory);
+
+        let upper: Config = yaml_serde::from_str(
+            "
+            journal_mode: DELETE
+            synchronous: FULL
+            temp_store: FILE
+            ",
+        )?;
+        assert_eq!(upper.sqlite.journal_mode, JournalMode::Delete);
+        assert_eq!(upper.sqlite.synchronous, Synchronous::Full);
+        assert_eq!(upper.sqlite.temp_store, TempStore::File);
+
+        let args = ConfigArgs::try_parse_from([
+            "s3ite",
+            "--journal-mode",
+            "truncate",
+            "--synchronous",
+            "extra",
+            "--temp-store",
+            "default",
+        ])?;
+        let cli = Config::from_config_args(args)?;
+        assert_eq!(cli.sqlite.journal_mode, JournalMode::Truncate);
+        assert_eq!(cli.sqlite.synchronous, Synchronous::Extra);
+        assert_eq!(cli.sqlite.temp_store, TempStore::Default);
+
+        Ok(())
     }
 
     #[test]
@@ -1406,9 +1434,9 @@ mod tests {
         assert_eq!(config.multipart_upload_ttl_seconds, 300);
         assert_eq!(config.completed_multipart_upload_ttl_seconds, 400);
         assert!(config.read_only);
-        assert_eq!(config.sqlite.journal_mode, JournalMode::DELETE);
-        assert_eq!(config.sqlite.synchronous, Synchronous::FULL);
-        assert_eq!(config.sqlite.temp_store, TempStore::FILE);
+        assert_eq!(config.sqlite.journal_mode, JournalMode::Delete);
+        assert_eq!(config.sqlite.synchronous, Synchronous::Full);
+        assert_eq!(config.sqlite.temp_store, TempStore::File);
 
         std::fs::remove_file(path).ok();
         Ok(())

@@ -19,7 +19,7 @@ use tracing::{debug, error};
 
 use crate::{
     Config,
-    sqlite::{SqliteError, SqliteResult},
+    sqlite::{SqliteError, SqliteResult, connection_pragmas},
 };
 
 /// Maximum number of queued commands per worker queue.
@@ -178,7 +178,7 @@ impl BucketConnection {
             move || {
                 let mut writer = rusqlite::Connection::open(path)?;
                 writer.set_transaction_behavior(TransactionBehavior::Immediate);
-                writer.execute_batch(&config.to_sql(Some(&bucket)))?;
+                writer.execute_batch(&connection_pragmas(&config, Some(&bucket)))?;
 
                 Ok(writer)
             },

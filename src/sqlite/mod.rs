@@ -6,6 +6,7 @@ use std::{
     sync::Arc,
 };
 
+use clap::ValueEnum;
 use rusqlite::{
     Error::ToSqlConversionFailure,
     ToSql, Transaction,
@@ -260,6 +261,37 @@ fn expiration_threshold(ttl_seconds: u64) -> Option<OffsetDateTime> {
 
     let seconds = i64::try_from(ttl_seconds).unwrap_or(i64::MAX);
     Some(OffsetDateTime::now_utc().saturating_sub(Duration::seconds(seconds)))
+}
+
+/// Renders the `SQLite` PRAGMA statements for a bucket connection.
+///
+/// `SQLite` interprets negative `cache_size` values as kibibytes, so the
+/// configured positive KiB value is emitted as `PRAGMA cache_size=-N`.
+pub(crate) fn connection_pragmas(config: &crate::Config, bucket: Option<&str>) -> String {
+    format!(
+        "
+        PRAGMA journal_mode={};
+        PRAGMA synchronous={};
+        PRAGMA temp_store={};
+        PRAGMA cache_size=-{};
+        PRAGMA query_only={};
+        PRAGMA foreign_keys=true;
+        PRAGMA auto_vacuum=INCREMENTAL;
+        ",
+        pragma_value(&config.journal_mode(bucket)),
+        pragma_value(&config.synchronous(bucket)),
+        pragma_value(&config.temp_store(bucket)),
+        config.cache_size(bucket),
+        config.read_only(bucket),
+    )
+}
+
+/// Returns the configured command/config spelling for a `ValueEnum` value.
+fn pragma_value<T: ValueEnum>(value: &T) -> String {
+    let Some(possible) = value.to_possible_value() else {
+        unreachable!("configuration enum variants must have clap values");
+    };
+    possible.get_name().to_string()
 }
 
 /// Bucket-level S3 object versioning state.
@@ -631,7 +663,7 @@ impl Sqlite {
 
         connection
             .write(move |connection| {
-                connection.execute_batch(&config.to_sql(Some(&bucket)))?;
+                connection.execute_batch(&connection_pragmas(&config, Some(&bucket)))?;
                 connection.execute_batch(
                     "
                     PRAGMA analysis_limit=1000;
@@ -775,11 +807,16 @@ mod tests {
     use rusqlite::Connection;
     use tokio::sync::RwLock;
 
-    use crate::{Config, config::Bucket, database::BucketConnection};
+    use crate::{
+        Config,
+        config::{Bucket, BucketPragmas, JournalMode, Pragmas, Synchronous, TempStore},
+        database::BucketConnection,
+    };
 
     use super::{
         BucketVersioningState, Duration, MultipartUploadState, OffsetDateTime, Sqlite, SqliteError,
-        SqliteResult, Uuid, expiration_threshold, row_size, sql_limit, sql_size,
+        SqliteResult, Uuid, connection_pragmas, expiration_threshold, row_size, sql_limit,
+        sql_size,
     };
 
     fn open_schema() -> SqliteResult<Connection> {
@@ -871,6 +908,49 @@ mod tests {
         assert_eq!(sql_limit(1)?, 1);
 
         Ok(())
+    }
+
+    #[test]
+    fn connection_pragmas_render_configured_sqlite_settings() {
+        let mut config = Config {
+            read_only: true,
+            sqlite: Pragmas {
+                journal_mode: JournalMode::Delete,
+                synchronous: Synchronous::Full,
+                temp_store: TempStore::File,
+                cache_size: 1024,
+            },
+            ..Config::default()
+        };
+
+        let service_sql = connection_pragmas(&config, None);
+        assert!(service_sql.contains("PRAGMA journal_mode=delete;"));
+        assert!(service_sql.contains("PRAGMA synchronous=full;"));
+        assert!(service_sql.contains("PRAGMA temp_store=file;"));
+        assert!(service_sql.contains("PRAGMA cache_size=-1024;"));
+        assert!(service_sql.contains("PRAGMA query_only=true;"));
+        assert!(service_sql.contains("PRAGMA foreign_keys=true;"));
+        assert!(service_sql.contains("PRAGMA auto_vacuum=INCREMENTAL;"));
+
+        config.buckets.insert(
+            "bucket".to_string(),
+            Bucket {
+                read_only: Some(false),
+                sqlite: Some(BucketPragmas {
+                    journal_mode: Some(JournalMode::Wal),
+                    synchronous: Some(Synchronous::Normal),
+                    temp_store: Some(TempStore::Memory),
+                    cache_size: Some(512),
+                }),
+            },
+        );
+
+        let bucket_sql = connection_pragmas(&config, Some("bucket"));
+        assert!(bucket_sql.contains("PRAGMA journal_mode=wal;"));
+        assert!(bucket_sql.contains("PRAGMA synchronous=normal;"));
+        assert!(bucket_sql.contains("PRAGMA temp_store=memory;"));
+        assert!(bucket_sql.contains("PRAGMA cache_size=-512;"));
+        assert!(bucket_sql.contains("PRAGMA query_only=false;"));
     }
 
     #[test]
