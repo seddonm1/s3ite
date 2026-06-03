@@ -406,23 +406,29 @@ mod tests {
     };
 
     use crate::{
-        checksum::{ChecksumTypeKind, FullObjectChecksum, PartChecksum, StoredChecksum},
-        sqlite::CompletedObjectPart,
+        checksum::{
+            ChecksumTypeKind, FullObjectChecksum, MultipartChecksumConfig,
+            MultipartCompletionChecksum, PartChecksum, StoredChecksum,
+        },
+        sqlite::{CompletedObjectPart, KeyMetadata, KeyValue},
     };
 
     use super::{
         ChecksumAlgorithmKind, ChecksumInput, ChecksumPolicy, checksum_algorithm_from_request,
-        checksum_mode_enabled, checksum_type_name, configured_part_checksum,
+        checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_mode_enabled,
+        checksum_struct, checksum_type_name, configured_part_checksum,
         default_crc64nvme_full_object_checksum, finish_part_checksum, finish_payload_checksum,
         multipart_checksum_config, multipart_checksum_type, object_checksum_for_part,
-        part_checksum_accumulator, payload_checksum_accumulator, validate_content_md5,
+        object_write_checksum_from_value, part_checksum_accumulator, payload_checksum_accumulator,
+        validate_content_md5,
     };
 
     fn assert_error_code<T>(result: s3s::S3Result<T>, code: &S3ErrorCode) {
-        match result {
-            Ok(_) => panic!("expected {code:?}"),
-            Err(err) => assert_eq!(err.code(), code),
-        }
+        let err = result.err();
+        assert!(
+            err.as_ref().is_some_and(|err| err.code() == code),
+            "expected {code:?}"
+        );
     }
 
     #[test]
@@ -471,13 +477,14 @@ mod tests {
 
     #[test]
     fn builds_multipart_checksum_config() {
-        let config = match multipart_checksum_config(
+        let config = multipart_checksum_config(
             Some(ChecksumAlgorithm::from_static(ChecksumAlgorithm::SHA256)),
             None,
-        ) {
-            Ok(Some(config)) => config,
-            Ok(None) => panic!("expected checksum config"),
-            Err(err) => panic!("unexpected error: {err:?}"),
+        )
+        .ok()
+        .flatten();
+        let Some(config) = config else {
+            unreachable!("SHA256 multipart checksum config should be valid");
         };
         assert_eq!(config.algorithm, ChecksumAlgorithmKind::Sha256);
         assert_eq!(config.checksum_type, ChecksumTypeKind::Composite);
@@ -488,43 +495,103 @@ mod tests {
     }
 
     #[test]
+    fn rejects_checksum_type_without_algorithm() {
+        assert_error_code(
+            multipart_checksum_config(
+                None,
+                Some(ChecksumType::from_static(ChecksumType::FULL_OBJECT)),
+            ),
+            &S3ErrorCode::InvalidArgument,
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_checksum_values() {
+        let input = ChecksumInput {
+            crc32: Some("crc32".to_string()),
+            sha1: Some("sha1".to_string()),
+            ..ChecksumInput::default()
+        };
+        assert_error_code(input.into_part_checksum(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
     fn completion_checksum_value_does_not_imply_checksum_type() {
-        let checksum = match (ChecksumInput {
+        let checksum = (ChecksumInput {
             crc32: Some("WgDhBQ==".to_string()),
             ..ChecksumInput::default()
         })
         .into_completion_checksum()
-        {
-            Ok(checksum) => checksum,
-            Err(err) => panic!("unexpected error: {err:?}"),
-        };
+        .ok();
 
-        assert_eq!(checksum.algorithm(), Some(ChecksumAlgorithmKind::Crc32));
-        assert_eq!(checksum.checksum_type(), None);
         assert_eq!(
-            checksum.value_for(ChecksumAlgorithmKind::Crc32),
+            checksum
+                .as_ref()
+                .and_then(MultipartCompletionChecksum::algorithm),
+            Some(ChecksumAlgorithmKind::Crc32)
+        );
+        assert_eq!(
+            checksum
+                .as_ref()
+                .and_then(MultipartCompletionChecksum::checksum_type),
+            None
+        );
+        assert_eq!(
+            checksum
+                .as_ref()
+                .and_then(|checksum| checksum.value_for(ChecksumAlgorithmKind::Crc32)),
             Some("WgDhBQ==")
         );
     }
 
     #[test]
     fn completion_checksum_preserves_explicit_checksum_type() {
-        let checksum = match (ChecksumInput {
+        let checksum = (ChecksumInput {
             checksum_type: Some(ChecksumType::from_static(ChecksumType::COMPOSITE)),
             crc32c: Some("xU+Krw==".to_string()),
             ..ChecksumInput::default()
         })
         .into_completion_checksum()
-        {
-            Ok(checksum) => checksum,
-            Err(err) => panic!("unexpected error: {err:?}"),
-        };
+        .ok();
 
-        assert_eq!(checksum.algorithm(), Some(ChecksumAlgorithmKind::Crc32c));
-        assert_eq!(checksum.checksum_type(), Some(ChecksumTypeKind::Composite));
         assert_eq!(
-            checksum.value_for(ChecksumAlgorithmKind::Crc32c),
+            checksum
+                .as_ref()
+                .and_then(MultipartCompletionChecksum::algorithm),
+            Some(ChecksumAlgorithmKind::Crc32c)
+        );
+        assert_eq!(
+            checksum
+                .as_ref()
+                .and_then(MultipartCompletionChecksum::checksum_type),
+            Some(ChecksumTypeKind::Composite)
+        );
+        assert_eq!(
+            checksum
+                .as_ref()
+                .and_then(|checksum| checksum.value_for(ChecksumAlgorithmKind::Crc32c)),
             Some("xU+Krw==")
+        );
+    }
+
+    #[test]
+    fn empty_checksum_input_has_no_part_or_completion_value() {
+        assert_eq!(
+            ChecksumInput::default().into_part_checksum().ok().flatten(),
+            None
+        );
+        let completion = ChecksumInput::default().into_completion_checksum().ok();
+        assert_eq!(
+            completion
+                .as_ref()
+                .and_then(MultipartCompletionChecksum::algorithm),
+            None
+        );
+        assert_eq!(
+            completion
+                .as_ref()
+                .and_then(MultipartCompletionChecksum::checksum_type),
+            None
         );
     }
 
@@ -563,22 +630,22 @@ mod tests {
     #[test]
     fn computes_default_payload_checksum() {
         let input = ChecksumInput::default();
-        let mut accumulator = match payload_checksum_accumulator(
-            &input,
-            ChecksumPolicy::DefaultCrc64NvmeFullObject,
-        ) {
-            Ok(accumulator) => accumulator,
-            Err(err) => panic!("unexpected error: {err:?}"),
-        };
-        accumulator.update(b"test data");
-        let checksum =
-            match finish_payload_checksum(&input, accumulator, ChecksumTypeKind::FullObject) {
-                Ok(checksum) => checksum,
-                Err(err) => panic!("unexpected error: {err:?}"),
-            };
+        let accumulator =
+            payload_checksum_accumulator(&input, ChecksumPolicy::DefaultCrc64NvmeFullObject);
+        assert!(accumulator.is_ok());
+        let mut accumulator = accumulator.ok();
+        assert!(accumulator.is_some());
+        if let Some(accumulator) = accumulator.as_mut() {
+            accumulator.update(b"test data");
+        }
+        let checksum = accumulator.and_then(|accumulator| {
+            finish_payload_checksum(&input, accumulator, ChecksumTypeKind::FullObject).ok()
+        });
         assert_eq!(
             checksum,
-            StoredChecksum::Full(FullObjectChecksum::Crc64Nvme("rsrzr5yYqFU=".to_string()))
+            Some(StoredChecksum::Full(FullObjectChecksum::Crc64Nvme(
+                "rsrzr5yYqFU=".to_string()
+            )))
         );
     }
 
@@ -609,39 +676,96 @@ mod tests {
             algorithm: Some(ChecksumAlgorithm::from_static(ChecksumAlgorithm::SHA256)),
             ..ChecksumInput::default()
         };
-        let mut accumulator = match part_checksum_accumulator(&input) {
-            Ok(Some(accumulator)) => accumulator,
-            Ok(None) => panic!("expected checksum accumulator"),
-            Err(err) => panic!("unexpected error: {err:?}"),
-        };
-        accumulator.update(b"test data");
-        let checksum = match finish_part_checksum(&input, Some(accumulator)) {
-            Ok(Some(checksum)) => checksum,
-            Ok(None) => panic!("expected part checksum"),
-            Err(err) => panic!("unexpected error: {err:?}"),
-        };
+        let mut accumulator = part_checksum_accumulator(&input).ok().flatten();
+        assert!(accumulator.is_some());
+        if let Some(accumulator) = accumulator.as_mut() {
+            accumulator.update(b"test data");
+        }
+        let checksum = finish_part_checksum(&input, accumulator).ok().flatten();
         assert_eq!(
             checksum,
-            PartChecksum::Sha256("kW8AJ6V1B0znKjMXd8NHjWUT94alkb2JLaGld78jNfk=".to_string())
+            Some(PartChecksum::Sha256(
+                "kW8AJ6V1B0znKjMXd8NHjWUT94alkb2JLaGld78jNfk=".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn computes_sha1_part_checksum_from_value_field() {
+        let input = ChecksumInput {
+            sha1: Some("9I3YU4IIYIFsddVND1hNyGMyenw=".to_string()),
+            ..ChecksumInput::default()
+        };
+        let mut accumulator = part_checksum_accumulator(&input).ok().flatten();
+        assert!(accumulator.is_some());
+        if let Some(accumulator) = accumulator.as_mut() {
+            accumulator.update(b"test data");
+        }
+        let checksum = finish_part_checksum(&input, accumulator).ok().flatten();
+        assert_eq!(
+            checksum,
+            Some(PartChecksum::Sha1(
+                "9I3YU4IIYIFsddVND1hNyGMyenw=".to_string()
+            ))
         );
     }
 
     #[test]
     fn computes_configured_part_checksum_when_upload_requested_one() {
-        let config = match multipart_checksum_config(
+        let config = multipart_checksum_config(
             Some(ChecksumAlgorithm::from_static(ChecksumAlgorithm::SHA256)),
             None,
-        ) {
-            Ok(config) => config,
-            Err(err) => panic!("unexpected error: {err:?}"),
-        };
-        let Some(checksum) = configured_part_checksum(config, b"test data") else {
-            panic!("expected copied part checksum");
-        };
+        )
+        .ok()
+        .flatten();
+        let checksum = configured_part_checksum(config, b"test data");
         assert_eq!(
             checksum,
-            PartChecksum::Sha256("kW8AJ6V1B0znKjMXd8NHjWUT94alkb2JLaGld78jNfk=".to_string())
+            Some(PartChecksum::Sha256(
+                "kW8AJ6V1B0znKjMXd8NHjWUT94alkb2JLaGld78jNfk=".to_string()
+            ))
         );
+    }
+
+    #[test]
+    fn object_write_checksum_requires_loaded_value() {
+        let object = KeyValue {
+            key: "key".to_string(),
+            value: None,
+            key_metadata: KeyMetadata {
+                version_id: "version".to_string(),
+                size: 4,
+                metadata: None,
+                content_type: None,
+                content_encoding: None,
+                cache_control: None,
+                expires: None,
+                last_modified: time::OffsetDateTime::UNIX_EPOCH,
+                md5: Some("md5".to_string()),
+                checksum: None,
+                is_latest: true,
+                is_delete_marker: false,
+            },
+        };
+
+        assert!(matches!(
+            object_write_checksum_from_value(ChecksumAlgorithmKind::Crc64Nvme, &object),
+            Err(crate::sqlite::SqliteError::Configuration(_))
+        ));
+    }
+
+    #[test]
+    fn response_checksum_fields_reflect_view_algorithm() {
+        let checksum = StoredChecksum::Full(FullObjectChecksum::Crc32("crc32".to_string()));
+        assert_eq!(checksum_crc32(&checksum), Some("crc32".to_string()));
+        assert_eq!(checksum_crc32c(&checksum), None);
+        assert_eq!(checksum_crc64nvme(&checksum), None);
+
+        let config = MultipartChecksumConfig::new(
+            ChecksumAlgorithmKind::Sha256,
+            ChecksumTypeKind::Composite,
+        );
+        assert_eq!(checksum_struct(config), None);
     }
 
     #[test]

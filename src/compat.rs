@@ -94,7 +94,7 @@ where
     }
 }
 
-fn should_preserve_body_stream(req: &Request<Incoming>) -> bool {
+fn should_preserve_body_stream<B>(req: &Request<B>) -> bool {
     if !matches!(*req.method(), Method::PUT | Method::POST) {
         return true;
     }
@@ -459,4 +459,397 @@ fn s3_error_response(status: StatusCode, code: &str) -> HttpResponse {
         HeaderValue::from_static("application/xml"),
     );
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    fn request(method: Method, uri: &str) -> Result<Request<()>, hyper::http::Error> {
+        Request::builder().method(method).uri(uri).body(())
+    }
+
+    async fn response_body_text(response: HttpResponse) -> Result<String, HttpError> {
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(HttpError::new)?
+            .to_bytes();
+        String::from_utf8(bytes.to_vec()).map_err(|err| HttpError::new(Box::new(err)))
+    }
+
+    fn error_code(response: HttpResponse) -> Result<String, HttpError> {
+        let status = response.status();
+        let body = futures::executor::block_on(response_body_text(response))?;
+        Ok(format!("{status} {body}"))
+    }
+
+    #[test]
+    fn body_stream_preservation_matches_supported_headers() -> Result<(), hyper::http::Error> {
+        assert!(should_preserve_body_stream(&request(
+            Method::GET,
+            "/bucket/key"
+        )?));
+        assert!(!should_preserve_body_stream(&request(
+            Method::PUT,
+            "/bucket/key"
+        )?));
+
+        let with_length = Request::builder()
+            .method(Method::PUT)
+            .uri("/bucket/key")
+            .header(CONTENT_LENGTH, "3")
+            .body(())?;
+        assert!(should_preserve_body_stream(&with_length));
+
+        let with_decoded_length = Request::builder()
+            .method(Method::POST)
+            .uri("/bucket")
+            .header(X_AMZ_DECODED_CONTENT_LENGTH, "3")
+            .body(())?;
+        assert!(should_preserve_body_stream(&with_decoded_length));
+
+        let streaming_checksum = Request::builder()
+            .method(Method::PUT)
+            .uri("/bucket/key")
+            .header(X_AMZ_CONTENT_SHA256, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+            .body(())?;
+        assert!(should_preserve_body_stream(&streaming_checksum));
+
+        let aws_chunked = Request::builder()
+            .method(Method::PUT)
+            .uri("/bucket/key")
+            .header(CONTENT_ENCODING, "gzip, aws-chunked")
+            .body(())?;
+        assert!(should_preserve_body_stream(&aws_chunked));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rewrites_successful_get_object_attributes_etags() -> Result<(), HttpError> {
+        let response = HttpResponse::new(Body::from(
+            "<GetObjectAttributesResult><ETag>\"abc\"</ETag></GetObjectAttributesResult>"
+                .to_string(),
+        ));
+
+        let response = rewrite_get_object_attributes_etag(response).await?;
+        let expected = "<GetObjectAttributesResult><ETag>abc</ETag></GetObjectAttributesResult>";
+        let expected_length = expected.len().to_string();
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_length.as_str())
+        );
+        let body = response_body_text(response).await?;
+        assert_eq!(body, expected);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn leaves_unsuccessful_and_non_utf8_attribute_bodies_alone() -> Result<(), HttpError> {
+        let mut unsuccessful = HttpResponse::new(Body::from("<ETag>\"abc\"</ETag>".to_string()));
+        *unsuccessful.status_mut() = StatusCode::NOT_FOUND;
+        let unsuccessful = rewrite_get_object_attributes_etag(unsuccessful).await?;
+        assert_eq!(
+            response_body_text(unsuccessful).await?,
+            "<ETag>\"abc\"</ETag>"
+        );
+
+        let non_utf8 = HttpResponse::new(Body::from(Bytes::from_static(&[0xff, b'"'])));
+        let non_utf8 = rewrite_get_object_attributes_etag(non_utf8).await?;
+        let bytes = non_utf8
+            .into_body()
+            .collect()
+            .await
+            .map_err(HttpError::new)?
+            .to_bytes();
+        assert_eq!(bytes.as_ref(), &[0xff, b'"']);
+
+        Ok(())
+    }
+
+    #[test]
+    fn presigned_expiry_validation_matches_compat_contract()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        assert!(presigned_expiry_compat(&request(Method::GET, "/bucket/key")?).is_none());
+        assert!(
+            presigned_expiry_compat(&request(Method::GET, "/bucket/key?X-Amz-Expires=1")?)
+                .is_none()
+        );
+        assert!(
+            presigned_expiry_compat(&request(Method::GET, "/bucket/key?X-Amz-Expires=604800")?)
+                .is_none()
+        );
+
+        let options =
+            presigned_expiry_compat(&request(Method::OPTIONS, "/bucket/key?X-Amz-Expires=60")?);
+        let Some(response) = options else {
+            panic!("OPTIONS presigned request should be rejected");
+        };
+        assert!(error_code(response)?.contains("400 Bad Request"));
+        let Some(response) =
+            presigned_expiry_compat(&request(Method::GET, "/bucket/key?X-Amz-Expires=bad")?)
+        else {
+            panic!("invalid expiry should be rejected");
+        };
+        assert!(error_code(response)?.contains("AccessDenied"));
+
+        let Some(response) =
+            presigned_expiry_compat(&request(Method::GET, "/bucket/key?X-Amz-Expires=0")?)
+        else {
+            panic!("zero expiry should be rejected");
+        };
+        assert!(error_code(response)?.contains("AccessDenied"));
+
+        let Some(response) =
+            presigned_expiry_compat(&request(Method::GET, "/bucket/key?X-Amz-Expires=604801")?)
+        else {
+            panic!("oversized expiry should be rejected");
+        };
+        assert!(error_code(response)?.contains("AccessDenied"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn query_lookup_requires_exact_named_pair() {
+        assert_eq!(
+            query_value("prefix=1&X-Amz-Expires=60&other=2", "X-Amz-Expires"),
+            Some("60")
+        );
+        assert_eq!(query_value("X-Amz-Expires", "X-Amz-Expires"), None);
+        assert_eq!(query_value("Other-X-Amz-Expires=60", "X-Amz-Expires"), None);
+    }
+
+    #[test]
+    fn parses_sig_v2_authorization_header() {
+        let Some(auth) = parse_authorization_v2("AWS access:signature") else {
+            panic!("valid SigV2 authorization should parse");
+        };
+        assert_eq!(auth.access_key, "access");
+        assert_eq!(auth.signature, "signature");
+        assert!(parse_authorization_v2("AWS :signature").is_none());
+        assert!(parse_authorization_v2("AWS access:").is_none());
+        assert!(parse_authorization_v2("Bearer token").is_none());
+    }
+
+    #[test]
+    fn validates_sig_v2_dates() {
+        let mut headers = HeaderMap::new();
+        assert!(validate_sig_v2_date(&headers).is_none());
+
+        headers.insert("x-amz-date", HeaderValue::from_static(""));
+        let Some(response) = validate_sig_v2_date(&headers) else {
+            panic!("empty date should fail");
+        };
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        headers.insert("x-amz-date", HeaderValue::from_static("not a date"));
+        let Some(response) = validate_sig_v2_date(&headers) else {
+            panic!("invalid date should fail");
+        };
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        headers.insert(
+            "x-amz-date",
+            HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 +0000"),
+        );
+        let Some(response) = validate_sig_v2_date(&headers) else {
+            panic!("skewed date should fail");
+        };
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn canonicalizes_sig_v2_headers_and_string_to_sign() -> Result<(), hyper::http::Error> {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-md5", HeaderValue::from_static("md5"));
+        headers.insert("content-type", HeaderValue::from_static("text/plain"));
+        headers.insert(
+            "date",
+            HeaderValue::from_static("Tue, 27 Mar 2007 19:36:42 +0000"),
+        );
+        headers.insert("x-amz-meta-z", HeaderValue::from_static(" zed "));
+        headers.append("x-amz-meta-a", HeaderValue::from_static("one"));
+        headers.append("x-amz-meta-a", HeaderValue::from_static("two"));
+        headers.insert("not-amz", HeaderValue::from_static("ignored"));
+
+        assert_eq!(
+            canonical_amz_headers(&headers),
+            "x-amz-meta-a:one,two\nx-amz-meta-z:zed\n"
+        );
+        assert_eq!(
+            sig_v2_string_to_sign(&Method::PUT, &headers, "/bucket/key"),
+            "PUT\nmd5\ntext/plain\nTue, 27 Mar 2007 19:36:42 +0000\nx-amz-meta-a:one,two\nx-amz-meta-z:zed\n/bucket/key"
+        );
+
+        headers.insert("x-amz-date", HeaderValue::from_static("date wins"));
+        assert_eq!(
+            sig_v2_string_to_sign(&Method::GET, &headers, "/bucket"),
+            "GET\nmd5\ntext/plain\n\nx-amz-date:date wins\nx-amz-meta-a:one,two\nx-amz-meta-z:zed\n/bucket"
+        );
+
+        let req = request(Method::GET, "/")?;
+        assert_eq!(header_value(req.headers(), "missing"), None);
+        Ok(())
+    }
+
+    #[test]
+    fn signs_hmac_sha1_and_encodes_base64() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(
+            sig_v2_signature("key", "The quick brown fox jumps over the lazy dog"),
+            "3nybhbi3iqa8ino29wqQcBydtNk="
+        );
+        assert_eq!(
+            sig_v2_signature(
+                "key",
+                "GET\n\n\nTue, 27 Mar 2007 19:36:42 +0000\n/johnsmith/photos/puppy.jpg"
+            ),
+            "EpELyoQzABuh9lHQ+KwND1xJ+Uc="
+        );
+    }
+
+    #[test]
+    fn rewrites_create_bucket_sig_v2_trailing_slash_signature() -> Result<(), hyper::http::Error> {
+        let secret = "secret";
+        let mut signed_headers = HeaderMap::new();
+        signed_headers.insert(
+            "date",
+            HeaderValue::from_static("Tue, 27 Mar 2007 19:36:42 +0000"),
+        );
+        let signed = sig_v2_string_to_sign(&Method::PUT, &signed_headers, "/bucket/");
+        let trailing_slash_signature = sig_v2_signature(secret, &signed);
+        let auth = AuthorizationV2 {
+            access_key: "access".to_string(),
+            signature: trailing_slash_signature,
+        };
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri("/bucket")
+            .header("date", "Tue, 27 Mar 2007 19:36:42 +0000")
+            .body(())?;
+
+        rewrite_create_bucket_sig_v2(&mut req, secret, &auth);
+
+        let Some(value) = req.headers().get(header::AUTHORIZATION) else {
+            panic!("authorization header should be rewritten");
+        };
+        let Ok(value) = value.to_str() else {
+            panic!("authorization header should be UTF-8");
+        };
+        assert!(value.starts_with("AWS access:"));
+        assert_ne!(value, format!("AWS access:{}", auth.signature));
+
+        Ok(())
+    }
+
+    #[test]
+    fn skips_create_bucket_sig_v2_rewrite_for_non_bucket_requests() -> Result<(), hyper::http::Error>
+    {
+        let auth = AuthorizationV2 {
+            access_key: "access".to_string(),
+            signature: "signature".to_string(),
+        };
+        for (method, uri) in [
+            (Method::GET, "/bucket"),
+            (Method::PUT, "/"),
+            (Method::PUT, "/bucket/key"),
+            (Method::PUT, "/bucket?versioning"),
+        ] {
+            let mut req = request(method, uri)?;
+            rewrite_create_bucket_sig_v2(&mut req, "secret", &auth);
+            assert!(req.headers().get(header::AUTHORIZATION).is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sig_v2_header_compat_rejects_malformed_auth_and_rewrites_valid_bucket_request()
+    -> Result<(), hyper::http::Error> {
+        let mut malformed = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header(header::AUTHORIZATION, "AWS missing-colon")
+            .body(())?;
+        let Some(response) = sig_v2_header_compat(&mut malformed, Some("secret")) else {
+            panic!("malformed SigV2 auth should be rejected");
+        };
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let secret = "secret";
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "date",
+            HeaderValue::from_static("Tue, 27 Mar 2007 19:36:42 +0000"),
+        );
+        let signature = sig_v2_signature(
+            secret,
+            &sig_v2_string_to_sign(&Method::PUT, &headers, "/bucket/"),
+        );
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri("/bucket")
+            .header("date", "Tue, 27 Mar 2007 19:36:42 +0000")
+            .header(header::AUTHORIZATION, format!("AWS access:{signature}"))
+            .body(())?;
+
+        assert!(sig_v2_header_compat(&mut req, Some(secret)).is_none());
+        let Some(value) = req.headers().get(header::AUTHORIZATION) else {
+            panic!("valid bucket SigV2 request should keep authorization");
+        };
+        let Ok(value) = value.to_str() else {
+            panic!("authorization header should be UTF-8");
+        };
+        assert!(value.starts_with("AWS access:"));
+        assert!(!value.ends_with(&signature));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn builds_xml_error_responses() -> Result<(), HttpError> {
+        let response = s3_error_response(StatusCode::FORBIDDEN, "AccessDenied");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("application/xml"))
+        );
+        assert_eq!(
+            response_body_text(response).await?,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>AccessDenied</Code></Error>"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn detects_get_object_attributes_requests() -> Result<(), hyper::http::Error> {
+        let req = request(Method::GET, "/bucket/key")?;
+        assert!(!is_get_object_attributes(&req));
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/bucket/key")
+            .header("x-amz-object-attributes", "ETag")
+            .body(())?;
+        assert!(is_get_object_attributes(&req));
+
+        let req = Request::builder()
+            .method(Method::HEAD)
+            .uri("/bucket/key")
+            .header("x-amz-object-attributes", "ETag")
+            .body(())?;
+        assert!(!is_get_object_attributes(&req));
+
+        Ok(())
+    }
 }

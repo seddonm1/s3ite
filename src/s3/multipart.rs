@@ -1097,10 +1097,11 @@ mod tests {
     use crate::sqlite::{KeyMetadata, PartChecksum};
 
     fn assert_error_code<T>(result: S3Result<T>, code: &S3ErrorCode) {
-        match result {
-            Ok(_) => panic!("expected {code:?}"),
-            Err(err) => assert_eq!(err.code(), code),
-        }
+        let err = result.err();
+        assert!(
+            err.as_ref().is_some_and(|err| err.code() == code),
+            "expected {code:?}"
+        );
     }
 
     fn part(part_number: Option<i32>, e_tag: Option<ETag>) -> CompletedPart {
@@ -1152,6 +1153,15 @@ mod tests {
         }
     }
 
+    fn access_point_source() -> CopySource {
+        CopySource::AccessPoint {
+            region: "us-east-1".into(),
+            account_id: "123456789012".into(),
+            access_point_name: "ap".into(),
+            key: "key".into(),
+        }
+    }
+
     #[test]
     fn validates_part_number_boundaries() {
         assert_error_code(validate_part_number(0), &S3ErrorCode::InvalidArgument);
@@ -1165,6 +1175,14 @@ mod tests {
         let uuid = Uuid::new_v4();
         assert_eq!(parse_upload_id(&uuid.to_string()).ok(), Some(uuid));
         assert_error_code(parse_upload_id("not-a-uuid"), &S3ErrorCode::NoSuchUpload);
+    }
+
+    #[test]
+    fn list_limit_rejects_zero_and_negative_values() {
+        assert_eq!(list_limit(None, 10, 100).ok(), Some(10));
+        assert_eq!(list_limit(Some(200), 10, 100).ok(), Some(100));
+        assert_error_code(list_limit(Some(0), 10, 100), &S3ErrorCode::InvalidArgument);
+        assert_error_code(list_limit(Some(-1), 10, 100), &S3ErrorCode::InvalidArgument);
     }
 
     #[test]
@@ -1222,34 +1240,38 @@ mod tests {
     fn parses_and_checks_copy_source_ranges() {
         assert_eq!(parse_copy_source_range(None).ok().flatten(), None);
 
-        let range = match parse_copy_source_range(Some("bytes=2-5".to_string())) {
-            Ok(Some(range)) => range,
-            Ok(None) => panic!("expected parsed range"),
-            Err(err) => panic!("unexpected error: {err:?}"),
+        let range = parse_copy_source_range(Some("bytes=2-5".to_string()))
+            .ok()
+            .flatten();
+        let Some(range) = range else {
+            unreachable!("valid copy-source range should parse");
         };
         assert_sqlite_ok(checked_copy_source_range(Some(range), 10), &(2..6));
 
-        let range = match parse_copy_source_range(Some("bytes=-4".to_string())) {
-            Ok(Some(range)) => range,
-            Ok(None) => panic!("expected parsed range"),
-            Err(err) => panic!("unexpected error: {err:?}"),
+        let range = parse_copy_source_range(Some("bytes=-4".to_string()))
+            .ok()
+            .flatten();
+        let Some(range) = range else {
+            unreachable!("valid suffix copy-source range should parse");
         };
         assert_sqlite_ok(checked_copy_source_range(Some(range), 10), &(6..10));
 
-        let range = match parse_copy_source_range(Some("bytes=8-20".to_string())) {
-            Ok(Some(range)) => range,
-            Ok(None) => panic!("expected parsed range"),
-            Err(err) => panic!("unexpected error: {err:?}"),
+        let range = parse_copy_source_range(Some("bytes=8-20".to_string()))
+            .ok()
+            .flatten();
+        let Some(range) = range else {
+            unreachable!("syntactically valid out-of-bounds range should parse");
         };
         assert!(matches!(
             checked_copy_source_range(Some(range), 10),
             Err(SqliteError::InvalidObjectRange)
         ));
 
-        let range = match parse_copy_source_range(Some("bytes=-0".to_string())) {
-            Ok(Some(range)) => range,
-            Ok(None) => panic!("expected parsed range"),
-            Err(err) => panic!("unexpected error: {err:?}"),
+        let range = parse_copy_source_range(Some("bytes=-0".to_string()))
+            .ok()
+            .flatten();
+        let Some(range) = range else {
+            unreachable!("syntactically valid empty suffix range should parse");
         };
         assert!(matches!(
             checked_copy_source_range(Some(range), 10),
@@ -1260,6 +1282,23 @@ mod tests {
             parse_copy_source_range(Some("not-a-range".to_string())),
             &S3ErrorCode::InvalidArgument,
         );
+    }
+
+    #[test]
+    fn upload_part_copy_rejects_access_point_sources() -> Result<(), s3s::dto::builders::BuildError>
+    {
+        let input = UploadPartCopyInput::builder()
+            .bucket("bucket".to_string())
+            .key("key".to_string())
+            .upload_id(Uuid::new_v4().to_string())
+            .part_number(1)
+            .copy_source(access_point_source())
+            .build()?;
+        assert_error_code(
+            parse_upload_part_copy_request(input, None),
+            &S3ErrorCode::NotImplemented,
+        );
+        Ok(())
     }
 
     #[test]

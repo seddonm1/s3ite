@@ -15,6 +15,8 @@ const SECRET_KEY: &str = "s3ite-secret-key-for-tests";
 const DEFAULT_RUST_LOG: &str = "s3ite=debug,s3s=warn";
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const COVERAGE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const COVERAGE_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Debug)]
 pub struct TestServer {
@@ -25,8 +27,18 @@ pub struct TestServer {
     endpoint: String,
 }
 
+#[derive(Debug, Default)]
+pub struct TestServerOptions {
+    pub domain_name: Option<String>,
+    pub permissive_cors: Option<bool>,
+}
+
 impl TestServer {
     pub async fn spawn() -> Result<Self> {
+        Self::spawn_with(TestServerOptions::default()).await
+    }
+
+    pub async fn spawn_with(options: TestServerOptions) -> Result<Self> {
         let root = TempDir::new().context("create temporary s3ite root")?;
         let data_root = root.path().join("data");
         fs::create_dir_all(&data_root).context("create temporary bucket root")?;
@@ -41,7 +53,8 @@ impl TestServer {
         let rust_log =
             std::env::var("S3ITE_TEST_LOG").unwrap_or_else(|_| DEFAULT_RUST_LOG.to_string());
 
-        let mut child = Command::new(&binary)
+        let mut command = Command::new(&binary);
+        command
             .arg("--root")
             .arg(&data_root)
             .arg("--host")
@@ -53,7 +66,17 @@ impl TestServer {
             .arg("--secret-key")
             .arg(SECRET_KEY)
             .arg("--maintenance-interval-seconds")
-            .arg("0")
+            .arg("0");
+        if let Some(domain_name) = options.domain_name {
+            command.arg("--domain-name").arg(domain_name);
+        }
+        if let Some(permissive_cors) = options.permissive_cors {
+            command
+                .arg("--permissive-cors")
+                .arg(permissive_cors.to_string());
+        }
+
+        let mut child = command
             .env("RUST_LOG", rust_log)
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr))
@@ -86,6 +109,10 @@ impl TestServer {
 
 impl Drop for TestServer {
     fn drop(&mut self) {
+        if coverage_run() && request_graceful_shutdown(&self.child).is_ok() {
+            let _ = wait_for_child_exit(&mut self.child, COVERAGE_SHUTDOWN_TIMEOUT);
+        }
+
         let _ = self.child.kill();
         let _ = self.child.wait();
 
@@ -100,6 +127,48 @@ impl Drop for TestServer {
             );
             let _ = root.keep();
         }
+    }
+}
+
+fn coverage_run() -> bool {
+    std::env::var_os("CARGO_LLVM_COV").is_some() || std::env::var_os("LLVM_PROFILE_FILE").is_some()
+}
+
+#[cfg(unix)]
+fn request_graceful_shutdown(child: &Child) -> io::Result<()> {
+    let status = Command::new("kill")
+        .arg("-INT")
+        .arg(child.id().to_string())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "kill -INT exited with status {status}"
+        )))
+    }
+}
+
+#[cfg(not(unix))]
+fn request_graceful_shutdown(_child: &Child) -> io::Result<()> {
+    Err(io::Error::other(
+        "graceful coverage shutdown is only supported on Unix",
+    ))
+}
+
+fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out waiting for s3ite process to exit",
+            ));
+        }
+        std::thread::sleep(COVERAGE_SHUTDOWN_POLL_INTERVAL);
     }
 }
 

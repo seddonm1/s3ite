@@ -711,15 +711,21 @@ impl Sqlite {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
         fs,
         path::{Path, PathBuf},
+        sync::Arc,
     };
 
     use rusqlite::Connection;
+    use tokio::sync::RwLock;
 
-    use crate::Config;
+    use crate::{Bucket, Config, database::BucketConnection};
 
-    use super::{OffsetDateTime, Sqlite, SqliteError, SqliteResult, Uuid};
+    use super::{
+        BucketVersioningState, Duration, MultipartUploadState, OffsetDateTime, Sqlite, SqliteError,
+        SqliteResult, Uuid, expiration_threshold, row_size, sql_limit, sql_size,
+    };
 
     fn open_schema() -> SqliteResult<Connection> {
         let mut connection = Connection::open_in_memory()?;
@@ -740,6 +746,174 @@ mod tests {
         fs::remove_dir_all(root).ok();
     }
 
+    #[test]
+    fn size_and_limit_helpers_reject_negative_values() -> SqliteResult<()> {
+        let connection = Connection::open_in_memory()?;
+
+        let result = connection.query_row("SELECT -1;", (), |row| row_size(row, 0));
+        assert!(result.is_err());
+        assert!(sql_size(-1).is_err());
+        assert!(sql_limit(-1).is_err());
+        assert_eq!(sql_size(0)?, 0);
+        assert_eq!(sql_limit(1)?, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn versioning_state_sql_roundtrips_and_rejects_unknown_values() -> SqliteResult<()> {
+        assert_eq!(
+            BucketVersioningState::from_sql(BucketVersioningState::NeverConfigured.as_sql())?,
+            BucketVersioningState::NeverConfigured
+        );
+        assert_eq!(
+            BucketVersioningState::from_sql(BucketVersioningState::Enabled.as_sql())?,
+            BucketVersioningState::Enabled
+        );
+        assert_eq!(
+            BucketVersioningState::from_sql(BucketVersioningState::Suspended.as_sql())?,
+            BucketVersioningState::Suspended
+        );
+        assert!(BucketVersioningState::from_sql("bad").is_err());
+        assert!(!BucketVersioningState::NeverConfigured.returns_write_version_id());
+        assert!(BucketVersioningState::Enabled.returns_write_version_id());
+        assert!(!BucketVersioningState::Suspended.returns_write_version_id());
+        Ok(())
+    }
+
+    #[test]
+    fn expiration_threshold_handles_disabled_and_active_ttls() {
+        assert!(expiration_threshold(0).is_none());
+        assert!(
+            expiration_threshold(60)
+                .is_some_and(|threshold| threshold <= OffsetDateTime::now_utc())
+        );
+    }
+
+    #[test]
+    fn schema_creation_is_idempotent_for_current_version() -> SqliteResult<()> {
+        let mut connection = Connection::open_in_memory()?;
+        let transaction = connection.transaction()?;
+        Sqlite::try_create_tables(&transaction)?;
+        transaction.commit()?;
+
+        let transaction = connection.transaction()?;
+        Sqlite::try_create_tables(&transaction)?;
+        transaction.commit()?;
+
+        let version: i32 = connection.query_row("PRAGMA user_version;", (), |row| row.get(0))?;
+        assert_eq!(version, super::BUCKET_SCHEMA_VERSION);
+        Ok(())
+    }
+
+    #[test]
+    fn nonzero_empty_schema_version_is_rejected() -> SqliteResult<()> {
+        let mut connection = Connection::open_in_memory()?;
+        connection.execute_batch("PRAGMA user_version = 4;")?;
+        let transaction = connection.transaction()?;
+
+        let err = Sqlite::try_create_tables(&transaction).err();
+        assert!(matches!(
+            err,
+            Some(SqliteError::UnsupportedSchemaVersion {
+                found: 4,
+                expected: super::BUCKET_SCHEMA_VERSION
+            })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn configured_missing_bucket_fails_startup() -> SqliteResult<()> {
+        let root = temp_root("missing-configured-bucket")?;
+        let mut buckets = HashMap::new();
+        buckets.insert(
+            "missing".to_string(),
+            Bucket {
+                read_only: Some(true),
+                sqlite: None,
+            },
+        );
+
+        let err = Sqlite::new(&Config {
+            root: root.clone(),
+            buckets,
+            ..Default::default()
+        })
+        .await
+        .err();
+        assert!(
+            matches!(err, Some(SqliteError::Configuration(message)) if message.contains("missing"))
+        );
+
+        remove_root(&root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prepare_existing_bucket_skips_read_only_buckets() -> SqliteResult<()> {
+        let root = temp_root("prepare-read-only")?;
+        let path = root.join("bucket.sqlite3");
+        let connection = BucketConnection::open(&path, &Config::default(), "bucket").await?;
+        let config = Config {
+            read_only: true,
+            ..Default::default()
+        };
+
+        Sqlite::try_prepare_existing_bucket(&connection, &config, "bucket").await?;
+        let version: i32 = connection
+            .read(|connection| {
+                Ok(connection.query_row("PRAGMA user_version;", (), |row| row.get(0))?)
+            })
+            .await?;
+        assert_eq!(version, 0);
+
+        connection.close().await?;
+        remove_root(&root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prepare_existing_bucket_creates_schema_for_writable_buckets() -> SqliteResult<()> {
+        let root = temp_root("prepare-writable")?;
+        let path = root.join("bucket.sqlite3");
+        let connection = BucketConnection::open(&path, &Config::default(), "bucket").await?;
+
+        Sqlite::try_prepare_existing_bucket(&connection, &Config::default(), "bucket").await?;
+        let version: i32 = connection
+            .read(|connection| {
+                Ok(connection.query_row("PRAGMA user_version;", (), |row| row.get(0))?)
+            })
+            .await?;
+        assert_eq!(version, super::BUCKET_SCHEMA_VERSION);
+
+        connection.close().await?;
+        remove_root(&root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn maintain_connection_runs_checkpoint_and_optional_vacuum() -> SqliteResult<()> {
+        let root = temp_root("maintain")?;
+        let path = root.join("bucket.sqlite3");
+        let connection = BucketConnection::open(&path, &Config::default(), "bucket").await?;
+        connection
+            .write(|connection| {
+                let transaction = connection.transaction()?;
+                Sqlite::try_create_tables(&transaction)?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .await?;
+
+        Sqlite::try_maintain_connection(&connection, None, None, 0).await?;
+        Sqlite::try_maintain_connection(&connection, None, None, 1).await?;
+
+        connection.close().await?;
+        remove_root(&root);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn old_bucket_schema_is_rejected() -> SqliteResult<()> {
         let root = temp_root("old-schema")?;
@@ -747,21 +921,18 @@ mod tests {
         connection.execute("CREATE TABLE data (key TEXT PRIMARY KEY, value BLOB);", ())?;
         drop(connection);
 
-        let Err(err) = Sqlite::new(&Config {
+        let err = Sqlite::new(&Config {
             root: root.clone(),
             ..Default::default()
         })
         .await
-        else {
-            remove_root(&root);
-            panic!("old bucket schema should fail startup");
-        };
+        .err();
         assert!(matches!(
             err,
-            SqliteError::UnsupportedSchemaVersion {
+            Some(SqliteError::UnsupportedSchemaVersion {
                 found: 0,
                 expected: super::BUCKET_SCHEMA_VERSION
-            }
+            })
         ));
 
         remove_root(&root);
@@ -772,19 +943,16 @@ mod tests {
     async fn zero_readers_fails_startup() -> SqliteResult<()> {
         let root = temp_root("zero-readers")?;
 
-        let Err(err) = Sqlite::new(&Config {
+        let err = Sqlite::new(&Config {
             root: root.clone(),
             readers: 0,
             ..Default::default()
         })
         .await
-        else {
-            remove_root(&root);
-            panic!("zero readers should fail startup");
-        };
+        .err();
         assert!(matches!(
             err,
-            SqliteError::Configuration(message) if message == "readers must be greater than zero"
+            Some(SqliteError::Configuration(message)) if message == "readers must be greater than zero"
         ));
 
         remove_root(&root);
@@ -795,19 +963,16 @@ mod tests {
     async fn zero_blob_readers_fails_startup() -> SqliteResult<()> {
         let root = temp_root("zero-blob-readers")?;
 
-        let Err(err) = Sqlite::new(&Config {
+        let err = Sqlite::new(&Config {
             root: root.clone(),
             blob_readers: 0,
             ..Default::default()
         })
         .await
-        else {
-            remove_root(&root);
-            panic!("zero blob readers should fail startup");
-        };
+        .err();
         assert!(matches!(
             err,
-            SqliteError::Configuration(message)
+            Some(SqliteError::Configuration(message))
                 if message == "blob_readers must be greater than zero"
         ));
 
@@ -944,6 +1109,74 @@ mod tests {
         );
 
         assert!(result.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn maintenance_task_runs_periodic_cleanup_for_writable_buckets() -> SqliteResult<()> {
+        let root = temp_root("periodic-maintenance")?;
+        let path = root.join("bucket.sqlite3");
+        let connection =
+            Arc::new(BucketConnection::open(&path, &Config::default(), "bucket").await?);
+        connection
+            .write(|connection| {
+                let transaction = connection.transaction()?;
+                Sqlite::try_create_tables(&transaction)?;
+                let upload_id = Uuid::new_v4();
+                Sqlite::try_create_multipart_upload(
+                    &transaction,
+                    upload_id,
+                    "bucket",
+                    "key",
+                    MultipartUploadState {
+                        access_key: None,
+                        metadata: None,
+                        content_type: None,
+                        content_encoding: None,
+                        cache_control: None,
+                        expires: None,
+                        checksum: None,
+                    },
+                )?;
+                transaction.execute(
+                    "UPDATE multipart_upload SET last_modified = ?2 WHERE upload_id = ?1;",
+                    (
+                        upload_id,
+                        OffsetDateTime::now_utc().saturating_sub(Duration::hours(2)),
+                    ),
+                )?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .await?;
+
+        let mut bucket_map = HashMap::new();
+        bucket_map.insert("bucket".to_string(), connection.clone());
+        Sqlite::spawn_maintenance_task(
+            Arc::new(RwLock::new(bucket_map)),
+            Config {
+                maintenance_interval_seconds: 1,
+                maintenance_vacuum_pages: 0,
+                multipart_upload_ttl_seconds: 1,
+                completed_multipart_upload_ttl_seconds: 0,
+                ..Default::default()
+            },
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+
+        let remaining: i64 = connection
+            .read(|connection| {
+                Ok(
+                    connection.query_row("SELECT COUNT(*) FROM multipart_upload;", (), |row| {
+                        row.get(0)
+                    })?,
+                )
+            })
+            .await?;
+        assert_eq!(remaining, 0);
+
+        connection.close().await?;
+        remove_root(&root);
         Ok(())
     }
 }

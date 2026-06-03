@@ -14,7 +14,7 @@ use support::{
     assertions::{assert_error_contains, assert_status},
     fixtures::{bucket_name, create_bucket, get_object_bytes},
     raw_http, sdk,
-    server::TestServer,
+    server::{TestServer, TestServerOptions},
 };
 use uuid::Uuid;
 
@@ -24,6 +24,40 @@ use uuid::Uuid;
 async fn test_bucket_list_empty() -> Result<()> {
     // Mirrors s3tests/functional/test_s3.py::test_bucket_list_empty
     let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+
+    let output = client.list_buckets().send().await?;
+    assert!(output.buckets().is_empty());
+
+    Ok(())
+}
+
+/// Verifies optional binary startup layers still serve ordinary path-style requests.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_server_domain_and_cors_startup_smoke() -> Result<()> {
+    let server = TestServer::spawn_with(TestServerOptions {
+        domain_name: Some("localhost".to_string()),
+        permissive_cors: Some(true),
+    })
+    .await?;
+    let client = sdk::client(&server);
+
+    let output = client.list_buckets().send().await?;
+    assert!(output.buckets().is_empty());
+
+    Ok(())
+}
+
+/// Verifies the binary serves requests when the optional CORS layer is disabled.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_server_without_cors_startup_smoke() -> Result<()> {
+    let server = TestServer::spawn_with(TestServerOptions {
+        permissive_cors: Some(false),
+        ..Default::default()
+    })
+    .await?;
     let client = sdk::client(&server);
 
     let output = client.list_buckets().send().await?;

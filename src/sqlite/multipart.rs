@@ -883,3 +883,262 @@ impl Sqlite {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use rusqlite::Connection;
+
+    use crate::{
+        checksum::{ChecksumAlgorithmKind, ChecksumTypeKind, FullObjectChecksum},
+        sqlite::{
+            CompletedMultipartUploadRecord, CompletedObjectPart, MultipartChecksumConfig,
+            MultipartCompletionChecksum, MultipartCompletionPart, MultipartCompletionRequest,
+            MultipartUploadState, NULL_VERSION_ID, ObjectWriteConditions, Sqlite, SqliteError,
+            SqliteResult, StoredChecksum,
+        },
+    };
+
+    use super::*;
+
+    fn open_schema() -> SqliteResult<Connection> {
+        let mut connection = Connection::open_in_memory()?;
+        connection.execute_batch("PRAGMA foreign_keys=true;")?;
+        let transaction = connection.transaction()?;
+        Sqlite::try_create_tables(&transaction)?;
+        transaction.commit()?;
+        Ok(connection)
+    }
+
+    fn upload_state() -> MultipartUploadState {
+        MultipartUploadState {
+            access_key: None,
+            metadata: None,
+            content_type: None,
+            content_encoding: None,
+            cache_control: None,
+            expires: None,
+            checksum: None,
+        }
+    }
+
+    fn completion_request(
+        upload_id: Uuid,
+        requested_parts: Vec<MultipartCompletionPart>,
+    ) -> MultipartCompletionRequest {
+        MultipartCompletionRequest {
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            upload_id,
+            requested_parts,
+            requested_checksum: MultipartCompletionChecksum::default(),
+            default_checksum: MultipartChecksumConfig::new(
+                ChecksumAlgorithmKind::Crc64Nvme,
+                ChecksumTypeKind::FullObject,
+            ),
+            access_key: None,
+            write_conditions: ObjectWriteConditions::default(),
+        }
+    }
+
+    #[test]
+    fn completion_transaction_rejects_empty_requested_parts() -> SqliteResult<()> {
+        let mut connection = open_schema()?;
+        let transaction = connection.transaction()?;
+        let request = completion_request(Uuid::new_v4(), Vec::new());
+
+        assert!(matches!(
+            Sqlite::try_complete_multipart_upload_transaction(&transaction, &request),
+            Err(SqliteError::InvalidMultipartPart)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn completion_transaction_returns_existing_completed_upload() -> SqliteResult<()> {
+        let mut connection = open_schema()?;
+        let transaction = connection.transaction()?;
+        let upload_id = Uuid::new_v4();
+        let checksum = StoredChecksum::Full(FullObjectChecksum::Crc64Nvme("crc".to_string()));
+        Sqlite::try_put_completed_multipart_upload(
+            &transaction,
+            CompletedMultipartUploadRecord {
+                upload_id,
+                bucket: "bucket",
+                key: "key",
+                access_key: None,
+                md5: "etag-1",
+                version_id: NULL_VERSION_ID,
+                returned_version_id: Some("returned"),
+                checksum: &checksum,
+            },
+        )?;
+
+        let outcome = Sqlite::try_complete_multipart_upload_transaction(
+            &transaction,
+            &completion_request(
+                upload_id,
+                vec![MultipartCompletionPart {
+                    part_number: 1,
+                    md5: "etag".to_string(),
+                    checksum: None,
+                }],
+            ),
+        )?;
+        assert_eq!(outcome.md5, "etag-1");
+        assert_eq!(outcome.version_id, NULL_VERSION_ID);
+        assert_eq!(outcome.returned_version_id.as_deref(), Some("returned"));
+        assert_eq!(outcome.checksum, checksum);
+        Ok(())
+    }
+
+    #[test]
+    fn upload_state_rejects_malformed_metadata_json() -> SqliteResult<()> {
+        let mut connection = open_schema()?;
+        let transaction = connection.transaction()?;
+        let upload_id = Uuid::new_v4();
+        let mut metadata = HashMap::new();
+        metadata.insert("color".to_string(), "blue".to_string());
+        Sqlite::try_create_multipart_upload(
+            &transaction,
+            upload_id,
+            "bucket",
+            "key",
+            MultipartUploadState {
+                metadata: Some(metadata),
+                ..upload_state()
+            },
+        )?;
+        transaction.execute(
+            "UPDATE multipart_upload SET metadata = '{not-json' WHERE upload_id = ?1;",
+            [upload_id],
+        )?;
+
+        assert!(matches!(
+            Sqlite::try_get_multipart_upload_state(&transaction, upload_id, "bucket", "key"),
+            Err(SqliteError::Rusqlite(
+                rusqlite::Error::FromSqlConversionFailure(..)
+            ))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn list_multipart_uploads_honors_marker_combinations() -> SqliteResult<()> {
+        let mut connection = open_schema()?;
+        let transaction = connection.transaction()?;
+        let alpha_first = Uuid::from_u128(1);
+        let alpha_second = Uuid::from_u128(2);
+        let beta = Uuid::from_u128(3);
+        for (upload_id, key) in [
+            (alpha_first, "alpha"),
+            (alpha_second, "alpha"),
+            (beta, "beta"),
+        ] {
+            Sqlite::try_create_multipart_upload(
+                &transaction,
+                upload_id,
+                "bucket",
+                key,
+                upload_state(),
+            )?;
+        }
+
+        let prefix_after_key = Sqlite::try_list_multipart_uploads(
+            &transaction,
+            Some("alpha"),
+            Some("alpha"),
+            None,
+            10,
+        )?;
+        assert_eq!(
+            prefix_after_key
+                .iter()
+                .map(|summary| summary.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["beta"]
+        );
+
+        let after_key_and_upload = Sqlite::try_list_multipart_uploads(
+            &transaction,
+            None,
+            Some("alpha"),
+            Some(alpha_first),
+            10,
+        )?;
+        assert_eq!(
+            after_key_and_upload
+                .iter()
+                .map(|summary| (summary.key.as_str(), summary.upload_id))
+                .collect::<Vec<_>>(),
+            vec![("alpha", alpha_second), ("beta", beta)]
+        );
+
+        let after_key_only =
+            Sqlite::try_list_multipart_uploads(&transaction, None, Some("alpha"), None, 10)?;
+        assert_eq!(
+            after_key_only
+                .iter()
+                .map(|summary| summary.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["beta"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn completed_part_storage_rejects_negative_boundaries() -> SqliteResult<()> {
+        let mut connection = open_schema()?;
+        let transaction = connection.transaction()?;
+        assert!(matches!(
+            Sqlite::try_put_completed_object_parts(
+                &transaction,
+                "key",
+                "version",
+                &[CompletedObjectPart {
+                    part_number: 1,
+                    start: -1,
+                    size: 1,
+                    md5: None,
+                    checksum: None,
+                }],
+            ),
+            Err(SqliteError::Rusqlite(
+                rusqlite::Error::ToSqlConversionFailure(_)
+            ))
+        ));
+        assert!(matches!(
+            Sqlite::try_put_completed_object_parts(
+                &transaction,
+                "key",
+                "version",
+                &[CompletedObjectPart {
+                    part_number: 1,
+                    start: 0,
+                    size: -1,
+                    md5: None,
+                    checksum: None,
+                }],
+            ),
+            Err(SqliteError::Rusqlite(
+                rusqlite::Error::ToSqlConversionFailure(_)
+            ))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn multipart_access_requires_matching_owner_key() {
+        let stored = "owner".to_string();
+        assert!(Sqlite::try_validate_multipart_access(Some(&stored), Some("owner")).is_ok());
+        assert!(matches!(
+            Sqlite::try_validate_multipart_access(Some(&stored), Some("other")),
+            Err(SqliteError::MultipartAccessDenied)
+        ));
+        assert!(matches!(
+            Sqlite::try_validate_multipart_access(None, Some("owner")),
+            Err(SqliteError::MultipartAccessDenied)
+        ));
+    }
+}

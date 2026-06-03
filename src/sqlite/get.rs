@@ -313,3 +313,183 @@ impl Sqlite {
             .optional()?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use rusqlite::Connection;
+    use time::OffsetDateTime;
+
+    use crate::{
+        checksum::{FullObjectChecksum, StoredChecksum},
+        sqlite::{Sqlite, SqliteError, SqliteResult},
+    };
+
+    fn open_schema() -> SqliteResult<Connection> {
+        let mut connection = Connection::open_in_memory()?;
+        connection.execute_batch("PRAGMA foreign_keys=true;")?;
+        let transaction = connection.transaction()?;
+        Sqlite::try_create_tables(&transaction)?;
+        transaction.commit()?;
+        Ok(connection)
+    }
+
+    fn insert_object(
+        connection: &Connection,
+        key: &str,
+        version_id: &str,
+        size: i64,
+        metadata: Option<&str>,
+        body: Option<&[u8]>,
+    ) -> SqliteResult<i64> {
+        connection.execute(
+            "
+            INSERT INTO object_version (
+                key,
+                version_id,
+                is_latest,
+                is_delete_marker,
+                size,
+                metadata,
+                content_type,
+                content_encoding,
+                cache_control,
+                expires,
+                last_modified,
+                md5,
+                checksum_algorithm,
+                checksum_type,
+                checksum_value
+            )
+            VALUES (?1, ?2, 1, 0, ?3, ?4, 'text/plain', 'gzip', 'max-age=1', ?5, ?6, 'md5', 3, 2, 'crc');",
+            (
+                key,
+                version_id,
+                size,
+                metadata,
+                OffsetDateTime::UNIX_EPOCH,
+                OffsetDateTime::UNIX_EPOCH,
+            ),
+        )?;
+        let sequence = connection.last_insert_rowid();
+        if let Some(body) = body {
+            connection.execute(
+                "INSERT INTO object_body (sequence, body) VALUES (?1, ?2);",
+                (sequence, body),
+            )?;
+        }
+        Ok(sequence)
+    }
+
+    fn assert_conversion_error<T>(result: &SqliteResult<T>) {
+        assert!(matches!(
+            result,
+            Err(SqliteError::Rusqlite(
+                rusqlite::Error::FromSqlConversionFailure(..)
+            ))
+        ));
+    }
+
+    #[test]
+    fn reads_current_object_metadata_body_and_blob_reference() -> SqliteResult<()> {
+        let mut connection = open_schema()?;
+        insert_object(
+            &connection,
+            "key",
+            "version",
+            4,
+            Some(r#"{"color":"blue"}"#),
+            Some(b"body"),
+        )?;
+        let transaction = connection.transaction()?;
+
+        let expected_metadata = {
+            let mut metadata = HashMap::new();
+            metadata.insert("color".to_string(), "blue".to_string());
+            metadata
+        };
+        let object = Sqlite::try_get_object(&transaction, "key")?;
+        assert_eq!(
+            object.as_ref().map(|object| object.value.as_deref()),
+            Some(Some(&b"body"[..]))
+        );
+        assert_eq!(
+            object
+                .as_ref()
+                .and_then(|object| object.key_metadata.metadata.as_ref()),
+            Some(&expected_metadata)
+        );
+        assert_eq!(
+            object
+                .as_ref()
+                .and_then(|object| object.key_metadata.content_type.as_deref()),
+            Some("text/plain")
+        );
+        assert_eq!(
+            object
+                .as_ref()
+                .and_then(|object| object.key_metadata.checksum.as_ref()),
+            Some(&StoredChecksum::Full(FullObjectChecksum::Crc64Nvme(
+                "crc".to_string()
+            )))
+        );
+
+        let reference = Sqlite::try_get_current_object_body_reference(&transaction, "key")?;
+        assert_eq!(
+            reference.as_ref().map(|reference| reference.sequence),
+            Some(1)
+        );
+        assert_eq!(
+            reference
+                .as_ref()
+                .and_then(|reference| reference.key_metadata.metadata.as_ref()),
+            Some(&expected_metadata)
+        );
+
+        let metadata = Sqlite::try_get_metadata(&transaction, "key")?;
+        assert_eq!(
+            metadata
+                .as_ref()
+                .and_then(|metadata| metadata.metadata.as_ref()),
+            Some(&expected_metadata)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn live_object_without_body_is_inconsistent() -> SqliteResult<()> {
+        let mut connection = open_schema()?;
+        insert_object(&connection, "key", "version", 4, None, None)?;
+        let transaction = connection.transaction()?;
+
+        assert!(matches!(
+            Sqlite::try_get_object(&transaction, "key"),
+            Err(SqliteError::ObjectBodyInconsistent)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_metadata_fails_all_read_shapes() -> SqliteResult<()> {
+        let mut connection = open_schema()?;
+        insert_object(
+            &connection,
+            "key",
+            "version",
+            4,
+            Some("{not-json"),
+            Some(b"body"),
+        )?;
+        let transaction = connection.transaction()?;
+
+        assert_conversion_error(&Sqlite::try_get_object(&transaction, "key"));
+        assert_conversion_error(&Sqlite::try_get_current_object_body_reference(
+            &transaction,
+            "key",
+        ));
+        assert_conversion_error(&Sqlite::try_get_metadata(&transaction, "key"));
+        Ok(())
+    }
+}

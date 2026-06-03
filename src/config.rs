@@ -745,15 +745,33 @@ mod tests {
         )?;
 
         let path_arg = path.to_string_lossy().into_owned();
+        let root = std::env::temp_dir().join(format!("s3ite-root-{}", uuid::Uuid::new_v4()));
+        let root_arg = root.to_string_lossy().into_owned();
 
         let args = ConfigArgs::try_parse_from([
             "s3ite",
             "--config",
             &path_arg,
+            "--root",
+            &root_arg,
+            "--host",
+            "127.0.0.1",
             "--port",
             "9001",
+            "--access-key",
+            "access",
+            "--secret-key",
+            "secret",
+            "--permissive-cors",
+            "false",
+            "--domain-name",
+            "s3.example.test",
+            "--concurrency-limit",
+            "32",
             "--cache-size",
             "1024",
+            "--readers",
+            "3",
             "--blob-readers",
             "8",
             "--blob-read-timeout-seconds",
@@ -766,11 +784,26 @@ mod tests {
             "300",
             "--completed-multipart-upload-ttl-seconds",
             "400",
+            "--read-only",
+            "true",
+            "--journal-mode",
+            "delete",
+            "--synchronous",
+            "full",
+            "--temp-store",
+            "file",
         ])?;
         let config = Config::from_config_args(args)?;
 
+        assert_eq!(config.root, root);
+        assert_eq!(config.host, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(config.port, 9001);
-        assert_eq!(config.readers, 2);
+        assert_eq!(config.access_key.as_deref(), Some("access"));
+        assert_eq!(config.secret_key.as_deref(), Some("secret"));
+        assert!(!config.permissive_cors);
+        assert_eq!(config.domain_name.as_deref(), Some("s3.example.test"));
+        assert_eq!(config.concurrency_limit, 32);
+        assert_eq!(config.readers, 3);
         assert_eq!(config.blob_readers, 8);
         assert_eq!(config.blob_read_timeout_seconds, 180);
         assert_eq!(config.maintenance_interval_seconds, 120);
@@ -778,6 +811,10 @@ mod tests {
         assert_eq!(config.sqlite.cache_size, 1024);
         assert_eq!(config.multipart_upload_ttl_seconds, 300);
         assert_eq!(config.completed_multipart_upload_ttl_seconds, 400);
+        assert!(config.read_only);
+        assert_eq!(config.sqlite.journal_mode, JournalMode::DELETE);
+        assert_eq!(config.sqlite.synchronous, Synchronous::FULL);
+        assert_eq!(config.sqlite.temp_store, TempStore::FILE);
 
         std::fs::remove_file(path).ok();
         Ok(())

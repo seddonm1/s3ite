@@ -145,6 +145,8 @@ impl Sqlite {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use tokio::sync::RwLock;
 
     use crate::{Bucket, Config};
@@ -157,6 +159,12 @@ mod tests {
             config,
             buckets: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    fn temp_root(name: &str) -> SqliteResult<PathBuf> {
+        let root = std::env::temp_dir().join(format!("s3ite-{name}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root)?;
+        Ok(root)
     }
 
     #[test]
@@ -199,5 +207,23 @@ mod tests {
         assert!(matches!(err, SqliteError::BucketReadOnly));
         assert!(sqlite.validate_mutable_bucket("writable").is_ok());
         assert!(sqlite.validate_mutable_bucket("unconfigured").is_ok());
+    }
+
+    #[tokio::test]
+    async fn opens_only_sqlite_bucket_files_from_root() -> SqliteResult<()> {
+        let root = temp_root("open-buckets")?;
+        fs::create_dir(root.join("directory.sqlite3"))?;
+        fs::write(root.join("ignored.txt"), b"not a bucket")?;
+        fs::File::create(root.join("bucket.sqlite3"))?;
+
+        let buckets = Sqlite::try_open_configured_buckets(&root, &Config::default()).await?;
+        assert_eq!(buckets.len(), 1);
+        assert!(buckets.contains_key("bucket"));
+        for connection in buckets.values() {
+            connection.close().await?;
+        }
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
     }
 }

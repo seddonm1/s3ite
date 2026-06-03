@@ -155,48 +155,58 @@ pub(super) fn checksum_conversion_error(error: SqliteError) -> rusqlite::Error {
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::{Connection, params};
+    use rusqlite::Connection;
 
     use crate::{
-        checksum::{ChecksumAlgorithmKind, ChecksumTypeKind, PartChecksum, StoredChecksum},
+        checksum::{
+            ChecksumAlgorithmKind, ChecksumTypeKind, FullObjectChecksum, PartChecksum,
+            StoredChecksum,
+        },
         sqlite::{
             MultipartChecksumConfig, SqliteError, optional_multipart_checksum_config,
-            optional_part_checksum, optional_stored_checksum,
+            optional_part_checksum, optional_stored_checksum, required_stored_checksum,
         },
     };
 
     use super::{decode_base64, decode_md5_hex, encode_hex, stored_checksum};
 
     fn assert_sqlite_error<T>(result: crate::sqlite::SqliteResult<T>, expected: &SqliteError) {
-        match result {
-            Ok(_) => panic!("expected {expected:?}"),
-            Err(err) => assert_eq!(
+        let err = result.err();
+        assert!(
+            err.as_ref()
+                .is_some_and(|err| std::mem::discriminant(err) == std::mem::discriminant(expected)),
+            "expected {expected:?}"
+        );
+        if let Some(err) = err {
+            assert_eq!(
                 std::mem::discriminant(&err),
                 std::mem::discriminant(expected),
                 "{err:?}"
-            ),
+            );
         }
     }
 
     #[test]
     fn algorithm_and_type_roundtrip_through_sqlite_columns() -> rusqlite::Result<()> {
         let connection = Connection::open_in_memory()?;
-        let (algorithm, checksum_type) = connection.query_row(
-            "SELECT ?1, ?2;",
-            params![
-                ChecksumAlgorithmKind::Crc64Nvme,
-                ChecksumTypeKind::FullObject
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, ChecksumAlgorithmKind>(0)?,
-                    row.get::<_, ChecksumTypeKind>(1)?,
-                ))
-            },
-        )?;
-
-        assert_eq!(algorithm, ChecksumAlgorithmKind::Crc64Nvme);
-        assert_eq!(checksum_type, ChecksumTypeKind::FullObject);
+        for algorithm in [
+            ChecksumAlgorithmKind::Crc32,
+            ChecksumAlgorithmKind::Crc32c,
+            ChecksumAlgorithmKind::Crc64Nvme,
+            ChecksumAlgorithmKind::Sha1,
+            ChecksumAlgorithmKind::Sha256,
+        ] {
+            let decoded = connection.query_row("SELECT ?1;", [algorithm], |row| {
+                row.get::<_, ChecksumAlgorithmKind>(0)
+            })?;
+            assert_eq!(decoded, algorithm);
+        }
+        for checksum_type in [ChecksumTypeKind::Composite, ChecksumTypeKind::FullObject] {
+            let decoded = connection.query_row("SELECT ?1;", [checksum_type], |row| {
+                row.get::<_, ChecksumTypeKind>(0)
+            })?;
+            assert_eq!(decoded, checksum_type);
+        }
         Ok(())
     }
 
@@ -212,6 +222,18 @@ mod tests {
         assert!(
             connection
                 .query_row("SELECT 99;", (), |row| row.get::<_, ChecksumTypeKind>(0))
+                .is_err()
+        );
+        assert!(
+            connection
+                .query_row("SELECT 'crc32';", (), |row| row
+                    .get::<_, ChecksumAlgorithmKind>(0))
+                .is_err()
+        );
+        assert!(
+            connection
+                .query_row("SELECT 'full-object';", (), |row| row
+                    .get::<_, ChecksumTypeKind>(0))
                 .is_err()
         );
         Ok(())
@@ -243,14 +265,13 @@ mod tests {
     #[test]
     fn part_checksum_never_carries_type() {
         assert_eq!(
-            match optional_part_checksum(
+            optional_part_checksum(
                 Some(ChecksumAlgorithmKind::Sha256),
                 None,
                 Some("sha".to_string())
-            ) {
-                Ok(checksum) => checksum,
-                Err(err) => panic!("unexpected error: {err:?}"),
-            },
+            )
+            .ok()
+            .flatten(),
             Some(PartChecksum::Sha256("sha".to_string()))
         );
         assert!(
@@ -266,14 +287,13 @@ mod tests {
     #[test]
     fn multipart_config_never_carries_value() {
         assert_eq!(
-            match optional_multipart_checksum_config(
+            optional_multipart_checksum_config(
                 Some(ChecksumAlgorithmKind::Sha256),
                 Some(ChecksumTypeKind::Composite),
                 None,
-            ) {
-                Ok(config) => config,
-                Err(err) => panic!("unexpected error: {err:?}"),
-            },
+            )
+            .ok()
+            .flatten(),
             Some(MultipartChecksumConfig::new(
                 ChecksumAlgorithmKind::Sha256,
                 ChecksumTypeKind::Composite,
@@ -300,16 +320,38 @@ mod tests {
             .is_err()
         );
         assert_eq!(
-            match optional_stored_checksum(
+            optional_stored_checksum(
                 Some(ChecksumAlgorithmKind::Sha256),
                 Some(ChecksumTypeKind::FullObject),
                 Some("sha".to_string()),
-            ) {
-                Ok(checksum) =>
-                    checksum.map(|checksum| (checksum.algorithm(), checksum.checksum_type())),
-                Err(err) => panic!("unexpected error: {err:?}"),
-            },
+            )
+            .ok()
+            .flatten()
+            .map(|checksum| (checksum.algorithm(), checksum.checksum_type())),
             Some((ChecksumAlgorithmKind::Sha256, ChecksumTypeKind::FullObject))
+        );
+    }
+
+    #[test]
+    fn required_stored_checksum_maps_to_row_conversion_errors() {
+        assert!(matches!(
+            required_stored_checksum(
+                ChecksumAlgorithmKind::Crc64Nvme,
+                ChecksumTypeKind::Composite,
+                "crc".to_string(),
+            ),
+            Err(rusqlite::Error::FromSqlConversionFailure(..))
+        ));
+        assert_eq!(
+            required_stored_checksum(
+                ChecksumAlgorithmKind::Crc32,
+                ChecksumTypeKind::FullObject,
+                "crc32".to_string(),
+            )
+            .ok(),
+            Some(StoredChecksum::Full(FullObjectChecksum::Crc32(
+                "crc32".to_string()
+            )))
         );
     }
 

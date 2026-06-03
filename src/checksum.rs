@@ -744,9 +744,10 @@ mod tests {
     use s3s::dto::{ChecksumAlgorithm, ChecksumType};
 
     use super::{
-        ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKind, CompositeChecksum,
-        FullObjectChecksum, MultipartCompletionChecksum, PartChecksum, StoredChecksum,
-        decode_base64, decode_md5_hex, encode_base64, encode_hex,
+        ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKind, ChecksumView,
+        CompositeChecksum, FullObjectChecksum, MultipartChecksumConfig,
+        MultipartCompletionChecksum, PartChecksum, StoredChecksum, decode_base64, decode_md5_hex,
+        encode_base64, encode_hex,
     };
 
     #[test]
@@ -768,6 +769,7 @@ mod tests {
                 Ok(kind)
             );
             assert_eq!(kind.to_s3().as_str(), name);
+            assert_eq!(ChecksumAlgorithm::from(kind).as_str(), name);
         }
         assert_eq!(ChecksumAlgorithmKind::from_name("MD5"), None);
     }
@@ -796,6 +798,58 @@ mod tests {
         assert_eq!(value.as_str(), "sha");
         assert_eq!(value.value_for(ChecksumAlgorithmKind::Sha256), Some("sha"));
         assert_eq!(value.value_for(ChecksumAlgorithmKind::Sha1), None);
+    }
+
+    #[test]
+    fn part_checksums_cover_each_algorithm_variant() {
+        for algorithm in [
+            ChecksumAlgorithmKind::Crc32,
+            ChecksumAlgorithmKind::Crc32c,
+            ChecksumAlgorithmKind::Crc64Nvme,
+            ChecksumAlgorithmKind::Sha1,
+            ChecksumAlgorithmKind::Sha256,
+        ] {
+            let checksum = PartChecksum::new(algorithm, algorithm.as_str().to_string());
+            assert_eq!(checksum.algorithm(), algorithm);
+            assert_eq!(checksum.as_str(), algorithm.as_str());
+            assert_eq!(checksum.value_for(algorithm), Some(algorithm.as_str()));
+        }
+    }
+
+    #[test]
+    fn full_object_checksums_cover_each_algorithm_variant() {
+        for algorithm in [
+            ChecksumAlgorithmKind::Crc32,
+            ChecksumAlgorithmKind::Crc32c,
+            ChecksumAlgorithmKind::Crc64Nvme,
+            ChecksumAlgorithmKind::Sha1,
+            ChecksumAlgorithmKind::Sha256,
+        ] {
+            let checksum = FullObjectChecksum::new(algorithm, algorithm.as_str().to_string());
+            assert_eq!(checksum.algorithm(), algorithm);
+            assert_eq!(checksum.as_str(), algorithm.as_str());
+        }
+    }
+
+    #[test]
+    fn composite_checksums_cover_supported_algorithm_variants() {
+        for algorithm in [
+            ChecksumAlgorithmKind::Crc32,
+            ChecksumAlgorithmKind::Crc32c,
+            ChecksumAlgorithmKind::Sha1,
+            ChecksumAlgorithmKind::Sha256,
+        ] {
+            let checksum = CompositeChecksum::new(algorithm, algorithm.as_str().to_string());
+            let Some(checksum) = checksum else {
+                unreachable!("algorithm is supported by composite checksums");
+            };
+            assert_eq!(checksum.algorithm(), algorithm);
+            assert_eq!(checksum.as_str(), algorithm.as_str());
+        }
+        assert_eq!(
+            CompositeChecksum::new(ChecksumAlgorithmKind::Crc64Nvme, "crc".to_string()),
+            None
+        );
     }
 
     #[test]
@@ -849,6 +903,56 @@ mod tests {
     }
 
     #[test]
+    fn checksum_views_expose_only_available_metadata() {
+        let object = StoredChecksum::Full(FullObjectChecksum::Crc64Nvme("object".to_string()));
+        let part = PartChecksum::Sha1("part".to_string());
+        let config = MultipartChecksumConfig::new(
+            ChecksumAlgorithmKind::Crc32c,
+            ChecksumTypeKind::Composite,
+        );
+
+        let object_view = ChecksumView::from(&object);
+        assert_eq!(
+            object_view.algorithm(),
+            Some(ChecksumAlgorithmKind::Crc64Nvme)
+        );
+        assert_eq!(
+            object_view.checksum_type(),
+            Some(ChecksumTypeKind::FullObject)
+        );
+        assert_eq!(
+            object_view.value_for(ChecksumAlgorithmKind::Crc64Nvme),
+            Some("object")
+        );
+        assert!(object_view.has_value());
+
+        let part_view = ChecksumView::from(&part);
+        assert_eq!(part_view.algorithm(), Some(ChecksumAlgorithmKind::Sha1));
+        assert_eq!(part_view.checksum_type(), None);
+        assert_eq!(
+            part_view.value_for(ChecksumAlgorithmKind::Sha1),
+            Some("part")
+        );
+        assert!(part_view.has_value());
+
+        let config_view = ChecksumView::from(config);
+        assert_eq!(config_view.algorithm(), Some(ChecksumAlgorithmKind::Crc32c));
+        assert_eq!(
+            config_view.checksum_type(),
+            Some(ChecksumTypeKind::Composite)
+        );
+        assert_eq!(config_view.value_for(ChecksumAlgorithmKind::Crc32c), None);
+        assert!(!config_view.has_value());
+
+        let no_object: Option<StoredChecksum> = None;
+        let no_part: Option<PartChecksum> = None;
+        let no_config: Option<MultipartChecksumConfig> = None;
+        assert_eq!(ChecksumView::from(&no_object).algorithm(), None);
+        assert_eq!(ChecksumView::from(&no_part).algorithm(), None);
+        assert_eq!(ChecksumView::from(&no_config).algorithm(), None);
+    }
+
+    #[test]
     fn encodes_lowercase_hex() {
         assert_eq!(encode_hex([0x00, 0x0f, 0x10, 0xab, 0xff]), "000f10abff");
     }
@@ -891,7 +995,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_base64() {
-        for value in ["", "abc", "not base64", "YW=J", "YR==", "YWJ="] {
+        for value in ["", "abc", "!!!!", "YW=J", "YR==", "YWJ=", "YQ==YQ=="] {
             assert_eq!(decode_base64(value), None, "{value}");
         }
     }

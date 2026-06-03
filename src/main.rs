@@ -146,3 +146,72 @@ async fn main() -> MainResult<()> {
     info!("server is stopped");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as _;
+
+    use super::*;
+
+    #[test]
+    fn main_error_formats_configuration_messages() {
+        let error = MainError::Configuration("bad domain".to_string());
+        assert_eq!(error.to_string(), "configuration error: bad domain");
+    }
+
+    #[test]
+    fn main_error_conversions_preserve_error_category() {
+        let config = MainError::from(ConfigError::Io(std::io::Error::other("config")));
+        assert!(config.to_string().contains("Config"));
+
+        let sqlite = MainError::from(SqliteError::BucketNotFound);
+        assert!(sqlite.to_string().contains("SQLite"));
+
+        let io = MainError::from(std::io::Error::other("bind"));
+        assert!(io.to_string().contains("Io"));
+    }
+
+    #[test]
+    fn main_error_sources_match_wrapped_variants() {
+        let config = MainError::from(ConfigError::Io(std::io::Error::other("config")));
+        assert!(config.source().is_some());
+        assert!(format!("{config:?}").contains("Config"));
+
+        let sqlite = MainError::from(SqliteError::Configuration("sqlite".to_string()));
+        assert!(sqlite.source().is_some());
+        assert!(format!("{sqlite:?}").contains("Sqlite"));
+
+        let io = MainError::from(std::io::Error::other("bind"));
+        assert!(io.source().is_some());
+        assert!(format!("{io:?}").contains("Io"));
+
+        let configuration = MainError::Configuration("domain".to_string());
+        assert!(configuration.source().is_none());
+        assert!(format!("{configuration:?}").contains("Configuration"));
+    }
+
+    #[test]
+    fn main_error_display_prefixes_are_stable() {
+        let config = MainError::from(ConfigError::Io(std::io::Error::other("config")));
+        assert!(config.to_string().starts_with("Config "));
+
+        let sqlite = MainError::from(SqliteError::BucketNotFound);
+        assert!(sqlite.to_string().starts_with("SQLite "));
+
+        let io = MainError::from(std::io::Error::other("bind"));
+        assert!(io.to_string().starts_with("Io "));
+
+        let configuration = MainError::Configuration("bad domain".to_string());
+        assert_eq!(configuration.to_string(), "configuration error: bad domain");
+    }
+
+    #[test]
+    fn main_result_alias_uses_main_error() {
+        fn configuration_failure() -> MainResult<()> {
+            Err(MainError::Configuration("bad".to_string()))
+        }
+
+        let error = configuration_failure().err();
+        assert!(matches!(error, Some(MainError::Configuration(message)) if message == "bad"));
+    }
+}

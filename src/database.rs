@@ -770,36 +770,20 @@ impl WorkerRole {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn close_is_idempotent_and_rejects_later_operations() -> SqliteResult<()> {
+    fn temp_path() -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("s3ite-{}.sqlite3", uuid::Uuid::new_v4()));
         std::fs::remove_file(&path).ok();
-
-        let config = Config {
-            readers: 1,
-            ..Default::default()
-        };
-        let connection = BucketConnection::open(&path, &config, "bucket").await?;
-
-        connection.close().await?;
-        connection.close().await?;
-
-        let Err(err) = connection.read(|_| Ok(())).await else {
-            panic!("read after close should fail");
-        };
-        assert!(matches!(err, SqliteError::DatabaseQueueClosed));
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(format!("{}-wal", path.to_string_lossy())).ok();
-        std::fs::remove_file(format!("{}-shm", path.to_string_lossy())).ok();
-        Ok(())
+        path
     }
 
-    #[tokio::test]
-    async fn blob_reader_timeout_releases_worker() -> SqliteResult<()> {
-        let path = std::env::temp_dir().join(format!("s3ite-{}.sqlite3", uuid::Uuid::new_v4()));
-        std::fs::remove_file(&path).ok();
+    fn remove_sqlite_files(path: &Path) {
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(format!("{}-wal", path.to_string_lossy())).ok();
+        std::fs::remove_file(format!("{}-shm", path.to_string_lossy())).ok();
+    }
 
+    async fn open_blob_test_connection() -> SqliteResult<(std::path::PathBuf, BucketConnection)> {
+        let path = temp_path();
         let config = Config {
             readers: 1,
             blob_readers: 1,
@@ -809,21 +793,403 @@ mod tests {
         let connection = BucketConnection::open(&path, &config, "bucket").await?;
         connection
             .write(|connection| {
-                connection.execute_batch(
+                let created = connection.execute_batch(
                     "
                     CREATE TABLE blob_source (
                         sequence INTEGER PRIMARY KEY,
                         body BLOB NOT NULL
                     ) STRICT;
                     ",
-                )?;
-                connection.execute(
+                );
+                assert!(created.is_ok(), "{created:?}");
+                let inserted = connection.execute(
                     "INSERT INTO blob_source (sequence, body) VALUES (1, ?1);",
                     [vec![7; 1024 * 1024]],
-                )?;
+                );
+                assert!(inserted.is_ok(), "{inserted:?}");
                 Ok(())
             })
             .await?;
+        Ok((path, connection))
+    }
+
+    #[tokio::test]
+    async fn invalid_reader_counts_fail_connection_open() -> SqliteResult<()> {
+        let path = temp_path();
+
+        let err = BucketConnection::open(
+            &path,
+            &Config {
+                readers: 0,
+                ..Default::default()
+            },
+            "bucket",
+        )
+        .await
+        .err();
+        assert!(
+            matches!(err, Some(SqliteError::Configuration(message)) if message == "readers must be greater than zero")
+        );
+
+        let err = BucketConnection::open(
+            &path,
+            &Config {
+                blob_readers: 0,
+                ..Default::default()
+            },
+            "bucket",
+        )
+        .await
+        .err();
+        assert!(
+            matches!(err, Some(SqliteError::Configuration(message)) if message == "blob_readers must be greater than zero")
+        );
+
+        remove_sqlite_files(&path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn writer_open_failure_is_reported() {
+        let result = BucketConnectionInner::connect(
+            || Err(rusqlite::Error::InvalidQuery),
+            Arc::new(rusqlite::Connection::open_in_memory),
+            1,
+            1,
+            None,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(SqliteError::Rusqlite(rusqlite::Error::InvalidQuery))
+        ));
+    }
+
+    fn sender_without_receiver() -> SyncSender<WorkerCommand> {
+        let (sender, receiver) = sync_channel(1);
+        drop(receiver);
+        sender
+    }
+
+    fn inner_with_handles(
+        writer_handle: Option<JoinHandle<()>>,
+        reader_handles: Vec<JoinHandle<()>>,
+        blob_reader_handles: Vec<JoinHandle<()>>,
+    ) -> BucketConnectionInner {
+        BucketConnectionInner {
+            writer_sender: sender_without_receiver(),
+            reader_sender: sender_without_receiver(),
+            blob_reader_sender: sender_without_receiver(),
+            writer_handle: Mutex::new(writer_handle),
+            reader_handles: Mutex::new(reader_handles),
+            blob_reader_handles: Mutex::new(blob_reader_handles),
+            blob_read_timeout: None,
+            closed: AtomicBool::new(true),
+        }
+    }
+
+    #[test]
+    fn worker_debug_and_role_names_are_stable() {
+        let execute = WorkerCommand::Execute(Box::new(|_| {}));
+        assert_eq!(format!("{execute:?}"), "Execute");
+        assert_eq!(format!("{:?}", WorkerCommand::Close), "Close");
+        assert_eq!(WorkerRole::Writer.name(), "writer");
+        assert_eq!(WorkerRole::Reader.name(), "reader");
+        assert_eq!(WorkerRole::BlobReader.name(), "blob reader");
+    }
+
+    #[test]
+    fn queue_send_errors_map_to_storage_errors() {
+        let (sender, receiver) = sync_channel(0);
+        let err = sender.try_send(WorkerCommand::Close).err();
+        assert!(matches!(
+            err.map(BucketConnectionInner::queue_send_error),
+            Some(SqliteError::DatabaseQueueFull)
+        ));
+
+        drop(receiver);
+        let err = sender.try_send(WorkerCommand::Close).err();
+        assert!(matches!(
+            err.map(BucketConnectionInner::queue_send_error),
+            Some(SqliteError::DatabaseQueueClosed)
+        ));
+    }
+
+    #[test]
+    fn close_blocking_reports_panicked_worker_threads() {
+        let reader = thread::spawn(|| panic!("reader join failure"));
+        assert!(matches!(
+            inner_with_handles(None, vec![reader], Vec::new()).close_blocking(),
+            Err(SqliteError::ThreadJoin)
+        ));
+
+        let blob_reader = thread::spawn(|| panic!("blob reader join failure"));
+        assert!(matches!(
+            inner_with_handles(None, Vec::new(), vec![blob_reader]).close_blocking(),
+            Err(SqliteError::ThreadJoin)
+        ));
+
+        let writer = thread::spawn(|| panic!("writer join failure"));
+        assert!(matches!(
+            inner_with_handles(Some(writer), Vec::new(), Vec::new()).close_blocking(),
+            Err(SqliteError::ThreadJoin)
+        ));
+    }
+
+    #[test]
+    fn worker_run_returns_on_disconnected_or_poisoned_queue() -> rusqlite::Result<()> {
+        let (sender, receiver) = sync_channel::<WorkerCommand>(1);
+        drop(sender);
+        let shared = Arc::new(Mutex::new(receiver));
+        WorkerRole::Reader.run(rusqlite::Connection::open_in_memory()?, &shared);
+
+        let (_sender, receiver) = sync_channel::<WorkerCommand>(1);
+        let shared = Arc::new(Mutex::new(receiver));
+        let poison = shared.clone();
+        let handle = thread::spawn(move || {
+            let locked = poison.lock();
+            assert!(locked.is_ok());
+            panic!("poison worker receiver lock");
+        });
+        assert!(handle.join().is_err());
+        WorkerRole::Reader.run(rusqlite::Connection::open_in_memory()?, &shared);
+        Ok(())
+    }
+
+    #[test]
+    fn worker_spawn_returns_when_start_notification_is_dropped() {
+        let (_sender, receiver) = sync_channel::<WorkerCommand>(1);
+        let shared = Arc::new(Mutex::new(receiver));
+        let (handle, started) = WorkerRole::Reader.spawn(shared, || {
+            thread::sleep(Duration::from_millis(20));
+            rusqlite::Connection::open_in_memory()
+        });
+        drop(started);
+        assert!(handle.join().is_ok());
+    }
+
+    #[tokio::test]
+    async fn blob_read_reports_transaction_start_errors() -> SqliteResult<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        connection.execute_batch("BEGIN IMMEDIATE;")?;
+        let (result_sender, result_receiver) = oneshot::channel();
+        let (chunk_sender, _chunk_receiver) = tokio_mpsc::channel(1);
+        let timed_out = AtomicBool::new(false);
+
+        BucketConnectionInner::execute_blob_read(
+            &mut connection,
+            |_| Ok(((), None)),
+            result_sender,
+            &chunk_sender,
+            None,
+            &timed_out,
+        );
+        let err = result_receiver
+            .await
+            .map_err(|_| SqliteError::ThreadJoin)?
+            .err();
+        assert!(matches!(err, Some(SqliteError::Rusqlite(_))));
+        connection.execute_batch("ROLLBACK;")?;
+        Ok(())
+    }
+
+    #[test]
+    fn send_blob_chunk_waits_without_timeout_for_capacity() {
+        let (sender, mut receiver) = tokio_mpsc::channel(1);
+        assert!(sender.try_send(Ok(Bytes::from_static(b"first"))).is_ok());
+        let drain = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            assert!(receiver.blocking_recv().is_some());
+            assert!(receiver.blocking_recv().is_some());
+        });
+        let timed_out = AtomicBool::new(false);
+
+        assert_eq!(
+            BucketConnectionInner::send_blob_chunk(
+                &sender,
+                Ok(Bytes::from_static(b"second")),
+                None,
+                &timed_out,
+            ),
+            Ok(())
+        );
+        assert!(!timed_out.load(Ordering::Acquire));
+        drop(sender);
+        assert!(drain.join().is_ok());
+    }
+
+    #[tokio::test]
+    async fn worker_closure_errors_are_returned_to_callers() -> SqliteResult<()> {
+        let path = temp_path();
+        let config = Config {
+            readers: 1,
+            blob_readers: 1,
+            ..Default::default()
+        };
+        let connection = BucketConnection::open(&path, &config, "bucket").await?;
+
+        let err = connection
+            .write(|_| Err::<(), _>(SqliteError::Configuration("write failed".to_string())))
+            .await
+            .err();
+        assert!(matches!(
+            err,
+            Some(SqliteError::Configuration(message)) if message == "write failed"
+        ));
+
+        let err = connection
+            .read(|_| Err::<(), _>(SqliteError::Configuration("read failed".to_string())))
+            .await
+            .err();
+        assert!(matches!(
+            err,
+            Some(SqliteError::Configuration(message)) if message == "read failed"
+        ));
+
+        let err = connection
+            .read_blob(|_| {
+                Err::<((), Option<BlobReadRequest>), _>(SqliteError::Configuration(
+                    "blob failed".to_string(),
+                ))
+            })
+            .await
+            .err();
+        assert!(matches!(
+            err,
+            Some(SqliteError::Configuration(message)) if message == "blob failed"
+        ));
+
+        connection.close().await?;
+        remove_sqlite_files(&path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blob_read_without_blob_request_returns_metadata_only() -> SqliteResult<()> {
+        let path = temp_path();
+        let config = Config {
+            readers: 1,
+            blob_readers: 1,
+            ..Default::default()
+        };
+        let connection = BucketConnection::open(&path, &config, "bucket").await?;
+
+        let (value, mut receiver) = connection.read_blob(|_| Ok((7, None))).await?;
+        assert_eq!(value, 7);
+        assert!(receiver.recv().await.is_none());
+
+        connection.close().await?;
+        remove_sqlite_files(&path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blob_read_rejects_inconsistent_spans() -> SqliteResult<()> {
+        let (path, connection) = open_blob_test_connection().await?;
+
+        let err = connection
+            .read_blob(|_| {
+                Ok((
+                    (),
+                    Some(BlobReadRequest::new("blob_source", "body", 1, 0, 1, 2)),
+                ))
+            })
+            .await
+            .err();
+        assert!(matches!(err, Some(SqliteError::ObjectBodyInconsistent)));
+
+        let err = connection
+            .read_blob(|_| {
+                Ok((
+                    (),
+                    Some(BlobReadRequest::new(
+                        "blob_source",
+                        "body",
+                        1,
+                        1024 * 1024,
+                        1,
+                        1024 * 1024,
+                    )),
+                ))
+            })
+            .await
+            .err();
+        assert!(matches!(err, Some(SqliteError::ObjectBodyInconsistent)));
+
+        connection.close().await?;
+        remove_sqlite_files(&path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blob_read_reports_missing_row_and_streams_offset_spans() -> SqliteResult<()> {
+        let (path, connection) = open_blob_test_connection().await?;
+
+        let err = connection
+            .read_blob(|_| {
+                Ok((
+                    (),
+                    Some(BlobReadRequest::new(
+                        "blob_source",
+                        "body",
+                        99,
+                        0,
+                        1,
+                        1024 * 1024,
+                    )),
+                ))
+            })
+            .await
+            .err();
+        assert!(matches!(err, Some(SqliteError::Rusqlite(_))));
+
+        let ((), mut receiver) = connection
+            .read_blob(|_| {
+                Ok((
+                    (),
+                    Some(BlobReadRequest::new(
+                        "blob_source",
+                        "body",
+                        1,
+                        5,
+                        2,
+                        1024 * 1024,
+                    )),
+                ))
+            })
+            .await?;
+        let chunk = receiver.recv().await.ok_or(SqliteError::ThreadJoin)??;
+        assert_eq!(chunk.as_ref(), &[7, 7]);
+        assert!(receiver.recv().await.is_none());
+
+        connection.close().await?;
+        remove_sqlite_files(&path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn close_is_idempotent_and_rejects_later_operations() -> SqliteResult<()> {
+        let path = temp_path();
+
+        let config = Config {
+            readers: 1,
+            ..Default::default()
+        };
+        let connection = BucketConnection::open(&path, &config, "bucket").await?;
+
+        connection.close().await?;
+        connection.close().await?;
+
+        let err = connection.read(|_| Ok(())).await.err();
+        assert!(matches!(err, Some(SqliteError::DatabaseQueueClosed)));
+
+        remove_sqlite_files(&path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blob_reader_timeout_releases_worker() -> SqliteResult<()> {
+        let (path, connection) = open_blob_test_connection().await?;
 
         let ((), stalled_receiver) = connection
             .read_blob(|_| {
@@ -863,9 +1229,7 @@ mod tests {
         assert_eq!(chunk.as_ref(), &[7]);
 
         connection.close().await?;
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(format!("{}-wal", path.to_string_lossy())).ok();
-        std::fs::remove_file(format!("{}-shm", path.to_string_lossy())).ok();
+        remove_sqlite_files(&path);
         Ok(())
     }
 }

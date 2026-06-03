@@ -732,15 +732,22 @@ pub(super) async fn get_object_attributes(
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, path::PathBuf, sync::Arc};
+
     use super::*;
 
+    use hyper::http::{Extensions, HeaderMap, Method, Uri};
+    use tokio::sync::RwLock;
+
+    use crate::Config;
     use crate::checksum::{FullObjectChecksum, PartChecksum};
 
     fn assert_error_code<T>(result: S3Result<T>, code: &S3ErrorCode) {
-        match result {
-            Ok(_) => panic!("expected {code:?}"),
-            Err(err) => assert_eq!(err.code(), code),
-        }
+        let err = result.err();
+        assert!(
+            err.as_ref().is_some_and(|err| err.code() == code),
+            "expected {code:?}"
+        );
     }
 
     fn assert_s3_ok<T>(result: S3Result<T>, expected: &T)
@@ -782,6 +789,39 @@ mod tests {
 
     fn object_checksum() -> StoredChecksum {
         StoredChecksum::Full(FullObjectChecksum::Crc64Nvme("object-crc64".to_string()))
+    }
+
+    fn request<T: Default>() -> S3Request<T> {
+        S3Request {
+            input: T::default(),
+            method: Method::GET,
+            uri: Uri::from_static("/"),
+            headers: HeaderMap::new(),
+            extensions: Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    fn sqlite_without_buckets() -> Sqlite {
+        Sqlite {
+            root: PathBuf::new(),
+            config: Config::default(),
+            buckets: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    #[test]
+    fn torrent_requests_are_not_supported() {
+        assert_error_code(
+            get_object_torrent(
+                &sqlite_without_buckets(),
+                request::<GetObjectTorrentInput>(),
+            ),
+            &S3ErrorCode::NoSuchKey,
+        );
     }
 
     #[test]
