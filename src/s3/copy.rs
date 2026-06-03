@@ -120,15 +120,6 @@ fn validate_copy_target(request: &CopyObjectRequest) -> S3Result<()> {
     Ok(())
 }
 
-/// Loads the source object selected by key and optional version ID.
-fn load_copy_source_object(
-    transaction: &rusqlite::Transaction<'_>,
-    key: &str,
-    version_id: Option<&str>,
-) -> SqliteResult<KeyValue> {
-    Sqlite::get_copy_source_object(transaction, key, version_id)
-}
-
 /// Rewrites loaded source metadata for the destination object.
 fn prepare_copied_object(
     mut object: KeyValue,
@@ -186,7 +177,7 @@ fn copy_object_result(
     }
 }
 
-/// Copies within one bucket so source validation and target write share a transaction.
+/// Copies within one bucket while keeping body/checksum work off the writer.
 async fn copy_object_same_bucket(
     sqlite: &Sqlite,
     request: CopyObjectRequest,
@@ -195,16 +186,28 @@ async fn copy_object_same_bucket(
         .get_connection(&request.target_bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
+    let source_key = request.source_key.clone();
+    let source_version_id = request.source_version_id.clone();
+    let source_conditions = request.source_conditions.clone();
+    let object = connection
+        .read(move |connection| {
+            let transaction = connection.transaction()?;
+            let object = Sqlite::get_copy_source_object(
+                &transaction,
+                &source_key,
+                source_version_id.as_deref(),
+            )?;
+            validate_copy_source_conditions(&object.key_metadata, &source_conditions)?;
+            Ok(object)
+        })
+        .await
+        .map_err(s3_error_from_sqlite)?;
+
+    let (object, checksum) =
+        prepare_copied_object(object, &request).map_err(s3_error_from_sqlite)?;
     connection
         .write(move |connection| {
             let transaction = connection.transaction()?;
-            let object = load_copy_source_object(
-                &transaction,
-                &request.source_key,
-                request.source_version_id.as_deref(),
-            )?;
-            validate_copy_source_conditions(&object.key_metadata, &request.source_conditions)?;
-            let (object, checksum) = prepare_copied_object(object, &request)?;
             let write_outcome = Sqlite::put_object(&transaction, object)?;
             let result = copy_object_result(
                 &checksum,
@@ -233,8 +236,11 @@ async fn copy_object_cross_bucket(
     let object = source_connection
         .read(move |connection| {
             let transaction = connection.transaction()?;
-            let object =
-                load_copy_source_object(&transaction, &source_key, source_version_id.as_deref())?;
+            let object = Sqlite::get_copy_source_object(
+                &transaction,
+                &source_key,
+                source_version_id.as_deref(),
+            )?;
             validate_copy_source_conditions(&object.key_metadata, &source_conditions)?;
             Ok(object)
         })

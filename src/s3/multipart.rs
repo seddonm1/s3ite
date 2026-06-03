@@ -1,23 +1,26 @@
 use std::collections::HashSet;
 
+use crate::database::BucketConnection;
+
 use super::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, ByteRange, CONTENT_MD5, ChecksumInput,
     CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CompletedObjectPart,
     CompletedPart, CopyPartResult, CopySource, CreateMultipartUploadInput,
     CreateMultipartUploadOutput, Digest, ETag, Initiator, InternalError, KeyValue, LIST_BATCH_SIZE,
     ListMultipartUploadsInput, ListMultipartUploadsOutput, ListPartsInput, ListPartsOutput, Md5,
-    Multipart, MultipartCompletionPart, MultipartCompletionRequest, MultipartUpload,
-    MultipartUploadState, MultipartUploadSummary, Not, ObjectAclRequest, ObjectReadConditions,
-    OffsetDateTime, Part, S3Error, S3ErrorCode, S3Range, S3Request, S3Response, S3Result, Sqlite,
-    SqliteError, SqliteResult, StorageClass, TryStreamExt, UploadPartCopyInput,
-    UploadPartCopyOutput, UploadPartInput, UploadPartOutput, Uuid, checksum_algorithm_output,
-    checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_sha1, checksum_sha256,
-    checksum_type_output, common_prefix_for_key, configured_part_checksum, copy_bytes, debug,
-    decode_list_input_value, default_crc64nvme_full_object_checksum, encode_list_value,
-    finish_part_checksum, hex, is_url_encoding, multipart_checksum_config,
-    normalize_content_encoding, object_write_conditions, output_delimiter, owner,
-    part_checksum_accumulator, s3_error, s3_error_from_sqlite, s3_error_with_message,
-    validate_content_md5, validate_copy_source_conditions, validate_object_acl,
+    Multipart, MultipartChecksumConfig, MultipartCompletion, MultipartCompletionPart,
+    MultipartCompletionRequest, MultipartUpload, MultipartUploadState, MultipartUploadSummary, Not,
+    ObjectAclRequest, ObjectReadConditions, OffsetDateTime, Part, PartChecksum, S3Error,
+    S3ErrorCode, S3Range, S3Request, S3Response, S3Result, Sqlite, SqliteError, SqliteResult,
+    StorageClass, StreamingBlob, TryStreamExt, UploadPartCopyInput, UploadPartCopyOutput,
+    UploadPartInput, UploadPartOutput, Uuid, checksum_algorithm_output, checksum_crc32,
+    checksum_crc32c, checksum_crc64nvme, checksum_sha1, checksum_sha256, checksum_type_output,
+    common_prefix_for_key, configured_part_checksum, copy_bytes, debug, decode_list_input_value,
+    default_crc64nvme_full_object_checksum, encode_list_value, finish_part_checksum, hex,
+    is_url_encoding, multipart_checksum_config, normalize_content_encoding,
+    object_write_conditions, output_delimiter, owner, part_checksum_accumulator, s3_error,
+    s3_error_from_sqlite, s3_error_with_message, validate_content_md5,
+    validate_copy_source_conditions, validate_object_acl,
 };
 
 /// Normalizes a completed multipart part list while preserving S3 ordering rules.
@@ -172,6 +175,58 @@ pub(super) fn part_md5(value: &[u8]) -> String {
     hex(md5_hash.finalize())
 }
 
+async fn read_upload_part_body(
+    body: StreamingBlob,
+    checksum_input: &ChecksumInput,
+    content_md5_present: bool,
+    content_md5: Option<&str>,
+) -> S3Result<(Vec<u8>, i64, String, Option<PartChecksum>)> {
+    let mut checksum_accumulator = part_checksum_accumulator(checksum_input)?;
+    let mut md5_hash = Md5::new();
+    let stream = body.inspect_ok(|bytes| {
+        let bytes = bytes.as_ref();
+        md5_hash.update(bytes);
+        if let Some(checksum_accumulator) = &mut checksum_accumulator {
+            checksum_accumulator.update(bytes);
+        }
+    });
+    let mut value = Vec::new();
+    copy_bytes(stream, &mut value).await?;
+    let md5_bytes = md5_hash.finalize();
+    let md5 = hex(md5_bytes);
+    let size = i64::try_from(value.len()).map_err(S3Error::internal_error)?;
+
+    validate_content_md5(content_md5_present, content_md5, md5_bytes.as_ref())?;
+    let explicit_checksum = finish_part_checksum(checksum_input, checksum_accumulator)?;
+    Ok((value, size, md5, explicit_checksum))
+}
+
+async fn read_multipart_checksum_config(
+    connection: &BucketConnection,
+    upload_id: Uuid,
+    bucket: &str,
+    key: &str,
+    access_key: Option<&str>,
+) -> S3Result<Option<MultipartChecksumConfig>> {
+    let bucket = bucket.to_string();
+    let key = key.to_string();
+    let access_key = access_key.map(str::to_string);
+    connection
+        .read(move |connection| {
+            let transaction = connection.transaction()?;
+            let upload_state =
+                Sqlite::get_multipart_upload_state(&transaction, upload_id, &bucket, &key)?
+                    .ok_or(SqliteError::MultipartUploadNotFound)?;
+            Sqlite::validate_multipart_access(
+                upload_state.access_key.as_ref(),
+                access_key.as_deref(),
+            )?;
+            Ok(upload_state.checksum)
+        })
+        .await
+        .map_err(s3_error_from_sqlite)
+}
+
 /// Converts a stored completed part boundary into an object byte range.
 pub(super) fn completed_part_range(part: &CompletedObjectPart) -> S3Result<ByteRange<u64>> {
     let start = u64::try_from(part.start).map_err(S3Error::internal_error)?;
@@ -203,6 +258,7 @@ pub(super) struct CopiedPart {
     md5: String,
 }
 
+#[derive(Clone)]
 struct UploadPartCopyRequest {
     bucket: String,
     key: String,
@@ -292,6 +348,8 @@ fn store_upload_part_copy(
     transaction: &rusqlite::Transaction<'_>,
     request: &UploadPartCopyRequest,
     copied_part: CopiedPart,
+    checksum_config: Option<MultipartChecksumConfig>,
+    checksum: Option<PartChecksum>,
 ) -> SqliteResult<CopyPartResult> {
     let upload_state = Sqlite::get_multipart_upload_state(
         transaction,
@@ -304,10 +362,17 @@ fn store_upload_part_copy(
         upload_state.access_key.as_ref(),
         request.access_key.as_deref(),
     )?;
+    if upload_state.checksum != checksum_config {
+        return Err(SqliteError::ChecksumMismatch);
+    }
 
     let now = OffsetDateTime::now_utc();
     let md5 = copied_part.md5;
-    let checksum = configured_part_checksum(upload_state.checksum, &copied_part.value);
+    let checksum_crc32 = checksum_crc32(&checksum);
+    let checksum_crc32c = checksum_crc32c(&checksum);
+    let checksum_crc64nvme = checksum_crc64nvme(&checksum);
+    let checksum_sha1 = checksum_sha1(&checksum);
+    let checksum_sha256 = checksum_sha256(&checksum);
     Sqlite::touch_multipart_upload(transaction, request.upload_id)?;
     Sqlite::put_multipart(
         transaction,
@@ -318,19 +383,32 @@ fn store_upload_part_copy(
             value: copied_part.value,
             size: copied_part.size,
             md5: Some(md5.clone()),
-            checksum: checksum.clone(),
+            checksum,
         },
     )?;
 
     Ok(CopyPartResult {
+        checksum_crc32,
+        checksum_crc32c,
+        checksum_crc64nvme,
+        checksum_sha1,
+        checksum_sha256,
+        e_tag: Some(ETag::Strong(md5)),
+        last_modified: Some(now.into()),
+    })
+}
+
+fn upload_part_output(md5: String, checksum: Option<&PartChecksum>) -> UploadPartOutput {
+    let checksum = checksum.cloned();
+    UploadPartOutput {
+        e_tag: Some(ETag::Strong(md5)),
         checksum_crc32: checksum_crc32(&checksum),
         checksum_crc32c: checksum_crc32c(&checksum),
         checksum_crc64nvme: checksum_crc64nvme(&checksum),
         checksum_sha1: checksum_sha1(&checksum),
         checksum_sha256: checksum_sha256(&checksum),
-        e_tag: Some(ETag::Strong(md5)),
-        last_modified: Some(now.into()),
-    })
+        ..Default::default()
+    }
 }
 
 async fn upload_part_copy_same_bucket(
@@ -341,11 +419,35 @@ async fn upload_part_copy_same_bucket(
         .get_connection(&request.bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
+    let source_request = request.clone();
+    let copied_part = connection
+        .read(move |connection| {
+            let transaction = connection.transaction()?;
+            load_upload_part_copy_source(&transaction, &source_request)
+        })
+        .await
+        .map_err(s3_error_from_sqlite)?;
+
+    let checksum_config = read_multipart_checksum_config(
+        &connection,
+        request.upload_id,
+        &request.bucket,
+        &request.key,
+        request.access_key.as_deref(),
+    )
+    .await?;
+    let checksum = configured_part_checksum(checksum_config, &copied_part.value);
+
     connection
         .write(move |connection| {
             let transaction = connection.transaction()?;
-            let copied_part = load_upload_part_copy_source(&transaction, &request)?;
-            let copy_part_result = store_upload_part_copy(&transaction, &request, copied_part)?;
+            let copy_part_result = store_upload_part_copy(
+                &transaction,
+                &request,
+                copied_part,
+                checksum_config,
+                checksum,
+            )?;
             transaction.commit()?;
             Ok(copy_part_result)
         })
@@ -385,10 +487,26 @@ async fn upload_part_copy_cross_bucket(
         .get_connection(&request.bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
+    let checksum_config = read_multipart_checksum_config(
+        &connection,
+        request.upload_id,
+        &request.bucket,
+        &request.key,
+        request.access_key.as_deref(),
+    )
+    .await?;
+    let checksum = configured_part_checksum(checksum_config, &copied_part.value);
+
     connection
         .write(move |connection| {
             let transaction = connection.transaction()?;
-            let copy_part_result = store_upload_part_copy(&transaction, &request, copied_part)?;
+            let copy_part_result = store_upload_part_copy(
+                &transaction,
+                &request,
+                copied_part,
+                checksum_config,
+                checksum,
+            )?;
             transaction.commit()?;
             Ok(copy_part_result)
         })
@@ -715,7 +833,13 @@ pub(super) async fn upload_part(
     sqlite: &Sqlite,
     req: S3Request<UploadPartInput>,
 ) -> S3Result<S3Response<UploadPartOutput>> {
-    let S3Request { input, headers, .. } = req;
+    let S3Request {
+        input,
+        headers,
+        credentials,
+        ..
+    } = req;
+    let access_key = credentials.map(|credentials| credentials.access_key);
     let UploadPartInput {
         body,
         bucket,
@@ -749,34 +873,30 @@ pub(super) async fn upload_part(
         sha256: request_checksum_sha256,
         ..ChecksumInput::default()
     };
-    let mut checksum_accumulator = part_checksum_accumulator(&checksum_input)?;
-    let mut md5_hash = Md5::new();
-    let stream = body.inspect_ok(|bytes| {
-        let bytes = bytes.as_ref();
-        md5_hash.update(bytes);
-        if let Some(checksum_accumulator) = &mut checksum_accumulator {
-            checksum_accumulator.update(bytes);
-        }
-    });
-    let mut value = Vec::new();
-    copy_bytes(stream, &mut value).await?;
-    let md5_bytes = md5_hash.finalize();
-    let md5 = hex(md5_bytes);
-    let size = i64::try_from(value.len()).map_err(S3Error::internal_error)?;
-
-    validate_content_md5(
+    let (value, size, md5, explicit_checksum) = read_upload_part_body(
+        body,
+        &checksum_input,
         headers.contains_key(CONTENT_MD5),
         content_md5.as_deref(),
-        md5_bytes.as_ref(),
-    )?;
-    let explicit_checksum = finish_part_checksum(&checksum_input, checksum_accumulator)?;
+    )
+    .await?;
 
     let md5_clone = md5.clone();
     let connection = sqlite
         .get_connection(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
-    let checksum = connection
+    let checksum_config = read_multipart_checksum_config(
+        &connection,
+        upload_id,
+        &bucket,
+        &key,
+        access_key.as_deref(),
+    )
+    .await?;
+    let checksum = explicit_checksum.or_else(|| configured_part_checksum(checksum_config, &value));
+    let checksum_write = checksum.clone();
+    connection
         .write(move |connection| {
             let transaction = connection.transaction()?;
 
@@ -785,13 +905,11 @@ pub(super) async fn upload_part(
                     .ok_or(SqliteError::MultipartUploadNotFound)?;
             Sqlite::validate_multipart_access(
                 upload_state.access_key.as_ref(),
-                req.credentials
-                    .as_ref()
-                    .map(|credentials| credentials.access_key.as_str()),
+                access_key.as_deref(),
             )?;
-
-            let checksum = explicit_checksum
-                .or_else(|| configured_part_checksum(upload_state.checksum, &value));
+            if upload_state.checksum != checksum_config {
+                return Err(SqliteError::ChecksumMismatch);
+            }
 
             Sqlite::touch_multipart_upload(&transaction, upload_id)?;
             Sqlite::put_multipart(
@@ -803,26 +921,17 @@ pub(super) async fn upload_part(
                     value,
                     size,
                     md5: Some(md5_clone),
-                    checksum: checksum.clone(),
+                    checksum: checksum_write,
                 },
             )?;
 
             transaction.commit()?;
-            Ok(checksum)
+            Ok(())
         })
         .await
         .map_err(s3_error_from_sqlite)?;
 
-    let output = UploadPartOutput {
-        e_tag: Some(ETag::Strong(md5)),
-        checksum_crc32: checksum_crc32(&checksum),
-        checksum_crc32c: checksum_crc32c(&checksum),
-        checksum_crc64nvme: checksum_crc64nvme(&checksum),
-        checksum_sha1: checksum_sha1(&checksum),
-        checksum_sha256: checksum_sha256(&checksum),
-        ..Default::default()
-    };
-    Ok(S3Response::new(output))
+    Ok(S3Response::new(upload_part_output(md5, checksum.as_ref())))
 }
 
 /// Copies an existing object byte range into a multipart upload part.
@@ -1072,15 +1181,27 @@ pub(super) async fn complete_multipart_upload(
         .get_connection(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
-    let completed = connection
-        .write(move |connection| {
+    let (request, completion) = connection
+        .read(move |connection| {
             let transaction = connection.transaction()?;
-            let completed = Sqlite::complete_multipart_upload_transaction(&transaction, &request)?;
-            transaction.commit()?;
-            Ok(completed)
+            let completion = Sqlite::prepare_multipart_upload_completion(&transaction, &request)?;
+            Ok((request, completion))
         })
         .await
         .map_err(s3_error_from_sqlite)?;
+    let completed = match completion {
+        MultipartCompletion::AlreadyCompleted(completed) => completed,
+        MultipartCompletion::Prepared(prepared) => connection
+            .write(move |connection| {
+                let transaction = connection.transaction()?;
+                let completed =
+                    Sqlite::put_prepared_multipart_upload(&transaction, &request, prepared)?;
+                transaction.commit()?;
+                Ok(completed)
+            })
+            .await
+            .map_err(s3_error_from_sqlite)?,
+    };
     debug!(version_id = %completed.version_id, "completed multipart upload");
 
     let completed_checksum_type = checksum_type_output(&completed.checksum);

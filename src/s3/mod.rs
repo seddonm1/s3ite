@@ -42,9 +42,10 @@ use uuid::Uuid;
 use crate::checksum::{ChecksumAlgorithmKind, ChecksumTypeKind};
 use crate::sqlite::{
     BucketVersioningState, CompletedObjectPart, KeyMetadata, KeyValue, Multipart,
-    MultipartCompletionPart, MultipartCompletionRequest, MultipartUploadState,
-    MultipartUploadSummary, ObjectBodyReference, ObjectDeleteOutcome, ObjectTagCondition,
-    ObjectWriteConditions, Sqlite, SqliteError, SqliteResult, StoredChecksum,
+    MultipartChecksumConfig, MultipartCompletion, MultipartCompletionPart,
+    MultipartCompletionRequest, MultipartUploadState, MultipartUploadSummary, ObjectBodyReference,
+    ObjectDeleteOutcome, ObjectTagCondition, ObjectWriteConditions, PartChecksum, Sqlite,
+    SqliteError, SqliteResult, StoredChecksum,
 };
 
 const LIST_BATCH_SIZE: i64 = 1024;

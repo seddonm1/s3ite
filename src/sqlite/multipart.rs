@@ -10,37 +10,49 @@ use crate::checksum::{ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKi
 use super::{
     CompletedMultipartUploadOutcome, CompletedMultipartUploadRecord, CompletedMultipartUploadState,
     CompletedObjectPart, KeyMetadata, KeyValue, Multipart, MultipartChecksumConfig,
-    MultipartCompletionChecksum, MultipartCompletionPart, MultipartCompletionRequest,
-    MultipartMetadata, MultipartUploadState, MultipartUploadSummary, PartChecksum, Sqlite,
-    SqliteError, SqliteResult, StoredChecksum, decode_base64, decode_md5_hex, encode_hex,
-    optional_multipart_checksum_config, optional_part_checksum, required_stored_checksum, row_size,
-    sql_limit, sql_size,
+    MultipartCompletion, MultipartCompletionChecksum, MultipartCompletionPart,
+    MultipartCompletionRequest, MultipartMetadata, MultipartUploadState, MultipartUploadSummary,
+    PartChecksum, PreparedMultipartUpload, Sqlite, SqliteError, SqliteResult, decode_base64,
+    decode_md5_hex, encode_hex, optional_multipart_checksum_config, optional_part_checksum,
+    required_stored_checksum, row_size, sql_limit, sql_size,
 };
 
-/// Buffered completed multipart object and its persisted part boundaries.
-#[derive(Debug)]
-struct CompletedMultipartObject {
-    value: Vec<u8>,
+#[derive(Clone, Copy)]
+struct CompletionPartMetadata<'a> {
+    part_number: i32,
     size: i64,
-    md5: String,
-    checksum: StoredChecksum,
-    parts: Vec<CompletedObjectPart>,
+    md5: Option<&'a str>,
+    checksum: Option<&'a PartChecksum>,
 }
 
-fn part_checksum_algorithm(checksum: Option<&PartChecksum>) -> Option<ChecksumAlgorithmKind> {
-    checksum.map(PartChecksum::algorithm)
+impl<'a> From<&'a Multipart> for CompletionPartMetadata<'a> {
+    fn from(part: &'a Multipart) -> Self {
+        Self {
+            part_number: part.part_number,
+            size: part.size,
+            md5: part.md5.as_deref(),
+            checksum: part.checksum.as_ref(),
+        }
+    }
 }
 
-fn part_checksum_value(checksum: Option<&PartChecksum>) -> Option<&str> {
-    checksum.map(PartChecksum::as_str)
+impl<'a> From<&'a MultipartMetadata> for CompletionPartMetadata<'a> {
+    fn from(part: &'a MultipartMetadata) -> Self {
+        Self {
+            part_number: part.part_number,
+            size: part.size,
+            md5: part.md5.as_deref(),
+            checksum: part.checksum.as_ref(),
+        }
+    }
 }
 
 impl Sqlite {
-    /// Validates and materializes multipart completion inside one transaction.
-    pub(crate) fn complete_multipart_upload_transaction(
+    /// Validates and materializes multipart completion from a read snapshot.
+    pub(crate) fn prepare_multipart_upload_completion(
         transaction: &Transaction,
         request: &MultipartCompletionRequest,
-    ) -> SqliteResult<CompletedMultipartUploadOutcome> {
+    ) -> SqliteResult<MultipartCompletion> {
         if request.requested_parts.is_empty() {
             return Err(SqliteError::InvalidMultipartPart);
         }
@@ -52,55 +64,65 @@ impl Sqlite {
             &request.key,
         )?
         else {
-            let completed = Self::get_completed_multipart_upload(
-                transaction,
-                request.upload_id,
-                &request.bucket,
-                &request.key,
-            )?
-            .ok_or(SqliteError::MultipartUploadNotFound)?;
-            Self::validate_multipart_access(
-                completed.access_key.as_ref(),
-                request.access_key.as_deref(),
-            )?;
-            return Ok(CompletedMultipartUploadOutcome {
-                md5: completed.md5,
-                version_id: completed.version_id,
-                returned_version_id: completed.returned_version_id,
-                checksum: completed.checksum,
-            });
+            return Self::completed_multipart_upload_outcome(transaction, request)
+                .map(MultipartCompletion::AlreadyCompleted);
         };
         Self::validate_multipart_access(
             upload_state.access_key.as_ref(),
             request.access_key.as_deref(),
         )?;
 
-        let completed_object = Self::materialize_multipart_object(
+        Self::materialize_multipart_object(
             transaction,
             request.upload_id,
             &request.requested_parts,
             upload_state.checksum,
             &request.requested_checksum,
             request.default_checksum,
-        )?;
+        )
+        .map(MultipartCompletion::Prepared)
+    }
 
+    /// Commits a prepared multipart completion after revalidating cheap state.
+    pub(crate) fn put_prepared_multipart_upload(
+        transaction: &Transaction,
+        request: &MultipartCompletionRequest,
+        prepared: PreparedMultipartUpload,
+    ) -> SqliteResult<CompletedMultipartUploadOutcome> {
+        let Some(upload_state) = Self::get_multipart_upload_state(
+            transaction,
+            request.upload_id,
+            &request.bucket,
+            &request.key,
+        )?
+        else {
+            return Self::completed_multipart_upload_outcome(transaction, request);
+        };
+        Self::validate_multipart_access(
+            upload_state.access_key.as_ref(),
+            request.access_key.as_deref(),
+        )?;
+        if upload_state.checksum != prepared.upload_checksum {
+            return Err(SqliteError::ChecksumMismatch);
+        }
+        Self::validate_multipart_completion_metadata(transaction, request, upload_state.checksum)?;
         Self::check_object_write_conditions(transaction, &request.key, &request.write_conditions)?;
         let write_outcome = Self::put_object(
             transaction,
             KeyValue {
                 key: request.key.clone(),
-                value: Some(completed_object.value),
+                value: Some(prepared.value),
                 key_metadata: KeyMetadata {
                     version_id: String::new(),
-                    size: completed_object.size,
+                    size: prepared.size,
                     metadata: upload_state.metadata,
                     content_type: upload_state.content_type,
                     content_encoding: upload_state.content_encoding,
                     cache_control: upload_state.cache_control,
                     expires: upload_state.expires,
                     last_modified: OffsetDateTime::now_utc(),
-                    md5: Some(completed_object.md5.clone()),
-                    checksum: Some(completed_object.checksum.clone()),
+                    md5: Some(prepared.md5.clone()),
+                    checksum: Some(prepared.checksum.clone()),
                     is_latest: true,
                     is_delete_marker: false,
                 },
@@ -110,7 +132,7 @@ impl Sqlite {
             transaction,
             &request.key,
             &write_outcome.version_id,
-            &completed_object.parts,
+            &prepared.parts,
         )?;
 
         Self::delete_multipart(transaction, request.upload_id)?;
@@ -121,18 +143,41 @@ impl Sqlite {
                 bucket: &request.bucket,
                 key: &request.key,
                 access_key: request.access_key.clone(),
-                md5: &completed_object.md5,
+                md5: &prepared.md5,
                 version_id: &write_outcome.version_id,
                 returned_version_id: write_outcome.returned_version_id.as_deref(),
-                checksum: &completed_object.checksum,
+                checksum: &prepared.checksum,
             },
         )?;
 
         Ok(CompletedMultipartUploadOutcome {
-            md5: completed_object.md5,
+            md5: prepared.md5,
             version_id: write_outcome.version_id,
             returned_version_id: write_outcome.returned_version_id,
-            checksum: completed_object.checksum,
+            checksum: prepared.checksum,
+        })
+    }
+
+    fn completed_multipart_upload_outcome(
+        transaction: &Transaction,
+        request: &MultipartCompletionRequest,
+    ) -> SqliteResult<CompletedMultipartUploadOutcome> {
+        let completed = Self::get_completed_multipart_upload(
+            transaction,
+            request.upload_id,
+            &request.bucket,
+            &request.key,
+        )?
+        .ok_or(SqliteError::MultipartUploadNotFound)?;
+        Self::validate_multipart_access(
+            completed.access_key.as_ref(),
+            request.access_key.as_deref(),
+        )?;
+        Ok(CompletedMultipartUploadOutcome {
+            md5: completed.md5,
+            version_id: completed.version_id,
+            returned_version_id: completed.returned_version_id,
+            checksum: completed.checksum,
         })
     }
 
@@ -144,7 +189,7 @@ impl Sqlite {
         upload_checksum: Option<MultipartChecksumConfig>,
         requested_checksum: &MultipartCompletionChecksum,
         default_checksum: MultipartChecksumConfig,
-    ) -> SqliteResult<CompletedMultipartObject> {
+    ) -> SqliteResult<PreparedMultipartUpload> {
         let parts = Self::get_multiparts(transaction, upload_id)?;
         if parts.len() != requested_parts.len() {
             return Err(SqliteError::InvalidMultipartPart);
@@ -171,7 +216,7 @@ impl Sqlite {
                 index,
                 final_part_number,
                 requested_part,
-                part,
+                CompletionPartMetadata::from(part),
                 algorithm,
                 require_requested_part_checksums,
             )?;
@@ -208,13 +253,47 @@ impl Sqlite {
             full_object_checksum,
             &completed_parts,
         )?;
-        Ok(CompletedMultipartObject {
+        Ok(PreparedMultipartUpload {
             value,
             size,
             md5,
             checksum,
+            upload_checksum,
             parts: completed_parts,
         })
+    }
+
+    fn validate_multipart_completion_metadata(
+        transaction: &Transaction,
+        request: &MultipartCompletionRequest,
+        upload_checksum: Option<MultipartChecksumConfig>,
+    ) -> SqliteResult<()> {
+        let limit = i64::try_from(request.requested_parts.len())
+            .map_err(|_| SqliteError::MultipartObjectTooLarge)?
+            .checked_add(1)
+            .ok_or(SqliteError::MultipartObjectTooLarge)?;
+        let parts = Self::list_multipart(transaction, request.upload_id, 0, limit)?;
+        if parts.len() != request.requested_parts.len() {
+            return Err(SqliteError::InvalidMultipartPart);
+        }
+
+        let final_part_number = request.requested_parts.len();
+        let algorithm = upload_checksum.map(|checksum| checksum.algorithm);
+        let require_requested_part_checksums = request.requested_checksum.has_value();
+        for (index, (requested_part, part)) in
+            request.requested_parts.iter().zip(parts.iter()).enumerate()
+        {
+            Self::validate_completion_part(
+                index,
+                final_part_number,
+                requested_part,
+                CompletionPartMetadata::from(part),
+                algorithm,
+                require_requested_part_checksums,
+            )?;
+        }
+
+        Ok(())
     }
 
     /// Resolves the final checksum algorithm and type for multipart completion.
@@ -252,7 +331,7 @@ impl Sqlite {
         index: usize,
         final_part_number: usize,
         requested_part: &MultipartCompletionPart,
-        part: &Multipart,
+        part: CompletionPartMetadata<'_>,
         algorithm: Option<ChecksumAlgorithmKind>,
         require_requested_checksum: bool,
     ) -> SqliteResult<()> {
@@ -262,7 +341,7 @@ impl Sqlite {
         if index + 1 != final_part_number && part.size < 5 * 1024 * 1024 {
             return Err(SqliteError::MultipartPartTooSmall);
         }
-        if part.md5.as_deref() != Some(requested_part.md5.as_str()) {
+        if part.md5 != Some(requested_part.md5.as_str()) {
             return Err(SqliteError::InvalidMultipartPart);
         }
         if let Some(algorithm) = algorithm {
@@ -274,7 +353,6 @@ impl Sqlite {
                 Some(requested_checksum)
                     if part
                         .checksum
-                        .as_ref()
                         .and_then(|checksum| checksum.value_for(algorithm))
                         == Some(requested_checksum) => {}
                 Some(_) => return Err(SqliteError::ChecksumMismatch),
@@ -545,9 +623,9 @@ impl Sqlite {
             multipart.value,
             size,
             multipart.md5,
-            part_checksum_algorithm(multipart.checksum.as_ref()),
+            multipart.checksum.as_ref().map(PartChecksum::algorithm),
             Option::<ChecksumTypeKind>::None,
-            part_checksum_value(multipart.checksum.as_ref()),
+            multipart.checksum.as_ref().map(PartChecksum::as_str),
         ))?)
     }
 
@@ -787,9 +865,9 @@ impl Sqlite {
                 sql_size(part.start)?,
                 sql_size(part.size)?,
                 &part.md5,
-                part_checksum_algorithm(part.checksum.as_ref()),
+                part.checksum.as_ref().map(PartChecksum::algorithm),
                 Option::<ChecksumTypeKind>::None,
-                part_checksum_value(part.checksum.as_ref()),
+                part.checksum.as_ref().map(PartChecksum::as_str),
             ))?;
         }
 
@@ -871,9 +949,9 @@ mod tests {
         checksum::{ChecksumAlgorithmKind, ChecksumTypeKind, FullObjectChecksum},
         sqlite::{
             CompletedMultipartUploadRecord, CompletedObjectPart, MultipartChecksumConfig,
-            MultipartCompletionChecksum, MultipartCompletionPart, MultipartCompletionRequest,
-            MultipartUploadState, NULL_VERSION_ID, ObjectWriteConditions, Sqlite, SqliteError,
-            SqliteResult, StoredChecksum,
+            MultipartCompletion, MultipartCompletionChecksum, MultipartCompletionPart,
+            MultipartCompletionRequest, MultipartUploadState, NULL_VERSION_ID,
+            ObjectWriteConditions, Sqlite, SqliteError, SqliteResult, StoredChecksum,
         },
     };
 
@@ -920,20 +998,20 @@ mod tests {
     }
 
     #[test]
-    fn completion_transaction_rejects_empty_requested_parts() -> SqliteResult<()> {
+    fn completion_prepare_rejects_empty_requested_parts() -> SqliteResult<()> {
         let mut connection = open_schema()?;
         let transaction = connection.transaction()?;
         let request = completion_request(Uuid::new_v4(), Vec::new());
 
         assert!(matches!(
-            Sqlite::complete_multipart_upload_transaction(&transaction, &request),
+            Sqlite::prepare_multipart_upload_completion(&transaction, &request),
             Err(SqliteError::InvalidMultipartPart)
         ));
         Ok(())
     }
 
     #[test]
-    fn completion_transaction_returns_existing_completed_upload() -> SqliteResult<()> {
+    fn completion_prepare_returns_existing_completed_upload() -> SqliteResult<()> {
         let mut connection = open_schema()?;
         let transaction = connection.transaction()?;
         let upload_id = Uuid::new_v4();
@@ -952,7 +1030,7 @@ mod tests {
             },
         )?;
 
-        let outcome = Sqlite::complete_multipart_upload_transaction(
+        let completion = Sqlite::prepare_multipart_upload_completion(
             &transaction,
             &completion_request(
                 upload_id,
@@ -963,6 +1041,9 @@ mod tests {
                 }],
             ),
         )?;
+        let MultipartCompletion::AlreadyCompleted(outcome) = completion else {
+            panic!("expected already-completed multipart outcome");
+        };
         assert_eq!(outcome.md5, "etag-1");
         assert_eq!(outcome.version_id, NULL_VERSION_ID);
         assert_eq!(outcome.returned_version_id.as_deref(), Some("returned"));

@@ -380,6 +380,24 @@ pub(crate) struct CompletedMultipartUploadOutcome {
     pub(crate) checksum: StoredChecksum,
 }
 
+/// Read-side multipart completion state.
+#[derive(Debug)]
+pub(crate) enum MultipartCompletion {
+    AlreadyCompleted(CompletedMultipartUploadOutcome),
+    Prepared(PreparedMultipartUpload),
+}
+
+/// Buffered completed multipart object and its persisted part boundaries.
+#[derive(Debug)]
+pub(crate) struct PreparedMultipartUpload {
+    value: Vec<u8>,
+    size: i64,
+    md5: String,
+    checksum: StoredChecksum,
+    upload_checksum: Option<MultipartChecksumConfig>,
+    parts: Vec<CompletedObjectPart>,
+}
+
 /// Object metadata loaded without the object body.
 #[derive(Debug)]
 pub(crate) struct KeyMetadata {
