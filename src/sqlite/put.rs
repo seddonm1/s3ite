@@ -13,7 +13,7 @@ const VERSION_ID_LEN: usize = 31;
 const VERSION_ID_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-.";
 
-/// Generates one opaque Ceph-shaped object version ID.
+/// Generates one opaque S3-safe object version ID.
 fn generate_version_id() -> SqliteResult<String> {
     let mut bytes = [0; VERSION_ID_LEN];
     getrandom::fill(&mut bytes).map_err(|err| SqliteError::Random(err.to_string()))?;

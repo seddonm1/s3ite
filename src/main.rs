@@ -13,9 +13,14 @@ use hyper_util::{
     server::conn::auto,
     service::TowerToHyperService,
 };
-use s3s::{auth::SimpleAuth, host::MultiDomain, service::S3ServiceBuilder};
+use s3s::{
+    auth::SimpleAuth,
+    host::MultiDomain,
+    service::{S3Service, S3ServiceBuilder},
+};
 use tokio::net::TcpListener;
-use tower::limit::ConcurrencyLimitLayer;
+use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer};
+use tower_http::cors::CorsLayer;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
 
@@ -47,46 +52,65 @@ enum MainError {
 }
 
 #[tokio::main]
-#[allow(clippy::too_many_lines)]
 async fn main() -> MainResult<()> {
+    init_tracing();
+
+    let config = Config::from_args()?;
+    let auth_compat = HeaderAuthCompatLayer::new(config.secret_key.clone());
+    let cors_layer = config.cors_layer()?;
+    let sqlite = Sqlite::new(&config).await?;
+    let svc = build_s3_service(&config, sqlite)?;
+    let listener = bind_listener(&config).await?;
+
+    serve(
+        listener,
+        svc,
+        auth_compat,
+        cors_layer,
+        config.concurrency_limit,
+    )
+    .await
+}
+
+fn init_tracing() {
     let env_filter = EnvFilter::from_default_env();
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_span_events(FmtSpan::CLOSE)
         .init();
+}
 
-    let config = Config::from_args()?;
-    let auth_compat = HeaderAuthCompatLayer::new(config.secret_key.clone());
-    let cors_layer = config.cors_layer()?;
+fn build_s3_service(config: &Config, sqlite: Sqlite) -> MainResult<S3Service> {
+    let mut s3 = S3ServiceBuilder::new(sqlite);
 
-    // Setup S3 provider
-    let sqlite = Sqlite::new(&config).await?;
+    if let (Some(access_key), Some(secret_key)) =
+        (config.access_key.clone(), config.secret_key.clone())
+    {
+        s3.set_auth(SimpleAuth::from_single(access_key, secret_key));
+    }
 
-    // Setup S3 service
-    let svc = {
-        let mut s3 = S3ServiceBuilder::new(sqlite);
+    if let Some(domain_name) = &config.domain_name {
+        let domains = [domain_name.as_str()];
+        let domains =
+            MultiDomain::new(&domains).map_err(|err| MainError::Configuration(err.to_string()))?;
+        s3.set_host(domains);
+    }
 
-        // Enable authentication
-        if let (Some(access_key), Some(secret_key)) =
-            (config.access_key.clone(), config.secret_key.clone())
-        {
-            s3.set_auth(SimpleAuth::from_single(access_key, secret_key));
-        }
+    Ok(s3.build())
+}
 
-        // Enable parsing virtual-hosted-style requests
-        if let Some(domain_name) = &config.domain_name {
-            let domains = [domain_name.as_str()];
-            let domains = MultiDomain::new(&domains)
-                .map_err(|err| MainError::Configuration(err.to_string()))?;
-            s3.set_host(domains);
-        }
-
-        s3.build()
-    };
-
-    // Parse addr
+async fn bind_listener(config: &Config) -> MainResult<TcpListener> {
     let addr = SocketAddr::new(config.host, config.port);
-    let listener = TcpListener::bind(addr).await?;
+    Ok(TcpListener::bind(addr).await?)
+}
+
+async fn serve(
+    listener: TcpListener,
+    svc: S3Service,
+    auth_compat: HeaderAuthCompatLayer,
+    cors_layer: Option<CorsLayer>,
+    concurrency_limit: u16,
+) -> MainResult<()> {
     let local_addr = listener.local_addr()?;
     let http_server = auto::Builder::new(TokioExecutor::new());
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
@@ -111,39 +135,21 @@ async fn main() -> MainResult<()> {
         };
 
         let io = TokioIo::new(stream);
-
-        if let Some(cors_layer) = cors_layer.clone() {
-            let conn = http_server.serve_connection(
-                io,
-                TowerToHyperService::new(
-                    tower::ServiceBuilder::new()
-                        .layer(cors_layer)
-                        .layer(auth_compat.clone())
-                        .layer(ChunkedBodyCompatLayer)
-                        .layer(ConcurrencyLimitLayer::new(config.concurrency_limit.into()))
-                        .service(svc.clone()),
-                ),
-            );
-            let conn = graceful.watch(conn.into_owned());
-            tokio::spawn(async move {
-                _ = conn.await;
-            });
-        } else {
-            let conn = http_server.serve_connection(
-                io,
-                TowerToHyperService::new(
-                    tower::ServiceBuilder::new()
-                        .layer(auth_compat.clone())
-                        .layer(ChunkedBodyCompatLayer)
-                        .layer(ConcurrencyLimitLayer::new(config.concurrency_limit.into()))
-                        .service(svc.clone()),
-                ),
-            );
-            let conn = graceful.watch(conn.into_owned());
-            tokio::spawn(async move {
-                _ = conn.await;
-            });
-        }
+        let conn = http_server.serve_connection(
+            io,
+            TowerToHyperService::new(
+                ServiceBuilder::new()
+                    .option_layer(cors_layer.clone())
+                    .layer(auth_compat.clone())
+                    .layer(ChunkedBodyCompatLayer)
+                    .layer(ConcurrencyLimitLayer::new(concurrency_limit.into()))
+                    .service(svc.clone()),
+            ),
+        );
+        let conn = graceful.watch(conn.into_owned());
+        tokio::spawn(async move {
+            _ = conn.await;
+        });
     }
 
     tokio::select! {

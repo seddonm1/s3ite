@@ -1,4 +1,9 @@
-//! Protocol compatibility layers that run before the `s3s` service.
+//! Protocol compatibility layers that run around the `s3s` service.
+//!
+//! `s3s` handles the normal S3 protocol surface. This module keeps the small
+//! set of HTTP and client-compatibility shims that need to happen before `s3s`
+//! parses a request or after it serializes a response, so operation handlers can
+//! stay focused on storage behavior rather than wire-format edge cases.
 
 use std::{
     future::Future,
@@ -24,7 +29,15 @@ use tower::{Layer, Service};
 
 type CompatBody = UnsyncBoxBody<Bytes, hyper::Error>;
 
-/// Normalizes decoded HTTP chunked uploads into fixed-length bodies for `s3s`.
+/// Normalizes ordinary HTTP chunked uploads into fixed-length bodies for `s3s`.
+///
+/// Some clients send object writes with HTTP `Transfer-Encoding: chunked`
+/// instead of a `Content-Length` header. By the time `hyper` hands the request
+/// to this service, the transfer framing has been decoded and removed, but
+/// `s3s` still needs a fixed content length for ordinary non-streaming S3
+/// writes. This layer buffers only those unlengthed `PUT`/`POST` bodies,
+/// restores `Content-Length`, and leaves real streaming or already-sized
+/// requests alone.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ChunkedBodyCompatLayer;
 
@@ -36,7 +49,7 @@ impl<S> Layer<S> for ChunkedBodyCompatLayer {
     }
 }
 
-/// Service wrapper for [`ChunkedBodyCompatLayer`].
+/// Service wrapper that applies [`ChunkedBodyCompatLayer`] per request.
 #[derive(Clone, Debug)]
 pub(crate) struct ChunkedBodyCompatService<S> {
     inner: S,
@@ -94,6 +107,11 @@ where
     }
 }
 
+/// Returns whether a request body should continue through `s3s` as a stream.
+///
+/// Non-write requests and writes that already carry S3 streaming markers or an
+/// explicit decoded length must not be buffered here, because downstream
+/// signing and payload decoders need to observe the original stream metadata.
 fn should_preserve_body_stream<B>(req: &Request<B>) -> bool {
     if !matches!(*req.method(), Method::PUT | Method::POST) {
         return true;
@@ -116,13 +134,26 @@ fn should_preserve_body_stream<B>(req: &Request<B>) -> bool {
             })
 }
 
-/// Handles request-header compatibility checks before `s3s` normalization.
+/// Handles authentication and response-shape compatibility around `s3s`.
+///
+/// This layer keeps client quirks that are independent of storage operations in
+/// one place: presigned expiry bounds, `SigV2` header edge cases, the
+/// `CreateBucket` `SigV2` trailing-slash canonical-resource mismatch, and the
+/// `GetObjectAttributes` `ETag` XML shape. `s3s` remains the primary request
+/// router and signer; this layer only adjusts cases where supported clients or
+/// conformance tests expect AWS-compatible behavior before or after that path.
 #[derive(Clone, Debug)]
 pub(crate) struct HeaderAuthCompatLayer {
     secret_key: Option<Arc<str>>,
 }
 
 impl HeaderAuthCompatLayer {
+    /// Creates a compatibility layer with the configured owner secret key.
+    ///
+    /// The secret is only used for the `SigV2` `CreateBucket` rewrite. When
+    /// auth is disabled, malformed `SigV2` headers and presigned expiry checks
+    /// still use their compatibility responses, but signatures are not
+    /// rewritten.
     pub(crate) fn new(secret_key: Option<String>) -> Self {
         Self {
             secret_key: secret_key.map(Arc::from),
@@ -141,6 +172,7 @@ impl<S> Layer<S> for HeaderAuthCompatLayer {
     }
 }
 
+/// Service wrapper that applies [`HeaderAuthCompatLayer`] per request.
 #[derive(Clone, Debug)]
 pub(crate) struct HeaderAuthCompatService<S> {
     inner: S,
@@ -183,10 +215,21 @@ where
     }
 }
 
+/// Detects `GetObjectAttributes` before `s3s` routes the request.
+///
+/// The response rewrite needs to run after `s3s` serializes the operation, but
+/// the operation signal lives in request headers rather than in the final HTTP
+/// response.
 fn is_get_object_attributes<B>(req: &Request<B>) -> bool {
     req.method() == Method::GET && req.headers().contains_key("x-amz-object-attributes")
 }
 
+/// Removes XML quotes around `GetObjectAttributes` `ETag` values.
+///
+/// S3 object `ETags` are quoted in ordinary object APIs, but AWS serializes the
+/// `GetObjectAttributes` XML field without those surrounding quote characters.
+/// The model-level value is shared, so this small post-serialization rewrite
+/// keeps the wire response compatible without special-casing storage output.
 async fn rewrite_get_object_attributes_etag(
     response: HttpResponse,
 ) -> Result<HttpResponse, HttpError> {
@@ -211,6 +254,12 @@ async fn rewrite_get_object_attributes_etag(
     Ok(HttpResponse::from_parts(parts, Body::from(text)))
 }
 
+/// Applies AWS-compatible presigned URL expiry rejection before auth parsing.
+///
+/// Presigned `SigV4` URLs must use `X-Amz-Expires` in the inclusive range
+/// `1..=604800`. Rejecting invalid values here gives clients the same broad
+/// status/code shape as AWS and prevents invalid preflight-like `OPTIONS`
+/// requests from falling through as ordinary S3 operations.
 fn presigned_expiry_compat<B>(req: &Request<B>) -> Option<HttpResponse> {
     let query = req.uri().query()?;
     let expires = query_value(query, "X-Amz-Expires")?;
@@ -232,6 +281,11 @@ fn presigned_expiry_compat<B>(req: &Request<B>) -> Option<HttpResponse> {
     None
 }
 
+/// Finds an exact query-pair value without percent-decoding.
+///
+/// The presigned expiry check only needs to identify the raw
+/// `X-Amz-Expires=value` pair. Leaving the rest of query parsing to `s3s`
+/// avoids changing signature inputs.
 fn query_value<'a>(query: &'a str, name: &str) -> Option<&'a str> {
     query.split('&').find_map(|pair| {
         let (key, value) = pair.split_once('=')?;
@@ -245,6 +299,12 @@ struct AuthorizationV2 {
     signature: String,
 }
 
+/// Applies `SigV2` header compatibility before `s3s` validates the signature.
+///
+/// `s3s` handles supported `SigV2` requests, but this shim supplies AWS-like
+/// errors for malformed Authorization headers and bad `x-amz-date` values. It
+/// also rewrites one `CreateBucket` form that some clients sign as `/bucket/`
+/// while sending `/bucket`, allowing `s3s` to verify the request it receives.
 fn sig_v2_header_compat<B>(req: &mut Request<B>, secret_key: Option<&str>) -> Option<HttpResponse> {
     let auth = req
         .headers()
@@ -272,6 +332,7 @@ fn sig_v2_header_compat<B>(req: &mut Request<B>, secret_key: Option<&str>) -> Op
     None
 }
 
+/// Parses the legacy `AWS access-key:signature` Authorization header.
 fn parse_authorization_v2(value: &str) -> Option<AuthorizationV2> {
     let value = value.strip_prefix("AWS ")?;
     let (access_key, signature) = value.split_once(':')?;
@@ -284,6 +345,11 @@ fn parse_authorization_v2(value: &str) -> Option<AuthorizationV2> {
     })
 }
 
+/// Rejects `SigV2` dates that AWS treats as invalid or too skewed.
+///
+/// Missing dates are left to downstream signature handling. Present but empty,
+/// malformed, pre-Unix-epoch, or more-than-15-minute-skewed dates are rejected
+/// here to match the expected public error surface.
 fn validate_sig_v2_date(headers: &HeaderMap) -> Option<HttpResponse> {
     let date = headers.get("x-amz-date")?;
     let date = date.to_str().ok().unwrap_or_default();
@@ -312,6 +378,12 @@ fn validate_sig_v2_date(headers: &HeaderMap) -> Option<HttpResponse> {
     None
 }
 
+/// Rewrites `CreateBucket` `SigV2` signatures from `/bucket/` to `/bucket`.
+///
+/// Some `SigV2` clients canonicalize `CreateBucket` with a trailing slash even
+/// when the HTTP request path omits it. When that trailing-slash signature is
+/// valid, this recalculates the equivalent signature for the actual request
+/// path so the normal `s3s` `SigV2` verifier can process the request.
 fn rewrite_create_bucket_sig_v2<B>(req: &mut Request<B>, secret_key: &str, auth: &AuthorizationV2) {
     if req.method() != Method::PUT || req.uri().query().is_some() {
         return;
@@ -337,6 +409,7 @@ fn rewrite_create_bucket_sig_v2<B>(req: &mut Request<B>, secret_key: &str, auth:
     }
 }
 
+/// Builds the `SigV2` string-to-sign for the limited compatibility rewrite.
 fn sig_v2_string_to_sign(method: &Method, headers: &HeaderMap, resource: &str) -> String {
     let mut value = String::with_capacity(256);
     value.push_str(method.as_str());
@@ -356,10 +429,12 @@ fn sig_v2_string_to_sign(method: &Method, headers: &HeaderMap, resource: &str) -
     value
 }
 
+/// Reads a UTF-8 header value used by `SigV2` signing.
 fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
 }
 
+/// Canonicalizes `x-amz-*` headers for `SigV2` signing.
 fn canonical_amz_headers(headers: &HeaderMap) -> String {
     let mut values = headers
         .iter()
@@ -392,10 +467,12 @@ fn canonical_amz_headers(headers: &HeaderMap) -> String {
     output
 }
 
+/// Signs a `SigV2` string-to-sign with HMAC-SHA1 and base64 encoding.
 fn sig_v2_signature(secret_key: &str, string_to_sign: &str) -> String {
     base64_encode(&hmac_sha1(secret_key.as_bytes(), string_to_sign.as_bytes()))
 }
 
+/// Computes HMAC-SHA1 without adding another dependency.
 fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; 20] {
     let mut key_block = [0_u8; 64];
     if key.len() > key_block.len() {
@@ -422,6 +499,7 @@ fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; 20] {
     outer.finalize()
 }
 
+/// Encodes bytes with the standard base64 alphabet used by `SigV2`.
 fn base64_encode(input: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
@@ -449,6 +527,10 @@ fn base64_encode(input: &[u8]) -> String {
     output
 }
 
+/// Builds the minimal XML S3 error responses emitted by compatibility checks.
+///
+/// These responses are intentionally small because they only cover cases that
+/// are rejected before the request reaches the normal `s3s` error machinery.
 fn s3_error_response(status: StatusCode, code: &str) -> HttpResponse {
     let body =
         format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code></Error>");

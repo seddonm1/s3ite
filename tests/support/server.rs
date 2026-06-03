@@ -32,7 +32,6 @@ pub struct TestServerOptions {
     pub config: Option<String>,
     pub cors: Option<String>,
     pub domain_name: Option<String>,
-    pub permissive_cors: Option<bool>,
     pub rust_log: Option<String>,
 }
 
@@ -81,11 +80,6 @@ impl TestServer {
         }
         if let Some(cors) = options.cors {
             command.arg("--cors").arg(cors);
-        }
-        if let Some(permissive_cors) = options.permissive_cors {
-            command
-                .arg("--permissive-cors")
-                .arg(permissive_cors.to_string());
         }
 
         let mut child = command

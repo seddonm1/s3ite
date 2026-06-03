@@ -1,3 +1,5 @@
+// Each integration test target compiles this shared module independently, so
+// helpers used by one conformance file can look unused to another.
 #![allow(dead_code)]
 
 pub mod assertions;

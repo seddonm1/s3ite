@@ -658,20 +658,17 @@ impl Sqlite {
             LIMIT ?3;",
         )?;
 
-        #[allow(clippy::let_and_return)]
-        let objects = stmt
-            .query_map((upload_id, after_part_number, limit), |row| {
-                Ok(MultipartMetadata {
-                    last_modified: row.get(0)?,
-                    part_number: row.get(1)?,
-                    size: row_size(row, 2)?,
-                    md5: row.get(3)?,
-                    checksum: optional_part_checksum(row.get(4)?, row.get(5)?, row.get(6)?)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let objects = stmt.query_map((upload_id, after_part_number, limit), |row| {
+            Ok(MultipartMetadata {
+                last_modified: row.get(0)?,
+                part_number: row.get(1)?,
+                size: row_size(row, 2)?,
+                md5: row.get(3)?,
+                checksum: optional_part_checksum(row.get(4)?, row.get(5)?, row.get(6)?)?,
+            })
+        })?;
 
-        Ok(objects)
+        Ok(objects.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Lists active multipart uploads ordered by key and upload ID.
@@ -899,22 +896,19 @@ impl Sqlite {
             ORDER BY part_number;",
         )?;
 
-        #[allow(clippy::let_and_return)]
-        let objects = stmt
-            .query_map([upload_id], |row| {
-                Ok(Multipart {
-                    upload_id,
-                    last_modified: row.get(0)?,
-                    part_number: row.get(1)?,
-                    value: row.get(2)?,
-                    size: row_size(row, 3)?,
-                    md5: row.get(4)?,
-                    checksum: optional_part_checksum(row.get(5)?, row.get(6)?, row.get(7)?)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let objects = stmt.query_map([upload_id], |row| {
+            Ok(Multipart {
+                upload_id,
+                last_modified: row.get(0)?,
+                part_number: row.get(1)?,
+                value: row.get(2)?,
+                size: row_size(row, 3)?,
+                md5: row.get(4)?,
+                checksum: optional_part_checksum(row.get(5)?, row.get(6)?, row.get(7)?)?,
+            })
+        })?;
 
-        Ok(objects)
+        Ok(objects.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Deletes multipart upload state and cascading parts.
