@@ -246,11 +246,11 @@ impl BucketConnection {
         self.inner.call(&self.inner.reader_sender, function).await
     }
 
-    /// Opens a read transaction, returns metadata, and streams a selected BLOB span.
+    /// Opens a read transaction, returns metadata, and streams selected BLOB spans.
     ///
     /// The preparation closure runs on a reader thread. When it returns a BLOB
     /// request, that same worker opens the BLOB before this method resolves and
-    /// then sends chunks over a bounded channel.
+    /// then sends each requested span over a bounded channel.
     ///
     /// # Errors
     ///
@@ -258,7 +258,7 @@ impl BucketConnection {
     /// full, the metadata load fails, or the BLOB cannot be opened.
     pub(crate) async fn read_blob<F, R>(&self, function: F) -> SqliteResult<(R, BlobReadReceiver)>
     where
-        F: FnOnce(&Transaction<'_>) -> SqliteResult<(R, Option<BlobReadRequest>)> + 'static + Send,
+        F: FnOnce(&Transaction<'_>) -> SqliteResult<(R, Vec<BlobReadRequest>)> + 'static + Send,
         R: Send + 'static,
     {
         self.inner
@@ -386,7 +386,7 @@ impl BucketConnectionInner {
         function: F,
     ) -> SqliteResult<(R, BlobReadReceiver)>
     where
-        F: FnOnce(&Transaction<'_>) -> SqliteResult<(R, Option<BlobReadRequest>)> + 'static + Send,
+        F: FnOnce(&Transaction<'_>) -> SqliteResult<(R, Vec<BlobReadRequest>)> + 'static + Send,
         R: Send + 'static,
     {
         let (result_sender, result_receiver) = oneshot::channel::<SqliteResult<R>>();
@@ -441,7 +441,7 @@ impl BucketConnectionInner {
         timed_out: &AtomicBool,
         runtime: &Handle,
     ) where
-        F: FnOnce(&Transaction<'_>) -> SqliteResult<(R, Option<BlobReadRequest>)>,
+        F: FnOnce(&Transaction<'_>) -> SqliteResult<(R, Vec<BlobReadRequest>)>,
     {
         let transaction = match connection.transaction() {
             Ok(transaction) => transaction,
@@ -450,41 +450,20 @@ impl BucketConnectionInner {
                 return;
             }
         };
-        let (result, request) = match function(&transaction) {
+        let (result, requests) = match function(&transaction) {
             Ok(value) => value,
             Err(error) => {
                 _ = result_sender.send(Err(error));
                 return;
             }
         };
-        let Some(request) = request else {
+        if requests.is_empty() {
             _ = result_sender.send(Ok(result));
-            return;
-        };
-
-        let mut blob = match transaction.blob_open(
-            MAIN_DB,
-            request.table,
-            request.column,
-            request.rowid,
-            true,
-        ) {
-            Ok(blob) => blob,
-            Err(error) => {
-                _ = result_sender.send(Err(error.into()));
-                return;
-            }
-        };
-
-        if let Err(error) = Self::validate_blob_span(&blob, request) {
-            _ = result_sender.send(Err(error));
             return;
         }
 
-        if request.start > 0
-            && let Err(error) = blob.seek(SeekFrom::Start(request.start))
-        {
-            _ = result_sender.send(Err(error.into()));
+        if let Err(error) = Self::validate_blob_requests(&transaction, &requests) {
+            _ = result_sender.send(Err(error));
             return;
         }
 
@@ -492,14 +471,75 @@ impl BucketConnectionInner {
             return;
         }
 
-        Self::stream_blob_chunks(
-            &mut blob,
-            request.length,
-            chunk_sender,
-            timeout,
-            timed_out,
-            runtime,
-        );
+        for request in requests {
+            let mut blob = match transaction.blob_open(
+                MAIN_DB,
+                request.table,
+                request.column,
+                request.rowid,
+                true,
+            ) {
+                Ok(blob) => blob,
+                Err(error) => {
+                    _ = Self::send_blob_chunk(
+                        chunk_sender,
+                        Err(error.into()),
+                        timeout,
+                        timed_out,
+                        runtime,
+                    );
+                    return;
+                }
+            };
+
+            if let Err(error) = Self::validate_blob_span(&blob, request) {
+                _ = Self::send_blob_chunk(chunk_sender, Err(error), timeout, timed_out, runtime);
+                return;
+            }
+
+            if request.start > 0
+                && let Err(error) = blob.seek(SeekFrom::Start(request.start))
+            {
+                _ = Self::send_blob_chunk(
+                    chunk_sender,
+                    Err(error.into()),
+                    timeout,
+                    timed_out,
+                    runtime,
+                );
+                return;
+            }
+
+            Self::stream_blob_chunks(
+                &mut blob,
+                request.length,
+                chunk_sender,
+                timeout,
+                timed_out,
+                runtime,
+            );
+            if timed_out.load(Ordering::Acquire) {
+                return;
+            }
+        }
+    }
+
+    /// Validates every requested BLOB span before returning metadata to callers.
+    fn validate_blob_requests(
+        transaction: &Transaction<'_>,
+        requests: &[BlobReadRequest],
+    ) -> SqliteResult<()> {
+        for request in requests {
+            let blob = transaction.blob_open(
+                MAIN_DB,
+                request.table,
+                request.column,
+                request.rowid,
+                true,
+            )?;
+            Self::validate_blob_span(&blob, *request)?;
+        }
+        Ok(())
     }
 
     /// Validates that the requested byte span fits inside the opened BLOB.
@@ -814,6 +854,10 @@ mod tests {
                 "INSERT INTO blob_source (sequence, body) VALUES (1, ?1);",
                 [vec![7; 1024 * 1024]],
             )?;
+            setup.execute(
+                "INSERT INTO blob_source (sequence, body) VALUES (2, ?1);",
+                [vec![8; 16]],
+            )?;
         }
 
         let config = Config {
@@ -991,7 +1035,7 @@ mod tests {
 
         BucketConnectionInner::execute_blob_read(
             &mut connection,
-            |_| Ok(((), None)),
+            |_| Ok(((), Vec::new())),
             result_sender,
             &chunk_sender,
             None,
@@ -1068,7 +1112,7 @@ mod tests {
 
         let err = connection
             .read_blob(|_| {
-                Err::<((), Option<BlobReadRequest>), _>(SqliteError::Configuration(
+                Err::<((), Vec<BlobReadRequest>), _>(SqliteError::Configuration(
                     "blob failed".to_string(),
                 ))
             })
@@ -1094,7 +1138,7 @@ mod tests {
         };
         let connection = BucketConnection::open(&path, &config, "bucket").await?;
 
-        let (value, mut receiver) = connection.read_blob(|_| Ok((7, None))).await?;
+        let (value, mut receiver) = connection.read_blob(|_| Ok((7, Vec::new()))).await?;
         assert_eq!(value, 7);
         assert!(receiver.recv().await.is_none());
 
@@ -1111,7 +1155,7 @@ mod tests {
             .read_blob(|_| {
                 Ok((
                     (),
-                    Some(BlobReadRequest::new("blob_source", "body", 1, 0, 1, 2)),
+                    vec![BlobReadRequest::new("blob_source", "body", 1, 0, 1, 2)],
                 ))
             })
             .await
@@ -1122,14 +1166,14 @@ mod tests {
             .read_blob(|_| {
                 Ok((
                     (),
-                    Some(BlobReadRequest::new(
+                    vec![BlobReadRequest::new(
                         "blob_source",
                         "body",
                         1,
                         1024 * 1024,
                         1,
                         1024 * 1024,
-                    )),
+                    )],
                 ))
             })
             .await
@@ -1149,14 +1193,14 @@ mod tests {
             .read_blob(|_| {
                 Ok((
                     (),
-                    Some(BlobReadRequest::new(
+                    vec![BlobReadRequest::new(
                         "blob_source",
                         "body",
                         99,
                         0,
                         1,
                         1024 * 1024,
-                    )),
+                    )],
                 ))
             })
             .await
@@ -1167,19 +1211,45 @@ mod tests {
             .read_blob(|_| {
                 Ok((
                     (),
-                    Some(BlobReadRequest::new(
+                    vec![BlobReadRequest::new(
                         "blob_source",
                         "body",
                         1,
                         5,
                         2,
                         1024 * 1024,
-                    )),
+                    )],
                 ))
             })
             .await?;
         let chunk = receiver.recv().await.ok_or(SqliteError::ThreadJoin)??;
         assert_eq!(chunk.as_ref(), &[7, 7]);
+        assert!(receiver.recv().await.is_none());
+
+        connection.close().await?;
+        remove_sqlite_files(&path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blob_read_streams_multiple_spans_in_order() -> SqliteResult<()> {
+        let (path, connection) = open_blob_test_connection().await?;
+
+        let ((), mut receiver) = connection
+            .read_blob(|_| {
+                Ok((
+                    (),
+                    vec![
+                        BlobReadRequest::new("blob_source", "body", 1, 3, 2, 1024 * 1024),
+                        BlobReadRequest::new("blob_source", "body", 2, 0, 3, 16),
+                    ],
+                ))
+            })
+            .await?;
+        let first = receiver.recv().await.ok_or(SqliteError::ThreadJoin)??;
+        let second = receiver.recv().await.ok_or(SqliteError::ThreadJoin)??;
+        assert_eq!(first.as_ref(), &[7, 7]);
+        assert_eq!(second.as_ref(), &[8, 8, 8]);
         assert!(receiver.recv().await.is_none());
 
         connection.close().await?;
@@ -1215,14 +1285,14 @@ mod tests {
             .read_blob(|_| {
                 Ok((
                     (),
-                    Some(BlobReadRequest::new(
+                    vec![BlobReadRequest::new(
                         "blob_source",
                         "body",
                         1,
                         0,
                         1024 * 1024,
                         1024 * 1024,
-                    )),
+                    )],
                 ))
             })
             .await?;
@@ -1234,14 +1304,14 @@ mod tests {
             .read_blob(|_| {
                 Ok((
                     (),
-                    Some(BlobReadRequest::new(
+                    vec![BlobReadRequest::new(
                         "blob_source",
                         "body",
                         1,
                         0,
                         1,
                         1024 * 1024,
-                    )),
+                    )],
                 ))
             })
             .await?;

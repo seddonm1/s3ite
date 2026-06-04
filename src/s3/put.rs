@@ -187,6 +187,7 @@ pub(super) async fn put_object(
         .get_connection(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
+    let chunk_size = sqlite.blob_chunk_size();
 
     let md5_clone = md5.clone();
     let checksum_clone = checksum.clone();
@@ -194,7 +195,7 @@ pub(super) async fn put_object(
         .write(move |connection| {
             let transaction = connection.transaction()?;
             Sqlite::check_object_write_conditions(&transaction, &key, &write_conditions)?;
-            let outcome = Sqlite::put_object(
+            let outcome = Sqlite::put_object_with_chunk_size(
                 &transaction,
                 KeyValue {
                     key,
@@ -214,6 +215,7 @@ pub(super) async fn put_object(
                         is_delete_marker: false,
                     },
                 },
+                chunk_size,
             )?;
             transaction.commit()?;
             Ok(outcome)

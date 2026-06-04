@@ -374,6 +374,7 @@ fn store_upload_part_copy(
     copied_part: CopiedPart,
     checksum_config: Option<MultipartChecksumConfig>,
     checksum: Option<PartChecksum>,
+    chunk_size: usize,
 ) -> SqliteResult<CopyPartResult> {
     let upload_state = Sqlite::get_multipart_upload_state(
         transaction,
@@ -398,18 +399,16 @@ fn store_upload_part_copy(
     let checksum_sha1 = checksum_sha1(&checksum);
     let checksum_sha256 = checksum_sha256(&checksum);
     Sqlite::touch_multipart_upload(transaction, request.upload_id)?;
-    Sqlite::put_multipart(
-        transaction,
-        Multipart {
-            upload_id: request.upload_id,
-            part_number: request.part_number,
-            last_modified: now,
-            value: copied_part.value,
-            size: copied_part.size,
-            md5: Some(md5.clone()),
-            checksum,
-        },
-    )?;
+    let multipart = Multipart {
+        upload_id: request.upload_id,
+        part_number: request.part_number,
+        last_modified: now,
+        value: copied_part.value,
+        size: copied_part.size,
+        md5: Some(md5.clone()),
+        checksum,
+    };
+    Sqlite::put_multipart_with_chunk_size(transaction, &multipart, chunk_size)?;
 
     Ok(CopyPartResult {
         checksum_crc32,
@@ -440,6 +439,7 @@ fn upload_part_output(md5: String, checksum: Option<&PartChecksum>) -> UploadPar
 async fn upload_part_copy_same_bucket(
     sqlite: &Sqlite,
     request: UploadPartCopyRequest,
+    chunk_size: usize,
 ) -> S3Result<CopyPartResult> {
     let connection = sqlite
         .get_connection(&request.bucket)
@@ -473,6 +473,7 @@ async fn upload_part_copy_same_bucket(
                 copied_part,
                 checksum_config,
                 checksum,
+                chunk_size,
             )?;
             transaction.commit()?;
             Ok(copy_part_result)
@@ -485,6 +486,7 @@ async fn upload_part_copy_same_bucket(
 async fn upload_part_copy_cross_bucket(
     sqlite: &Sqlite,
     request: UploadPartCopyRequest,
+    chunk_size: usize,
 ) -> S3Result<CopyPartResult> {
     let source_connection = sqlite
         .get_connection(&request.source_bucket)
@@ -533,6 +535,7 @@ async fn upload_part_copy_cross_bucket(
                 copied_part,
                 checksum_config,
                 checksum,
+                chunk_size,
             )?;
             transaction.commit()?;
             Ok(copy_part_result)
@@ -910,6 +913,7 @@ pub(super) async fn upload_part(
     .await?;
 
     let md5_clone = md5.clone();
+    let chunk_size = sqlite.blob_chunk_size();
     let connection = sqlite
         .get_connection(&bucket)
         .await
@@ -940,18 +944,16 @@ pub(super) async fn upload_part(
             }
 
             Sqlite::touch_multipart_upload(&transaction, upload_id)?;
-            Sqlite::put_multipart(
-                &transaction,
-                Multipart {
-                    upload_id,
-                    part_number,
-                    last_modified: OffsetDateTime::now_utc(),
-                    value,
-                    size,
-                    md5: Some(md5_clone),
-                    checksum: checksum_write,
-                },
-            )?;
+            let multipart = Multipart {
+                upload_id,
+                part_number,
+                last_modified: OffsetDateTime::now_utc(),
+                value,
+                size,
+                md5: Some(md5_clone),
+                checksum: checksum_write,
+            };
+            Sqlite::put_multipart_with_chunk_size(&transaction, &multipart, chunk_size)?;
 
             transaction.commit()?;
             Ok(())
@@ -980,10 +982,11 @@ pub(super) async fn upload_part_copy(
         .validate_mutable_bucket(&request.bucket)
         .map_err(s3_error_from_sqlite)?;
     let same_bucket = request.source_bucket == request.bucket;
+    let chunk_size = sqlite.blob_chunk_size();
     let copy_part_result = if same_bucket {
-        upload_part_copy_same_bucket(sqlite, request).await?
+        upload_part_copy_same_bucket(sqlite, request, chunk_size).await?
     } else {
-        upload_part_copy_cross_bucket(sqlite, request).await?
+        upload_part_copy_cross_bucket(sqlite, request, chunk_size).await?
     };
 
     let output = UploadPartCopyOutput {
@@ -1308,7 +1311,6 @@ mod tests {
             part_number,
             start,
             size,
-            md5: Some("md5".to_string()),
             checksum: Some(PartChecksum::Sha256("sha".to_string())),
         }
     }

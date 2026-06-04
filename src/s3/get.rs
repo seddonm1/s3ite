@@ -16,7 +16,7 @@ use super::{
     validate_read_conditions,
 };
 
-use crate::database::{BlobReadReceiver, BlobReadRequest, BucketConnection};
+use crate::database::{BlobReadReceiver, BucketConnection};
 
 /// Reports that `BitTorrent` metadata is unavailable for this object store.
 pub(super) fn get_object_torrent(
@@ -224,10 +224,10 @@ async fn load_get_object(
                 None => Sqlite::get_current_object_body_reference(transaction, &key)?,
             };
             let Some(object) = object else {
-                return Ok((ObjectBodyReadStart::Missing, None));
+                return Ok((ObjectBodyReadStart::Missing, Vec::new()));
             };
             if object.key_metadata.is_delete_marker {
-                return Ok((ObjectBodyReadStart::DeleteMarker, None));
+                return Ok((ObjectBodyReadStart::DeleteMarker, Vec::new()));
             }
             if let Err(failure) = validate_read_conditions(&object.key_metadata, &conditions) {
                 return Ok((
@@ -235,7 +235,7 @@ async fn load_get_object(
                         failure,
                         md5: object.key_metadata.md5.clone(),
                     },
-                    None,
+                    Vec::new(),
                 ));
             }
 
@@ -250,15 +250,11 @@ async fn load_get_object(
                 completed_part_count,
                 object_size,
             )?;
-            let length = object_range.end - object_range.start;
-            let request = BlobReadRequest::new(
-                "object_body",
-                "body",
+            let requests = Sqlite::object_blob_read_requests(
+                transaction,
                 object.sequence,
-                object_range.start,
-                length,
-                object_size,
-            );
+                object_range.clone(),
+            )?;
 
             Ok((
                 ObjectBodyReadStart::Found(Box::new(ObjectBodyReadFound {
@@ -267,7 +263,7 @@ async fn load_get_object(
                     completed_part_count,
                     object_range,
                 })),
-                Some(request),
+                requests,
             ))
         })
         .await
@@ -783,7 +779,6 @@ mod tests {
             part_number,
             start,
             size,
-            md5: Some("md5".to_string()),
             checksum: Some(PartChecksum::Sha256("part-sha256".to_string())),
         }
     }
@@ -811,6 +806,7 @@ mod tests {
             root: PathBuf::new(),
             config: Config::default(),
             buckets: Arc::new(RwLock::new(HashMap::new())),
+            blob_chunk_size: crate::sqlite::DEFAULT_OBJECT_BLOB_CHUNK_SIZE,
         }
     }
 

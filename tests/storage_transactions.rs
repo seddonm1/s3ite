@@ -477,29 +477,34 @@ fn object_rows(connection: &Connection, key: &str) -> Result<Vec<ObjectRow>> {
             ov.md5,
             ov.checksum_algorithm,
             ov.checksum_type,
-            ov.checksum_value,
-            ob.body
+            ov.checksum_value
         FROM object_version AS ov
-        LEFT JOIN object_body AS ob ON ob.sequence = ov.sequence
         WHERE ov.key = ?1
         ORDER BY ov.sequence;",
     )?;
-    Ok(stmt
-        .query_map([key], |row| {
-            Ok(ObjectRow {
-                sequence: row.get(0)?,
-                version_id: row.get(1)?,
-                is_latest: row.get::<_, i64>(2)? != 0,
-                is_delete_marker: row.get::<_, i64>(3)? != 0,
-                size: row.get(4)?,
-                md5: row.get(5)?,
-                checksum_algorithm: row.get(6)?,
-                checksum_type: row.get(7)?,
-                checksum_value: row.get(8)?,
-                body: row.get(9)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?)
+    let mut rows = stmt.query([key])?;
+    let mut objects = Vec::new();
+    while let Some(row) = rows.next()? {
+        let sequence = row.get(0)?;
+        let is_delete_marker = row.get::<_, i64>(3)? != 0;
+        objects.push(ObjectRow {
+            sequence,
+            version_id: row.get(1)?,
+            is_latest: row.get::<_, i64>(2)? != 0,
+            is_delete_marker,
+            size: row.get(4)?,
+            md5: row.get(5)?,
+            checksum_algorithm: row.get(6)?,
+            checksum_type: row.get(7)?,
+            checksum_value: row.get(8)?,
+            body: if is_delete_marker {
+                None
+            } else {
+                Some(object_body(connection, sequence)?)
+            },
+        });
+    }
+    Ok(objects)
 }
 
 fn single_object_row(connection: &Connection, key: &str) -> Result<ObjectRow> {
@@ -522,8 +527,8 @@ fn object_body_count(connection: &Connection, key: &str) -> Result<i64> {
     Ok(connection.query_row(
         "
         SELECT COUNT(*)
-        FROM object_body AS ob
-        JOIN object_version AS ov ON ov.sequence = ob.sequence
+        FROM object_blob_chunk AS ob
+        JOIN object_version AS ov ON ov.sequence = ob.object_sequence
         WHERE ov.key = ?1;",
         [key],
         |row| row.get(0),
@@ -540,7 +545,7 @@ fn active_upload_count(connection: &Connection, upload_id: Uuid) -> Result<i64> 
 
 fn active_part_count(connection: &Connection, upload_id: Uuid) -> Result<i64> {
     Ok(connection.query_row(
-        "SELECT COUNT(*) FROM multipart_upload_part WHERE upload_id = ?1;",
+        "SELECT COUNT(*) FROM object_part WHERE upload_id = ?1;",
         params![upload_id],
         |row| row.get(0),
     )?)
@@ -556,7 +561,11 @@ fn completed_upload_count(connection: &Connection, upload_id: Uuid) -> Result<i6
 
 fn completed_object_part_count(connection: &Connection, key: &str) -> Result<i64> {
     Ok(connection.query_row(
-        "SELECT COUNT(*) FROM completed_object_part WHERE key = ?1;",
+        "
+        SELECT COUNT(*)
+        FROM object_part AS op
+        JOIN object_version AS ov ON ov.sequence = op.object_sequence
+        WHERE ov.key = ?1;",
         [key],
         |row| row.get(0),
     )?)
@@ -567,29 +576,69 @@ fn multipart_part_row(
     upload_id: Uuid,
     part_number: i32,
 ) -> Result<MultipartPartRow> {
-    Ok(connection.query_row(
+    let (part_number, size, md5, checksum_algorithm, checksum_value) = connection.query_row(
         "
         SELECT
             part_number,
             size,
             md5,
             checksum_algorithm,
-            checksum_value,
-            value
-        FROM multipart_upload_part
+            checksum_value
+        FROM object_part
         WHERE upload_id = ?1 AND part_number = ?2;",
         params![upload_id, part_number],
         |row| {
-            Ok(MultipartPartRow {
-                part_number: row.get(0)?,
-                size: row.get(1)?,
-                md5: row.get(2)?,
-                checksum_algorithm: row.get(3)?,
-                checksum_value: row.get(4)?,
-                body: row.get(5)?,
-            })
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
         },
-    )?)
+    )?;
+    Ok(MultipartPartRow {
+        part_number,
+        size,
+        md5,
+        checksum_algorithm,
+        checksum_value,
+        body: multipart_part_body(connection, upload_id, part_number)?,
+    })
+}
+
+fn object_body(connection: &Connection, sequence: i64) -> Result<Vec<u8>> {
+    let mut stmt = connection.prepare(
+        "
+        SELECT body
+        FROM object_blob_chunk
+        WHERE object_sequence = ?1
+        ORDER BY offset;",
+    )?;
+    let chunks = stmt
+        .query_map([sequence], |row| row.get::<_, Vec<u8>>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(chunks.into_iter().flatten().collect())
+}
+
+fn multipart_part_body(
+    connection: &Connection,
+    upload_id: Uuid,
+    part_number: i32,
+) -> Result<Vec<u8>> {
+    let mut stmt = connection.prepare(
+        "
+        SELECT body
+        FROM object_blob_chunk
+        WHERE upload_id = ?1 AND part_number = ?2
+        ORDER BY chunk_number;",
+    )?;
+    let chunks = stmt
+        .query_map(params![upload_id, part_number], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(chunks.into_iter().flatten().collect())
 }
 
 async fn create_upload(client: &Client, bucket: &str, key: &str) -> Result<String> {

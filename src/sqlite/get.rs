@@ -1,8 +1,10 @@
 //! `SQLite` object read helpers.
 
-use std::ops::Not;
+use std::ops::{Not, Range as ByteRange};
 
 use rusqlite::{OptionalExtension, Transaction};
+
+use crate::database::BlobReadRequest;
 
 use super::{
     KeyMetadata, KeyValue, ObjectBodyReference, Sqlite, SqliteError, SqliteResult,
@@ -61,9 +63,9 @@ impl Sqlite {
         let mut stmt = transaction.prepare_cached(
             "
             SELECT
+                ov.sequence,
                 ov.key,
                 ov.version_id,
-                ob.body,
                 ov.size,
                 ov.metadata,
                 ov.content_type,
@@ -78,7 +80,6 @@ impl Sqlite {
                 ov.is_latest,
                 ov.is_delete_marker
             FROM object_version AS ov
-            LEFT JOIN object_body AS ob ON ob.sequence = ov.sequence
             WHERE ov.key = ?1
                 AND (?2 IS NULL OR ov.version_id = ?2)
                 AND (?2 IS NOT NULL OR ov.is_latest = 1)
@@ -87,56 +88,171 @@ impl Sqlite {
 
         let object = stmt
             .query_row((key, version_id, include_delete_markers), |row| {
-                Ok(KeyValue {
-                    key: row.get(0)?,
-                    value: row.get(2)?,
-                    key_metadata: KeyMetadata {
-                        version_id: row.get(1)?,
-                        size: row_size(row, 3)?,
-                        metadata: row
-                            .get::<_, Option<String>>(4)?
-                            .map(|metadata| serde_json::from_str(&metadata))
-                            .transpose()
-                            .map_err(|err| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    4,
-                                    rusqlite::types::Type::Text,
-                                    Box::new(err),
-                                )
-                            })?,
-                        content_type: row.get(5)?,
-                        content_encoding: row.get(6)?,
-                        cache_control: row.get(7)?,
-                        expires: row.get(8)?,
-                        last_modified: row.get(9)?,
-                        md5: row.get(10)?,
-                        checksum: optional_stored_checksum(
-                            row.get(11)?,
-                            row.get(12)?,
-                            row.get(13)?,
-                        )?,
-                        is_latest: row_bool(row, 14)?,
-                        is_delete_marker: row_bool(row, 15)?,
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    KeyValue {
+                        key: row.get(1)?,
+                        value: None,
+                        key_metadata: KeyMetadata {
+                            version_id: row.get(2)?,
+                            size: row_size(row, 3)?,
+                            metadata: row
+                                .get::<_, Option<String>>(4)?
+                                .map(|metadata| serde_json::from_str(&metadata))
+                                .transpose()
+                                .map_err(|err| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        4,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(err),
+                                    )
+                                })?,
+                            content_type: row.get(5)?,
+                            content_encoding: row.get(6)?,
+                            cache_control: row.get(7)?,
+                            expires: row.get(8)?,
+                            last_modified: row.get(9)?,
+                            md5: row.get(10)?,
+                            checksum: optional_stored_checksum(
+                                row.get(11)?,
+                                row.get(12)?,
+                                row.get(13)?,
+                            )?,
+                            is_latest: row_bool(row, 14)?,
+                            is_delete_marker: row_bool(row, 15)?,
+                        },
                     },
-                })
+                ))
             })
             .optional()?;
 
-        if let Some(object) = object.as_ref()
-            && object.key_metadata.is_delete_marker.not()
-        {
-            let value = object
-                .value
-                .as_ref()
-                .ok_or(SqliteError::ObjectBodyInconsistent)?;
-            let value_size =
-                i64::try_from(value.len()).map_err(|_| SqliteError::ObjectBodyInconsistent)?;
-            if value_size != object.key_metadata.size {
+        let Some((sequence, mut object)) = object else {
+            return Ok(None);
+        };
+
+        if object.key_metadata.is_delete_marker.not() {
+            object.value = Some(Self::get_object_bytes(
+                transaction,
+                sequence,
+                object.key_metadata.size,
+            )?);
+        }
+
+        Ok(Some(object))
+    }
+
+    /// Reassembles object bytes from stored chunks for copy-style operations.
+    pub(super) fn get_object_bytes(
+        transaction: &Transaction,
+        object_sequence: i64,
+        expected_size: i64,
+    ) -> SqliteResult<Vec<u8>> {
+        let expected_size =
+            usize::try_from(expected_size).map_err(|_| SqliteError::ObjectBodyInconsistent)?;
+        let mut stmt = transaction.prepare_cached(
+            "
+            SELECT
+                offset,
+                size,
+                body
+            FROM object_blob_chunk
+            WHERE object_sequence = ?1
+            ORDER BY offset;",
+        )?;
+        let mut rows = stmt.query([object_sequence])?;
+        let mut value = Vec::with_capacity(expected_size);
+        let mut expected_offset = 0usize;
+
+        while let Some(row) = rows.next()? {
+            let offset = usize::try_from(row_size(row, 0)?)
+                .map_err(|_| SqliteError::ObjectBodyInconsistent)?;
+            let size = usize::try_from(row_size(row, 1)?)
+                .map_err(|_| SqliteError::ObjectBodyInconsistent)?;
+            let body = row.get::<_, Vec<u8>>(2)?;
+
+            if offset != expected_offset || body.len() != size {
                 return Err(SqliteError::ObjectBodyInconsistent);
+            }
+            expected_offset = expected_offset
+                .checked_add(size)
+                .ok_or(SqliteError::ObjectBodyInconsistent)?;
+            value.extend_from_slice(&body);
+        }
+
+        if expected_offset != expected_size || value.len() != expected_size {
+            return Err(SqliteError::ObjectBodyInconsistent);
+        }
+
+        Ok(value)
+    }
+
+    /// Builds ordered `SQLite` BLOB read requests for an object byte range.
+    pub(crate) fn object_blob_read_requests(
+        transaction: &Transaction,
+        object_sequence: i64,
+        range: ByteRange<u64>,
+    ) -> SqliteResult<Vec<BlobReadRequest>> {
+        if range.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let start = i64::try_from(range.start).map_err(|_| SqliteError::ObjectBodyInconsistent)?;
+        let end = i64::try_from(range.end).map_err(|_| SqliteError::ObjectBodyInconsistent)?;
+        let mut stmt = transaction.prepare_cached(
+            "
+            SELECT
+                chunk_id,
+                offset,
+                size
+            FROM object_blob_chunk
+            WHERE object_sequence = ?1
+                AND offset < ?3
+                AND offset + size > ?2
+            ORDER BY offset;",
+        )?;
+        let mut rows = stmt.query((object_sequence, start, end))?;
+        let mut requests = Vec::new();
+        let mut next = range.start;
+
+        while let Some(row) = rows.next()? {
+            let rowid = row.get(0)?;
+            let offset = u64::try_from(row_size(row, 1)?)
+                .map_err(|_| SqliteError::ObjectBodyInconsistent)?;
+            let size = u64::try_from(row_size(row, 2)?)
+                .map_err(|_| SqliteError::ObjectBodyInconsistent)?;
+            let chunk_end = offset
+                .checked_add(size)
+                .ok_or(SqliteError::ObjectBodyInconsistent)?;
+            if offset > next || chunk_end <= next {
+                return Err(SqliteError::ObjectBodyInconsistent);
+            }
+
+            let read_start = next - offset;
+            let read_end = range.end.min(chunk_end) - offset;
+            let length = read_end
+                .checked_sub(read_start)
+                .ok_or(SqliteError::ObjectBodyInconsistent)?;
+            requests.push(BlobReadRequest::new(
+                "object_blob_chunk",
+                "body",
+                rowid,
+                read_start,
+                length,
+                size,
+            ));
+            next = next
+                .checked_add(length)
+                .ok_or(SqliteError::ObjectBodyInconsistent)?;
+            if next == range.end {
+                break;
             }
         }
 
-        Ok(object)
+        if next != range.end {
+            return Err(SqliteError::ObjectBodyInconsistent);
+        }
+
+        Ok(requests)
     }
 
     /// Fetches the current object metadata and body rowid by key.
@@ -375,8 +491,22 @@ mod tests {
         let sequence = connection.last_insert_rowid();
         if let Some(body) = body {
             connection.execute(
-                "INSERT INTO object_body (sequence, body) VALUES (?1, ?2);",
-                (sequence, body),
+                "
+                INSERT INTO object_blob_chunk (
+                    object_sequence,
+                    upload_id,
+                    part_number,
+                    chunk_number,
+                    offset,
+                    size,
+                    body
+                )
+                VALUES (?1, NULL, 1, 1, 0, ?2, ?3);",
+                (
+                    sequence,
+                    i64::try_from(body.len()).map_err(|_| SqliteError::ObjectBodyInconsistent)?,
+                    body,
+                ),
             )?;
         }
         Ok(sequence)

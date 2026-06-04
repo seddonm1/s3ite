@@ -253,10 +253,12 @@ async fn copy_object_same_bucket(
 
     let (object, checksum) =
         prepare_copied_object(object, &request).map_err(s3_error_from_sqlite)?;
+    let chunk_size = sqlite.blob_chunk_size();
     connection
         .write(move |connection| {
             let transaction = connection.transaction()?;
-            let write_outcome = Sqlite::put_object(&transaction, object)?;
+            let write_outcome =
+                Sqlite::put_object_with_chunk_size(&transaction, object, chunk_size)?;
             let result = copy_object_result(
                 &checksum,
                 write_outcome.md5.clone(),
@@ -307,10 +309,12 @@ async fn copy_object_cross_bucket(
         .get_connection(&request.target_bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
+    let chunk_size = sqlite.blob_chunk_size();
     target_connection
         .write(move |connection| {
             let transaction = connection.transaction()?;
-            let write_outcome = Sqlite::put_object(&transaction, object)?;
+            let write_outcome =
+                Sqlite::put_object_with_chunk_size(&transaction, object, chunk_size)?;
             let result = copy_object_result(
                 &checksum,
                 write_outcome.md5.clone(),

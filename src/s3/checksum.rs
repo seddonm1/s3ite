@@ -776,7 +776,6 @@ mod tests {
             part_number: 1,
             start: 0,
             size: 9,
-            md5: None,
             checksum: None,
         };
         assert_eq!(

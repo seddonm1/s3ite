@@ -5,8 +5,8 @@ use std::ops::Not;
 use rusqlite::{Error::ToSqlConversionFailure, Transaction};
 
 use super::{
-    BucketVersioningState, KeyValue, NULL_VERSION_ID, ObjectTagCondition, ObjectWriteConditions,
-    ObjectWriteOutcome, Sqlite, SqliteError, SqliteResult, sql_size,
+    BucketVersioningState, KeyMetadata, KeyValue, NULL_VERSION_ID, ObjectTagCondition,
+    ObjectWriteConditions, ObjectWriteOutcome, Sqlite, SqliteError, SqliteResult, sql_size,
 };
 
 const VERSION_ID_LEN: usize = 31;
@@ -120,21 +120,15 @@ impl Sqlite {
         }
     }
 
-    /// Inserts an object version or replaces the `null` version.
-    pub(crate) fn put_object(
+    /// Inserts object version metadata or replaces the `null` version.
+    pub(super) fn put_object_version(
         transaction: &Transaction,
-        kv: KeyValue,
+        key: &str,
+        key_metadata: KeyMetadata,
     ) -> SqliteResult<ObjectWriteOutcome> {
-        let KeyValue {
-            key,
-            value,
-            key_metadata,
-            ..
-        } = kv;
-        let value = value.ok_or(SqliteError::ObjectBodyInconsistent)?;
         let state = Self::get_bucket_versioning_state(transaction)?;
         let version_id = match state {
-            BucketVersioningState::Enabled => Self::generate_unique_version_id(transaction, &key)?,
+            BucketVersioningState::Enabled => Self::generate_unique_version_id(transaction, key)?,
             BucketVersioningState::NeverConfigured | BucketVersioningState::Suspended => {
                 NULL_VERSION_ID.to_string()
             }
@@ -142,9 +136,9 @@ impl Sqlite {
         let returned_version_id = state.returns_write_version_id().then(|| version_id.clone());
 
         if state.returns_write_version_id().not() {
-            Self::delete_version_row(transaction, &key, NULL_VERSION_ID)?;
+            Self::delete_version_row(transaction, key, NULL_VERSION_ID)?;
         }
-        Self::clear_latest(transaction, &key)?;
+        Self::clear_latest(transaction, key)?;
 
         let mut stmt = transaction.prepare_cached(
             "
@@ -195,18 +189,195 @@ impl Sqlite {
         drop(stmt);
 
         let sequence = transaction.last_insert_rowid();
-        let mut stmt = transaction.prepare_cached(
-            "
-            INSERT INTO object_body (sequence, body)
-            VALUES (?1, ?2);",
-        )?;
-        stmt.execute((sequence, value))?;
 
         Ok(ObjectWriteOutcome {
+            sequence,
             version_id,
             returned_version_id,
             md5: key_metadata.md5,
             last_modified: key_metadata.last_modified,
         })
+    }
+
+    /// Inserts body bytes as bounded chunks for an object or multipart owner.
+    pub(super) fn put_object_blob_chunks(
+        transaction: &Transaction,
+        object_sequence: Option<i64>,
+        upload_id: Option<uuid::Uuid>,
+        part_number: i32,
+        value: &[u8],
+        base_offset: i64,
+        chunk_size: usize,
+    ) -> SqliteResult<()> {
+        if chunk_size == 0 {
+            return Err(SqliteError::Configuration(
+                "object blob chunk size must be greater than zero".to_string(),
+            ));
+        }
+
+        let mut stmt = transaction.prepare_cached(
+            "
+            INSERT INTO object_blob_chunk (
+                object_sequence,
+                upload_id,
+                part_number,
+                chunk_number,
+                offset,
+                size,
+                body
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
+        )?;
+
+        for (index, chunk) in value.chunks(chunk_size).enumerate() {
+            let chunk_number =
+                i32::try_from(index + 1).map_err(|_| SqliteError::MultipartObjectTooLarge)?;
+            let offset = base_offset
+                .checked_add(
+                    i64::try_from(
+                        index
+                            .checked_mul(chunk_size)
+                            .ok_or(SqliteError::MultipartObjectTooLarge)?,
+                    )
+                    .map_err(|_| SqliteError::MultipartObjectTooLarge)?,
+                )
+                .ok_or(SqliteError::MultipartObjectTooLarge)?;
+            let size =
+                i64::try_from(chunk.len()).map_err(|_| SqliteError::MultipartObjectTooLarge)?;
+            stmt.execute((
+                object_sequence,
+                upload_id,
+                part_number,
+                chunk_number,
+                sql_size(offset)?,
+                sql_size(size)?,
+                chunk,
+            ))?;
+        }
+
+        Ok(())
+    }
+
+    /// Inserts an object version or replaces the `null` version.
+    #[cfg(test)]
+    pub(crate) fn put_object(
+        transaction: &Transaction,
+        kv: KeyValue,
+    ) -> SqliteResult<ObjectWriteOutcome> {
+        Self::put_object_with_chunk_size(transaction, kv, super::DEFAULT_OBJECT_BLOB_CHUNK_SIZE)
+    }
+
+    /// Inserts an object version using the requested body chunk size.
+    pub(crate) fn put_object_with_chunk_size(
+        transaction: &Transaction,
+        kv: KeyValue,
+        chunk_size: usize,
+    ) -> SqliteResult<ObjectWriteOutcome> {
+        let KeyValue {
+            key,
+            value,
+            key_metadata,
+            ..
+        } = kv;
+        let value = value.ok_or(SqliteError::ObjectBodyInconsistent)?;
+        let expected_size =
+            usize::try_from(key_metadata.size).map_err(|_| SqliteError::ObjectBodyInconsistent)?;
+        if value.len() != expected_size {
+            return Err(SqliteError::ObjectBodyInconsistent);
+        }
+
+        let write_outcome = Self::put_object_version(transaction, &key, key_metadata)?;
+        Self::put_object_blob_chunks(
+            transaction,
+            Some(write_outcome.sequence),
+            None,
+            1,
+            &value,
+            0,
+            chunk_size,
+        )?;
+        Ok(write_outcome)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+    use time::OffsetDateTime;
+
+    use crate::{
+        checksum::{FullObjectChecksum, StoredChecksum},
+        sqlite::{KeyMetadata, KeyValue, Sqlite, SqliteError, SqliteResult},
+    };
+
+    fn open_schema() -> SqliteResult<Connection> {
+        let mut connection = Connection::open_in_memory()?;
+        connection.execute_batch("PRAGMA foreign_keys=true;")?;
+        let transaction = connection.transaction()?;
+        Sqlite::create_tables(&transaction)?;
+        transaction.commit()?;
+        Ok(connection)
+    }
+
+    fn key_value(key: &str, value: &[u8]) -> KeyValue {
+        KeyValue {
+            key: key.to_string(),
+            value: Some(value.to_vec()),
+            key_metadata: KeyMetadata {
+                version_id: String::new(),
+                size: i64::try_from(value.len())
+                    .unwrap_or_else(|err| panic!("test body should fit i64: {err:?}")),
+                metadata: None,
+                content_type: None,
+                content_encoding: None,
+                cache_control: None,
+                expires: None,
+                last_modified: OffsetDateTime::UNIX_EPOCH,
+                md5: Some("md5".to_string()),
+                checksum: Some(StoredChecksum::Full(FullObjectChecksum::Crc64Nvme(
+                    "crc".to_string(),
+                ))),
+                is_latest: true,
+                is_delete_marker: false,
+            },
+        }
+    }
+
+    #[test]
+    fn put_object_with_small_chunk_size_splits_body() -> SqliteResult<()> {
+        let mut connection = open_schema()?;
+        let transaction = connection.transaction()?;
+
+        let outcome =
+            Sqlite::put_object_with_chunk_size(&transaction, key_value("key", b"abcde"), 2)?;
+        let chunks = {
+            let mut stmt = transaction.prepare(
+                "
+                SELECT offset, size, body
+                FROM object_blob_chunk
+                WHERE object_sequence = ?1
+                ORDER BY offset;",
+            )?;
+            stmt.query_map([outcome.sequence], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        assert_eq!(
+            chunks,
+            vec![
+                (0, 2, b"ab".to_vec()),
+                (2, 2, b"cd".to_vec()),
+                (4, 1, b"e".to_vec()),
+            ]
+        );
+        let object = Sqlite::get_object(&transaction, "key")?.ok_or(SqliteError::ObjectNotFound)?;
+        assert_eq!(object.value.as_deref(), Some(b"abcde".as_slice()));
+        Ok(())
     }
 }

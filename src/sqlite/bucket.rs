@@ -135,7 +135,7 @@ mod tests {
 
     use tokio::sync::RwLock;
 
-    use crate::{Config, config::Bucket};
+    use crate::{Config, config::Bucket, sqlite::DEFAULT_OBJECT_BLOB_CHUNK_SIZE};
 
     use super::*;
 
@@ -144,6 +144,7 @@ mod tests {
             root: PathBuf::new(),
             config,
             buckets: Arc::new(RwLock::new(HashMap::new())),
+            blob_chunk_size: DEFAULT_OBJECT_BLOB_CHUNK_SIZE,
         }
     }
 
