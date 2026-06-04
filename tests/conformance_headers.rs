@@ -458,6 +458,11 @@ async fn sig_v2_request(
         .iter()
         .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
         .collect::<Vec<_>>();
+    if matches!(method, Method::PUT | Method::POST)
+        && header_value(&headers, "content-length").is_none()
+    {
+        headers.push(("Content-Length".to_string(), body.len().to_string()));
+    }
     if header_value(&headers, "x-amz-date").is_none() {
         headers.push((
             "x-amz-date".to_string(),

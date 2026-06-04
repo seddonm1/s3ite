@@ -11,16 +11,17 @@ use super::{
     ListMultipartUploadsInput, ListMultipartUploadsOutput, ListPartsInput, ListPartsOutput, Md5,
     Multipart, MultipartChecksumConfig, MultipartCompletion, MultipartCompletionPart,
     MultipartCompletionRequest, MultipartUpload, MultipartUploadState, MultipartUploadSummary, Not,
-    ObjectAclRequest, ObjectReadConditions, OffsetDateTime, Part, PartChecksum, S3Error,
-    S3ErrorCode, S3Range, S3Request, S3Response, S3Result, Sqlite, SqliteError, SqliteResult,
-    StorageClass, StreamingBlob, TryStreamExt, UploadPartCopyInput, UploadPartCopyOutput,
-    UploadPartInput, UploadPartOutput, Uuid, checksum_algorithm_output, checksum_crc32,
-    checksum_crc32c, checksum_crc64nvme, checksum_sha1, checksum_sha256, checksum_type_output,
-    common_prefix_for_key, configured_part_checksum, copy_bytes, debug, decode_list_input_value,
-    default_crc64nvme_full_object_checksum, encode_list_value, finish_part_checksum, hex,
-    is_url_encoding, multipart_checksum_config, normalize_content_encoding,
-    object_write_conditions, output_delimiter, owner, part_checksum_accumulator, s3_error,
-    s3_error_from_sqlite, s3_error_with_message, validate_content_md5, validate_no_sse_headers,
+    ObjectAclRequest, ObjectReadConditions, OffsetDateTime, Part, PartChecksum,
+    S3_SINGLE_REQUEST_BODY_MAX, S3Error, S3ErrorCode, S3Range, S3Request, S3Response, S3Result,
+    Sqlite, SqliteError, SqliteResult, StorageClass, StreamingBlob, TryStreamExt,
+    UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput, Uuid,
+    checksum_algorithm_output, checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_sha1,
+    checksum_sha256, checksum_type_output, common_prefix_for_key, configured_part_checksum,
+    copy_bytes, debug, decode_list_input_value, default_crc64nvme_full_object_checksum,
+    encode_list_value, finish_part_checksum, hex, is_url_encoding, multipart_checksum_config,
+    normalize_content_encoding, object_write_conditions, output_delimiter, owner,
+    part_checksum_accumulator, s3_error, s3_error_from_sqlite, s3_error_with_message,
+    validate_content_md5, validate_declared_object_write_length, validate_no_sse_headers,
     validate_object_acl,
 };
 
@@ -144,6 +145,19 @@ pub(super) fn checked_copy_source_range(
         }
         None => Ok(0..object_size),
     }
+}
+
+/// Rejects copy-part ranges that exceed S3's single-request upload limit.
+fn validate_upload_part_copy_size(range: ByteRange<u64>) -> SqliteResult<i64> {
+    let size = range
+        .end
+        .checked_sub(range.start)
+        .ok_or(SqliteError::InvalidObjectRange)?;
+    let size = i64::try_from(size).map_err(|_| SqliteError::SingleRequestObjectTooLarge)?;
+    if size > S3_SINGLE_REQUEST_BODY_MAX {
+        return Err(SqliteError::SingleRequestObjectTooLarge);
+    }
+    Ok(size)
 }
 
 /// Returns an object byte slice for upload-copy storage.
@@ -334,17 +348,21 @@ fn load_upload_part_copy_source(
     transaction: &rusqlite::Transaction<'_>,
     request: &UploadPartCopyRequest,
 ) -> SqliteResult<CopiedPart> {
+    let metadata = Sqlite::get_copy_source_metadata(
+        transaction,
+        &request.source_key,
+        request.source_version_id.as_deref(),
+    )?;
+    validate_copy_source_conditions(&metadata, &request.source_conditions)?;
+    let object_size = u64::try_from(metadata.size).map_err(|_| SqliteError::InvalidObjectRange)?;
+    let byte_range = checked_copy_source_range(request.copy_source_range, object_size)?;
+    let size = validate_upload_part_copy_size(byte_range.clone())?;
     let object = Sqlite::get_copy_source_object(
         transaction,
         &request.source_key,
         request.source_version_id.as_deref(),
     )?;
-    validate_copy_source_conditions(&object.key_metadata, &request.source_conditions)?;
-    let object_size =
-        u64::try_from(object.key_metadata.size).map_err(|_| SqliteError::InvalidObjectRange)?;
-    let byte_range = checked_copy_source_range(request.copy_source_range, object_size)?;
     let value = copied_part_bytes(&object, byte_range)?;
-    let size = i64::try_from(value.len()).map_err(|_| SqliteError::MultipartObjectTooLarge)?;
     let md5 = part_md5(&value);
     Ok(CopiedPart { value, size, md5 })
 }
@@ -854,6 +872,7 @@ pub(super) async fn upload_part(
         key,
         upload_id,
         part_number,
+        content_length,
         content_md5,
         checksum_algorithm,
         checksum_crc32: request_checksum_crc32,
@@ -868,9 +887,10 @@ pub(super) async fn upload_part(
         .validate_mutable_bucket(&bucket)
         .map_err(s3_error_from_sqlite)?;
 
-    let body = body.ok_or_else(|| s3_error(S3ErrorCode::IncompleteBody))?;
     let upload_id = parse_upload_id(&upload_id)?;
     validate_part_number(part_number)?;
+    validate_declared_object_write_length(&headers, content_length)?;
+    let body = body.ok_or_else(|| s3_error(S3ErrorCode::IncompleteBody))?;
 
     let checksum_input = ChecksumInput {
         algorithm: checksum_algorithm,
@@ -1422,6 +1442,22 @@ mod tests {
             parse_copy_source_range(Some("not-a-range".to_string())),
             &S3ErrorCode::InvalidArgument,
         );
+    }
+
+    #[test]
+    fn validates_upload_part_copy_size_boundaries() {
+        assert_eq!(
+            validate_upload_part_copy_size(0..S3_SINGLE_REQUEST_BODY_MAX as u64).ok(),
+            Some(S3_SINGLE_REQUEST_BODY_MAX)
+        );
+        assert!(matches!(
+            validate_upload_part_copy_size(0..(S3_SINGLE_REQUEST_BODY_MAX as u64 + 1)),
+            Err(SqliteError::SingleRequestObjectTooLarge)
+        ));
+        assert!(matches!(
+            validate_upload_part_copy_size(ByteRange { start: 10, end: 5 }),
+            Err(SqliteError::InvalidObjectRange)
+        ));
     }
 
     #[test]

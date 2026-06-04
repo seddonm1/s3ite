@@ -27,6 +27,7 @@ pub(super) fn s3_error_from_sqlite(error: SqliteError) -> S3Error {
         SqliteError::MultipartAccessDenied => S3Error::new(S3ErrorCode::AccessDenied),
         SqliteError::InvalidMultipartPart => S3Error::new(S3ErrorCode::InvalidPart),
         SqliteError::MultipartPartTooSmall => S3Error::new(S3ErrorCode::EntityTooSmall),
+        SqliteError::SingleRequestObjectTooLarge => S3Error::new(S3ErrorCode::EntityTooLarge),
         SqliteError::MultipartObjectTooLarge => {
             S3Error::with_message(InternalError, "multipart object is too large")
         }
@@ -168,6 +169,10 @@ mod tests {
         assert_maps(
             SqliteError::MultipartPartTooSmall,
             &S3ErrorCode::EntityTooSmall,
+        );
+        assert_maps(
+            SqliteError::SingleRequestObjectTooLarge,
+            &S3ErrorCode::EntityTooLarge,
         );
     }
 

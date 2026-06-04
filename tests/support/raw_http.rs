@@ -1,4 +1,7 @@
-use std::{future::Future, time::SystemTime};
+use std::{
+    future::Future,
+    time::{Duration, SystemTime},
+};
 
 use anyhow::{Context, Result};
 use aws_credential_types::Credentials;
@@ -11,7 +14,11 @@ use aws_sigv4::{
 };
 use bytes::Bytes;
 use futures::stream;
-use reqwest::{Client, Method, Response};
+use reqwest::{Client, Method, Response, StatusCode};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    time::timeout,
+};
 
 use super::server::TestServer;
 
@@ -56,6 +63,11 @@ pub fn path_segment(value: &str) -> String {
     encoded
 }
 
+pub struct RawHttpResponse {
+    pub status: StatusCode,
+    pub body: String,
+}
+
 pub async fn signed_request(
     server: &TestServer,
     method: Method,
@@ -73,12 +85,22 @@ pub async fn signed_request_with_headers(
     headers: &[(&str, &str)],
 ) -> Result<Response> {
     let url = format!("{}{}", server.endpoint(), path_and_query);
-    let signing_headers = signing_headers(server, &method, &url, &body, headers)?;
+    let content_length = body.len().to_string();
+    let mut request_headers = Vec::with_capacity(headers.len() + 1);
+    request_headers.extend(headers.iter().copied());
+    if matches!(method, Method::PUT | Method::POST)
+        && !headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("Content-Length"))
+    {
+        request_headers.push(("Content-Length", content_length.as_str()));
+    }
+    let signing_headers = signing_headers(server, &method, &url, &body, &request_headers)?;
 
     let client = client()?;
     let mut request = client.request(method, &url).body(body);
-    for (name, value) in headers {
-        request = request.header(*name, *value);
+    for (name, value) in request_headers {
+        request = request.header(name, value);
     }
     for (name, value) in signing_headers {
         request = request.header(name, value);
@@ -108,6 +130,90 @@ pub async fn signed_chunked_request(
     Ok(request.send().await?)
 }
 
+pub async fn signed_header_only_request(
+    server: &TestServer,
+    method: Method,
+    path_and_query: &str,
+    headers: &[(&str, &str)],
+) -> Result<RawHttpResponse> {
+    signed_header_only_request_with_body(
+        server,
+        method,
+        path_and_query,
+        headers,
+        SignableBody::Bytes(&[]),
+    )
+    .await
+}
+
+async fn signed_header_only_request_with_body(
+    server: &TestServer,
+    method: Method,
+    path_and_query: &str,
+    headers: &[(&str, &str)],
+    body: SignableBody<'_>,
+) -> Result<RawHttpResponse> {
+    let url = format!("{}{}", server.endpoint(), path_and_query);
+    let signing_headers = signing_headers_with_body(server, &method, &url, body, headers)?;
+    let authority = server
+        .endpoint()
+        .strip_prefix("http://")
+        .context("test server endpoint should be HTTP")?;
+
+    let mut request = format!(
+        "{} {path_and_query} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n",
+        method.as_str()
+    );
+    for (name, value) in headers {
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+    for (name, value) in signing_headers {
+        if headers
+            .iter()
+            .any(|(provided, _)| provided.eq_ignore_ascii_case(&name))
+        {
+            continue;
+        }
+        request.push_str(&name);
+        request.push_str(": ");
+        request.push_str(&value);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+
+    let mut stream = tokio::net::TcpStream::connect(authority).await?;
+    stream.write_all(request.as_bytes()).await?;
+    stream.shutdown().await?;
+
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+        .await
+        .context("timed out waiting for raw response")??;
+    parse_raw_response(&response)
+}
+
+fn parse_raw_response(response: &[u8]) -> Result<RawHttpResponse> {
+    let text = String::from_utf8_lossy(response);
+    let status_line = text
+        .lines()
+        .next()
+        .context("raw response missing status line")?;
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .context("raw response status line missing code")?
+        .parse::<u16>()?;
+    let status = StatusCode::from_u16(status_code)?;
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default();
+    Ok(RawHttpResponse { status, body })
+}
+
 pub async fn signed_streaming_request_after_first_chunk<F, Fut>(
     server: &TestServer,
     method: Method,
@@ -122,7 +228,16 @@ where
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     let url = format!("{}{}", server.endpoint(), path_and_query);
-    let signing_headers = signing_headers(server, &method, &url, &body, headers)?;
+    let content_length = body.len().to_string();
+    let mut request_headers = Vec::with_capacity(headers.len() + 1);
+    request_headers.extend(headers.iter().copied());
+    if !headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("Content-Length"))
+    {
+        request_headers.push(("Content-Length", content_length.as_str()));
+    }
+    let signing_headers = signing_headers(server, &method, &url, &body, &request_headers)?;
     let (sender, receiver) = tokio::sync::mpsc::channel(1);
     let sender_task = tokio::spawn(async move {
         let chunk_size = chunk_size.max(1);
@@ -148,8 +263,8 @@ where
     let mut request = client
         .request(method, &url)
         .body(reqwest::Body::wrap_stream(stream));
-    for (name, value) in headers {
-        request = request.header(*name, *value);
+    for (name, value) in request_headers {
+        request = request.header(name, value);
     }
     for (name, value) in signing_headers {
         request = request.header(name, value);
@@ -169,6 +284,16 @@ fn signing_headers(
     method: &Method,
     url: &str,
     body: &[u8],
+    headers: &[(&str, &str)],
+) -> Result<Vec<(String, String)>> {
+    signing_headers_with_body(server, method, url, SignableBody::Bytes(body), headers)
+}
+
+fn signing_headers_with_body(
+    server: &TestServer,
+    method: &Method,
+    url: &str,
+    body: SignableBody<'_>,
     headers: &[(&str, &str)],
 ) -> Result<Vec<(String, String)>> {
     let mut signing_settings = SigningSettings::default();
@@ -192,12 +317,8 @@ fn signing_headers(
         .settings(signing_settings)
         .build()?
         .into();
-    let signable_request = SignableRequest::new(
-        method.as_str(),
-        url,
-        headers.iter().copied(),
-        SignableBody::Bytes(body),
-    )?;
+    let signable_request =
+        SignableRequest::new(method.as_str(), url, headers.iter().copied(), body)?;
     let (signing_instructions, _signature) = sign(signable_request, &signing_params)?.into_parts();
     Ok(signing_instructions
         .headers()

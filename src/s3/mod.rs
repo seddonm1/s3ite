@@ -30,7 +30,10 @@ use s3s::{
         PutObjectOutput, Range as S3Range, StorageClass, StreamingBlob, Timestamp, Type,
         UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
     },
-    header::{CONTENT_MD5, CONTENT_TYPE, ETAG, X_AMZ_DELETE_MARKER, X_AMZ_REQUEST_ID},
+    header::{
+        CONTENT_MD5, CONTENT_TYPE, ETAG, X_AMZ_CONTENT_SHA256, X_AMZ_DECODED_CONTENT_LENGTH,
+        X_AMZ_DELETE_MARKER, X_AMZ_REQUEST_ID,
+    },
 };
 use time::OffsetDateTime;
 use tokio::{
@@ -53,6 +56,7 @@ const LIST_BATCH_SIZE: i64 = 1024;
 const CONTINUATION_TOKEN_PREFIX: &str = "s3ite:v1:";
 const OWNER_DISPLAY_NAME: &str = "s3ite";
 const OWNER_ID: &str = "s3ite";
+const S3_SINGLE_REQUEST_BODY_MAX: i64 = 5_i64 * 1024 * 1024 * 1024;
 const UNSUPPORTED_SSE_HEADERS: &[&str] = &[
     "x-amz-server-side-encryption",
     "x-amz-server-side-encryption-aws-kms-key-id",
@@ -130,6 +134,54 @@ fn validate_no_sse_headers(headers: &HeaderMap) -> S3Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Returns whether request headers describe an AWS `SigV4` streaming body.
+fn is_aws_streaming_body(headers: &HeaderMap) -> bool {
+    headers
+        .get(X_AMZ_CONTENT_SHA256)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("STREAMING-"))
+        || headers.contains_key(X_AMZ_DECODED_CONTENT_LENGTH)
+}
+
+/// Reads `x-amz-decoded-content-length` as a declared object-byte length.
+fn decoded_content_length(headers: &HeaderMap) -> S3Result<Option<i64>> {
+    let Some(value) = headers.get(X_AMZ_DECODED_CONTENT_LENGTH) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| s3_error(S3ErrorCode::InvalidArgument))?;
+    value
+        .parse::<i64>()
+        .map(Some)
+        .map_err(|_| s3_error(S3ErrorCode::InvalidArgument))
+}
+
+/// Validates an already-declared single-request object body size.
+fn validate_single_request_body_size(size: i64) -> S3Result<i64> {
+    if size < 0 {
+        return Err(s3_error(S3ErrorCode::InvalidArgument));
+    }
+    if size > S3_SINGLE_REQUEST_BODY_MAX {
+        return Err(s3_error(S3ErrorCode::EntityTooLarge));
+    }
+    Ok(size)
+}
+
+/// Validates object-write size declarations before any request bytes are read.
+fn validate_declared_object_write_length(
+    headers: &HeaderMap,
+    content_length: Option<i64>,
+) -> S3Result<i64> {
+    let declared_size = if is_aws_streaming_body(headers) {
+        decoded_content_length(headers)?
+            .ok_or_else(|| s3_error(S3ErrorCode::MissingContentLength))?
+    } else {
+        content_length.ok_or_else(|| s3_error(S3ErrorCode::MissingContentLength))?
+    };
+    validate_single_request_body_size(declared_size)
 }
 
 #[derive(Clone, Debug)]
@@ -736,6 +788,89 @@ mod tests {
                 "error should explain unsupported SSE header {header}"
             );
         }
+    }
+
+    #[test]
+    fn validates_declared_object_write_length_boundaries() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            validate_declared_object_write_length(&headers, Some(S3_SINGLE_REQUEST_BODY_MAX)).ok(),
+            Some(S3_SINGLE_REQUEST_BODY_MAX)
+        );
+
+        let error =
+            validate_declared_object_write_length(&headers, Some(S3_SINGLE_REQUEST_BODY_MAX + 1))
+                .err();
+        assert!(matches!(
+            error.as_ref().map(S3Error::code),
+            Some(&S3ErrorCode::EntityTooLarge)
+        ));
+
+        let error = validate_declared_object_write_length(&headers, None).err();
+        assert!(matches!(
+            error.as_ref().map(S3Error::code),
+            Some(&S3ErrorCode::MissingContentLength)
+        ));
+
+        let error = validate_declared_object_write_length(&headers, Some(-1)).err();
+        assert!(matches!(
+            error.as_ref().map(S3Error::code),
+            Some(&S3ErrorCode::InvalidArgument)
+        ));
+    }
+
+    #[test]
+    fn validates_aws_streaming_decoded_content_length() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            X_AMZ_CONTENT_SHA256,
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+                .parse()
+                .unwrap_or_else(|err| panic!("valid header should parse: {err:?}")),
+        );
+
+        let error = validate_declared_object_write_length(&headers, Some(1)).err();
+        assert!(matches!(
+            error.as_ref().map(S3Error::code),
+            Some(&S3ErrorCode::MissingContentLength)
+        ));
+
+        headers.insert(
+            X_AMZ_DECODED_CONTENT_LENGTH,
+            S3_SINGLE_REQUEST_BODY_MAX
+                .to_string()
+                .parse()
+                .unwrap_or_else(|err| panic!("valid header should parse: {err:?}")),
+        );
+        assert_eq!(
+            validate_declared_object_write_length(&headers, None).ok(),
+            Some(S3_SINGLE_REQUEST_BODY_MAX)
+        );
+
+        headers.insert(
+            X_AMZ_DECODED_CONTENT_LENGTH,
+            (S3_SINGLE_REQUEST_BODY_MAX + 1)
+                .to_string()
+                .parse()
+                .unwrap_or_else(|err| panic!("valid header should parse: {err:?}")),
+        );
+        let error = validate_declared_object_write_length(&headers, Some(1)).err();
+        assert!(matches!(
+            error.as_ref().map(S3Error::code),
+            Some(&S3ErrorCode::EntityTooLarge)
+        ));
+
+        headers.insert(
+            X_AMZ_DECODED_CONTENT_LENGTH,
+            "not-a-number"
+                .parse()
+                .unwrap_or_else(|err| panic!("valid header should parse: {err:?}")),
+        );
+        let error = validate_declared_object_write_length(&headers, Some(1)).err();
+        assert!(matches!(
+            error.as_ref().map(S3Error::code),
+            Some(&S3ErrorCode::InvalidArgument)
+        ));
     }
 
     #[test]

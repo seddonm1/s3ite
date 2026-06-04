@@ -21,6 +21,8 @@ use support::{
     server::TestServer,
 };
 
+const S3_SINGLE_REQUEST_BODY_MAX: u64 = 5_u64 * 1024 * 1024 * 1024;
+
 /// Verifies HeadObject reports zero content length for an empty object.
 #[tokio::test]
 #[serial(conformance)]
@@ -578,11 +580,11 @@ async fn test_object_write_to_nonexist_bucket() -> Result<()> {
     Ok(())
 }
 
-/// Verifies PutObject accepts chunked transfer encoding.
+/// Verifies ordinary non-AWS chunked PutObject is rejected before storage.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_object_write_with_chunked_transfer_encoding() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_object_write_with_chunked_transfer_encoding
+    // Ceph s3-tests accepts this, but s3ite requires AWS-declared object size before reading bytes.
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-obj");
@@ -595,9 +597,59 @@ async fn test_object_write_with_chunked_transfer_encoding() -> Result<()> {
         b"bar".to_vec(),
     )
     .await?;
-    assert_status(&response, StatusCode::OK);
+    assert_status(&response, StatusCode::LENGTH_REQUIRED);
+    assert!(response.text().await?.contains("MissingContentLength"));
 
-    assert_eq!(get_object_bytes(&client, &bucket, "foo").await?, b"bar");
+    let error = match client.get_object().bucket(&bucket).key("foo").send().await {
+        Ok(_) => bail!("ordinary chunked PutObject should not store plaintext"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "NoSuchKey");
+
+    Ok(())
+}
+
+/// Verifies PutObject rejects missing `Content-Length` without reading a body.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_object_write_missing_content_length() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-obj");
+
+    create_bucket(&client, &bucket).await?;
+    let response = raw_http::signed_chunked_request(
+        &server,
+        Method::PUT,
+        &format!("/{bucket}/missing-length"),
+        Vec::new(),
+    )
+    .await?;
+    assert_status(&response, StatusCode::LENGTH_REQUIRED);
+    assert!(response.text().await?.contains("MissingContentLength"));
+
+    Ok(())
+}
+
+/// Verifies PutObject rejects oversized declared bodies before bytes are sent.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_object_write_oversized_content_length() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-obj");
+    let oversized = (S3_SINGLE_REQUEST_BODY_MAX + 1).to_string();
+
+    create_bucket(&client, &bucket).await?;
+    let response = raw_http::signed_header_only_request(
+        &server,
+        Method::PUT,
+        &format!("/{bucket}/too-large"),
+        &[("Content-Length", oversized.as_str())],
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    assert!(response.body.contains("EntityTooLarge"));
 
     Ok(())
 }

@@ -31,7 +31,7 @@ mod database;
 mod s3;
 mod sqlite;
 
-use self::compat::{ChunkedBodyCompatLayer, HeaderAuthCompatLayer};
+use self::compat::HeaderAuthCompatLayer;
 pub(crate) use self::{
     config::{Config, ConfigError},
     sqlite::{Sqlite, SqliteError},
@@ -141,7 +141,6 @@ async fn serve(
                 ServiceBuilder::new()
                     .option_layer(cors_layer.clone())
                     .layer(auth_compat.clone())
-                    .layer(ChunkedBodyCompatLayer)
                     .layer(ConcurrencyLimitLayer::new(concurrency_limit.into()))
                     .service(svc.clone()),
             ),

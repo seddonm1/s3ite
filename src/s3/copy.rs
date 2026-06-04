@@ -5,12 +5,13 @@ use std::collections::HashMap;
 use super::{
     ChecksumAlgorithmKind, CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource, ETag,
     KeyMetadata, KeyValue, MetadataDirective, Not, ObjectAclRequest, ObjectReadConditions,
-    OffsetDateTime, S3ErrorCode, S3Request, S3Response, S3Result, Sqlite, SqliteError,
-    SqliteResult, StoredChecksum, checksum_algorithm_from_request, checksum_crc32, checksum_crc32c,
-    checksum_crc64nvme, checksum_sha1, checksum_sha256, checksum_type_output, http_date_time,
-    normalize_content_encoding, object_write_checksum_from_value, s3_error, s3_error_from_sqlite,
-    s3_error_with_message, strong_etag_condition_matches, validate_no_sse_headers,
-    validate_object_acl, weak_etag_condition_matches,
+    OffsetDateTime, S3_SINGLE_REQUEST_BODY_MAX, S3ErrorCode, S3Request, S3Response, S3Result,
+    Sqlite, SqliteError, SqliteResult, StoredChecksum, checksum_algorithm_from_request,
+    checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_sha1, checksum_sha256,
+    checksum_type_output, http_date_time, normalize_content_encoding,
+    object_write_checksum_from_value, s3_error, s3_error_from_sqlite, s3_error_with_message,
+    strong_etag_condition_matches, validate_no_sse_headers, validate_object_acl,
+    weak_etag_condition_matches,
 };
 
 /// Parsed copy request with source, destination, metadata, and checksum intent.
@@ -59,6 +60,14 @@ pub(super) fn validate_copy_source_conditions(
         return Err(SqliteError::PreconditionFailed);
     }
 
+    Ok(())
+}
+
+/// Rejects source objects too large for single-request `CopyObject`.
+fn validate_copy_source_size(metadata: &KeyMetadata) -> SqliteResult<()> {
+    if metadata.size > S3_SINGLE_REQUEST_BODY_MAX {
+        return Err(SqliteError::SingleRequestObjectTooLarge);
+    }
     Ok(())
 }
 
@@ -225,12 +234,18 @@ async fn copy_object_same_bucket(
     let object = connection
         .read(move |connection| {
             let transaction = connection.transaction()?;
+            let metadata = Sqlite::get_copy_source_metadata(
+                &transaction,
+                &source_key,
+                source_version_id.as_deref(),
+            )?;
+            validate_copy_source_conditions(&metadata, &source_conditions)?;
+            validate_copy_source_size(&metadata)?;
             let object = Sqlite::get_copy_source_object(
                 &transaction,
                 &source_key,
                 source_version_id.as_deref(),
             )?;
-            validate_copy_source_conditions(&object.key_metadata, &source_conditions)?;
             Ok(object)
         })
         .await
@@ -269,12 +284,18 @@ async fn copy_object_cross_bucket(
     let object = source_connection
         .read(move |connection| {
             let transaction = connection.transaction()?;
+            let metadata = Sqlite::get_copy_source_metadata(
+                &transaction,
+                &source_key,
+                source_version_id.as_deref(),
+            )?;
+            validate_copy_source_conditions(&metadata, &source_conditions)?;
+            validate_copy_source_size(&metadata)?;
             let object = Sqlite::get_copy_source_object(
                 &transaction,
                 &source_key,
                 source_version_id.as_deref(),
             )?;
-            validate_copy_source_conditions(&object.key_metadata, &source_conditions)?;
             Ok(object)
         })
         .await
@@ -641,6 +662,19 @@ mod tests {
         assert_precondition_failed(&validate_copy_source_conditions(
             &object,
             &source_conditions(None, None, None, Some(before)),
+        ));
+    }
+
+    #[test]
+    fn rejects_copy_source_over_single_request_limit() {
+        let mut metadata = metadata(Some("md5"), OffsetDateTime::UNIX_EPOCH);
+        metadata.size = S3_SINGLE_REQUEST_BODY_MAX;
+        assert!(validate_copy_source_size(&metadata).is_ok());
+
+        metadata.size = S3_SINGLE_REQUEST_BODY_MAX + 1;
+        assert!(matches!(
+            validate_copy_source_size(&metadata),
+            Err(SqliteError::SingleRequestObjectTooLarge)
         ));
     }
 

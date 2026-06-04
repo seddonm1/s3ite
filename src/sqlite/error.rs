@@ -75,6 +75,9 @@ pub enum SqliteError {
     /// A completed multipart object is too large to store.
     #[error("multipart object is too large")]
     MultipartObjectTooLarge,
+    /// A single-request S3 write or copy exceeds the protocol object limit.
+    #[error("single-request object body is too large")]
+    SingleRequestObjectTooLarge,
 }
 
 #[derive(Debug, thiserror::Error)]

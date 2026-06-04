@@ -8,7 +8,7 @@ use super::{
     checksum_sha1, checksum_sha256, checksum_type_output, copy_bytes, debug,
     finish_payload_checksum, hex, normalize_content_encoding, object_write_conditions,
     payload_checksum_accumulator, s3_error, s3_error_from_sqlite, validate_content_md5,
-    validate_no_sse_headers, validate_object_acl,
+    validate_declared_object_write_length, validate_no_sse_headers, validate_object_acl,
 };
 
 /// Fully buffered object body plus hashes needed by the storage write.
@@ -136,7 +136,7 @@ pub(super) async fn put_object(
         metadata,
         cache_control,
         content_encoding,
-        content_length: _,
+        content_length,
         content_md5,
         content_type,
         checksum_algorithm,
@@ -154,15 +154,11 @@ pub(super) async fn put_object(
     let write_conditions = object_write_conditions(if_match, if_none_match);
     let content_encoding = normalize_content_encoding(content_encoding);
     validate_put_storage_class(storage_class.as_ref())?;
+    validate_declared_object_write_length(&headers, content_length)?;
 
     let Some(body) = body else {
         return Err(s3_error(S3ErrorCode::IncompleteBody));
     };
-
-    let connection = sqlite
-        .get_connection(&bucket)
-        .await
-        .map_err(s3_error_from_sqlite)?;
 
     let BufferedObjectBody {
         value,
@@ -186,6 +182,11 @@ pub(super) async fn put_object(
     .await?;
 
     debug!(path = %key, ?size, %md5, "write file");
+
+    let connection = sqlite
+        .get_connection(&bucket)
+        .await
+        .map_err(s3_error_from_sqlite)?;
 
     let md5_clone = md5.clone();
     let checksum_clone = checksum.clone();

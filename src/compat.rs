@@ -12,127 +12,14 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::Bytes;
-use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
-use hyper::{
-    body::Incoming,
-    http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header},
-};
+use http_body_util::BodyExt;
+use hyper::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
 use s3s::{
     Body, HttpError, HttpResponse,
     crypto::{Checksum, Sha1},
-    header::{
-        CONTENT_ENCODING, CONTENT_LENGTH, X_AMZ_CONTENT_SHA256, X_AMZ_DECODED_CONTENT_LENGTH,
-    },
+    header::CONTENT_LENGTH,
 };
 use tower::{Layer, Service};
-
-type CompatBody = UnsyncBoxBody<Bytes, hyper::Error>;
-
-/// Normalizes ordinary HTTP chunked uploads into fixed-length bodies for `s3s`.
-///
-/// Some clients send object writes with HTTP `Transfer-Encoding: chunked`
-/// instead of a `Content-Length` header. By the time `hyper` hands the request
-/// to this service, the transfer framing has been decoded and removed, but
-/// `s3s` still needs a fixed content length for ordinary non-streaming S3
-/// writes. This layer buffers only those unlengthed `PUT`/`POST` bodies,
-/// restores `Content-Length`, and leaves real streaming or already-sized
-/// requests alone.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct ChunkedBodyCompatLayer;
-
-impl<S> Layer<S> for ChunkedBodyCompatLayer {
-    type Service = ChunkedBodyCompatService<S>;
-
-    fn layer(&self, inner: S) -> Self::Service {
-        ChunkedBodyCompatService { inner }
-    }
-}
-
-/// Service wrapper that applies [`ChunkedBodyCompatLayer`] per request.
-#[derive(Clone, Debug)]
-pub(crate) struct ChunkedBodyCompatService<S> {
-    inner: S,
-}
-
-impl<S> Service<Request<Incoming>> for ChunkedBodyCompatService<S>
-where
-    S: Service<Request<CompatBody>, Response = HttpResponse, Error = HttpError>
-        + Clone
-        + Send
-        + 'static,
-    S::Future: Send + 'static,
-{
-    type Response = HttpResponse;
-    type Error = HttpError;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
-    }
-
-    fn call(&mut self, req: Request<Incoming>) -> Self::Future {
-        if should_preserve_body_stream(&req) {
-            let future = self.inner.call(req.map(BodyExt::boxed_unsync));
-            return Box::pin(future);
-        }
-
-        let mut inner = {
-            let clone = self.inner.clone();
-            std::mem::replace(&mut self.inner, clone)
-        };
-        Box::pin(async move {
-            let (mut parts, body) = req.into_parts();
-            let bytes = body
-                .collect()
-                .await
-                .map_err(|err| HttpError::new(Box::new(err)))?
-                .to_bytes();
-            let content_length = bytes
-                .len()
-                .to_string()
-                .parse()
-                .map_err(|err| HttpError::new(Box::new(err)))?;
-            parts.headers.insert(CONTENT_LENGTH, content_length);
-            parts.headers.remove(header::TRANSFER_ENCODING);
-            inner
-                .call(Request::from_parts(
-                    parts,
-                    Full::new(bytes)
-                        .map_err(|never| match never {})
-                        .boxed_unsync(),
-                ))
-                .await
-        })
-    }
-}
-
-/// Returns whether a request body should continue through `s3s` as a stream.
-///
-/// Non-write requests and writes that already carry S3 streaming markers or an
-/// explicit decoded length must not be buffered here, because downstream
-/// signing and payload decoders need to observe the original stream metadata.
-fn should_preserve_body_stream<B>(req: &Request<B>) -> bool {
-    if !matches!(*req.method(), Method::PUT | Method::POST) {
-        return true;
-    }
-
-    let headers = req.headers();
-    headers.contains_key(CONTENT_LENGTH)
-        || headers.contains_key(X_AMZ_DECODED_CONTENT_LENGTH)
-        || headers
-            .get(X_AMZ_CONTENT_SHA256)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.starts_with("STREAMING-"))
-        || headers
-            .get(CONTENT_ENCODING)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| {
-                value
-                    .split(',')
-                    .any(|part| part.trim().eq_ignore_ascii_case("aws-chunked"))
-            })
-}
 
 /// Handles authentication and response-shape compatibility around `s3s`.
 ///
@@ -546,6 +433,7 @@ fn s3_error_response(status: StatusCode, code: &str) -> HttpResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use http_body_util::BodyExt;
 
     fn request(method: Method, uri: &str) -> Result<Request<()>, hyper::http::Error> {
@@ -566,48 +454,6 @@ mod tests {
         let status = response.status();
         let body = futures::executor::block_on(response_body_text(response))?;
         Ok(format!("{status} {body}"))
-    }
-
-    #[test]
-    fn body_stream_preservation_matches_supported_headers() -> Result<(), hyper::http::Error> {
-        assert!(should_preserve_body_stream(&request(
-            Method::GET,
-            "/bucket/key"
-        )?));
-        assert!(!should_preserve_body_stream(&request(
-            Method::PUT,
-            "/bucket/key"
-        )?));
-
-        let with_length = Request::builder()
-            .method(Method::PUT)
-            .uri("/bucket/key")
-            .header(CONTENT_LENGTH, "3")
-            .body(())?;
-        assert!(should_preserve_body_stream(&with_length));
-
-        let with_decoded_length = Request::builder()
-            .method(Method::POST)
-            .uri("/bucket")
-            .header(X_AMZ_DECODED_CONTENT_LENGTH, "3")
-            .body(())?;
-        assert!(should_preserve_body_stream(&with_decoded_length));
-
-        let streaming_checksum = Request::builder()
-            .method(Method::PUT)
-            .uri("/bucket/key")
-            .header(X_AMZ_CONTENT_SHA256, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
-            .body(())?;
-        assert!(should_preserve_body_stream(&streaming_checksum));
-
-        let aws_chunked = Request::builder()
-            .method(Method::PUT)
-            .uri("/bucket/key")
-            .header(CONTENT_ENCODING, "gzip, aws-chunked")
-            .body(())?;
-        assert!(should_preserve_body_stream(&aws_chunked));
-
-        Ok(())
     }
 
     #[tokio::test]

@@ -22,6 +22,7 @@ use support::{
 };
 
 const MIB: usize = 1024 * 1024;
+const S3_SINGLE_REQUEST_BODY_MAX: u64 = 5_u64 * 1024 * 1024 * 1024;
 
 /// Verifies multipart upload completion is idempotent and materializes bytes.
 #[tokio::test]
@@ -142,6 +143,35 @@ async fn test_multipart_upload_small() -> Result<()> {
 
     let body = get_object_bytes(&client, &bucket, key).await?;
     assert_eq!(body, vec![0]);
+
+    Ok(())
+}
+
+/// Verifies UploadPart rejects oversized declared bodies before bytes are sent.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_upload_part_oversized_content_length() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-mpu");
+    let key = "too-large-part";
+    let oversized = (S3_SINGLE_REQUEST_BODY_MAX + 1).to_string();
+
+    create_bucket(&client, &bucket).await?;
+    let upload_id = create_upload(&client, &bucket, key).await?;
+    let response = raw_http::signed_header_only_request(
+        &server,
+        Method::PUT,
+        &format!(
+            "/{}/{}?partNumber=1&uploadId={upload_id}",
+            raw_http::path_segment(&bucket),
+            raw_http::path_segment(key)
+        ),
+        &[("Content-Length", oversized.as_str())],
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    assert!(response.body.contains("EntityTooLarge"));
 
     Ok(())
 }
