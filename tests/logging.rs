@@ -21,7 +21,8 @@ use support::{
     server::{TestServer, TestServerOptions},
 };
 
-const LOG_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_LOG_TIMEOUT: Duration = Duration::from_secs(5);
+const COVERAGE_LOG_TIMEOUT: Duration = Duration::from_secs(30);
 const LOG_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 #[tokio::test]
@@ -64,16 +65,8 @@ async fn bucket_creation_and_put_object_are_logged() -> Result<()> {
     let bucket = bucket_name("s3ite-log");
 
     create_bucket(&client, &bucket).await?;
-    let log = wait_for_log_contains_all(
-        &server,
-        &[
-            "created bucket",
-            &format!("create_bucket{{bucket={bucket}}}: s3ite::s3: close"),
-            "time.busy=",
-            "time.idle=",
-        ],
-    )
-    .await?;
+    let log = wait_for_log_contains(&server, "created bucket").await?;
+    wait_for_log_span_closes(&server, &[format!("create_bucket{{bucket={bucket}}}")]).await?;
     assert!(log.contains(&bucket));
 
     client
@@ -83,14 +76,12 @@ async fn bucket_creation_and_put_object_are_logged() -> Result<()> {
         .body(ByteStream::from_static(b"body"))
         .send()
         .await?;
-    let log = wait_for_log_contains_all(
+    let log = wait_for_log_contains(&server, "write file").await?;
+    wait_for_log_span_closes(
         &server,
-        &[
-            "write file",
-            &format!(
-                "put_object{{bucket={bucket} key=logged-object content_length=Some(4)}}: s3ite::s3: close"
-            ),
-        ],
+        &[format!(
+            "put_object{{bucket={bucket} key=logged-object content_length=Some(4)}}"
+        )],
     )
     .await?;
     assert!(log.contains("logged-object"));
@@ -103,12 +94,11 @@ async fn bucket_creation_and_put_object_are_logged() -> Result<()> {
         .key("logged-object")
         .send()
         .await?;
-    let log = wait_for_log_contains_all(
+    let log = wait_for_log_span_closes(
         &server,
-        &[
-            &format!("get_object{{bucket={bucket} key=logged-object"),
-            "version_id= part_number=None range=None}: s3ite::s3: close",
-        ],
+        &[format!(
+            "get_object{{bucket={bucket} key=logged-object version_id= part_number=None range=None}}"
+        )],
     )
     .await?;
     assert!(!log.contains("secret-key-for-tests"));
@@ -129,14 +119,12 @@ async fn multipart_completion_is_logged() -> Result<()> {
     let part = upload_part(&client, &bucket, key, &upload_id, 1, b"part-body").await?;
     complete_upload(&client, &bucket, key, &upload_id, vec![part]).await?;
 
-    let log = wait_for_log_contains_all(
+    let log = wait_for_log_contains(&server, "completed multipart upload").await?;
+    wait_for_log_span_closes(
         &server,
-        &[
-            "completed multipart upload",
-            &format!(
-                "complete_multipart_upload{{bucket={bucket} key={key} upload_id={upload_id}}}: s3ite::s3: close"
-            ),
-        ],
+        &[format!(
+            "complete_multipart_upload{{bucket={bucket} key={key} upload_id={upload_id}}}"
+        )],
     )
     .await?;
     assert!(log.contains("version_id=null"));
@@ -332,64 +320,60 @@ async fn all_s3_endpoint_trace_closes_are_logged() -> Result<()> {
         .await?;
     client.delete_bucket().bucket(&empty_bucket).send().await?;
 
-    let expected = vec![
-        format!("create_bucket{{bucket={bucket}}}: s3ite::s3: close"),
-        format!("create_bucket{{bucket={target_bucket}}}: s3ite::s3: close"),
-        format!("create_bucket{{bucket={empty_bucket}}}: s3ite::s3: close"),
-        format!("copy_object{{bucket={bucket} key={copy_key}}}: s3ite::s3: close"),
-        format!("delete_bucket{{bucket={empty_bucket}}}: s3ite::s3: close"),
-        format!("delete_object{{bucket={bucket} key={delete_key} version_id=}}: s3ite::s3: close"),
-        format!("delete_objects{{bucket={bucket} key_count=2}}: s3ite::s3: close"),
-        format!("get_bucket_location{{bucket={bucket}}}: s3ite::s3: close"),
-        format!("get_bucket_acl{{bucket={bucket}}}: s3ite::s3: close"),
-        format!("get_bucket_versioning{{bucket={bucket}}}: s3ite::s3: close"),
-        format!("put_bucket_versioning{{bucket={bucket}}}: s3ite::s3: close"),
+    let expected_spans = vec![
+        format!("create_bucket{{bucket={bucket}}}"),
+        format!("create_bucket{{bucket={target_bucket}}}"),
+        format!("create_bucket{{bucket={empty_bucket}}}"),
+        format!("copy_object{{bucket={bucket} key={copy_key}}}"),
+        format!("delete_bucket{{bucket={empty_bucket}}}"),
+        format!("delete_object{{bucket={bucket} key={delete_key} version_id=}}"),
+        format!("delete_objects{{bucket={bucket} key_count=2}}"),
+        format!("get_bucket_location{{bucket={bucket}}}"),
+        format!("get_bucket_acl{{bucket={bucket}}}"),
+        format!("get_bucket_versioning{{bucket={bucket}}}"),
+        format!("put_bucket_versioning{{bucket={bucket}}}"),
+        format!("get_object{{bucket={bucket} key={key} version_id= part_number=None range=None}}"),
+        format!("get_object_torrent{{bucket={bucket} key={key}}}"),
+        format!("head_bucket{{bucket={bucket}}}"),
+        format!("head_object{{bucket={bucket} key={key} version_id= part_number=None}}"),
         format!(
-            "get_object{{bucket={bucket} key={key} version_id= part_number=None range=None}}: s3ite::s3: close"
+            "get_object_attributes{{bucket={bucket} key={key} version_id= max_parts=Some(2) part_number_marker=Some(0)}}"
         ),
-        format!("get_object_torrent{{bucket={bucket} key={key}}}: s3ite::s3: close"),
-        format!("head_bucket{{bucket={bucket}}}: s3ite::s3: close"),
+        format!("get_object_acl{{bucket={bucket} key={key} version_id=}}"),
+        format!("put_bucket_acl{{bucket={bucket}}}"),
+        "list_buckets{prefix= continuation_token= max_buckets=None}".to_string(),
         format!(
-            "head_object{{bucket={bucket} key={key} version_id= part_number=None}}: s3ite::s3: close"
-        ),
-        format!(
-            "get_object_attributes{{bucket={bucket} key={key} version_id= max_parts=Some(2) part_number_marker=Some(0)}}: s3ite::s3: close"
-        ),
-        format!("get_object_acl{{bucket={bucket} key={key} version_id=}}: s3ite::s3: close"),
-        format!("put_bucket_acl{{bucket={bucket}}}: s3ite::s3: close"),
-        "list_buckets{prefix= continuation_token= max_buckets=None}: s3ite::s3: close".to_string(),
-        format!(
-            "list_objects{{bucket={bucket} prefix=logged delimiter=/ marker= max_keys=Some(10)}}: s3ite::s3: close"
+            "list_objects{{bucket={bucket} prefix=logged delimiter=/ marker= max_keys=Some(10)}}"
         ),
         format!(
-            "list_object_versions{{bucket={bucket} prefix=logged delimiter=/ key_marker= version_id_marker= max_keys=Some(10)}}: s3ite::s3: close"
+            "list_object_versions{{bucket={bucket} prefix=logged delimiter=/ key_marker= version_id_marker= max_keys=Some(10)}}"
         ),
         format!(
-            "list_objects_v2{{bucket={bucket} prefix=logged delimiter=/ continuation_token= start_after=logged- max_keys=Some(10)}}: s3ite::s3: close"
+            "list_objects_v2{{bucket={bucket} prefix=logged delimiter=/ continuation_token= start_after=logged- max_keys=Some(10)}}"
         ),
         format!(
-            "list_multipart_uploads{{bucket={bucket} prefix=logged delimiter=/ key_marker= upload_id_marker= max_uploads=Some(10)}}: s3ite::s3: close"
+            "list_multipart_uploads{{bucket={bucket} prefix=logged delimiter=/ key_marker= upload_id_marker= max_uploads=Some(10)}}"
         ),
-        format!("put_object{{bucket={bucket} key={key} content_length=Some(4)}}: s3ite::s3: close"),
-        format!("put_object_acl{{bucket={bucket} key={key} version_id=}}: s3ite::s3: close"),
-        format!("create_multipart_upload{{bucket={bucket} key={multipart_key}}}: s3ite::s3: close"),
+        format!("put_object{{bucket={bucket} key={key} content_length=Some(4)}}"),
+        format!("put_object_acl{{bucket={bucket} key={key} version_id=}}"),
+        format!("create_multipart_upload{{bucket={bucket} key={multipart_key}}}"),
         format!(
-            "upload_part{{bucket={bucket} key={multipart_key} upload_id={upload_id} part_number=1 content_length=Some(9)}}: s3ite::s3: close"
-        ),
-        format!(
-            "upload_part_copy{{bucket={bucket} key={copy_part_key} upload_id={copy_upload_id} part_number=1 source_range=bytes=0-3}}: s3ite::s3: close"
+            "upload_part{{bucket={bucket} key={multipart_key} upload_id={upload_id} part_number=1 content_length=Some(9)}}"
         ),
         format!(
-            "list_parts{{bucket={bucket} key={multipart_key} upload_id={upload_id} part_number_marker=Some(0) max_parts=Some(10)}}: s3ite::s3: close"
+            "upload_part_copy{{bucket={bucket} key={copy_part_key} upload_id={copy_upload_id} part_number=1 source_range=bytes=0-3}}"
         ),
         format!(
-            "abort_multipart_upload{{bucket={bucket} key={abort_key} upload_id={abort_upload_id}}}: s3ite::s3: close"
+            "list_parts{{bucket={bucket} key={multipart_key} upload_id={upload_id} part_number_marker=Some(0) max_parts=Some(10)}}"
         ),
         format!(
-            "complete_multipart_upload{{bucket={bucket} key={multipart_key} upload_id={upload_id}}}: s3ite::s3: close"
+            "abort_multipart_upload{{bucket={bucket} key={abort_key} upload_id={abort_upload_id}}}"
+        ),
+        format!(
+            "complete_multipart_upload{{bucket={bucket} key={multipart_key} upload_id={upload_id}}}"
         ),
     ];
-    let log = wait_for_log_contains_all(&server, &expected).await?;
+    let log = wait_for_log_span_closes(&server, &expected_spans).await?;
     assert!(log.contains("time.busy="));
     assert!(log.contains("time.idle="));
     assert!(!log.contains("secret-key-for-tests"));
@@ -413,7 +397,7 @@ async fn wait_for_log_contains_all<S>(server: &TestServer, needles: &[S]) -> Res
 where
     S: AsRef<str>,
 {
-    let deadline = Instant::now() + LOG_TIMEOUT;
+    let deadline = Instant::now() + log_timeout();
     loop {
         let log = tokio::fs::read_to_string(server.log_path())
             .await
@@ -430,6 +414,50 @@ where
             bail!("timed out waiting for log entries {missing:?}; current log:\n{log}");
         }
         tokio::time::sleep(LOG_POLL_INTERVAL).await;
+    }
+}
+
+async fn wait_for_log_span_closes<S>(server: &TestServer, spans: &[S]) -> Result<String>
+where
+    S: AsRef<str>,
+{
+    let deadline = Instant::now() + log_timeout();
+    loop {
+        let log = tokio::fs::read_to_string(server.log_path())
+            .await
+            .with_context(|| format!("read {}", server.log_path().display()))?;
+        let missing = spans
+            .iter()
+            .map(AsRef::as_ref)
+            .filter(|span| !has_span_close(&log, span))
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(log);
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for span close entries {missing:?}; current log:\n{log}");
+        }
+        tokio::time::sleep(LOG_POLL_INTERVAL).await;
+    }
+}
+
+fn has_span_close(log: &str, span: &str) -> bool {
+    log.lines().any(|line| {
+        line.contains(span)
+            && line.contains(": close")
+            && line.contains("time.busy=")
+            && line.contains("time.idle=")
+    })
+}
+
+fn log_timeout() -> Duration {
+    if std::env::var_os("CARGO_LLVM_COV").is_some()
+        || std::env::var_os("LLVM_PROFILE_FILE").is_some()
+        || std::env::var_os("CI").is_some()
+    {
+        COVERAGE_LOG_TIMEOUT
+    } else {
+        DEFAULT_LOG_TIMEOUT
     }
 }
 

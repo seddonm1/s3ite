@@ -131,12 +131,14 @@ impl TestServer {
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        if coverage_run() && request_graceful_shutdown(&self.child).is_ok() {
-            let _ = wait_for_child_exit(&mut self.child, COVERAGE_SHUTDOWN_TIMEOUT);
-        }
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            if coverage_run() && request_graceful_shutdown(&self.child).is_ok() {
+                let _ = wait_for_child_exit(&mut self.child, COVERAGE_SHUTDOWN_TIMEOUT);
+            }
 
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
 
         if std::env::var_os("S3ITE_TEST_KEEP_ROOT").is_some()
             && let Some(root) = self.root.take()
