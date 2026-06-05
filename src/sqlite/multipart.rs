@@ -663,6 +663,7 @@ impl Sqlite {
             INSERT INTO object_part (
                 object_sequence,
                 upload_id,
+                is_multipart_part,
                 last_modified,
                 part_number,
                 start,
@@ -672,7 +673,7 @@ impl Sqlite {
                 checksum_type,
                 checksum_value
             )
-            VALUES (NULL, ?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8);",
+            VALUES (NULL, ?1, 1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8);",
         )?;
 
         let size = sql_size(multipart.size)?;
@@ -834,7 +835,10 @@ impl Sqlite {
                 op.checksum_value
             FROM object_part AS op
             JOIN object_version AS ov ON ov.sequence = op.object_sequence
-            WHERE ov.key = ?1 AND ov.version_id = ?2 AND op.part_number = ?3;",
+            WHERE ov.key = ?1
+                AND ov.version_id = ?2
+                AND op.is_multipart_part = 1
+                AND op.part_number = ?3;",
         )?;
 
         Ok(stmt
@@ -871,6 +875,7 @@ impl Sqlite {
             JOIN object_version AS ov ON ov.sequence = op.object_sequence
             WHERE ov.key = ?1
                 AND ov.version_id = ?2
+                AND op.is_multipart_part = 1
                 AND op.part_number > ?3
             ORDER BY op.part_number
             LIMIT ?4;",
@@ -899,7 +904,7 @@ impl Sqlite {
             SELECT COUNT(*)
             FROM object_part AS op
             JOIN object_version AS ov ON ov.sequence = op.object_sequence
-            WHERE ov.key = ?1 AND ov.version_id = ?2;",
+            WHERE ov.key = ?1 AND ov.version_id = ?2 AND op.is_multipart_part = 1;",
         )?;
         let count = stmt.query_row((key, version_id), |row| row_size(row, 0))?;
         i32::try_from(count).map_err(|_| SqliteError::MultipartObjectTooLarge)
@@ -918,6 +923,7 @@ impl Sqlite {
             INSERT INTO object_part (
                 object_sequence,
                 upload_id,
+                is_multipart_part,
                 last_modified,
                 part_number,
                 start,
@@ -934,6 +940,7 @@ impl Sqlite {
                     WHERE key = ?1 AND version_id = ?2
                 ),
                 NULL,
+                1,
                 ?3,
                 ?4,
                 ?5,

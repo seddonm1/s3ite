@@ -3,6 +3,7 @@
 use std::ops::Not;
 
 use rusqlite::{Error::ToSqlConversionFailure, Transaction};
+use time::OffsetDateTime;
 
 use super::{
     BucketVersioningState, KeyMetadata, KeyValue, NULL_VERSION_ID, ObjectTagCondition,
@@ -199,6 +200,34 @@ impl Sqlite {
         })
     }
 
+    /// Inserts the storage part row that owns single-request object chunks.
+    fn put_object_storage_part(
+        transaction: &Transaction,
+        object_sequence: i64,
+        last_modified: OffsetDateTime,
+        size: i64,
+    ) -> SqliteResult<()> {
+        let mut stmt = transaction.prepare_cached(
+            "
+            INSERT INTO object_part (
+                object_sequence,
+                upload_id,
+                is_multipart_part,
+                last_modified,
+                part_number,
+                start,
+                size,
+                md5,
+                checksum_algorithm,
+                checksum_type,
+                checksum_value
+            )
+            VALUES (?1, NULL, 0, ?2, 1, 0, ?3, NULL, NULL, NULL, NULL);",
+        )?;
+        stmt.execute((object_sequence, last_modified, sql_size(size)?))?;
+        Ok(())
+    }
+
     /// Inserts body bytes as bounded chunks for an object or multipart owner.
     pub(super) fn put_object_blob_chunks(
         transaction: &Transaction,
@@ -287,6 +316,12 @@ impl Sqlite {
         }
 
         let write_outcome = Self::put_object_version(transaction, &key, key_metadata)?;
+        Self::put_object_storage_part(
+            transaction,
+            write_outcome.sequence,
+            write_outcome.last_modified,
+            i64::try_from(value.len()).map_err(|_| SqliteError::ObjectBodyInconsistent)?,
+        )?;
         Self::put_object_blob_chunks(
             transaction,
             Some(write_outcome.sequence),

@@ -41,7 +41,7 @@ pub use self::error::{SqliteError, SqliteResult};
 
 pub(crate) const NULL_VERSION_ID: &str = "null";
 
-const BUCKET_SCHEMA_VERSION: i32 = 7;
+const BUCKET_SCHEMA_VERSION: i32 = 8;
 pub(crate) const DEFAULT_OBJECT_BLOB_CHUNK_SIZE: usize = 128 * 1024 * 1024;
 const BUCKET_SCHEMA_SQL: &str = "
 -- Singleton bucket metadata, currently the object versioning state.
@@ -140,10 +140,11 @@ CREATE INDEX multipart_upload_list
 CREATE INDEX multipart_upload_expiry
     ON multipart_upload(DATETIME(last_modified));
 
--- Logical S3 part metadata for active uploads or completed multipart objects.
+-- Logical storage part metadata for object bytes and S3 multipart boundaries.
 CREATE TABLE object_part (
     object_sequence INTEGER,
     upload_id BLOB,
+    is_multipart_part INTEGER NOT NULL CHECK(is_multipart_part IN (0, 1)),
     last_modified TEXT NOT NULL,
     part_number INTEGER NOT NULL CHECK(part_number BETWEEN 1 AND 10000),
     start INTEGER CHECK(start >= 0),
@@ -168,6 +169,20 @@ CREATE TABLE object_part (
         )
     ),
     CHECK (
+        is_multipart_part = 1
+        OR
+        (
+            object_sequence IS NOT NULL
+            AND upload_id IS NULL
+            AND part_number = 1
+            AND start = 0
+            AND md5 IS NULL
+            AND checksum_algorithm IS NULL
+            AND checksum_type IS NULL
+            AND checksum_value IS NULL
+        )
+    ),
+    CHECK (
         (
             checksum_algorithm IS NULL
             AND checksum_type IS NULL
@@ -183,14 +198,14 @@ CREATE TABLE object_part (
 ) STRICT;
 
 CREATE UNIQUE INDEX object_part_object_part
-    ON object_part(object_sequence, part_number)
-    WHERE object_sequence IS NOT NULL;
+    ON object_part(object_sequence, part_number);
 CREATE UNIQUE INDEX object_part_upload_part
-    ON object_part(upload_id, part_number)
-    WHERE upload_id IS NOT NULL;
+    ON object_part(upload_id, part_number);
 CREATE INDEX object_part_object_start
     ON object_part(object_sequence, start)
     WHERE object_sequence IS NOT NULL;
+CREATE INDEX object_part_completed_list
+    ON object_part(object_sequence, is_multipart_part, part_number);
 
 -- Physical object bytes split into bounded SQLite BLOB chunks.
 CREATE TABLE object_blob_chunk (
@@ -204,6 +219,14 @@ CREATE TABLE object_blob_chunk (
     body BLOB NOT NULL,
     FOREIGN KEY (object_sequence) REFERENCES object_version (sequence) ON DELETE CASCADE,
     FOREIGN KEY (upload_id) REFERENCES multipart_upload (upload_id) ON DELETE CASCADE,
+    FOREIGN KEY (object_sequence, part_number)
+        REFERENCES object_part (object_sequence, part_number)
+        ON DELETE CASCADE
+        DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (upload_id, part_number)
+        REFERENCES object_part (upload_id, part_number)
+        ON DELETE CASCADE
+        DEFERRABLE INITIALLY DEFERRED,
     CHECK (
         (
             object_sequence IS NOT NULL
@@ -250,7 +273,7 @@ CREATE INDEX completed_multipart_upload_expiry
 INSERT INTO bucket_state (id, versioning_state)
 VALUES (1, 0);
 
-PRAGMA user_version = 7;
+PRAGMA user_version = 8;
 ";
 
 /// Reads a nonnegative object size column from a row.
@@ -1195,6 +1218,26 @@ mod tests {
             }));
         }
 
+        let blob_chunk_columns = foreign_key_columns(&connection, "object_blob_chunk")?;
+        assert!(blob_chunk_columns.iter().any(|column| {
+            column.table == "object_part"
+                && column.from == "object_sequence"
+                && column.to == "object_sequence"
+                && column.on_delete == "CASCADE"
+        }));
+        assert!(blob_chunk_columns.iter().any(|column| {
+            column.table == "object_part"
+                && column.from == "part_number"
+                && column.to == "part_number"
+                && column.on_delete == "CASCADE"
+        }));
+        assert!(blob_chunk_columns.iter().any(|column| {
+            column.table == "object_part"
+                && column.from == "upload_id"
+                && column.to == "upload_id"
+                && column.on_delete == "CASCADE"
+        }));
+
         Ok(())
     }
 
@@ -1225,6 +1268,10 @@ mod tests {
         assert_eq!(
             index_columns(&connection, "object_part_object_part")?,
             ["object_sequence", "part_number"]
+        );
+        assert_eq!(
+            index_columns(&connection, "object_part_completed_list")?,
+            ["object_sequence", "is_multipart_part", "part_number"]
         );
         assert_eq!(
             index_columns(&connection, "object_blob_chunk_upload_order")?,
@@ -1501,6 +1548,20 @@ mod tests {
         let sequence = connection.last_insert_rowid();
         connection.execute(
             "
+            INSERT INTO object_part (
+                object_sequence,
+                upload_id,
+                is_multipart_part,
+                last_modified,
+                part_number,
+                start,
+                size
+            )
+            VALUES (?1, NULL, 0, ?2, 1, 0, 1);",
+            (sequence, OffsetDateTime::now_utc()),
+        )?;
+        connection.execute(
+            "
             INSERT INTO object_blob_chunk (
                 object_sequence,
                 upload_id,
@@ -1566,6 +1627,7 @@ mod tests {
             INSERT INTO object_part (
                 object_sequence,
                 upload_id,
+                is_multipart_part,
                 last_modified,
                 part_number,
                 start,
@@ -1574,7 +1636,7 @@ mod tests {
                 checksum_type,
                 checksum_value
             )
-            VALUES (NULL, ?1, ?2, 1, NULL, 1, 5, 1, 'sha');",
+            VALUES (NULL, ?1, 1, ?2, 1, NULL, 1, 5, 1, 'sha');",
             (upload_id, OffsetDateTime::now_utc()),
         );
 
@@ -1585,6 +1647,39 @@ mod tests {
     #[test]
     fn blob_chunk_rows_require_one_owner_and_matching_size() -> SqliteResult<()> {
         let connection = open_schema()?;
+        connection.execute(
+            "
+            INSERT INTO object_version (
+                key,
+                version_id,
+                is_latest,
+                is_delete_marker,
+                size,
+                last_modified,
+                md5,
+                checksum_algorithm,
+                checksum_type,
+                checksum_value
+            )
+            VALUES ('key', 'null', 1, 0, 1, ?1, 'md5', 3, 2, 'crc');",
+            [OffsetDateTime::now_utc()],
+        )?;
+        let sequence = connection.last_insert_rowid();
+        connection.execute(
+            "
+            INSERT INTO object_part (
+                object_sequence,
+                upload_id,
+                is_multipart_part,
+                last_modified,
+                part_number,
+                start,
+                size
+            )
+            VALUES (?1, NULL, 0, ?2, 1, 0, 1);",
+            (sequence, OffsetDateTime::now_utc()),
+        )?;
+
         let no_owner = connection.execute(
             "
             INSERT INTO object_blob_chunk (
@@ -1599,6 +1694,20 @@ mod tests {
             VALUES (NULL, NULL, 1, 1, 0, 1, X'00');",
             (),
         );
+        let missing_part = connection.execute(
+            "
+            INSERT INTO object_blob_chunk (
+                object_sequence,
+                upload_id,
+                part_number,
+                chunk_number,
+                offset,
+                size,
+                body
+            )
+            VALUES (?1, NULL, 2, 1, 0, 1, X'00');",
+            [sequence],
+        );
         let wrong_size = connection.execute(
             "
             INSERT INTO object_blob_chunk (
@@ -1610,11 +1719,12 @@ mod tests {
                 size,
                 body
             )
-            VALUES (NULL, X'00', 1, 1, 0, 2, X'00');",
-            (),
+            VALUES (?1, NULL, 1, 1, 0, 2, X'00');",
+            [sequence],
         );
 
         assert!(no_owner.is_err());
+        assert!(missing_part.is_err());
         assert!(wrong_size.is_err());
         Ok(())
     }

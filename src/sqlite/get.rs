@@ -492,6 +492,24 @@ mod tests {
         if let Some(body) = body {
             connection.execute(
                 "
+                INSERT INTO object_part (
+                    object_sequence,
+                    upload_id,
+                    is_multipart_part,
+                    last_modified,
+                    part_number,
+                    start,
+                    size
+                )
+                VALUES (?1, NULL, 0, ?2, 1, 0, ?3);",
+                (
+                    sequence,
+                    OffsetDateTime::UNIX_EPOCH,
+                    i64::try_from(body.len()).map_err(|_| SqliteError::ObjectBodyInconsistent)?,
+                ),
+            )?;
+            connection.execute(
+                "
                 INSERT INTO object_blob_chunk (
                     object_sequence,
                     upload_id,

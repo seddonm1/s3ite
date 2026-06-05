@@ -105,6 +105,7 @@ async fn put_object_persists_metadata_and_body_together() -> Result<()> {
     assert!(!row.is_delete_marker);
     assert_eq!(row.size, 3);
     assert_eq!(row.body.as_deref(), Some(b"foo".as_slice()));
+    assert_eq!(storage_part_count(&connection, row.sequence)?, 1);
     assert!(row.md5.as_ref().is_some_and(|md5| !md5.is_empty()));
     assert!(row.checksum_algorithm.is_some());
     assert!(row.checksum_type.is_some());
@@ -565,8 +566,19 @@ fn completed_object_part_count(connection: &Connection, key: &str) -> Result<i64
         SELECT COUNT(*)
         FROM object_part AS op
         JOIN object_version AS ov ON ov.sequence = op.object_sequence
-        WHERE ov.key = ?1;",
+        WHERE ov.key = ?1 AND op.is_multipart_part = 1;",
         [key],
+        |row| row.get(0),
+    )?)
+}
+
+fn storage_part_count(connection: &Connection, object_sequence: i64) -> Result<i64> {
+    Ok(connection.query_row(
+        "
+        SELECT COUNT(*)
+        FROM object_part
+        WHERE object_sequence = ?1 AND is_multipart_part = 0;",
+        [object_sequence],
         |row| row.get(0),
     )?)
 }
