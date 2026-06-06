@@ -37,6 +37,9 @@ pub(crate) use self::{
     sqlite::{Sqlite, SqliteError},
 };
 
+#[derive(Clone, Copy, Debug)]
+struct ClientAddress(SocketAddr);
+
 type MainResult<T> = std::result::Result<T, MainError>;
 
 #[derive(Debug, thiserror::Error)]
@@ -119,7 +122,7 @@ async fn serve(
     info!("server is running at http://{local_addr}");
 
     loop {
-        let (stream, _) = tokio::select! {
+        let (stream, remote_addr) = tokio::select! {
             res = listener.accept() => {
                 match res {
                     Ok(conn) => conn,
@@ -139,6 +142,10 @@ async fn serve(
             io,
             TowerToHyperService::new(
                 ServiceBuilder::new()
+                    .map_request(move |mut request: hyper::Request<hyper::body::Incoming>| {
+                        request.extensions_mut().insert(ClientAddress(remote_addr));
+                        request
+                    })
                     .option_layer(cors_layer.clone())
                     .layer(auth_compat.clone())
                     .layer(ConcurrencyLimitLayer::new(concurrency_limit.into()))
@@ -153,10 +160,10 @@ async fn serve(
 
     tokio::select! {
         () = graceful.shutdown() => {
-             tracing::debug!("Gracefully shutdown!");
+             info!("graceful shutdown completed");
         },
         () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-             tracing::debug!("Waited 10 seconds for graceful shutdown, aborting...");
+             tracing::warn!("graceful shutdown timed out; aborting open connections");
         }
     }
 

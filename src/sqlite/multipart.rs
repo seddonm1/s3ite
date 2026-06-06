@@ -151,7 +151,6 @@ impl Sqlite {
 
         Ok(CompletedMultipartUploadOutcome {
             md5: prepared.md5,
-            version_id: write_outcome.version_id,
             returned_version_id: write_outcome.returned_version_id,
             checksum: prepared.checksum,
         })
@@ -175,7 +174,6 @@ impl Sqlite {
         )?;
         Ok(CompletedMultipartUploadOutcome {
             md5: completed.md5,
-            version_id: completed.version_id,
             returned_version_id: completed.returned_version_id,
             checksum: completed.checksum,
         })
@@ -596,7 +594,6 @@ impl Sqlite {
             SELECT
                 access_key,
                 md5,
-                version_id,
                 returned_version_id,
                 checksum_algorithm,
                 checksum_type,
@@ -610,9 +607,8 @@ impl Sqlite {
                 Ok(CompletedMultipartUploadState {
                     access_key: row.get(0)?,
                     md5: row.get(1)?,
-                    version_id: row.get(2)?,
-                    returned_version_id: row.get(3)?,
-                    checksum: required_stored_checksum(row.get(4)?, row.get(5)?, row.get(6)?)?,
+                    returned_version_id: row.get(2)?,
+                    checksum: required_stored_checksum(row.get(3)?, row.get(4)?, row.get(5)?)?,
                 })
             })
             .optional()?)
@@ -1234,7 +1230,6 @@ mod tests {
             panic!("expected already-completed multipart outcome");
         };
         assert_eq!(outcome.md5, "etag-1");
-        assert_eq!(outcome.version_id, NULL_VERSION_ID);
         assert_eq!(outcome.returned_version_id.as_deref(), Some("returned"));
         assert_eq!(outcome.checksum, checksum);
         Ok(())
@@ -1323,8 +1318,9 @@ mod tests {
         assert!(Sqlite::get_multiparts(&transaction, upload_id)?.is_empty());
         let object = Sqlite::get_object(&transaction, "key")?.ok_or(SqliteError::ObjectNotFound)?;
         assert_eq!(object.value.as_deref(), Some(b"abc".as_slice()));
+        let version_id = object.key_metadata.version_id;
         let completed_part =
-            Sqlite::get_completed_object_part(&transaction, "key", &outcome.version_id, 1)?
+            Sqlite::get_completed_object_part(&transaction, "key", &version_id, 1)?
                 .ok_or(SqliteError::InvalidMultipartPart)?;
         assert_eq!(completed_part.start, 0);
         assert_eq!(completed_part.size, 3);
@@ -1337,7 +1333,7 @@ mod tests {
                 FROM object_version
                 WHERE key = 'key' AND version_id = ?1
             );",
-            [&outcome.version_id],
+            [&version_id],
             |row| row.get(0),
         )?;
         let upload_chunk_count: i64 = transaction.query_row(
@@ -1350,7 +1346,6 @@ mod tests {
 
         let retry = Sqlite::put_prepared_multipart_upload(&transaction, &request, retry_prepared)?;
         assert_eq!(retry.md5, outcome.md5);
-        assert_eq!(retry.version_id, outcome.version_id);
         assert_eq!(retry.returned_version_id, outcome.returned_version_id);
         assert_eq!(retry.checksum, outcome.checksum);
 

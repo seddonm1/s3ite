@@ -8,7 +8,6 @@ use std::{
 use path_absolutize::Absolutize;
 use rusqlite::Transaction;
 use tokio::fs;
-use tracing::debug;
 
 use super::{BucketConnection, BucketVersioningState, Sqlite, SqliteError, SqliteResult};
 
@@ -89,8 +88,7 @@ impl Sqlite {
 
         let mut buckets = self.buckets.write().await;
         if buckets.contains_key(&bucket).not() {
-            buckets.insert(bucket.clone(), Arc::new(connection));
-            debug!(bucket = %bucket, "created bucket");
+            buckets.insert(bucket, Arc::new(connection));
         }
 
         Ok(())

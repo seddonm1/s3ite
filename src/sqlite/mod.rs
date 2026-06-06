@@ -504,7 +504,6 @@ pub(crate) struct MultipartUploadSummary {
 pub(crate) struct CompletedMultipartUploadState {
     pub(crate) access_key: Option<String>,
     pub(crate) md5: String,
-    pub(crate) version_id: String,
     pub(crate) returned_version_id: Option<String>,
     pub(crate) checksum: StoredChecksum,
 }
@@ -526,7 +525,6 @@ pub(crate) struct CompletedMultipartUploadRecord<'a> {
 #[derive(Debug)]
 pub(crate) struct CompletedMultipartUploadOutcome {
     pub(crate) md5: String,
-    pub(crate) version_id: String,
     pub(crate) returned_version_id: Option<String>,
     pub(crate) checksum: StoredChecksum,
 }

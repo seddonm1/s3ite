@@ -12,7 +12,7 @@ use tempfile::TempDir;
 
 const ACCESS_KEY: &str = "s3ite-access-key";
 const SECRET_KEY: &str = "s3ite-secret-key-for-tests";
-const DEFAULT_RUST_LOG: &str = "s3ite=debug,s3s=warn";
+const DEFAULT_RUST_LOG: &str = "s3ite=info,s3s=warn";
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const COVERAGE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);

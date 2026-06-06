@@ -1,4 +1,7 @@
-use std::ops::{Not, Range as ByteRange};
+use std::{
+    fmt,
+    ops::{Not, Range as ByteRange},
+};
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
@@ -40,9 +43,9 @@ use tokio::{
     fs,
     io::{AsyncWrite, AsyncWriteExt},
 };
-use tracing::debug;
 use uuid::Uuid;
 
+use crate::ClientAddress;
 use crate::checksum::{ChecksumAlgorithmKind, ChecksumTypeKind};
 use crate::sqlite::{
     BucketVersioningState, CompletedObjectPart, KeyMetadata, KeyValue, Multipart,
@@ -69,6 +72,37 @@ const UNSUPPORTED_SSE_HEADERS: &[&str] = &[
     "x-amz-copy-source-server-side-encryption-customer-key",
     "x-amz-copy-source-server-side-encryption-customer-key-md5",
 ];
+
+struct TraceOption<T>(Option<T>);
+
+impl<T: fmt::Display> fmt::Display for TraceOption<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(value) = &self.0 {
+            write!(formatter, "{value}")?;
+        }
+        Ok(())
+    }
+}
+
+fn trace_option<T: fmt::Display>(value: Option<T>) -> TraceOption<T> {
+    TraceOption(value)
+}
+
+/// Returns the authenticated access key for request trace fields.
+fn user_id<T>(req: &S3Request<T>) -> &str {
+    req.credentials
+        .as_ref()
+        .map_or("", |credentials| credentials.access_key.as_str())
+}
+
+/// Returns the remote client IP address for request trace fields.
+fn client_ip<T>(req: &S3Request<T>) -> TraceOption<std::net::IpAddr> {
+    trace_option(
+        req.extensions
+            .get::<ClientAddress>()
+            .map(|client_address| client_address.0.ip()),
+    )
+}
 
 mod bucket;
 mod checksum;
@@ -311,7 +345,8 @@ where
 #[async_trait::async_trait]
 impl S3 for Sqlite {
     /// Creates a bucket database if it does not already exist.
-    #[tracing::instrument(skip_all, fields(bucket = %req.input.bucket))]
+    #[tracing::instrument(skip_all, fields(user_id = %user_id(&req),
+            client_ip = %client_ip(&req), bucket = %req.input.bucket))]
     async fn create_bucket(
         &self,
         req: S3Request<CreateBucketInput>,
@@ -320,7 +355,11 @@ impl S3 for Sqlite {
     }
 
     /// Copies an object between buckets while applying S3 metadata-directive rules.
-    #[tracing::instrument(skip_all, fields(bucket = %req.input.bucket, key = %req.input.key))]
+    #[tracing::instrument(
+        skip_all,
+        fields(user_id = %user_id(&req),
+            client_ip = %client_ip(&req), bucket = %req.input.bucket, key = %req.input.key)
+    )]
     async fn copy_object(
         &self,
         req: S3Request<CopyObjectInput>,
@@ -329,7 +368,8 @@ impl S3 for Sqlite {
     }
 
     /// Deletes an empty bucket database and its `SQLite` sidecar files.
-    #[tracing::instrument(skip_all, fields(bucket = %req.input.bucket))]
+    #[tracing::instrument(skip_all, fields(user_id = %user_id(&req),
+            client_ip = %client_ip(&req), bucket = %req.input.bucket))]
     async fn delete_bucket(
         &self,
         req: S3Request<DeleteBucketInput>,
@@ -341,6 +381,8 @@ impl S3 for Sqlite {
     #[tracing::instrument(
         skip_all,
         fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
             bucket = %req.input.bucket,
             key = %req.input.key,
             version_id = %req.input.version_id.as_deref().unwrap_or("")
@@ -356,7 +398,12 @@ impl S3 for Sqlite {
     /// Deletes a batch of objects and returns S3 multi-delete results.
     #[tracing::instrument(
         skip_all,
-        fields(bucket = %req.input.bucket, key_count = req.input.delete.objects.len())
+        fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
+            bucket = %req.input.bucket,
+            key_count = req.input.delete.objects.len()
+        )
     )]
     async fn delete_objects(
         &self,
@@ -366,7 +413,8 @@ impl S3 for Sqlite {
     }
 
     /// Returns the default bucket location for an existing bucket.
-    #[tracing::instrument(skip_all, fields(bucket = %req.input.bucket))]
+    #[tracing::instrument(skip_all, fields(user_id = %user_id(&req),
+            client_ip = %client_ip(&req), bucket = %req.input.bucket))]
     async fn get_bucket_location(
         &self,
         req: S3Request<GetBucketLocationInput>,
@@ -375,7 +423,8 @@ impl S3 for Sqlite {
     }
 
     /// Returns the fixed owner ACL for an existing bucket.
-    #[tracing::instrument(skip_all, fields(bucket = %req.input.bucket))]
+    #[tracing::instrument(skip_all, fields(user_id = %user_id(&req),
+            client_ip = %client_ip(&req), bucket = %req.input.bucket))]
     async fn get_bucket_acl(
         &self,
         req: S3Request<GetBucketAclInput>,
@@ -384,7 +433,8 @@ impl S3 for Sqlite {
     }
 
     /// Returns the bucket versioning state.
-    #[tracing::instrument(skip_all, fields(bucket = %req.input.bucket))]
+    #[tracing::instrument(skip_all, fields(user_id = %user_id(&req),
+            client_ip = %client_ip(&req), bucket = %req.input.bucket))]
     async fn get_bucket_versioning(
         &self,
         req: S3Request<GetBucketVersioningInput>,
@@ -393,7 +443,8 @@ impl S3 for Sqlite {
     }
 
     /// Updates the bucket versioning state.
-    #[tracing::instrument(skip_all, fields(bucket = %req.input.bucket))]
+    #[tracing::instrument(skip_all, fields(user_id = %user_id(&req),
+            client_ip = %client_ip(&req), bucket = %req.input.bucket))]
     async fn put_bucket_versioning(
         &self,
         req: S3Request<PutBucketVersioningInput>,
@@ -405,11 +456,13 @@ impl S3 for Sqlite {
     #[tracing::instrument(
         skip_all,
         fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
             bucket = %req.input.bucket,
             key = %req.input.key,
             version_id = %req.input.version_id.as_deref().unwrap_or(""),
-            part_number = ?req.input.part_number,
-            range = ?req.input.range
+            part_number = %trace_option(req.input.part_number),
+            range = %trace_option(req.input.range.map(|range| range.to_header_string()))
         )
     )]
     async fn get_object(
@@ -420,7 +473,11 @@ impl S3 for Sqlite {
     }
 
     /// Reports that `BitTorrent` metadata is not available for the object.
-    #[tracing::instrument(skip_all, fields(bucket = %req.input.bucket, key = %req.input.key))]
+    #[tracing::instrument(
+        skip_all,
+        fields(user_id = %user_id(&req),
+            client_ip = %client_ip(&req), bucket = %req.input.bucket, key = %req.input.key)
+    )]
     async fn get_object_torrent(
         &self,
         req: S3Request<GetObjectTorrentInput>,
@@ -429,7 +486,8 @@ impl S3 for Sqlite {
     }
 
     /// Checks whether a bucket exists.
-    #[tracing::instrument(skip_all, fields(bucket = %req.input.bucket))]
+    #[tracing::instrument(skip_all, fields(user_id = %user_id(&req),
+            client_ip = %client_ip(&req), bucket = %req.input.bucket))]
     async fn head_bucket(
         &self,
         req: S3Request<HeadBucketInput>,
@@ -441,10 +499,12 @@ impl S3 for Sqlite {
     #[tracing::instrument(
         skip_all,
         fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
             bucket = %req.input.bucket,
             key = %req.input.key,
             version_id = %req.input.version_id.as_deref().unwrap_or(""),
-            part_number = ?req.input.part_number
+            part_number = %trace_option(req.input.part_number)
         )
     )]
     async fn head_object(
@@ -458,11 +518,13 @@ impl S3 for Sqlite {
     #[tracing::instrument(
         skip_all,
         fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
             bucket = %req.input.bucket,
             key = %req.input.key,
             version_id = %req.input.version_id.as_deref().unwrap_or(""),
-            max_parts = ?req.input.max_parts,
-            part_number_marker = ?req.input.part_number_marker
+            max_parts = %trace_option(req.input.max_parts),
+            part_number_marker = %trace_option(req.input.part_number_marker)
         )
     )]
     async fn get_object_attributes(
@@ -476,6 +538,8 @@ impl S3 for Sqlite {
     #[tracing::instrument(
         skip_all,
         fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
             bucket = %req.input.bucket,
             key = %req.input.key,
             version_id = %req.input.version_id.as_deref().unwrap_or("")
@@ -489,7 +553,8 @@ impl S3 for Sqlite {
     }
 
     /// Accepts owner-equivalent bucket ACL writes as no-ops.
-    #[tracing::instrument(skip_all, fields(bucket = %req.input.bucket))]
+    #[tracing::instrument(skip_all, fields(user_id = %user_id(&req),
+            client_ip = %client_ip(&req), bucket = %req.input.bucket))]
     async fn put_bucket_acl(
         &self,
         req: S3Request<PutBucketAclInput>,
@@ -501,9 +566,11 @@ impl S3 for Sqlite {
     #[tracing::instrument(
         skip_all,
         fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
             prefix = %req.input.prefix.as_deref().unwrap_or(""),
             continuation_token = %req.input.continuation_token.as_deref().unwrap_or(""),
-            max_buckets = ?req.input.max_buckets
+            max_buckets = %trace_option(req.input.max_buckets)
         )
     )]
     async fn list_buckets(
@@ -517,11 +584,13 @@ impl S3 for Sqlite {
     #[tracing::instrument(
         skip_all,
         fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
             bucket = %req.input.bucket,
             prefix = %req.input.prefix.as_deref().unwrap_or(""),
             delimiter = %req.input.delimiter.as_deref().unwrap_or(""),
             marker = %req.input.marker.as_deref().unwrap_or(""),
-            max_keys = ?req.input.max_keys
+            max_keys = %trace_option(req.input.max_keys)
         )
     )]
     async fn list_objects(
@@ -535,12 +604,14 @@ impl S3 for Sqlite {
     #[tracing::instrument(
         skip_all,
         fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
             bucket = %req.input.bucket,
             prefix = %req.input.prefix.as_deref().unwrap_or(""),
             delimiter = %req.input.delimiter.as_deref().unwrap_or(""),
             key_marker = %req.input.key_marker.as_deref().unwrap_or(""),
             version_id_marker = %req.input.version_id_marker.as_deref().unwrap_or(""),
-            max_keys = ?req.input.max_keys
+            max_keys = %trace_option(req.input.max_keys)
         )
     )]
     async fn list_object_versions(
@@ -554,12 +625,14 @@ impl S3 for Sqlite {
     #[tracing::instrument(
         skip_all,
         fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
             bucket = %req.input.bucket,
             prefix = %req.input.prefix.as_deref().unwrap_or(""),
             delimiter = %req.input.delimiter.as_deref().unwrap_or(""),
             continuation_token = %req.input.continuation_token.as_deref().unwrap_or(""),
             start_after = %req.input.start_after.as_deref().unwrap_or(""),
-            max_keys = ?req.input.max_keys
+            max_keys = %trace_option(req.input.max_keys)
         )
     )]
     async fn list_objects_v2(
@@ -573,12 +646,14 @@ impl S3 for Sqlite {
     #[tracing::instrument(
         skip_all,
         fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
             bucket = %req.input.bucket,
             prefix = %req.input.prefix.as_deref().unwrap_or(""),
             delimiter = %req.input.delimiter.as_deref().unwrap_or(""),
             key_marker = %req.input.key_marker.as_deref().unwrap_or(""),
             upload_id_marker = %req.input.upload_id_marker.as_deref().unwrap_or(""),
-            max_uploads = ?req.input.max_uploads
+            max_uploads = %trace_option(req.input.max_uploads)
         )
     )]
     async fn list_multipart_uploads(
@@ -592,9 +667,11 @@ impl S3 for Sqlite {
     #[tracing::instrument(
         skip_all,
         fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
             bucket = %req.input.bucket,
             key = %req.input.key,
-            content_length = ?req.input.content_length
+            content_length = %trace_option(req.input.content_length)
         )
     )]
     async fn put_object(
@@ -608,6 +685,8 @@ impl S3 for Sqlite {
     #[tracing::instrument(
         skip_all,
         fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
             bucket = %req.input.bucket,
             key = %req.input.key,
             version_id = %req.input.version_id.as_deref().unwrap_or("")
@@ -621,7 +700,11 @@ impl S3 for Sqlite {
     }
 
     /// Creates multipart upload state for a future object.
-    #[tracing::instrument(skip_all, fields(bucket = %req.input.bucket, key = %req.input.key))]
+    #[tracing::instrument(
+        skip_all,
+        fields(user_id = %user_id(&req),
+            client_ip = %client_ip(&req), bucket = %req.input.bucket, key = %req.input.key)
+    )]
     async fn create_multipart_upload(
         &self,
         req: S3Request<CreateMultipartUploadInput>,
@@ -633,11 +716,13 @@ impl S3 for Sqlite {
     #[tracing::instrument(
         skip_all,
         fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
             bucket = %req.input.bucket,
             key = %req.input.key,
             upload_id = %req.input.upload_id,
             part_number = req.input.part_number,
-            content_length = ?req.input.content_length
+            content_length = %trace_option(req.input.content_length)
         )
     )]
     async fn upload_part(
@@ -651,6 +736,8 @@ impl S3 for Sqlite {
     #[tracing::instrument(
         skip_all,
         fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
             bucket = %req.input.bucket,
             key = %req.input.key,
             upload_id = %req.input.upload_id,
@@ -669,11 +756,13 @@ impl S3 for Sqlite {
     #[tracing::instrument(
         skip_all,
         fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
             bucket = %req.input.bucket,
             key = %req.input.key,
             upload_id = %req.input.upload_id,
-            part_number_marker = ?req.input.part_number_marker,
-            max_parts = ?req.input.max_parts
+            part_number_marker = %trace_option(req.input.part_number_marker),
+            max_parts = %trace_option(req.input.max_parts)
         )
     )]
     async fn list_parts(
@@ -687,6 +776,8 @@ impl S3 for Sqlite {
     #[tracing::instrument(
         skip_all,
         fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
             bucket = %req.input.bucket,
             key = %req.input.key,
             upload_id = %req.input.upload_id
@@ -703,6 +794,8 @@ impl S3 for Sqlite {
     #[tracing::instrument(
         skip_all,
         fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
             bucket = %req.input.bucket,
             key = %req.input.key,
             upload_id = %req.input.upload_id

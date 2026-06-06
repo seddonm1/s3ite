@@ -17,8 +17,8 @@ use super::{
     UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput, Uuid,
     checksum_algorithm_output, checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_sha1,
     checksum_sha256, checksum_type_output, common_prefix_for_key, configured_part_checksum,
-    copy_bytes, debug, decode_list_input_value, default_crc64nvme_full_object_checksum,
-    encode_list_value, finish_part_checksum, hex, is_url_encoding, multipart_checksum_config,
+    copy_bytes, decode_list_input_value, default_crc64nvme_full_object_checksum, encode_list_value,
+    finish_part_checksum, hex, is_url_encoding, multipart_checksum_config,
     normalize_content_encoding, object_write_conditions, output_delimiter, owner,
     part_checksum_accumulator, s3_error, s3_error_from_sqlite, s3_error_with_message,
     validate_content_md5, validate_declared_object_write_length, validate_no_sse_headers,
@@ -1234,8 +1234,6 @@ pub(super) async fn complete_multipart_upload(
             .await
             .map_err(s3_error_from_sqlite)?,
     };
-    debug!(version_id = %completed.version_id, "completed multipart upload");
-
     let completed_checksum_type = checksum_type_output(&completed.checksum);
     let output = CompleteMultipartUploadOutput {
         bucket: Some(bucket),

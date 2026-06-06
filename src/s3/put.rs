@@ -5,10 +5,10 @@ use super::{
     KeyValue, Md5, Not, ObjectAclRequest, OffsetDateTime, PutObjectInput, PutObjectOutput, S3Error,
     S3ErrorCode, S3Request, S3Response, S3Result, Sqlite, StorageClass, StoredChecksum,
     StreamingBlob, TryStreamExt, checksum_crc32, checksum_crc32c, checksum_crc64nvme,
-    checksum_sha1, checksum_sha256, checksum_type_output, copy_bytes, debug,
-    finish_payload_checksum, hex, normalize_content_encoding, object_write_conditions,
-    payload_checksum_accumulator, s3_error, s3_error_from_sqlite, validate_content_md5,
-    validate_declared_object_write_length, validate_no_sse_headers, validate_object_acl,
+    checksum_sha1, checksum_sha256, checksum_type_output, copy_bytes, finish_payload_checksum, hex,
+    normalize_content_encoding, object_write_conditions, payload_checksum_accumulator, s3_error,
+    s3_error_from_sqlite, validate_content_md5, validate_declared_object_write_length,
+    validate_no_sse_headers, validate_object_acl,
 };
 
 /// Fully buffered object body plus hashes needed by the storage write.
@@ -180,8 +180,6 @@ pub(super) async fn put_object(
         },
     )
     .await?;
-
-    debug!(path = %key, ?size, %md5, "write file");
 
     let connection = sqlite
         .get_connection(&bucket)
