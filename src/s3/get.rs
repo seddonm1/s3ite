@@ -3,20 +3,21 @@
 use std::ops::Range as ByteRange;
 
 use super::{
-    ChecksumMode, CompletedObjectPart, ETag, GetObjectAttributesInput, GetObjectAttributesOutput,
-    GetObjectAttributesParts, GetObjectInput, GetObjectOutput, GetObjectTorrentInput,
-    GetObjectTorrentOutput, HeadObjectInput, HeadObjectOutput, KeyMetadata, Not, ObjectAttributes,
-    ObjectBodyReference, ObjectPart, ObjectReadConditionFailure, ObjectReadConditions, S3Error,
-    S3ErrorCode, S3Range, S3Request, S3Response, S3Result, Sqlite, SqliteError, SqliteResult,
-    StorageClass, StoredChecksum, StreamExt, StreamingBlob, checksum_crc32, checksum_crc32c,
-    checksum_crc64nvme, checksum_mode_enabled, checksum_sha1, checksum_sha256, checksum_struct,
-    checksum_type_output, list_limit, not_found_delete_marker_error, not_modified_error,
-    object_checksum_for_part, requested_part_range, s3_error, s3_error_from_sqlite,
-    s3_error_with_message, stream, validate_no_sse_headers, validate_part_number,
-    validate_read_conditions,
+    Bytes, ChecksumMode, CompletedObjectPart, ETag, GetObjectAttributesInput,
+    GetObjectAttributesOutput, GetObjectAttributesParts, GetObjectInput, GetObjectOutput,
+    GetObjectTorrentInput, GetObjectTorrentOutput, HeadObjectInput, HeadObjectOutput, KeyMetadata,
+    Not, ObjectAttributes, ObjectBodyReference, ObjectPart, ObjectReadConditionFailure,
+    ObjectReadConditions, S3Error, S3ErrorCode, S3Range, S3Request, S3Response, S3Result, Sqlite,
+    SqliteError, SqliteResult, StorageClass, StoredChecksum, StreamExt, StreamingBlob,
+    checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_mode_enabled, checksum_sha1,
+    checksum_sha256, checksum_struct, checksum_type_output, list_limit,
+    not_found_delete_marker_error, not_modified_error, object_checksum_for_part,
+    requested_part_range, s3_error, s3_error_from_sqlite, s3_error_with_message, sse_s3_output,
+    stream, validate_no_sse_headers, validate_part_number, validate_read_conditions,
 };
 
 use crate::database::{BlobReadReceiver, BucketConnection};
+use crate::sse;
 
 /// Reports that `BitTorrent` metadata is unavailable for this object store.
 pub(super) fn get_object_torrent(
@@ -47,7 +48,13 @@ struct ObjectBodyRead {
     completed_part: Option<CompletedObjectPart>,
     completed_part_count: i32,
     object_range: ByteRange<u64>,
-    body: BlobReadReceiver,
+    body: ObjectBodyReadBody,
+}
+
+/// Backing body for a GetObject response.
+enum ObjectBodyReadBody {
+    Blob(BlobReadReceiver),
+    Bytes(Bytes),
 }
 
 /// Metadata selected inside the blob-reader transaction before streaming starts.
@@ -213,6 +220,7 @@ async fn load_get_object(
     part_number: Option<i32>,
     range: Option<S3Range>,
     conditions: ObjectReadConditions,
+    sse_s3_master_key: Option<[u8; 32]>,
 ) -> S3Result<ObjectBodyRead> {
     let (start, body) = connection
         .read_blob(move |transaction| {
@@ -250,11 +258,15 @@ async fn load_get_object(
                 completed_part_count,
                 object_size,
             )?;
-            let requests = Sqlite::object_blob_read_requests(
-                transaction,
-                object.sequence,
-                object_range.clone(),
-            )?;
+            let requests = if object.key_metadata.encryption.is_some() {
+                Vec::new()
+            } else {
+                Sqlite::object_blob_read_requests(
+                    transaction,
+                    object.sequence,
+                    object_range.clone(),
+                )?
+            };
 
             Ok((
                 ObjectBodyReadStart::Found(Box::new(ObjectBodyReadFound {
@@ -278,13 +290,48 @@ async fn load_get_object(
             }
             ObjectReadConditionFailure::NotModified => not_modified_error(md5.as_deref())?,
         }),
-        ObjectBodyReadStart::Found(read) => Ok(ObjectBodyRead {
-            object: read.object,
-            completed_part: read.completed_part,
-            completed_part_count: read.completed_part_count,
-            object_range: read.object_range,
-            body,
-        }),
+        ObjectBodyReadStart::Found(read) => {
+            let body = if let Some(stored) = read.object.key_metadata.encryption.clone() {
+                let master_key = sse_s3_master_key.ok_or_else(|| {
+                    s3_error_with_message(S3ErrorCode::InvalidRequest, "SSE-S3 is not configured")
+                })?;
+                let object_sequence = read.object.sequence;
+                let object_size = read.object.key_metadata.size;
+                let object_range = read.object_range.clone();
+                let bytes = connection
+                    .read(move |connection| {
+                        let transaction = connection.transaction()?;
+                        let active = sse::active_sse_from_stored(&master_key, stored)
+                            .map_err(SqliteError::Configuration)?;
+                        let value = Sqlite::get_object_bytes_decrypted(
+                            &transaction,
+                            object_sequence,
+                            object_size,
+                            &active,
+                        )?;
+                        let start = usize::try_from(object_range.start)
+                            .map_err(|_| SqliteError::InvalidObjectRange)?;
+                        let end = usize::try_from(object_range.end)
+                            .map_err(|_| SqliteError::InvalidObjectRange)?;
+                        value
+                            .get(start..end)
+                            .map(<[u8]>::to_vec)
+                            .ok_or(SqliteError::InvalidObjectRange)
+                    })
+                    .await
+                    .map_err(s3_error_from_sqlite)?;
+                ObjectBodyReadBody::Bytes(Bytes::from(bytes))
+            } else {
+                ObjectBodyReadBody::Blob(body)
+            };
+            Ok(ObjectBodyRead {
+                object: read.object,
+                completed_part: read.completed_part,
+                completed_part_count: read.completed_part_count,
+                object_range: read.object_range,
+                body,
+            })
+        }
     }
 }
 
@@ -363,45 +410,54 @@ fn get_object_output(
     let object_range = read.object_range;
     let content_length = object_range.end - object_range.start;
     let content_length_i64 = i64::try_from(content_length).map_err(S3Error::internal_error)?;
-    let body = stream::unfold(
-        (read.body, content_length, false),
-        |(mut receiver, remaining, done)| async move {
-            if done {
-                return None;
-            }
-            match receiver.recv().await {
-                Some(Ok(bytes)) => {
-                    let Ok(chunk_len) = u64::try_from(bytes.len()) else {
-                        return Some((
-                            Err(S3Error::with_message(
-                                S3ErrorCode::InternalError,
-                                "object body chunk length does not fit u64",
-                            )),
+    let body = match read.body {
+        ObjectBodyReadBody::Blob(body) => StreamingBlob::wrap::<_, S3Error>(
+            stream::unfold(
+                (body, content_length, false),
+                |(mut receiver, remaining, done)| async move {
+                    if done {
+                        return None;
+                    }
+                    match receiver.recv().await {
+                        Some(Ok(bytes)) => {
+                            let Ok(chunk_len) = u64::try_from(bytes.len()) else {
+                                return Some((
+                                    Err(S3Error::with_message(
+                                        S3ErrorCode::InternalError,
+                                        "object body chunk length does not fit u64",
+                                    )),
+                                    (receiver, 0, true),
+                                ));
+                            };
+                            let Some(remaining) = remaining.checked_sub(chunk_len) else {
+                                return Some((
+                                    Err(s3_error_from_sqlite(SqliteError::ObjectBodyInconsistent)),
+                                    (receiver, 0, true),
+                                ));
+                            };
+                            Some((Ok(bytes), (receiver, remaining, false)))
+                        }
+                        Some(Err(error)) => {
+                            Some((Err(s3_error_from_sqlite(error)), (receiver, 0, true)))
+                        }
+                        None if remaining == 0 => None,
+                        None if receiver.timed_out() => Some((
+                            Err(s3_error_from_sqlite(SqliteError::ObjectBodyReadTimeout)),
                             (receiver, 0, true),
-                        ));
-                    };
-                    let Some(remaining) = remaining.checked_sub(chunk_len) else {
-                        return Some((
+                        )),
+                        None => Some((
                             Err(s3_error_from_sqlite(SqliteError::ObjectBodyInconsistent)),
                             (receiver, 0, true),
-                        ));
-                    };
-                    Some((Ok(bytes), (receiver, remaining, false)))
-                }
-                Some(Err(error)) => Some((Err(s3_error_from_sqlite(error)), (receiver, 0, true))),
-                None if remaining == 0 => None,
-                None if receiver.timed_out() => Some((
-                    Err(s3_error_from_sqlite(SqliteError::ObjectBodyReadTimeout)),
-                    (receiver, 0, true),
-                )),
-                None => Some((
-                    Err(s3_error_from_sqlite(SqliteError::ObjectBodyInconsistent)),
-                    (receiver, 0, true),
-                )),
-            }
-        },
-    )
-    .fuse();
+                        )),
+                    }
+                },
+            )
+            .fuse(),
+        ),
+        ObjectBodyReadBody::Bytes(bytes) => StreamingBlob::wrap::<_, S3Error>(
+            stream::once(async move { Ok::<Bytes, S3Error>(bytes) }).fuse(),
+        ),
+    };
     let response_checksum = response_checksum(
         key_metadata.checksum.as_ref(),
         read.completed_part.as_ref(),
@@ -412,7 +468,7 @@ fn get_object_output(
     let checksum_type = checksum_type_output(&response_checksum);
 
     Ok(GetObjectOutput {
-        body: Some(StreamingBlob::wrap::<_, S3Error>(body)),
+        body: Some(body),
         accept_ranges: Some("bytes".to_string()),
         cache_control: key_metadata.cache_control,
         checksum_crc32: checksum_crc32(&response_checksum),
@@ -435,6 +491,7 @@ fn get_object_output(
         metadata: key_metadata.metadata,
         e_tag: key_metadata.md5.map(ETag::Strong),
         parts_count: (read.completed_part_count > 0).then_some(read.completed_part_count),
+        server_side_encryption: sse_s3_output(key_metadata.encryption.is_some()),
         version_id: Some(version_id),
         ..Default::default()
     })
@@ -493,6 +550,7 @@ fn head_object_output(
         last_modified: Some(object.last_modified.into()),
         metadata: object.metadata,
         parts_count: (read.completed_part_count > 0).then_some(read.completed_part_count),
+        server_side_encryption: sse_s3_output(object.encryption.is_some()),
         version_id: Some(object.version_id),
         ..Default::default()
     })
@@ -535,6 +593,7 @@ pub(super) async fn get_object(
             etag_none_matches: if_none_match,
             unmodified_since: if_unmodified_since.map(Into::into),
         },
+        sqlite.config.sse_s3_master_key(),
     )
     .await?;
     let output = get_object_output(read, range.as_ref(), part_number, checksum_mode.as_ref())?;

@@ -30,6 +30,7 @@ mod config;
 mod database;
 mod s3;
 mod sqlite;
+mod sse;
 
 use self::compat::HeaderAuthCompatLayer;
 pub(crate) use self::{

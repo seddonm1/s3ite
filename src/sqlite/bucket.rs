@@ -10,6 +10,7 @@ use rusqlite::Transaction;
 use tokio::fs;
 
 use super::{BucketConnection, BucketVersioningState, Sqlite, SqliteError, SqliteResult};
+use crate::sse::SSE_S3_ALGORITHM_CODE;
 
 impl Sqlite {
     /// Opens all existing bucket databases under the configured root.
@@ -124,6 +125,29 @@ impl Sqlite {
             WHERE id = 1;",
         )?;
         Ok(stmt.execute([state])?)
+    }
+
+    /// Returns whether this bucket applies SSE-S3 by default to new objects.
+    pub(crate) fn get_bucket_default_sse_s3(transaction: &Transaction) -> SqliteResult<bool> {
+        let mut stmt = transaction
+            .prepare_cached("SELECT default_sse_algorithm FROM bucket_state WHERE id = 1;")?;
+        let algorithm = stmt.query_row((), |row| row.get::<_, Option<i64>>(0))?;
+        Ok(algorithm == Some(SSE_S3_ALGORITHM_CODE))
+    }
+
+    /// Updates the bucket's default SSE-S3 setting.
+    pub(crate) fn put_bucket_default_sse_s3(
+        transaction: &Transaction,
+        enabled: bool,
+    ) -> SqliteResult<usize> {
+        let algorithm = enabled.then_some(SSE_S3_ALGORITHM_CODE);
+        let mut stmt = transaction.prepare_cached(
+            "
+            UPDATE bucket_state
+            SET default_sse_algorithm = ?1
+            WHERE id = 1;",
+        )?;
+        Ok(stmt.execute([algorithm])?)
     }
 }
 

@@ -6,15 +6,16 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::checksum::{ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKind};
+use crate::sse;
 
 use super::{
     CompletedMultipartUploadOutcome, CompletedMultipartUploadRecord, CompletedMultipartUploadState,
     CompletedObjectPart, KeyMetadata, Multipart, MultipartChecksumConfig, MultipartCompletion,
     MultipartCompletionChecksum, MultipartCompletionPart, MultipartCompletionRequest,
-    MultipartMetadata, MultipartUploadState, MultipartUploadSummary, PartChecksum,
-    PreparedMultipartUpload, Sqlite, SqliteError, SqliteResult, decode_base64, decode_md5_hex,
-    encode_hex, optional_multipart_checksum_config, optional_part_checksum,
-    required_stored_checksum, row_size, sql_limit, sql_size,
+    MultipartMetadata, MultipartPartWrite, MultipartUploadState, MultipartUploadSummary,
+    PartChecksum, PreparedMultipartUpload, Sqlite, SqliteError, SqliteResult, decode_base64,
+    decode_md5_hex, encode_hex, optional_multipart_checksum_config, optional_part_checksum,
+    optional_stored_sse, required_stored_checksum, row_size, sql_limit, sql_size,
 };
 
 #[derive(Clone, Copy)]
@@ -79,8 +80,10 @@ impl Sqlite {
             request.upload_id,
             &request.requested_parts,
             upload_state.checksum,
+            upload_state.encryption,
             &request.requested_checksum,
             request.default_checksum,
+            request.sse_s3_master_key.as_ref(),
         )
         .map(MultipartCompletion::Prepared)
     }
@@ -107,6 +110,9 @@ impl Sqlite {
         if upload_state.checksum != prepared.upload_checksum {
             return Err(SqliteError::ChecksumMismatch);
         }
+        if upload_state.encryption != prepared.encryption {
+            return Err(SqliteError::ObjectBodyInconsistent);
+        }
         Self::validate_multipart_completion_metadata(transaction, request, upload_state.checksum)?;
         Self::check_object_write_conditions(transaction, &request.key, &request.write_conditions)?;
         let write_outcome = Self::put_object_version(
@@ -123,6 +129,7 @@ impl Sqlite {
                 last_modified: OffsetDateTime::now_utc(),
                 md5: Some(prepared.md5.clone()),
                 checksum: Some(prepared.checksum.clone()),
+                encryption: prepared.encryption.clone(),
                 is_latest: true,
                 is_delete_marker: false,
             },
@@ -153,6 +160,7 @@ impl Sqlite {
             md5: prepared.md5,
             returned_version_id: write_outcome.returned_version_id,
             checksum: prepared.checksum,
+            encryption: prepared.encryption,
         })
     }
 
@@ -176,6 +184,7 @@ impl Sqlite {
             md5: completed.md5,
             returned_version_id: completed.returned_version_id,
             checksum: completed.checksum,
+            encryption: None,
         })
     }
 
@@ -185,8 +194,10 @@ impl Sqlite {
         upload_id: Uuid,
         requested_parts: &[MultipartCompletionPart],
         upload_checksum: Option<MultipartChecksumConfig>,
+        upload_encryption: Option<sse::StoredSse>,
         requested_checksum: &MultipartCompletionChecksum,
         default_checksum: MultipartChecksumConfig,
+        sse_s3_master_key: Option<&[u8; 32]>,
     ) -> SqliteResult<PreparedMultipartUpload> {
         let limit = i64::try_from(requested_parts.len())
             .map_err(|_| SqliteError::MultipartObjectTooLarge)?
@@ -207,6 +218,18 @@ impl Sqlite {
         let mut full_object_checksum = (checksum_config.checksum_type
             == ChecksumTypeKind::FullObject)
             .then(|| ChecksumAccumulator::new(checksum_config.algorithm));
+        let upload_encryption_active = upload_encryption
+            .clone()
+            .map(|stored| {
+                let master_key = sse_s3_master_key.ok_or_else(|| {
+                    SqliteError::Configuration(
+                        "SSE-S3 master key is required to complete encrypted multipart uploads"
+                            .to_string(),
+                    )
+                })?;
+                sse::active_sse_from_stored(master_key, stored).map_err(SqliteError::Configuration)
+            })
+            .transpose()?;
         let final_part_number = requested_parts.len();
         let mut offset = 0;
         let algorithm = upload_checksum.map(|checksum| checksum.algorithm);
@@ -241,6 +264,7 @@ impl Sqlite {
                     upload_id,
                     part.part_number,
                     full_object_checksum,
+                    upload_encryption_active.as_ref(),
                 )?;
             }
         }
@@ -262,6 +286,7 @@ impl Sqlite {
             md5,
             checksum,
             upload_checksum,
+            encryption: upload_encryption,
             parts: completed_parts,
         })
     }
@@ -334,10 +359,11 @@ impl Sqlite {
         upload_id: Uuid,
         part_number: i32,
         accumulator: &mut ChecksumAccumulator,
+        encryption: Option<&sse::ActiveSse>,
     ) -> SqliteResult<()> {
         let mut stmt = transaction.prepare_cached(
             "
-            SELECT body
+            SELECT body, sse_nonce, sse_tag
             FROM object_blob_chunk
             WHERE upload_id = ?1 AND part_number = ?2
             ORDER BY chunk_number;",
@@ -345,6 +371,16 @@ impl Sqlite {
         let mut rows = stmt.query((upload_id, part_number))?;
         while let Some(row) = rows.next()? {
             let body = row.get::<_, Vec<u8>>(0)?;
+            let sse_nonce = row.get::<_, Option<Vec<u8>>>(1)?;
+            let sse_tag = row.get::<_, Option<Vec<u8>>>(2)?;
+            let body = match (encryption, sse_nonce, sse_tag) {
+                (Some(encryption), Some(sse_nonce), Some(sse_tag)) => {
+                    sse::decrypt_chunk(encryption, &sse_nonce, &sse_tag, &body)
+                        .map_err(SqliteError::Configuration)?
+                }
+                (None, None, None) => body,
+                _ => return Err(SqliteError::ObjectBodyInconsistent),
+            };
             accumulator.update(&body);
         }
         Ok(())
@@ -448,13 +484,17 @@ impl Sqlite {
                 expires,
                 checksum_algorithm,
                 checksum_type,
-                checksum_value
+                checksum_value,
+                sse_algorithm,
+                sse_key_nonce,
+                sse_key_ciphertext,
+                sse_key_tag
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14);",
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18);",
         )?;
 
         let now = OffsetDateTime::now_utc();
-        Ok(stmt.execute((
+        Ok(stmt.execute(rusqlite::params![
             upload_id,
             now,
             now,
@@ -473,7 +513,23 @@ impl Sqlite {
             state.checksum.map(|checksum| checksum.algorithm),
             state.checksum.map(|checksum| checksum.checksum_type),
             Option::<String>::None,
-        ))?)
+            state
+                .encryption
+                .as_ref()
+                .map(|_| sse::SSE_S3_ALGORITHM_CODE),
+            state
+                .encryption
+                .as_ref()
+                .map(|encryption| encryption.key_nonce.as_slice()),
+            state
+                .encryption
+                .as_ref()
+                .map(|encryption| encryption.key_ciphertext.as_slice()),
+            state
+                .encryption
+                .as_ref()
+                .map(|encryption| encryption.key_tag.as_slice()),
+        ])?)
     }
 
     /// Fetches multipart upload state for validation and completion.
@@ -494,7 +550,11 @@ impl Sqlite {
                 expires,
                 checksum_algorithm,
                 checksum_type,
-                checksum_value
+                checksum_value,
+                sse_algorithm,
+                sse_key_nonce,
+                sse_key_ciphertext,
+                sse_key_tag
             FROM multipart_upload
             WHERE upload_id = ?1 AND bucket = ?2 AND key = ?3;",
         )?;
@@ -522,6 +582,12 @@ impl Sqlite {
                         row.get(6)?,
                         row.get(7)?,
                         row.get(8)?,
+                    )?,
+                    encryption: optional_stored_sse(
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
                     )?,
                 })
             })
@@ -693,7 +759,78 @@ impl Sqlite {
             &multipart.value,
             0,
             chunk_size,
+            multipart.encryption.as_ref(),
         )?;
+
+        Ok(inserted)
+    }
+
+    /// Inserts or replaces a multipart upload part whose chunks were encoded before the transaction.
+    pub(crate) fn put_multipart_with_encoded_chunks<I>(
+        transaction: &Transaction,
+        part: MultipartPartWrite,
+        chunks: I,
+    ) -> SqliteResult<usize>
+    where
+        I: IntoIterator<Item = super::EncodedBlobChunk>,
+    {
+        let mut delete_chunks = transaction.prepare_cached(
+            "
+            DELETE FROM object_blob_chunk
+            WHERE upload_id = ?1 AND part_number = ?2;",
+        )?;
+        delete_chunks.execute((part.upload_id, part.part_number))?;
+        drop(delete_chunks);
+
+        let mut delete_part = transaction.prepare_cached(
+            "
+            DELETE FROM object_part
+            WHERE upload_id = ?1 AND part_number = ?2;",
+        )?;
+        delete_part.execute((part.upload_id, part.part_number))?;
+        drop(delete_part);
+
+        let mut stmt = transaction.prepare_cached(
+            "
+            INSERT INTO object_part (
+                object_sequence,
+                upload_id,
+                is_multipart_part,
+                last_modified,
+                part_number,
+                start,
+                size,
+                md5,
+                checksum_algorithm,
+                checksum_type,
+                checksum_value
+            )
+            VALUES (NULL, ?1, 1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8);",
+        )?;
+
+        let inserted = stmt.execute((
+            part.upload_id,
+            part.last_modified,
+            part.part_number,
+            sql_size(part.size)?,
+            part.md5.as_deref(),
+            part.checksum.as_ref().map(PartChecksum::algorithm),
+            Option::<ChecksumTypeKind>::None,
+            part.checksum.as_ref().map(PartChecksum::as_str),
+        ))?;
+        drop(stmt);
+
+        let written_size = Self::put_encoded_object_blob_chunks(
+            transaction,
+            None,
+            Some(part.upload_id),
+            part.part_number,
+            0,
+            chunks,
+        )?;
+        if written_size != part.size {
+            return Err(SqliteError::ObjectBodyInconsistent);
+        }
 
         Ok(inserted)
     }
@@ -1000,6 +1137,7 @@ impl Sqlite {
                 size,
                 md5: row.get(3)?,
                 checksum: optional_part_checksum(row.get(4)?, row.get(5)?, row.get(6)?)?,
+                encryption: None,
             });
         }
 
@@ -1126,10 +1264,11 @@ mod tests {
     use crate::{
         checksum::{ChecksumAlgorithmKind, ChecksumTypeKind, FullObjectChecksum},
         sqlite::{
-            CompletedMultipartUploadRecord, CompletedObjectPart, MultipartChecksumConfig,
-            MultipartCompletion, MultipartCompletionChecksum, MultipartCompletionPart,
-            MultipartCompletionRequest, MultipartUploadState, NULL_VERSION_ID,
-            ObjectWriteConditions, Sqlite, SqliteError, SqliteResult, StoredChecksum,
+            CompletedMultipartUploadRecord, CompletedObjectPart, EncodedBlobChunk,
+            MultipartChecksumConfig, MultipartCompletion, MultipartCompletionChecksum,
+            MultipartCompletionPart, MultipartCompletionRequest, MultipartPartWrite,
+            MultipartUploadState, NULL_VERSION_ID, ObjectWriteConditions, Sqlite, SqliteError,
+            SqliteResult, StoredChecksum,
         },
     };
 
@@ -1153,6 +1292,7 @@ mod tests {
             cache_control: None,
             expires: None,
             checksum: None,
+            encryption: None,
         }
     }
 
@@ -1172,6 +1312,7 @@ mod tests {
             ),
             access_key: None,
             write_conditions: ObjectWriteConditions::default(),
+            sse_s3_master_key: None,
         }
     }
 
@@ -1267,6 +1408,90 @@ mod tests {
     }
 
     #[test]
+    fn put_multipart_with_encoded_chunks_replaces_part_rows() -> SqliteResult<()> {
+        let mut connection = open_schema()?;
+        let transaction = connection.transaction()?;
+        let upload_id = Uuid::new_v4();
+        Sqlite::create_multipart_upload(&transaction, upload_id, "bucket", "key", upload_state())?;
+        Sqlite::put_multipart_with_chunk_size(
+            &transaction,
+            &Multipart {
+                upload_id,
+                part_number: 1,
+                last_modified: time::OffsetDateTime::now_utc(),
+                value: b"old".to_vec(),
+                size: 3,
+                md5: Some("old-md5".to_string()),
+                checksum: None,
+                encryption: None,
+            },
+            2,
+        )?;
+
+        let inserted = Sqlite::put_multipart_with_encoded_chunks(
+            &transaction,
+            MultipartPartWrite {
+                upload_id,
+                part_number: 1,
+                last_modified: time::OffsetDateTime::now_utc(),
+                size: 5,
+                md5: Some("new-md5".to_string()),
+                checksum: None,
+            },
+            vec![
+                EncodedBlobChunk {
+                    chunk_number: 1,
+                    offset: 0,
+                    size: 2,
+                    body: b"ab".to_vec(),
+                    sse_nonce: None,
+                    sse_tag: None,
+                },
+                EncodedBlobChunk {
+                    chunk_number: 2,
+                    offset: 2,
+                    size: 3,
+                    body: b"cde".to_vec(),
+                    sse_nonce: None,
+                    sse_tag: None,
+                },
+            ],
+        )?;
+        let chunks = {
+            let mut stmt = transaction.prepare(
+                "
+                SELECT offset, size, body
+                FROM object_blob_chunk
+                WHERE upload_id = ?1 AND part_number = 1
+                ORDER BY offset;",
+            )?;
+            stmt.query_map([upload_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        assert_eq!(inserted, 1);
+        assert_eq!(
+            chunks,
+            vec![(0, 2, b"ab".to_vec()), (2, 3, b"cde".to_vec())]
+        );
+        assert_eq!(
+            transaction.query_row(
+                "SELECT size, md5 FROM object_part WHERE upload_id = ?1 AND part_number = 1;",
+                [upload_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )?,
+            (5, "new-md5".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
     fn completion_put_persists_object_parts_and_retries_from_completed_ledger() -> SqliteResult<()>
     {
         let mut connection = open_schema()?;
@@ -1291,6 +1516,7 @@ mod tests {
             size: 3,
             md5: Some(part_md5.to_string()),
             checksum: None,
+            encryption: None,
         };
         Sqlite::put_multipart_with_chunk_size(&transaction, &multipart, 2)?;
         let mut request = completion_request(

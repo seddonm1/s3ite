@@ -218,10 +218,6 @@ impl Sqlite {
         mut after_key: Option<String>,
         max_keys: usize,
     ) -> S3Result<KeyListing> {
-        let connection = self
-            .get_connection(bucket)
-            .await
-            .map_err(s3_error_from_sqlite)?;
         let mut keys = Vec::new();
         let mut common_prefixes = Vec::new();
         let mut seen_common_prefixes = HashSet::new();
@@ -231,22 +227,32 @@ impl Sqlite {
         let mut is_truncated = false;
         let list_batch_len = usize::try_from(LIST_BATCH_SIZE).map_err(S3Error::internal_error)?;
 
-        if max_keys > 0 {
+        if max_keys == 0 {
+            self.get_connection(bucket)
+                .await
+                .map_err(s3_error_from_sqlite)?;
+        } else {
             'pages: loop {
                 let prefix = prefix_filter.to_string();
                 let after_key_query = after_key.clone();
-                let summaries = connection
-                    .read(move |connection| {
-                        let transaction = connection.transaction()?;
-                        Self::list_objects(
-                            &transaction,
-                            Some(&prefix),
-                            after_key_query.as_deref(),
-                            LIST_BATCH_SIZE,
-                        )
-                    })
-                    .await
-                    .map_err(s3_error_from_sqlite)?;
+                let summaries = {
+                    let connection = self
+                        .get_connection(bucket)
+                        .await
+                        .map_err(s3_error_from_sqlite)?;
+                    connection
+                        .read(move |connection| {
+                            let transaction = connection.transaction()?;
+                            Self::list_objects(
+                                &transaction,
+                                Some(&prefix),
+                                after_key_query.as_deref(),
+                                LIST_BATCH_SIZE,
+                            )
+                        })
+                        .await
+                        .map_err(s3_error_from_sqlite)?
+                };
 
                 if summaries.is_empty() {
                     break;
@@ -327,10 +333,6 @@ impl Sqlite {
         mut after_version_id: Option<String>,
         max_keys: usize,
     ) -> S3Result<ObjectVersionListing> {
-        let connection = self
-            .get_connection(bucket)
-            .await
-            .map_err(s3_error_from_sqlite)?;
         let mut versions = Vec::new();
         let mut delete_markers = Vec::new();
         let mut common_prefixes = Vec::new();
@@ -342,18 +344,28 @@ impl Sqlite {
         let mut is_truncated = false;
         let list_batch_len = usize::try_from(LIST_BATCH_SIZE).map_err(S3Error::internal_error)?;
 
-        if max_keys > 0 {
+        if max_keys == 0 {
+            self.get_connection(bucket)
+                .await
+                .map_err(s3_error_from_sqlite)?;
+        } else {
             'pages: loop {
                 let prefix = prefix_filter.to_string();
                 let after_key_query = after_key.clone();
                 let after_version_id_query = after_version_id.clone();
-                let summaries = Self::list_version_page(
-                    &connection,
-                    prefix,
-                    after_key_query,
-                    after_version_id_query,
-                )
-                .await?;
+                let summaries = {
+                    let connection = self
+                        .get_connection(bucket)
+                        .await
+                        .map_err(s3_error_from_sqlite)?;
+                    Self::list_version_page(
+                        &connection,
+                        prefix,
+                        after_key_query,
+                        after_version_id_query,
+                    )
+                    .await?
+                };
 
                 if summaries.is_empty() {
                     break;

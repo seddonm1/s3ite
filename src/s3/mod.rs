@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt,
     ops::{Not, Range as ByteRange},
 };
@@ -16,22 +17,26 @@ use s3s::{
         BucketVersioningStatus, ChecksumMode, CommonPrefix, CompleteMultipartUploadInput,
         CompleteMultipartUploadOutput, CompletedPart, CopyObjectInput, CopyObjectOutput,
         CopyObjectResult, CopyPartResult, CopySource, CreateBucketInput, CreateBucketOutput,
-        CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketInput,
-        DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput,
-        DeleteObjectsOutput, DeletedObject, ETag, ETagCondition, Error as DeleteError,
-        GetBucketAclInput, GetBucketAclOutput, GetBucketLocationInput, GetBucketLocationOutput,
-        GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectAclInput, GetObjectAclOutput,
-        GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectAttributesParts,
-        GetObjectInput, GetObjectOutput, GetObjectTorrentInput, GetObjectTorrentOutput, Grant,
-        Grantee, HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, Initiator,
-        ListBucketsInput, ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput,
-        ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput,
-        ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput, MFADelete,
-        MetadataDirective, MultipartUpload, ObjectAttributes, ObjectCannedACL, ObjectPart, Owner,
-        Part, Permission, PutBucketAclInput, PutBucketAclOutput, PutBucketVersioningInput,
-        PutBucketVersioningOutput, PutObjectAclInput, PutObjectAclOutput, PutObjectInput,
-        PutObjectOutput, Range as S3Range, StorageClass, StreamingBlob, Timestamp, Type,
-        UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
+        CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketEncryptionInput,
+        DeleteBucketEncryptionOutput, DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput,
+        DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
+        ETagCondition, Error as DeleteError, GetBucketAclInput, GetBucketAclOutput,
+        GetBucketEncryptionInput, GetBucketEncryptionOutput, GetBucketLocationInput,
+        GetBucketLocationOutput, GetBucketVersioningInput, GetBucketVersioningOutput,
+        GetObjectAclInput, GetObjectAclOutput, GetObjectAttributesInput, GetObjectAttributesOutput,
+        GetObjectAttributesParts, GetObjectInput, GetObjectOutput, GetObjectTorrentInput,
+        GetObjectTorrentOutput, Grant, Grantee, HeadBucketInput, HeadBucketOutput, HeadObjectInput,
+        HeadObjectOutput, Initiator, ListBucketsInput, ListBucketsOutput,
+        ListMultipartUploadsInput, ListMultipartUploadsOutput, ListObjectVersionsInput,
+        ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
+        ListObjectsV2Output, ListPartsInput, ListPartsOutput, MFADelete, MetadataDirective,
+        MultipartUpload, ObjectAttributes, ObjectCannedACL, ObjectPart, Owner, Part, Permission,
+        PutBucketAclInput, PutBucketAclOutput, PutBucketEncryptionInput, PutBucketEncryptionOutput,
+        PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectAclInput, PutObjectAclOutput,
+        PutObjectInput, PutObjectOutput, Range as S3Range, ServerSideEncryption,
+        ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
+        StorageClass, StreamingBlob, Timestamp, Type, UploadPartCopyInput, UploadPartCopyOutput,
+        UploadPartInput, UploadPartOutput,
     },
     header::{
         CONTENT_MD5, CONTENT_TYPE, ETAG, X_AMZ_CONTENT_SHA256, X_AMZ_DECODED_CONTENT_LENGTH,
@@ -50,18 +55,19 @@ use crate::checksum::{ChecksumAlgorithmKind, ChecksumTypeKind};
 use crate::sqlite::{
     BucketVersioningState, CompletedObjectPart, KeyMetadata, KeyValue, Multipart,
     MultipartChecksumConfig, MultipartCompletion, MultipartCompletionPart,
-    MultipartCompletionRequest, MultipartUploadState, MultipartUploadSummary, ObjectBodyReference,
-    ObjectDeleteOutcome, ObjectTagCondition, ObjectWriteConditions, PartChecksum, Sqlite,
-    SqliteError, SqliteResult, StoredChecksum,
+    MultipartCompletionRequest, MultipartPartWrite, MultipartUploadState, MultipartUploadSummary,
+    ObjectBodyReference, ObjectDeleteOutcome, ObjectTagCondition, ObjectWriteConditions,
+    PartChecksum, Sqlite, SqliteError, SqliteResult, StoredChecksum,
 };
+use crate::sse::{self, ActiveSse};
 
 const LIST_BATCH_SIZE: i64 = 1024;
 const CONTINUATION_TOKEN_PREFIX: &str = "s3ite:v1:";
 const OWNER_DISPLAY_NAME: &str = "s3ite";
 const OWNER_ID: &str = "s3ite";
 const S3_SINGLE_REQUEST_BODY_MAX: i64 = 5_i64 * 1024 * 1024 * 1024;
+const SSE_HEADER: &str = "x-amz-server-side-encryption";
 const UNSUPPORTED_SSE_HEADERS: &[&str] = &[
-    "x-amz-server-side-encryption",
     "x-amz-server-side-encryption-aws-kms-key-id",
     "x-amz-server-side-encryption-context",
     "x-amz-server-side-encryption-bucket-key-enabled",
@@ -108,6 +114,7 @@ mod bucket;
 mod checksum;
 mod copy;
 mod delete;
+mod encrypted_body;
 mod error;
 mod get;
 mod list;
@@ -124,6 +131,7 @@ use self::{
         multipart_checksum_config, object_checksum_for_part, object_write_checksum_from_value,
         part_checksum_accumulator, payload_checksum_accumulator, validate_content_md5,
     },
+    encrypted_body::{read_object_body_encrypted, read_part_body_encrypted},
     error::{
         not_found_delete_marker_error, not_modified_error, s3_error, s3_error_from_sqlite,
         s3_error_with_message,
@@ -152,22 +160,167 @@ pub(super) fn normalize_content_encoding(content_encoding: Option<String>) -> Op
     values.is_empty().not().then(|| values.join(", "))
 }
 
-/// Rejects server-side-encryption headers until encrypted storage is implemented.
-///
-/// Accepting these headers while persisting plaintext would be misleading, so
-/// every operation that could otherwise observe or mutate object data rejects
-/// the request before touching storage.
+/// Decodes SDK-encoded UTF-8 metadata values before storing them.
+pub(super) fn normalize_metadata(
+    metadata: Option<HashMap<String, String>>,
+) -> Option<HashMap<String, String>> {
+    metadata.map(|metadata| {
+        metadata
+            .into_iter()
+            .map(|(key, value)| (key, decode_rfc2047_metadata_value(&value)))
+            .collect()
+    })
+}
+
+fn decode_rfc2047_metadata_value(value: &str) -> String {
+    decode_rfc2047_word(value).unwrap_or_else(|| value.to_string())
+}
+
+fn decode_rfc2047_word(value: &str) -> Option<String> {
+    let encoded = value.strip_prefix("=?")?.strip_suffix("?=")?;
+    let mut parts = encoded.splitn(3, '?');
+    let charset = parts.next()?;
+    let encoding = parts.next()?;
+    let payload = parts.next()?;
+    if charset.eq_ignore_ascii_case("utf-8").not() && charset.eq_ignore_ascii_case("us-ascii").not()
+    {
+        return None;
+    }
+
+    let bytes = match encoding {
+        encoding if encoding.eq_ignore_ascii_case("b") => {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(payload)
+                .ok()?
+        }
+        encoding if encoding.eq_ignore_ascii_case("q") => decode_rfc2047_q(payload)?,
+        _ => return None,
+    };
+    String::from_utf8(bytes).ok()
+}
+
+fn decode_rfc2047_q(payload: &str) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(payload.len());
+    let mut iter = payload.as_bytes().iter().copied();
+    while let Some(byte) = iter.next() {
+        match byte {
+            b'_' => bytes.push(b' '),
+            b'=' => {
+                let high = iter.next()?;
+                let low = iter.next()?;
+                let high = hex_digit(high)?;
+                let low = hex_digit(low)?;
+                bytes.push((high << 4) | low);
+            }
+            byte => bytes.push(byte),
+        }
+    }
+    Some(bytes)
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Rejects request-level SSE headers for operations where they do not apply.
 fn validate_no_sse_headers(headers: &HeaderMap) -> S3Result<()> {
+    if headers.contains_key(SSE_HEADER) {
+        return Err(s3_error_with_message(
+            S3ErrorCode::InvalidArgument,
+            "server-side encryption headers are not valid for this operation",
+        ));
+    }
+    validate_no_unsupported_sse_headers(headers)
+}
+
+/// Rejects SSE variants this backend does not implement.
+fn validate_no_unsupported_sse_headers(headers: &HeaderMap) -> S3Result<()> {
     if UNSUPPORTED_SSE_HEADERS
         .iter()
         .any(|header| headers.contains_key(*header))
     {
         return Err(s3_error_with_message(
-            S3ErrorCode::NotImplemented,
-            "server-side encryption is not supported",
+            S3ErrorCode::InvalidArgument,
+            "only SSE-S3 with AES256 is supported",
         ));
     }
     Ok(())
+}
+
+/// Validates object-write SSE settings and returns whether AES256 was requested.
+fn requested_sse_s3(
+    server_side_encryption: Option<&ServerSideEncryption>,
+    has_kms_settings: bool,
+    has_sse_customer_settings: bool,
+    has_bucket_key_setting: bool,
+) -> S3Result<bool> {
+    if has_sse_customer_settings || has_kms_settings || has_bucket_key_setting {
+        return Err(s3_error_with_message(
+            S3ErrorCode::InvalidArgument,
+            "only SSE-S3 with AES256 is supported",
+        ));
+    }
+
+    match server_side_encryption {
+        Some(algorithm) if algorithm.as_str() == sse::SSE_S3_ALGORITHM => Ok(true),
+        Some(_) => Err(s3_error_with_message(
+            S3ErrorCode::InvalidArgument,
+            "server-side encryption must be AES256",
+        )),
+        None => Ok(false),
+    }
+}
+
+/// Resolves explicit SSE-S3 and bucket default encryption for an object write.
+async fn resolve_write_encryption(
+    sqlite: &Sqlite,
+    bucket: &str,
+    explicit_sse_s3: bool,
+) -> S3Result<Option<ActiveSse>> {
+    let use_sse_s3 = if explicit_sse_s3 {
+        true
+    } else {
+        let connection = sqlite
+            .get_connection(bucket)
+            .await
+            .map_err(s3_error_from_sqlite)?;
+        connection
+            .read(|connection| {
+                let transaction = connection.transaction()?;
+                Sqlite::get_bucket_default_sse_s3(&transaction)
+            })
+            .await
+            .map_err(s3_error_from_sqlite)?
+    };
+
+    if use_sse_s3.not() {
+        return Ok(None);
+    }
+
+    let master_key = sqlite.config.sse_s3_master_key().ok_or_else(|| {
+        s3_error_with_message(S3ErrorCode::InvalidRequest, "SSE-S3 is not configured")
+    })?;
+    sse::new_active_sse(&master_key)
+        .map(Some)
+        .map_err(|_| s3_error_with_message(InternalError, "SSE-S3 encryption failed"))
+}
+
+/// Returns the response enum for encrypted object outputs.
+fn sse_s3_output(encrypted: bool) -> Option<ServerSideEncryption> {
+    encrypted.then(|| ServerSideEncryption::from_static(ServerSideEncryption::AES256))
+}
+
+/// Returns the configured SSE-S3 master key or a protocol error.
+fn require_sse_s3_master_key(sqlite: &Sqlite) -> S3Result<[u8; 32]> {
+    sqlite.config.sse_s3_master_key().ok_or_else(|| {
+        s3_error_with_message(S3ErrorCode::InvalidRequest, "SSE-S3 is not configured")
+    })
 }
 
 /// Returns whether request headers describe an AWS `SigV4` streaming body.
@@ -377,6 +530,16 @@ impl S3 for Sqlite {
         bucket::delete_bucket(self, req).await
     }
 
+    /// Deletes a bucket's default encryption configuration.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id(&req),
+            client_ip = %client_ip(&req), bucket = %req.input.bucket))]
+    async fn delete_bucket_encryption(
+        &self,
+        req: S3Request<DeleteBucketEncryptionInput>,
+    ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
+        bucket::delete_bucket_encryption(self, req).await
+    }
+
     /// Deletes an object by key.
     #[tracing::instrument(
         skip_all,
@@ -420,6 +583,16 @@ impl S3 for Sqlite {
         req: S3Request<GetBucketLocationInput>,
     ) -> S3Result<S3Response<GetBucketLocationOutput>> {
         bucket::get_bucket_location(self, req).await
+    }
+
+    /// Returns a bucket's default encryption configuration.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id(&req),
+            client_ip = %client_ip(&req), bucket = %req.input.bucket))]
+    async fn get_bucket_encryption(
+        &self,
+        req: S3Request<GetBucketEncryptionInput>,
+    ) -> S3Result<S3Response<GetBucketEncryptionOutput>> {
+        bucket::get_bucket_encryption(self, req).await
     }
 
     /// Returns the fixed owner ACL for an existing bucket.
@@ -560,6 +733,16 @@ impl S3 for Sqlite {
         req: S3Request<PutBucketAclInput>,
     ) -> S3Result<S3Response<PutBucketAclOutput>> {
         owner::put_bucket_acl(self, req).await
+    }
+
+    /// Updates a bucket's default encryption configuration.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id(&req),
+            client_ip = %client_ip(&req), bucket = %req.input.bucket))]
+    async fn put_bucket_encryption(
+        &self,
+        req: S3Request<PutBucketEncryptionInput>,
+    ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
+        bucket::put_bucket_encryption(self, req).await
     }
 
     /// Lists all open bucket databases.
@@ -827,6 +1010,7 @@ mod tests {
             last_modified,
             md5: md5.map(str::to_string),
             checksum: None,
+            encryption: None,
             is_latest: true,
             is_delete_marker: false,
         }
@@ -864,9 +1048,55 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_rfc2047_metadata_values() {
+        let metadata = HashMap::from([
+            (
+                "base64".to_string(),
+                "=?UTF-8?B?SGVsbG8gV29ybGTDqQ==?=".to_string(),
+            ),
+            (
+                "quoted".to_string(),
+                "=?utf-8?q?Hello_World=C3=A9?=".to_string(),
+            ),
+            ("plain".to_string(), "Hello World".to_string()),
+            ("invalid".to_string(), "=?UTF-8?B?not base64!?=".to_string()),
+        ]);
+
+        let normalized = normalize_metadata(Some(metadata)).expect("metadata remains present");
+        assert_eq!(
+            normalized.get("base64").map(String::as_str),
+            Some("Hello World\u{e9}")
+        );
+        assert_eq!(
+            normalized.get("quoted").map(String::as_str),
+            Some("Hello World\u{e9}")
+        );
+        assert_eq!(
+            normalized.get("plain").map(String::as_str),
+            Some("Hello World")
+        );
+        assert_eq!(
+            normalized.get("invalid").map(String::as_str),
+            Some("=?UTF-8?B?not base64!?=")
+        );
+        assert_eq!(normalize_metadata(None), None);
+    }
+
+    #[test]
     fn rejects_server_side_encryption_headers() {
         let mut headers = HeaderMap::new();
         assert!(validate_no_sse_headers(&headers).is_ok());
+
+        headers.insert(SSE_HEADER, hyper::http::HeaderValue::from_static("AES256"));
+        let error = validate_no_sse_headers(&headers).err();
+        assert!(matches!(
+            error.as_ref().map(S3Error::code),
+            Some(&S3ErrorCode::InvalidArgument)
+        ));
+        assert!(
+            format!("{error:?}").contains("not valid for this operation"),
+            "error should explain operation-level SSE rejection"
+        );
 
         for header in UNSUPPORTED_SSE_HEADERS {
             headers.clear();
@@ -874,10 +1104,10 @@ mod tests {
             let error = validate_no_sse_headers(&headers).err();
             assert!(matches!(
                 error.as_ref().map(S3Error::code),
-                Some(&S3ErrorCode::NotImplemented)
+                Some(&S3ErrorCode::InvalidArgument)
             ));
             assert!(
-                format!("{error:?}").contains("server-side encryption is not supported"),
+                format!("{error:?}").contains("only SSE-S3 with AES256 is supported"),
                 "error should explain unsupported SSE header {header}"
             );
         }

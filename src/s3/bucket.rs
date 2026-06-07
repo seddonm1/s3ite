@@ -1,12 +1,16 @@
 use super::{
     Bucket, BucketAclRequest, BucketVersioningState, BucketVersioningStatus, CreateBucketInput,
-    CreateBucketOutput, DeleteBucketInput, DeleteBucketOutput, GetBucketLocationInput,
-    GetBucketLocationOutput, GetBucketVersioningInput, GetBucketVersioningOutput, HeadBucketInput,
-    HeadBucketOutput, InternalError, ListBucketsInput, ListBucketsOutput, MFADelete, Not,
+    CreateBucketOutput, DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput,
+    DeleteBucketInput, DeleteBucketOutput, GetBucketEncryptionInput, GetBucketEncryptionOutput,
+    GetBucketLocationInput, GetBucketLocationOutput, GetBucketVersioningInput,
+    GetBucketVersioningOutput, HeadBucketInput, HeadBucketOutput, InternalError, ListBucketsInput,
+    ListBucketsOutput, MFADelete, Not, PutBucketEncryptionInput, PutBucketEncryptionOutput,
     PutBucketVersioningInput, PutBucketVersioningOutput, S3Error, S3ErrorCode, S3Request,
-    S3Response, S3Result, Sqlite, SqliteError, Timestamp, decode_continuation_token,
-    encode_continuation_token, fs, list_limit, s3_error, s3_error_from_sqlite,
-    s3_error_with_message, validate_bucket_acl,
+    S3Response, S3Result, ServerSideEncryption, ServerSideEncryptionByDefault,
+    ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Sqlite, SqliteError, Timestamp,
+    decode_continuation_token, encode_continuation_token, fs, list_limit,
+    require_sse_s3_master_key, s3_error, s3_error_from_sqlite, s3_error_with_message,
+    validate_bucket_acl,
 };
 
 /// Returns whether a bucket name satisfies S3 DNS-compatible naming rules.
@@ -196,6 +200,142 @@ pub(super) async fn get_bucket_versioning(
         status,
         ..Default::default()
     }))
+}
+
+/// Deletes the bucket's default SSE-S3 configuration.
+pub(super) async fn delete_bucket_encryption(
+    sqlite: &Sqlite,
+    req: S3Request<DeleteBucketEncryptionInput>,
+) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
+    let DeleteBucketEncryptionInput { bucket, .. } = req.input;
+
+    sqlite
+        .validate_mutable_bucket(&bucket)
+        .map_err(s3_error_from_sqlite)?;
+    let connection = sqlite
+        .get_connection(&bucket)
+        .await
+        .map_err(s3_error_from_sqlite)?;
+    connection
+        .write(|connection| {
+            let transaction = connection.transaction()?;
+            Sqlite::put_bucket_default_sse_s3(&transaction, false)?;
+            Ok(transaction.commit()?)
+        })
+        .await
+        .map_err(s3_error_from_sqlite)?;
+
+    Ok(S3Response::new(DeleteBucketEncryptionOutput {}))
+}
+
+/// Returns the bucket's default SSE-S3 configuration.
+pub(super) async fn get_bucket_encryption(
+    sqlite: &Sqlite,
+    req: S3Request<GetBucketEncryptionInput>,
+) -> S3Result<S3Response<GetBucketEncryptionOutput>> {
+    let GetBucketEncryptionInput { bucket, .. } = req.input;
+    let connection = sqlite
+        .get_connection(&bucket)
+        .await
+        .map_err(s3_error_from_sqlite)?;
+    let enabled = connection
+        .read(|connection| {
+            let transaction = connection.transaction()?;
+            Sqlite::get_bucket_default_sse_s3(&transaction)
+        })
+        .await
+        .map_err(s3_error_from_sqlite)?;
+
+    if enabled.not() {
+        let code = "ServerSideEncryptionConfigurationNotFoundError"
+            .parse()
+            .unwrap_or_else(|err| match err {});
+        return Err(s3_error(code));
+    }
+
+    Ok(S3Response::new(GetBucketEncryptionOutput {
+        server_side_encryption_configuration: Some(sse_s3_bucket_encryption_configuration()),
+    }))
+}
+
+/// Updates the bucket's default encryption configuration.
+pub(super) async fn put_bucket_encryption(
+    sqlite: &Sqlite,
+    req: S3Request<PutBucketEncryptionInput>,
+) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
+    let PutBucketEncryptionInput {
+        bucket,
+        server_side_encryption_configuration,
+        ..
+    } = req.input;
+
+    sqlite
+        .validate_mutable_bucket(&bucket)
+        .map_err(s3_error_from_sqlite)?;
+    validate_sse_s3_bucket_encryption_configuration(&server_side_encryption_configuration)?;
+    require_sse_s3_master_key(sqlite)?;
+
+    let connection = sqlite
+        .get_connection(&bucket)
+        .await
+        .map_err(s3_error_from_sqlite)?;
+    connection
+        .write(|connection| {
+            let transaction = connection.transaction()?;
+            Sqlite::put_bucket_default_sse_s3(&transaction, true)?;
+            Ok(transaction.commit()?)
+        })
+        .await
+        .map_err(s3_error_from_sqlite)?;
+
+    Ok(S3Response::new(PutBucketEncryptionOutput {}))
+}
+
+fn sse_s3_bucket_encryption_configuration() -> ServerSideEncryptionConfiguration {
+    ServerSideEncryptionConfiguration {
+        rules: vec![ServerSideEncryptionRule {
+            apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
+                kms_master_key_id: None,
+                sse_algorithm: ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+            }),
+            bucket_key_enabled: None,
+        }],
+    }
+}
+
+fn validate_sse_s3_bucket_encryption_configuration(
+    configuration: &ServerSideEncryptionConfiguration,
+) -> S3Result<()> {
+    let [rule] = configuration.rules.as_slice() else {
+        return Err(s3_error_with_message(
+            S3ErrorCode::InvalidArgument,
+            "bucket encryption must contain exactly one rule",
+        ));
+    };
+
+    if rule.bucket_key_enabled.unwrap_or(false) {
+        return Err(s3_error_with_message(
+            S3ErrorCode::InvalidArgument,
+            "S3 bucket keys are not supported",
+        ));
+    }
+
+    let Some(default) = rule.apply_server_side_encryption_by_default.as_ref() else {
+        return Err(s3_error_with_message(
+            S3ErrorCode::InvalidArgument,
+            "bucket encryption rule must specify an SSE algorithm",
+        ));
+    };
+    if default.kms_master_key_id.is_some()
+        || default.sse_algorithm.as_str() != ServerSideEncryption::AES256
+    {
+        return Err(s3_error_with_message(
+            S3ErrorCode::InvalidArgument,
+            "bucket default encryption must be AES256",
+        ));
+    }
+
+    Ok(())
 }
 
 /// Updates the bucket versioning state.

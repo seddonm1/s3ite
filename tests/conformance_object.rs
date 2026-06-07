@@ -6,6 +6,8 @@
 
 mod support;
 
+use std::collections::HashMap;
+
 use anyhow::{Result, bail};
 use aws_sdk_s3::{
     Client,
@@ -13,6 +15,7 @@ use aws_sdk_s3::{
     types::{Delete, ObjectIdentifier},
 };
 use reqwest::{Method, StatusCode};
+use rusqlite::Connection;
 use serial_test::serial;
 use support::{
     assertions::{assert_error_contains, assert_status},
@@ -905,6 +908,35 @@ async fn test_object_set_get_metadata_overwrite_to_empty() -> Result<()> {
     Ok(())
 }
 
+/// Verifies RFC-2047 encoded user metadata is decoded before storage.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_object_rfc2047_metadata_is_decoded_before_storage() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-obj");
+    let key = "rfc2047-metadata";
+
+    create_bucket(&client, &bucket).await?;
+    let response = raw_http::signed_request_with_headers(
+        &server,
+        Method::PUT,
+        &object_path(&bucket, key),
+        b"bar".to_vec(),
+        &[("x-amz-meta-meta1", "=?UTF-8?B?SGVsbG8gV29ybGTDqQ==?=")],
+    )
+    .await?;
+    assert_status(&response, StatusCode::OK);
+
+    let metadata = stored_object_metadata(&server, &bucket, key)?;
+    assert_eq!(
+        metadata.get("meta1").map(String::as_str),
+        Some("Hello World\u{e9}")
+    );
+
+    Ok(())
+}
+
 /// Verifies a byte buffer upload is readable as the original body.
 #[tokio::test]
 #[serial(conformance)]
@@ -1181,6 +1213,35 @@ async fn set_get_metadata_in_bucket(
         .and_then(|metadata| metadata.get("meta1"))
         .ok_or_else(|| anyhow::anyhow!("object response missing meta1 metadata"))?;
     Ok(metadata.to_owned())
+}
+
+fn stored_object_metadata(
+    server: &TestServer,
+    bucket: &str,
+    key: &str,
+) -> Result<HashMap<String, String>> {
+    let path = server.data_root().join(format!("{bucket}.sqlite3"));
+    let connection = Connection::open(path)?;
+    let raw: String = connection.query_row(
+        "
+        SELECT metadata
+        FROM object_version
+        WHERE key = ?1 AND is_delete_marker = 0
+        ORDER BY sequence DESC
+        LIMIT 1;
+        ",
+        [key],
+        |row| row.get(0),
+    )?;
+    Ok(serde_json::from_str(&raw)?)
+}
+
+fn object_path(bucket: &str, key: &str) -> String {
+    format!(
+        "/{}/{}",
+        raw_http::path_segment(bucket),
+        raw_http::path_segment(key)
+    )
 }
 
 fn now_seconds() -> Result<i64> {

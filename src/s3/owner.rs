@@ -176,10 +176,6 @@ pub(super) async fn put_bucket_acl(
     } = req.input;
 
     sqlite
-        .get_connection(&bucket)
-        .await
-        .map_err(s3_error_from_sqlite)?;
-    sqlite
         .validate_mutable_bucket(&bucket)
         .map_err(s3_error_from_sqlite)?;
     validate_bucket_acl(&BucketAclRequest {
@@ -196,6 +192,10 @@ pub(super) async fn put_bucket_acl(
         .filter(|value| *value)
         .count(),
     })?;
+    sqlite
+        .get_connection(&bucket)
+        .await
+        .map_err(s3_error_from_sqlite)?;
 
     Ok(S3Response::new(PutBucketAclOutput::default()))
 }
@@ -219,12 +219,27 @@ pub(super) async fn put_object_acl(
         ..
     } = req.input;
 
+    sqlite
+        .validate_mutable_bucket(&bucket)
+        .map_err(s3_error_from_sqlite)?;
+    validate_object_acl(&ObjectAclRequest {
+        acl: acl.as_ref(),
+        has_access_control_policy: access_control_policy.is_some(),
+        grant_header_count: [
+            grant_full_control.is_some(),
+            grant_read.is_some(),
+            grant_read_acp.is_some(),
+            grant_write.is_some(),
+            grant_write_acp.is_some(),
+        ]
+        .into_iter()
+        .filter(|value| *value)
+        .count(),
+    })?;
+
     let connection = sqlite
         .get_connection(&bucket)
         .await
-        .map_err(s3_error_from_sqlite)?;
-    sqlite
-        .validate_mutable_bucket(&bucket)
         .map_err(s3_error_from_sqlite)?;
     connection
         .read(move |connection| {
@@ -241,21 +256,6 @@ pub(super) async fn put_object_acl(
         })
         .await
         .map_err(s3_error_from_sqlite)?;
-
-    validate_object_acl(&ObjectAclRequest {
-        acl: acl.as_ref(),
-        has_access_control_policy: access_control_policy.is_some(),
-        grant_header_count: [
-            grant_full_control.is_some(),
-            grant_read.is_some(),
-            grant_read_acp.is_some(),
-            grant_write.is_some(),
-            grant_write_acp.is_some(),
-        ]
-        .into_iter()
-        .filter(|value| *value)
-        .count(),
-    })?;
 
     Ok(S3Response::new(PutObjectAclOutput::default()))
 }

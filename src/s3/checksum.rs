@@ -743,9 +743,11 @@ mod tests {
                 last_modified: time::OffsetDateTime::UNIX_EPOCH,
                 md5: Some("md5".to_string()),
                 checksum: None,
+                encryption: None,
                 is_latest: true,
                 is_delete_marker: false,
             },
+            encryption: None,
         };
 
         assert!(matches!(

@@ -10,7 +10,9 @@ keywords = ["s3", "sqlite"]
 categories = ["database"]
 
 [dependencies]
+aes-gcm = "0.10"
 async-trait = "0.1.89"
+base64 = "0.22"
 bytes = "1.11.1"
 clap = { version = "4.6.1", features = ["derive"] }
 futures = "0.3.32"

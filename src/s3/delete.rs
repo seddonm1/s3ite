@@ -237,6 +237,7 @@ mod tests {
             last_modified,
             md5: md5.map(str::to_string),
             checksum: None,
+            encryption: None,
             is_latest: true,
             is_delete_marker: false,
         }

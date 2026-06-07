@@ -65,6 +65,10 @@ struct ConfigArgs {
     #[clap(long, requires = "access_key")]
     secret_key: Option<String>,
 
+    /// Base64-encoded 32-byte master key used for SSE-S3 object encryption.
+    #[clap(long)]
+    sse_s3_key: Option<String>,
+
     /// The domain to use to allow parsing virtual-hosted-style requests.
     #[clap(long)]
     domain_name: Option<String>,
@@ -175,6 +179,9 @@ pub struct Config {
     /// The secret access key that is used to authenticate for this service.
     pub secret_key: Option<String>,
 
+    /// Base64-encoded 32-byte master key used for SSE-S3 object encryption.
+    pub sse_s3_key: Option<String>,
+
     /// Enforces a limit on the concurrent number of requests the underlying service can handle.
     /// This can be tuned depending on infrastructure as SSD/HDD will deal with resource contention very differently.
     #[serde(default = "default_concurrency_limit")]
@@ -251,6 +258,7 @@ impl Default for Config {
             port: default_port(),
             access_key: None,
             secret_key: None,
+            sse_s3_key: None,
             concurrency_limit: default_concurrency_limit(),
             readers: default_readers(),
             blob_readers: default_blob_readers(),
@@ -320,6 +328,9 @@ impl Config {
         }
         if let Some(secret_key) = args.secret_key {
             self.secret_key = Some(secret_key);
+        }
+        if let Some(sse_s3_key) = args.sse_s3_key {
+            self.sse_s3_key = Some(sse_s3_key);
         }
         if let Some(cors) = args.cors {
             self.cors = cors.into();
@@ -405,7 +416,17 @@ impl Config {
         self.cors_mode()
             .validate()
             .map_err(ConfigError::Configuration)?;
+        if let Some(key) = self.sse_s3_key.as_deref() {
+            crate::sse::parse_master_key(key).map_err(ConfigError::Configuration)?;
+        }
         self.cors_layer().map(|_| ())
+    }
+
+    /// Returns the decoded SSE-S3 master key when configured.
+    pub(crate) fn sse_s3_master_key(&self) -> Option<[u8; 32]> {
+        self.sse_s3_key
+            .as_deref()
+            .and_then(|key| crate::sse::parse_master_key(key).ok())
     }
 
     /// Builds the configured `CORS` middleware layer.

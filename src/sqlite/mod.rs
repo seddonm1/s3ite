@@ -21,10 +21,10 @@ pub(crate) use crate::checksum::{
     MultipartChecksumConfig, MultipartCompletionChecksum, PartChecksum, StoredChecksum,
 };
 use crate::database::BucketConnection;
+use crate::sse::{ActiveSse, SSE_S3_ALGORITHM_CODE, StoredSse};
 
 mod bucket;
 mod checksum;
-mod copy;
 mod delete;
 mod error;
 mod get;
@@ -41,13 +41,14 @@ pub use self::error::{SqliteError, SqliteResult};
 
 pub(crate) const NULL_VERSION_ID: &str = "null";
 
-const BUCKET_SCHEMA_VERSION: i32 = 8;
+const BUCKET_SCHEMA_VERSION: i32 = 9;
 pub(crate) const DEFAULT_OBJECT_BLOB_CHUNK_SIZE: usize = 128 * 1024 * 1024;
 const BUCKET_SCHEMA_SQL: &str = "
 -- Singleton bucket metadata, currently the object versioning state.
 CREATE TABLE bucket_state (
     id INTEGER PRIMARY KEY CHECK(id = 1),
-    versioning_state INTEGER NOT NULL CHECK(versioning_state IN (0, 1, 2))
+    versioning_state INTEGER NOT NULL CHECK(versioning_state IN (0, 1, 2)),
+    default_sse_algorithm INTEGER CHECK(default_sse_algorithm IN (1))
 ) STRICT;
 
 -- Object metadata for every live version and delete marker.
@@ -68,7 +69,26 @@ CREATE TABLE object_version (
     checksum_algorithm INTEGER CHECK(checksum_algorithm BETWEEN 1 AND 5),
     checksum_type INTEGER CHECK(checksum_type BETWEEN 1 AND 2),
     checksum_value TEXT,
+    sse_algorithm INTEGER CHECK(sse_algorithm IN (1)),
+    sse_key_nonce BLOB,
+    sse_key_ciphertext BLOB,
+    sse_key_tag BLOB,
     UNIQUE(key, version_id),
+    CHECK (
+        (
+            sse_algorithm IS NULL
+            AND sse_key_nonce IS NULL
+            AND sse_key_ciphertext IS NULL
+            AND sse_key_tag IS NULL
+        )
+        OR
+        (
+            sse_algorithm = 1
+            AND length(sse_key_nonce) = 12
+            AND length(sse_key_ciphertext) = 32
+            AND length(sse_key_tag) = 16
+        )
+    ),
     CHECK (
         (
             is_delete_marker = 0
@@ -90,6 +110,10 @@ CREATE TABLE object_version (
             AND checksum_algorithm IS NULL
             AND checksum_type IS NULL
             AND checksum_value IS NULL
+            AND sse_algorithm IS NULL
+            AND sse_key_nonce IS NULL
+            AND sse_key_ciphertext IS NULL
+            AND sse_key_tag IS NULL
         )
     )
 ) STRICT;
@@ -119,7 +143,26 @@ CREATE TABLE multipart_upload (
     checksum_algorithm INTEGER CHECK(checksum_algorithm BETWEEN 1 AND 5),
     checksum_type INTEGER CHECK(checksum_type BETWEEN 1 AND 2),
     checksum_value TEXT,
+    sse_algorithm INTEGER CHECK(sse_algorithm IN (1)),
+    sse_key_nonce BLOB,
+    sse_key_ciphertext BLOB,
+    sse_key_tag BLOB,
     UNIQUE(upload_id, bucket, key),
+    CHECK (
+        (
+            sse_algorithm IS NULL
+            AND sse_key_nonce IS NULL
+            AND sse_key_ciphertext IS NULL
+            AND sse_key_tag IS NULL
+        )
+        OR
+        (
+            sse_algorithm = 1
+            AND length(sse_key_nonce) = 12
+            AND length(sse_key_ciphertext) = 32
+            AND length(sse_key_tag) = 16
+        )
+    ),
     CHECK (
         (
             checksum_algorithm IS NULL
@@ -217,6 +260,8 @@ CREATE TABLE object_blob_chunk (
     offset INTEGER NOT NULL CHECK(offset >= 0),
     size INTEGER NOT NULL CHECK(size >= 0),
     body BLOB NOT NULL,
+    sse_nonce BLOB,
+    sse_tag BLOB,
     FOREIGN KEY (object_sequence) REFERENCES object_version (sequence) ON DELETE CASCADE,
     FOREIGN KEY (upload_id) REFERENCES multipart_upload (upload_id) ON DELETE CASCADE,
     FOREIGN KEY (object_sequence, part_number)
@@ -236,6 +281,17 @@ CREATE TABLE object_blob_chunk (
         (
             object_sequence IS NULL
             AND upload_id IS NOT NULL
+        )
+    ),
+    CHECK (
+        (
+            sse_nonce IS NULL
+            AND sse_tag IS NULL
+        )
+        OR
+        (
+            length(sse_nonce) = 12
+            AND length(sse_tag) = 16
         )
     ),
     CHECK (size = length(body))
@@ -273,7 +329,7 @@ CREATE INDEX completed_multipart_upload_expiry
 INSERT INTO bucket_state (id, versioning_state)
 VALUES (1, 0);
 
-PRAGMA user_version = 8;
+PRAGMA user_version = 9;
 ";
 
 /// Reads a nonnegative object size column from a row.
@@ -308,6 +364,28 @@ fn sql_limit(value: i64) -> rusqlite::Result<i64> {
 /// Reads an integer row column as a `SQLite` boolean.
 fn row_bool(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<bool> {
     Ok(row.get::<_, i32>(idx)? != 0)
+}
+
+/// Reads nullable SSE-S3 envelope metadata from contiguous row columns.
+fn optional_stored_sse(
+    algorithm: Option<i64>,
+    key_nonce: Option<Vec<u8>>,
+    key_ciphertext: Option<Vec<u8>>,
+    key_tag: Option<Vec<u8>>,
+) -> rusqlite::Result<Option<StoredSse>> {
+    match (algorithm, key_nonce, key_ciphertext, key_tag) {
+        (None, None, None, None) => Ok(None),
+        (Some(algorithm), Some(key_nonce), Some(key_ciphertext), Some(key_tag))
+            if algorithm == SSE_S3_ALGORITHM_CODE =>
+        {
+            Ok(Some(StoredSse {
+                key_nonce,
+                key_ciphertext,
+                key_tag,
+            }))
+        }
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
 }
 
 /// Converts a configured TTL into an expiration cutoff timestamp.
@@ -441,6 +519,18 @@ pub(crate) struct KeyValue {
     pub(crate) key: String,
     pub(crate) value: Option<Vec<u8>>,
     pub(crate) key_metadata: KeyMetadata,
+    pub(crate) encryption: Option<ActiveSse>,
+}
+
+/// Pre-encoded object blob chunk ready to insert into storage.
+#[derive(Debug)]
+pub(crate) struct EncodedBlobChunk {
+    pub(crate) chunk_number: i32,
+    pub(crate) offset: i64,
+    pub(crate) size: i64,
+    pub(crate) body: Vec<u8>,
+    pub(crate) sse_nonce: Option<Vec<u8>>,
+    pub(crate) sse_tag: Option<Vec<u8>>,
 }
 
 /// Metadata plus rowid needed to stream an object body from `SQLite`.
@@ -488,6 +578,7 @@ pub(crate) struct MultipartUploadState {
     pub(crate) cache_control: Option<String>,
     pub(crate) expires: Option<OffsetDateTime>,
     pub(crate) checksum: Option<MultipartChecksumConfig>,
+    pub(crate) encryption: Option<StoredSse>,
 }
 
 /// Active multipart upload row returned by multipart upload listing.
@@ -527,6 +618,7 @@ pub(crate) struct CompletedMultipartUploadOutcome {
     pub(crate) md5: String,
     pub(crate) returned_version_id: Option<String>,
     pub(crate) checksum: StoredChecksum,
+    pub(crate) encryption: Option<StoredSse>,
 }
 
 /// Read-side multipart completion state.
@@ -543,6 +635,7 @@ pub(crate) struct PreparedMultipartUpload {
     md5: String,
     checksum: StoredChecksum,
     upload_checksum: Option<MultipartChecksumConfig>,
+    encryption: Option<StoredSse>,
     parts: Vec<CompletedObjectPart>,
 }
 
@@ -559,6 +652,7 @@ pub(crate) struct KeyMetadata {
     pub(crate) last_modified: OffsetDateTime,
     pub(crate) md5: Option<String>,
     pub(crate) checksum: Option<StoredChecksum>,
+    pub(crate) encryption: Option<StoredSse>,
     pub(crate) is_latest: bool,
     pub(crate) is_delete_marker: bool,
 }
@@ -588,6 +682,18 @@ pub(crate) struct Multipart {
     pub(crate) part_number: i32,
     pub(crate) last_modified: OffsetDateTime,
     pub(crate) value: Vec<u8>,
+    pub(crate) size: i64,
+    pub(crate) md5: Option<String>,
+    pub(crate) checksum: Option<PartChecksum>,
+    pub(crate) encryption: Option<ActiveSse>,
+}
+
+/// Metadata for a multipart part whose chunks are already encoded.
+#[derive(Debug)]
+pub(crate) struct MultipartPartWrite {
+    pub(crate) upload_id: Uuid,
+    pub(crate) part_number: i32,
+    pub(crate) last_modified: OffsetDateTime,
     pub(crate) size: i64,
     pub(crate) md5: Option<String>,
     pub(crate) checksum: Option<PartChecksum>,
@@ -631,6 +737,7 @@ pub(crate) struct MultipartCompletionRequest {
     pub(crate) default_checksum: MultipartChecksumConfig,
     pub(crate) access_key: Option<String>,
     pub(crate) write_conditions: ObjectWriteConditions,
+    pub(crate) sse_s3_master_key: Option<[u8; 32]>,
 }
 
 /// SQLite-backed storage state and open bucket connections.
@@ -1751,6 +1858,7 @@ mod tests {
                         cache_control: None,
                         expires: None,
                         checksum: None,
+                        encryption: None,
                     },
                 )?;
                 transaction.execute(
@@ -1833,6 +1941,7 @@ mod maintenance_tests {
                 cache_control: None,
                 expires: None,
                 checksum: None,
+                encryption: None,
             },
         )?;
         transaction.execute(
@@ -1876,6 +1985,7 @@ mod maintenance_tests {
                 cache_control: None,
                 expires: None,
                 checksum: None,
+                encryption: None,
             },
         )?;
         let multipart = Multipart {
@@ -1886,6 +1996,7 @@ mod maintenance_tests {
             size: 4,
             md5: None,
             checksum: None,
+            encryption: None,
         };
         Sqlite::put_multipart(&transaction, &multipart)?;
         transaction.execute(

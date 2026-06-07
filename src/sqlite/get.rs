@@ -1,14 +1,19 @@
 //! `SQLite` object read helpers.
 
-use std::ops::{Not, Range as ByteRange};
+#[cfg(test)]
+use std::ops::Not;
+use std::ops::Range as ByteRange;
 
 use rusqlite::{OptionalExtension, Transaction};
 
 use crate::database::BlobReadRequest;
+use crate::sse;
 
+#[cfg(test)]
+use super::KeyValue;
 use super::{
-    KeyMetadata, KeyValue, ObjectBodyReference, Sqlite, SqliteError, SqliteResult,
-    optional_stored_checksum, row_bool, row_size,
+    KeyMetadata, ObjectBodyReference, Sqlite, SqliteError, SqliteResult, optional_stored_checksum,
+    optional_stored_sse, row_bool, row_size,
 };
 
 impl Sqlite {
@@ -37,6 +42,7 @@ impl Sqlite {
     }
 
     /// Fetches the current visible object body and metadata by key.
+    #[cfg(test)]
     pub(crate) fn get_object(
         transaction: &Transaction,
         key: &str,
@@ -44,16 +50,8 @@ impl Sqlite {
         Self::get_object_internal(transaction, key, None, false)
     }
 
-    /// Fetches an exact visible object body and metadata by key and version ID.
-    pub(crate) fn get_object_version(
-        transaction: &Transaction,
-        key: &str,
-        version_id: &str,
-    ) -> SqliteResult<Option<KeyValue>> {
-        Self::get_object_internal(transaction, key, Some(version_id), false)
-    }
-
     /// Fetches an object body and metadata by current or exact version selector.
+    #[cfg(test)]
     fn get_object_internal(
         transaction: &Transaction,
         key: &str,
@@ -77,6 +75,10 @@ impl Sqlite {
                 ov.checksum_algorithm,
                 ov.checksum_type,
                 ov.checksum_value,
+                ov.sse_algorithm,
+                ov.sse_key_nonce,
+                ov.sse_key_ciphertext,
+                ov.sse_key_tag,
                 ov.is_latest,
                 ov.is_delete_marker
             FROM object_version AS ov
@@ -118,9 +120,16 @@ impl Sqlite {
                                 row.get(12)?,
                                 row.get(13)?,
                             )?,
-                            is_latest: row_bool(row, 14)?,
-                            is_delete_marker: row_bool(row, 15)?,
+                            encryption: optional_stored_sse(
+                                row.get(14)?,
+                                row.get(15)?,
+                                row.get(16)?,
+                                row.get(17)?,
+                            )?,
+                            is_latest: row_bool(row, 18)?,
+                            is_delete_marker: row_bool(row, 19)?,
                         },
+                        encryption: None,
                     },
                 ))
             })
@@ -142,10 +151,35 @@ impl Sqlite {
     }
 
     /// Reassembles object bytes from stored chunks for copy-style operations.
-    pub(super) fn get_object_bytes(
+    pub(crate) fn get_object_bytes(
         transaction: &Transaction,
         object_sequence: i64,
         expected_size: i64,
+    ) -> SqliteResult<Vec<u8>> {
+        Self::get_object_bytes_with_encryption(transaction, object_sequence, expected_size, None)
+    }
+
+    /// Reassembles and decrypts object bytes from stored chunks.
+    pub(crate) fn get_object_bytes_decrypted(
+        transaction: &Transaction,
+        object_sequence: i64,
+        expected_size: i64,
+        encryption: &sse::ActiveSse,
+    ) -> SqliteResult<Vec<u8>> {
+        Self::get_object_bytes_with_encryption(
+            transaction,
+            object_sequence,
+            expected_size,
+            Some(encryption),
+        )
+    }
+
+    /// Reassembles object bytes from chunks, optionally decrypting each chunk.
+    fn get_object_bytes_with_encryption(
+        transaction: &Transaction,
+        object_sequence: i64,
+        expected_size: i64,
+        encryption: Option<&sse::ActiveSse>,
     ) -> SqliteResult<Vec<u8>> {
         let expected_size =
             usize::try_from(expected_size).map_err(|_| SqliteError::ObjectBodyInconsistent)?;
@@ -154,7 +188,9 @@ impl Sqlite {
             SELECT
                 offset,
                 size,
-                body
+                body,
+                sse_nonce,
+                sse_tag
             FROM object_blob_chunk
             WHERE object_sequence = ?1
             ORDER BY offset;",
@@ -169,8 +205,21 @@ impl Sqlite {
             let size = usize::try_from(row_size(row, 1)?)
                 .map_err(|_| SqliteError::ObjectBodyInconsistent)?;
             let body = row.get::<_, Vec<u8>>(2)?;
+            let sse_nonce = row.get::<_, Option<Vec<u8>>>(3)?;
+            let sse_tag = row.get::<_, Option<Vec<u8>>>(4)?;
 
             if offset != expected_offset || body.len() != size {
+                return Err(SqliteError::ObjectBodyInconsistent);
+            }
+            let body = match (encryption, sse_nonce, sse_tag) {
+                (Some(encryption), Some(sse_nonce), Some(sse_tag)) => {
+                    sse::decrypt_chunk(encryption, &sse_nonce, &sse_tag, &body)
+                        .map_err(SqliteError::Configuration)?
+                }
+                (None, None, None) => body,
+                _ => return Err(SqliteError::ObjectBodyInconsistent),
+            };
+            if body.len() != size {
                 return Err(SqliteError::ObjectBodyInconsistent);
             }
             expected_offset = expected_offset
@@ -295,6 +344,10 @@ impl Sqlite {
                 checksum_algorithm,
                 checksum_type,
                 checksum_value,
+                sse_algorithm,
+                sse_key_nonce,
+                sse_key_ciphertext,
+                sse_key_tag,
                 is_latest,
                 is_delete_marker
             FROM object_version
@@ -335,8 +388,14 @@ impl Sqlite {
                             row.get(11)?,
                             row.get(12)?,
                         )?,
-                        is_latest: row_bool(row, 13)?,
-                        is_delete_marker: row_bool(row, 14)?,
+                        encryption: optional_stored_sse(
+                            row.get(13)?,
+                            row.get(14)?,
+                            row.get(15)?,
+                            row.get(16)?,
+                        )?,
+                        is_latest: row_bool(row, 17)?,
+                        is_delete_marker: row_bool(row, 18)?,
                     },
                 })
             })
@@ -390,6 +449,10 @@ impl Sqlite {
                 checksum_algorithm,
                 checksum_type,
                 checksum_value,
+                sse_algorithm,
+                sse_key_nonce,
+                sse_key_ciphertext,
+                sse_key_tag,
                 is_latest,
                 is_delete_marker
             FROM object_version
@@ -422,8 +485,14 @@ impl Sqlite {
                     last_modified: row.get(7)?,
                     md5: row.get(8)?,
                     checksum: optional_stored_checksum(row.get(9)?, row.get(10)?, row.get(11)?)?,
-                    is_latest: row_bool(row, 12)?,
-                    is_delete_marker: row_bool(row, 13)?,
+                    encryption: optional_stored_sse(
+                        row.get(12)?,
+                        row.get(13)?,
+                        row.get(14)?,
+                        row.get(15)?,
+                    )?,
+                    is_latest: row_bool(row, 16)?,
+                    is_delete_marker: row_bool(row, 17)?,
                 })
             })
             .optional()?)

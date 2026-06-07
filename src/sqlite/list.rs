@@ -204,9 +204,11 @@ mod tests {
                 checksum: Some(StoredChecksum::Full(FullObjectChecksum::Crc64Nvme(
                     format!("crc64-{key}"),
                 ))),
+                encryption: None,
                 is_latest: true,
                 is_delete_marker: false,
             },
+            encryption: None,
         }
     }
 
