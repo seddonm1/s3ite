@@ -417,7 +417,7 @@ impl Config {
             .validate()
             .map_err(ConfigError::Configuration)?;
         if let Some(key) = self.sse_s3_key.as_deref() {
-            crate::sse::parse_master_key(key).map_err(ConfigError::Configuration)?;
+            crate::s3::parse_master_key(key).map_err(ConfigError::Configuration)?;
         }
         self.cors_layer().map(|_| ())
     }
@@ -426,7 +426,7 @@ impl Config {
     pub(crate) fn sse_s3_master_key(&self) -> Option<[u8; 32]> {
         self.sse_s3_key
             .as_deref()
-            .and_then(|key| crate::sse::parse_master_key(key).ok())
+            .and_then(|key| crate::s3::parse_master_key(key).ok())
     }
 
     /// Builds the configured `CORS` middleware layer.

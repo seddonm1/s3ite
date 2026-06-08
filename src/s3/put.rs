@@ -120,6 +120,7 @@ fn put_object_output(
 }
 
 /// Stores an object body and metadata.
+#[allow(clippy::too_many_lines)]
 pub(super) async fn put_object(
     sqlite: &Sqlite,
     req: S3Request<PutObjectInput>,
@@ -213,7 +214,7 @@ pub(super) async fn put_object(
                 Sqlite::check_object_write_conditions(&transaction, &key, &write_conditions)?;
                 let outcome = Sqlite::put_object_with_encoded_chunks(
                     &transaction,
-                    key,
+                    &key,
                     KeyMetadata {
                         version_id: String::new(),
                         size,
@@ -225,7 +226,7 @@ pub(super) async fn put_object(
                         last_modified: OffsetDateTime::now_utc(),
                         md5: Some(md5_clone),
                         checksum: Some(checksum_clone),
-                        encryption: stored_encryption,
+                        stored_sse: stored_encryption,
                         is_latest: true,
                         is_delete_marker: false,
                     },
@@ -287,11 +288,10 @@ pub(super) async fn put_object(
                         last_modified: OffsetDateTime::now_utc(),
                         md5: Some(md5_clone),
                         checksum: Some(checksum_clone),
-                        encryption: None,
+                        stored_sse: None,
                         is_latest: true,
                         is_delete_marker: false,
                     },
-                    encryption: None,
                 },
                 chunk_size,
             )?;

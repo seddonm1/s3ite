@@ -4,17 +4,17 @@ use std::collections::HashMap;
 
 use super::{
     ChecksumAlgorithmKind, CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource, ETag,
-    KeyMetadata, KeyValue, MetadataDirective, Not, ObjectAclRequest, ObjectBodyReference,
-    ObjectReadConditions, OffsetDateTime, S3_SINGLE_REQUEST_BODY_MAX, S3ErrorCode, S3Request,
-    S3Response, S3Result, Sqlite, SqliteError, SqliteResult, StoredChecksum,
-    checksum_algorithm_from_request, checksum_crc32, checksum_crc32c, checksum_crc64nvme,
-    checksum_sha1, checksum_sha256, checksum_type_output, http_date_time,
+    InternalError, KeyMetadata, KeyValue, MetadataDirective, Not, ObjectAclRequest,
+    ObjectBodyReference, ObjectReadConditions, OffsetDateTime, S3_SINGLE_REQUEST_BODY_MAX,
+    S3ErrorCode, S3Request, S3Response, S3Result, Sqlite, SqliteError, SqliteResult,
+    StoredChecksum, StoredSse, active_sse_from_stored, checksum_algorithm_from_request,
+    checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_sha1, checksum_sha256,
+    checksum_type_output, decrypt_stored_chunks, encrypt_value_chunks, http_date_time,
     normalize_content_encoding, normalize_metadata, object_write_checksum_from_value,
     requested_sse_s3, resolve_write_encryption, s3_error, s3_error_from_sqlite,
     s3_error_with_message, sse_s3_output, strong_etag_condition_matches,
     validate_no_unsupported_sse_headers, validate_object_acl, weak_etag_condition_matches,
 };
-use crate::sse;
 
 /// Parsed copy request with source, destination, metadata, and checksum intent.
 struct CopyObjectRequest {
@@ -191,7 +191,7 @@ fn validate_copy_target(request: &CopyObjectRequest) -> S3Result<()> {
 fn prepare_copied_object(
     mut object: KeyValue,
     request: &CopyObjectRequest,
-    target_encryption: Option<sse::ActiveSse>,
+    target_stored_sse: Option<StoredSse>,
 ) -> SqliteResult<(KeyValue, StoredChecksum)> {
     object.key.clone_from(&request.target_key);
     object.key_metadata.last_modified = OffsetDateTime::now_utc();
@@ -223,10 +223,7 @@ fn prepare_copied_object(
         .unwrap_or(ChecksumAlgorithmKind::Crc64Nvme);
     let checksum = object_write_checksum_from_value(checksum_kind, &object)?;
     object.key_metadata.checksum = Some(checksum.clone());
-    object.key_metadata.encryption = target_encryption
-        .as_ref()
-        .map(|encryption| encryption.stored.clone());
-    object.encryption = target_encryption;
+    object.key_metadata.stored_sse = target_stored_sse;
     Ok((object, checksum))
 }
 
@@ -254,15 +251,16 @@ pub(super) fn load_copy_source_object(
         return Err(SqliteError::ObjectNotFound);
     }
 
-    let value = if let Some(stored) = key_metadata.encryption.clone() {
+    let value = if let Some(stored) = key_metadata.stored_sse.clone() {
         let master_key = sse_s3_master_key.ok_or_else(|| {
             SqliteError::Configuration(
                 "SSE-S3 master key is required to read encrypted objects".to_string(),
             )
         })?;
         let active =
-            sse::active_sse_from_stored(master_key, stored).map_err(SqliteError::Configuration)?;
-        Sqlite::get_object_bytes_decrypted(transaction, sequence, key_metadata.size, &active)?
+            active_sse_from_stored(master_key, stored).map_err(SqliteError::Configuration)?;
+        let chunks = Sqlite::get_object_blob_chunks(transaction, sequence, key_metadata.size)?;
+        decrypt_stored_chunks(&active, chunks)?
     } else {
         Sqlite::get_object_bytes(transaction, sequence, key_metadata.size)?
     };
@@ -271,7 +269,6 @@ pub(super) fn load_copy_source_object(
         key: key.to_string(),
         value: Some(value),
         key_metadata,
-        encryption: None,
     })
 }
 
@@ -328,9 +325,21 @@ async fn copy_object_same_bucket(
     let target_encryption =
         resolve_write_encryption(sqlite, &request.target_bucket, request.explicit_sse_s3).await?;
     let encrypted = target_encryption.is_some();
-    let (object, checksum) =
-        prepare_copied_object(object, &request, target_encryption).map_err(s3_error_from_sqlite)?;
     let chunk_size = sqlite.blob_chunk_size();
+    let target_stored_sse = target_encryption
+        .as_ref()
+        .map(|encryption| encryption.stored.clone());
+    let (object, checksum) =
+        prepare_copied_object(object, &request, target_stored_sse).map_err(s3_error_from_sqlite)?;
+    let encrypted_chunks = target_encryption
+        .as_ref()
+        .map(|encryption| {
+            let value = object.value.as_deref().ok_or_else(|| {
+                s3_error_with_message(InternalError, "copy source body is missing")
+            })?;
+            encrypt_value_chunks(value, chunk_size, encryption)
+        })
+        .transpose()?;
     let connection = sqlite
         .get_connection(&request.target_bucket)
         .await
@@ -338,8 +347,14 @@ async fn copy_object_same_bucket(
     connection
         .write(move |connection| {
             let transaction = connection.transaction()?;
-            let write_outcome =
-                Sqlite::put_object_with_chunk_size(&transaction, object, chunk_size)?;
+            let write_outcome = if let Some(chunks) = encrypted_chunks {
+                let KeyValue {
+                    key, key_metadata, ..
+                } = object;
+                Sqlite::put_object_with_encoded_chunks(&transaction, &key, key_metadata, chunks)?
+            } else {
+                Sqlite::put_object_with_chunk_size(&transaction, object, chunk_size)?
+            };
             let result = copy_object_result(
                 &checksum,
                 write_outcome.md5.clone(),
@@ -386,9 +401,21 @@ async fn copy_object_cross_bucket(
     let target_encryption =
         resolve_write_encryption(sqlite, &request.target_bucket, request.explicit_sse_s3).await?;
     let encrypted = target_encryption.is_some();
-    let (object, checksum) =
-        prepare_copied_object(object, &request, target_encryption).map_err(s3_error_from_sqlite)?;
     let chunk_size = sqlite.blob_chunk_size();
+    let target_stored_sse = target_encryption
+        .as_ref()
+        .map(|encryption| encryption.stored.clone());
+    let (object, checksum) =
+        prepare_copied_object(object, &request, target_stored_sse).map_err(s3_error_from_sqlite)?;
+    let encrypted_chunks = target_encryption
+        .as_ref()
+        .map(|encryption| {
+            let value = object.value.as_deref().ok_or_else(|| {
+                s3_error_with_message(InternalError, "copy source body is missing")
+            })?;
+            encrypt_value_chunks(value, chunk_size, encryption)
+        })
+        .transpose()?;
     let target_connection = sqlite
         .get_connection(&request.target_bucket)
         .await
@@ -396,8 +423,14 @@ async fn copy_object_cross_bucket(
     target_connection
         .write(move |connection| {
             let transaction = connection.transaction()?;
-            let write_outcome =
-                Sqlite::put_object_with_chunk_size(&transaction, object, chunk_size)?;
+            let write_outcome = if let Some(chunks) = encrypted_chunks {
+                let KeyValue {
+                    key, key_metadata, ..
+                } = object;
+                Sqlite::put_object_with_encoded_chunks(&transaction, &key, key_metadata, chunks)?
+            } else {
+                Sqlite::put_object_with_chunk_size(&transaction, object, chunk_size)?
+            };
             let result = copy_object_result(
                 &checksum,
                 write_outcome.md5.clone(),
@@ -447,7 +480,7 @@ mod tests {
     use super::*;
 
     use crate::{
-        checksum::{ChecksumAlgorithmKind, FullObjectChecksum},
+        s3::{ChecksumAlgorithmKind, FullObjectChecksum},
         sqlite::KeyMetadata,
     };
     use s3s::dto::{ChecksumAlgorithm, ETagCondition, ObjectCannedACL, Timestamp};
@@ -508,11 +541,10 @@ mod tests {
                 last_modified: OffsetDateTime::UNIX_EPOCH,
                 md5: Some("md5".to_string()),
                 checksum,
-                encryption: None,
+                stored_sse: None,
                 is_latest: true,
                 is_delete_marker: false,
             },
-            encryption: None,
         }
     }
 

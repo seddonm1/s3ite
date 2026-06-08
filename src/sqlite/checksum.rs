@@ -10,15 +10,12 @@ use rusqlite::{
     types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef},
 };
 
-use crate::checksum::{
-    ChecksumAlgorithmKind, ChecksumTypeKind, MultipartChecksumConfig,
+use crate::s3::{
+    ChecksumAlgorithmKind, ChecksumTypeKind, MultipartChecksumConfig, PartChecksum, StoredChecksum,
     decode_md5_hex as decode_storage_md5_hex,
 };
-pub(crate) use crate::checksum::{PartChecksum, StoredChecksum};
 
 use super::{SqliteError, SqliteResult};
-
-pub(super) use crate::checksum::{decode_base64, encode_hex};
 
 const CHECKSUM_ALGORITHM_CRC32: i64 = 1;
 const CHECKSUM_ALGORITHM_CRC32C: i64 = 2;
@@ -162,17 +159,17 @@ mod tests {
     use rusqlite::Connection;
 
     use crate::{
-        checksum::{
-            ChecksumAlgorithmKind, ChecksumTypeKind, FullObjectChecksum, PartChecksum,
-            StoredChecksum,
+        s3::{
+            ChecksumAlgorithmKind, ChecksumTypeKind, FullObjectChecksum, MultipartChecksumConfig,
+            PartChecksum, StoredChecksum, decode_base64, encode_hex,
         },
         sqlite::{
-            MultipartChecksumConfig, SqliteError, optional_multipart_checksum_config,
-            optional_part_checksum, optional_stored_checksum, required_stored_checksum,
+            SqliteError, optional_multipart_checksum_config, optional_part_checksum,
+            optional_stored_checksum, required_stored_checksum,
         },
     };
 
-    use super::{decode_base64, decode_md5_hex, encode_hex, stored_checksum};
+    use super::{decode_md5_hex, stored_checksum};
 
     fn assert_sqlite_error<T>(result: crate::sqlite::SqliteResult<T>, expected: &SqliteError) {
         let err = result.err();
@@ -260,9 +257,9 @@ mod tests {
                 "value".to_string(),
             )
             .ok(),
-            Some(StoredChecksum::Full(
-                crate::checksum::FullObjectChecksum::Crc64Nvme("value".to_string())
-            ))
+            Some(StoredChecksum::Full(FullObjectChecksum::Crc64Nvme(
+                "value".to_string()
+            )))
         );
     }
 

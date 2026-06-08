@@ -9,15 +9,15 @@ use super::{
     Not, ObjectAttributes, ObjectBodyReference, ObjectPart, ObjectReadConditionFailure,
     ObjectReadConditions, S3Error, S3ErrorCode, S3Range, S3Request, S3Response, S3Result, Sqlite,
     SqliteError, SqliteResult, StorageClass, StoredChecksum, StreamExt, StreamingBlob,
-    checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_mode_enabled, checksum_sha1,
-    checksum_sha256, checksum_struct, checksum_type_output, list_limit,
-    not_found_delete_marker_error, not_modified_error, object_checksum_for_part,
-    requested_part_range, s3_error, s3_error_from_sqlite, s3_error_with_message, sse_s3_output,
-    stream, validate_no_sse_headers, validate_part_number, validate_read_conditions,
+    active_sse_from_stored, checksum_crc32, checksum_crc32c, checksum_crc64nvme,
+    checksum_mode_enabled, checksum_sha1, checksum_sha256, checksum_struct, checksum_type_output,
+    decrypt_stored_chunks, list_limit, not_found_delete_marker_error, not_modified_error,
+    object_checksum_for_part, requested_part_range, s3_error, s3_error_from_sqlite,
+    s3_error_with_message, sse_s3_output, stream, validate_no_sse_headers, validate_part_number,
+    validate_read_conditions,
 };
 
 use crate::database::{BlobReadReceiver, BucketConnection};
-use crate::sse;
 
 /// Reports that `BitTorrent` metadata is unavailable for this object store.
 pub(super) fn get_object_torrent(
@@ -51,7 +51,7 @@ struct ObjectBodyRead {
     body: ObjectBodyReadBody,
 }
 
-/// Backing body for a GetObject response.
+/// Backing body for a `GetObject` response.
 enum ObjectBodyReadBody {
     Blob(BlobReadReceiver),
     Bytes(Bytes),
@@ -213,6 +213,7 @@ fn response_checksum(
 }
 
 /// Resolves object metadata and opens a bounded blob stream for `GetObject`.
+#[allow(clippy::too_many_lines)]
 async fn load_get_object(
     connection: &BucketConnection,
     key: String,
@@ -258,7 +259,7 @@ async fn load_get_object(
                 completed_part_count,
                 object_size,
             )?;
-            let requests = if object.key_metadata.encryption.is_some() {
+            let requests = if object.key_metadata.stored_sse.is_some() {
                 Vec::new()
             } else {
                 Sqlite::object_blob_read_requests(
@@ -291,7 +292,7 @@ async fn load_get_object(
             ObjectReadConditionFailure::NotModified => not_modified_error(md5.as_deref())?,
         }),
         ObjectBodyReadStart::Found(read) => {
-            let body = if let Some(stored) = read.object.key_metadata.encryption.clone() {
+            let body = if let Some(stored) = read.object.key_metadata.stored_sse.clone() {
                 let master_key = sse_s3_master_key.ok_or_else(|| {
                     s3_error_with_message(S3ErrorCode::InvalidRequest, "SSE-S3 is not configured")
                 })?;
@@ -301,14 +302,14 @@ async fn load_get_object(
                 let bytes = connection
                     .read(move |connection| {
                         let transaction = connection.transaction()?;
-                        let active = sse::active_sse_from_stored(&master_key, stored)
+                        let active = active_sse_from_stored(&master_key, stored)
                             .map_err(SqliteError::Configuration)?;
-                        let value = Sqlite::get_object_bytes_decrypted(
+                        let chunks = Sqlite::get_object_blob_chunks(
                             &transaction,
                             object_sequence,
                             object_size,
-                            &active,
                         )?;
+                        let value = decrypt_stored_chunks(&active, chunks)?;
                         let start = usize::try_from(object_range.start)
                             .map_err(|_| SqliteError::InvalidObjectRange)?;
                         let end = usize::try_from(object_range.end)
@@ -491,7 +492,7 @@ fn get_object_output(
         metadata: key_metadata.metadata,
         e_tag: key_metadata.md5.map(ETag::Strong),
         parts_count: (read.completed_part_count > 0).then_some(read.completed_part_count),
-        server_side_encryption: sse_s3_output(key_metadata.encryption.is_some()),
+        server_side_encryption: sse_s3_output(key_metadata.stored_sse.is_some()),
         version_id: Some(version_id),
         ..Default::default()
     })
@@ -550,7 +551,7 @@ fn head_object_output(
         last_modified: Some(object.last_modified.into()),
         metadata: object.metadata,
         parts_count: (read.completed_part_count > 0).then_some(read.completed_part_count),
-        server_side_encryption: sse_s3_output(object.encryption.is_some()),
+        server_side_encryption: sse_s3_output(object.stored_sse.is_some()),
         version_id: Some(object.version_id),
         ..Default::default()
     })
@@ -795,8 +796,10 @@ mod tests {
     use hyper::http::{Extensions, HeaderMap, Method, Uri};
     use tokio::sync::RwLock;
 
-    use crate::Config;
-    use crate::checksum::{FullObjectChecksum, PartChecksum};
+    use crate::{
+        Config,
+        s3::{FullObjectChecksum, PartChecksum},
+    };
 
     fn assert_error_code<T>(result: S3Result<T>, code: &S3ErrorCode) {
         let err = result.err();

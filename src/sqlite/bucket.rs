@@ -10,7 +10,7 @@ use rusqlite::Transaction;
 use tokio::fs;
 
 use super::{BucketConnection, BucketVersioningState, Sqlite, SqliteError, SqliteResult};
-use crate::sse::SSE_S3_ALGORITHM_CODE;
+use crate::s3::SSE_S3_ALGORITHM_CODE;
 
 impl Sqlite {
     /// Opens all existing bucket databases under the configured root.

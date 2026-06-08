@@ -7,13 +7,12 @@ use std::ops::Range as ByteRange;
 use rusqlite::{OptionalExtension, Transaction};
 
 use crate::database::BlobReadRequest;
-use crate::sse;
 
 #[cfg(test)]
 use super::KeyValue;
 use super::{
-    KeyMetadata, ObjectBodyReference, Sqlite, SqliteError, SqliteResult, optional_stored_checksum,
-    optional_stored_sse, row_bool, row_size,
+    KeyMetadata, ObjectBodyReference, Sqlite, SqliteError, SqliteResult, StoredBlobChunk,
+    optional_stored_checksum, optional_stored_sse, row_bool, row_size,
 };
 
 impl Sqlite {
@@ -120,7 +119,7 @@ impl Sqlite {
                                 row.get(12)?,
                                 row.get(13)?,
                             )?,
-                            encryption: optional_stored_sse(
+                            stored_sse: optional_stored_sse(
                                 row.get(14)?,
                                 row.get(15)?,
                                 row.get(16)?,
@@ -129,7 +128,6 @@ impl Sqlite {
                             is_latest: row_bool(row, 18)?,
                             is_delete_marker: row_bool(row, 19)?,
                         },
-                        encryption: None,
                     },
                 ))
             })
@@ -156,36 +154,34 @@ impl Sqlite {
         object_sequence: i64,
         expected_size: i64,
     ) -> SqliteResult<Vec<u8>> {
-        Self::get_object_bytes_with_encryption(transaction, object_sequence, expected_size, None)
+        let chunks = Self::get_object_blob_chunks(transaction, object_sequence, expected_size)?;
+        let expected_size =
+            usize::try_from(expected_size).map_err(|_| SqliteError::ObjectBodyInconsistent)?;
+        let mut value = Vec::with_capacity(expected_size);
+        for chunk in chunks {
+            if chunk.sse_nonce.is_some() || chunk.sse_tag.is_some() {
+                return Err(SqliteError::ObjectBodyInconsistent);
+            }
+            value.extend_from_slice(&chunk.body);
+        }
+        if value.len() != expected_size {
+            return Err(SqliteError::ObjectBodyInconsistent);
+        }
+        Ok(value)
     }
 
-    /// Reassembles and decrypts object bytes from stored chunks.
-    pub(crate) fn get_object_bytes_decrypted(
+    /// Reads stored object chunks without decrypting them.
+    pub(crate) fn get_object_blob_chunks(
         transaction: &Transaction,
         object_sequence: i64,
         expected_size: i64,
-        encryption: &sse::ActiveSse,
-    ) -> SqliteResult<Vec<u8>> {
-        Self::get_object_bytes_with_encryption(
-            transaction,
-            object_sequence,
-            expected_size,
-            Some(encryption),
-        )
-    }
-
-    /// Reassembles object bytes from chunks, optionally decrypting each chunk.
-    fn get_object_bytes_with_encryption(
-        transaction: &Transaction,
-        object_sequence: i64,
-        expected_size: i64,
-        encryption: Option<&sse::ActiveSse>,
-    ) -> SqliteResult<Vec<u8>> {
+    ) -> SqliteResult<Vec<StoredBlobChunk>> {
         let expected_size =
             usize::try_from(expected_size).map_err(|_| SqliteError::ObjectBodyInconsistent)?;
         let mut stmt = transaction.prepare_cached(
             "
             SELECT
+                chunk_number,
                 offset,
                 size,
                 body,
@@ -196,43 +192,47 @@ impl Sqlite {
             ORDER BY offset;",
         )?;
         let mut rows = stmt.query([object_sequence])?;
-        let mut value = Vec::with_capacity(expected_size);
+        let mut chunks = Vec::new();
+        let mut expected_chunk_number = 1;
         let mut expected_offset = 0usize;
 
         while let Some(row) = rows.next()? {
-            let offset = usize::try_from(row_size(row, 0)?)
+            let chunk_number = row.get::<_, i32>(0)?;
+            let offset = usize::try_from(row_size(row, 1)?)
                 .map_err(|_| SqliteError::ObjectBodyInconsistent)?;
-            let size = usize::try_from(row_size(row, 1)?)
+            let size = usize::try_from(row_size(row, 2)?)
                 .map_err(|_| SqliteError::ObjectBodyInconsistent)?;
-            let body = row.get::<_, Vec<u8>>(2)?;
-            let sse_nonce = row.get::<_, Option<Vec<u8>>>(3)?;
-            let sse_tag = row.get::<_, Option<Vec<u8>>>(4)?;
+            let body = row.get::<_, Vec<u8>>(3)?;
+            let sse_nonce = row.get::<_, Option<Vec<u8>>>(4)?;
+            let sse_tag = row.get::<_, Option<Vec<u8>>>(5)?;
 
-            if offset != expected_offset || body.len() != size {
+            if chunk_number != expected_chunk_number || offset != expected_offset {
                 return Err(SqliteError::ObjectBodyInconsistent);
             }
-            let body = match (encryption, sse_nonce, sse_tag) {
-                (Some(encryption), Some(sse_nonce), Some(sse_tag)) => {
-                    sse::decrypt_chunk(encryption, &sse_nonce, &sse_tag, &body)
-                        .map_err(SqliteError::Configuration)?
-                }
-                (None, None, None) => body,
-                _ => return Err(SqliteError::ObjectBodyInconsistent),
-            };
             if body.len() != size {
                 return Err(SqliteError::ObjectBodyInconsistent);
             }
+            chunks.push(StoredBlobChunk {
+                chunk_number,
+                offset: i64::try_from(offset).map_err(|_| SqliteError::ObjectBodyInconsistent)?,
+                size: i64::try_from(size).map_err(|_| SqliteError::ObjectBodyInconsistent)?,
+                body,
+                sse_nonce,
+                sse_tag,
+            });
+            expected_chunk_number = expected_chunk_number
+                .checked_add(1)
+                .ok_or(SqliteError::ObjectBodyInconsistent)?;
             expected_offset = expected_offset
                 .checked_add(size)
                 .ok_or(SqliteError::ObjectBodyInconsistent)?;
-            value.extend_from_slice(&body);
         }
 
-        if expected_offset != expected_size || value.len() != expected_size {
+        if expected_offset != expected_size {
             return Err(SqliteError::ObjectBodyInconsistent);
         }
 
-        Ok(value)
+        Ok(chunks)
     }
 
     /// Builds ordered `SQLite` BLOB read requests for an object byte range.
@@ -388,7 +388,7 @@ impl Sqlite {
                             row.get(11)?,
                             row.get(12)?,
                         )?,
-                        encryption: optional_stored_sse(
+                        stored_sse: optional_stored_sse(
                             row.get(13)?,
                             row.get(14)?,
                             row.get(15)?,
@@ -485,7 +485,7 @@ impl Sqlite {
                     last_modified: row.get(7)?,
                     md5: row.get(8)?,
                     checksum: optional_stored_checksum(row.get(9)?, row.get(10)?, row.get(11)?)?,
-                    encryption: optional_stored_sse(
+                    stored_sse: optional_stored_sse(
                         row.get(12)?,
                         row.get(13)?,
                         row.get(14)?,
@@ -507,7 +507,7 @@ mod tests {
     use time::OffsetDateTime;
 
     use crate::{
-        checksum::{FullObjectChecksum, StoredChecksum},
+        s3::{FullObjectChecksum, StoredChecksum},
         sqlite::{Sqlite, SqliteError, SqliteResult},
     };
 

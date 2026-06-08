@@ -125,7 +125,9 @@ mod tests {
             ("invalid".to_string(), "=?UTF-8?B?not base64!?=".to_string()),
         ]);
 
-        let normalized = normalize_metadata(Some(metadata)).expect("metadata remains present");
+        let Some(normalized) = normalize_metadata(Some(metadata)) else {
+            panic!("metadata remains present");
+        };
         assert_eq!(
             normalized.get("base64").map(String::as_str),
             Some("Hello World\u{e9}")

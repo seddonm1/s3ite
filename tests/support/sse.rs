@@ -144,6 +144,7 @@ pub fn sse_s3_bucket_configuration() -> Result<ServerSideEncryptionConfiguration
         .build()?)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn assert_rejected_without_object(
     server: &TestServer,
     client: &Client,

@@ -324,6 +324,7 @@ impl Sqlite {
     }
 
     /// Lists object versions and common prefixes using S3 version marker semantics.
+    #[allow(clippy::too_many_lines)]
     async fn list_versions(
         &self,
         bucket: &str,

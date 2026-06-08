@@ -161,7 +161,7 @@ mod tests {
     use rusqlite::Connection;
 
     use crate::{
-        checksum::{FullObjectChecksum, StoredChecksum},
+        s3::{FullObjectChecksum, StoredChecksum},
         sqlite::{BucketVersioningState, KeyMetadata, KeyValue, SqliteError},
     };
 
@@ -204,11 +204,10 @@ mod tests {
                 checksum: Some(StoredChecksum::Full(FullObjectChecksum::Crc64Nvme(
                     format!("crc64-{key}"),
                 ))),
-                encryption: None,
+                stored_sse: None,
                 is_latest: true,
                 is_delete_marker: false,
             },
-            encryption: None,
         }
     }
 

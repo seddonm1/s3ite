@@ -50,13 +50,11 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::ClientAddress;
-use crate::checksum::{ChecksumAlgorithmKind, ChecksumTypeKind};
 use crate::sqlite::{
     BucketVersioningState, CompletedObjectPart, KeyMetadata, KeyValue, Multipart,
-    MultipartChecksumConfig, MultipartCompletion, MultipartCompletionPart,
-    MultipartCompletionRequest, MultipartPartWrite, MultipartUploadState, MultipartUploadSummary,
-    ObjectBodyReference, ObjectDeleteOutcome, ObjectTagCondition, ObjectWriteConditions,
-    PartChecksum, Sqlite, SqliteError, SqliteResult, StoredChecksum,
+    MultipartCompletion, MultipartCompletionPart, MultipartCompletionRequest, MultipartPartWrite,
+    MultipartUploadState, MultipartUploadSummary, ObjectBodyReference, ObjectDeleteOutcome,
+    ObjectTagCondition, ObjectWriteConditions, Sqlite, SqliteError, SqliteResult,
 };
 
 const LIST_BATCH_SIZE: i64 = 1024;
@@ -101,7 +99,6 @@ mod bucket;
 mod checksum;
 mod copy;
 mod delete;
-mod encrypted_upload_body;
 mod error;
 mod get;
 mod list;
@@ -109,7 +106,19 @@ mod metadata;
 mod multipart;
 mod owner;
 mod put;
-mod sse_headers;
+mod sse;
+
+pub(crate) use self::{
+    checksum::{
+        ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKind, MultipartChecksumConfig,
+        MultipartCompletionChecksum, PartChecksum, StoredChecksum, decode_base64, decode_md5_hex,
+        encode_hex,
+    },
+    sse::{SSE_S3_ALGORITHM_CODE, StoredSse, parse_master_key},
+};
+
+#[cfg(test)]
+pub(crate) use self::checksum::FullObjectChecksum;
 
 use self::{
     checksum::{
@@ -120,7 +129,6 @@ use self::{
         multipart_checksum_config, object_checksum_for_part, object_write_checksum_from_value,
         part_checksum_accumulator, payload_checksum_accumulator, validate_content_md5,
     },
-    encrypted_upload_body::{read_object_body_encrypted, read_part_body_encrypted},
     error::{
         not_found_delete_marker_error, not_modified_error, s3_error, s3_error_from_sqlite,
         s3_error_with_message,
@@ -133,8 +141,10 @@ use self::{
     metadata::{normalize_content_encoding, normalize_metadata},
     multipart::{requested_part_range, validate_part_number},
     owner::{BucketAclRequest, ObjectAclRequest, owner, validate_bucket_acl, validate_object_acl},
-    sse_headers::{
-        requested_sse_s3, require_sse_s3_master_key, resolve_write_encryption, sse_s3_output,
+    sse::{
+        ActiveSse, active_sse_from_stored, decrypt_stored_chunks, encrypt_value_chunks,
+        read_object_body_encrypted, read_part_body_encrypted, requested_sse_s3,
+        require_sse_s3_master_key, resolve_write_encryption, sse_s3_output,
         validate_no_sse_headers, validate_no_unsupported_sse_headers,
     },
 };
@@ -826,7 +836,7 @@ mod tests {
             last_modified,
             md5: md5.map(str::to_string),
             checksum: None,
-            encryption: None,
+            stored_sse: None,
             is_latest: true,
             is_delete_marker: false,
         }

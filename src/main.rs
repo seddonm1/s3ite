@@ -24,13 +24,11 @@ use tower_http::cors::CorsLayer;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
 
-mod checksum;
 mod compat;
 mod config;
 mod database;
 mod s3;
 mod sqlite;
-mod sse;
 
 use self::compat::HeaderAuthCompatLayer;
 pub(crate) use self::{

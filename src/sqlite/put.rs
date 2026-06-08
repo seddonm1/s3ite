@@ -5,8 +5,6 @@ use std::ops::Not;
 use rusqlite::{Error::ToSqlConversionFailure, Transaction};
 use time::OffsetDateTime;
 
-use crate::sse;
-
 use super::{
     BucketVersioningState, EncodedBlobChunk, KeyMetadata, KeyValue, NULL_VERSION_ID,
     ObjectTagCondition, ObjectWriteConditions, ObjectWriteOutcome, Sqlite, SqliteError,
@@ -194,21 +192,21 @@ impl Sqlite {
             checksum.checksum_type(),
             checksum.as_str(),
             key_metadata
-                .encryption
+                .stored_sse
                 .as_ref()
-                .map(|_| sse::SSE_S3_ALGORITHM_CODE),
+                .map(|_| crate::s3::SSE_S3_ALGORITHM_CODE),
             key_metadata
-                .encryption
+                .stored_sse
                 .as_ref()
-                .map(|encryption| encryption.key_nonce.as_slice()),
+                .map(|stored_sse| stored_sse.nonce.as_slice()),
             key_metadata
-                .encryption
+                .stored_sse
                 .as_ref()
-                .map(|encryption| encryption.key_ciphertext.as_slice()),
+                .map(|stored_sse| stored_sse.ciphertext.as_slice()),
             key_metadata
-                .encryption
+                .stored_sse
                 .as_ref()
-                .map(|encryption| encryption.key_tag.as_slice()),
+                .map(|stored_sse| stored_sse.tag.as_slice()),
         ])?;
         drop(stmt);
 
@@ -260,7 +258,6 @@ impl Sqlite {
         value: &[u8],
         base_offset: i64,
         chunk_size: usize,
-        encryption: Option<&sse::ActiveSse>,
     ) -> SqliteResult<()> {
         if chunk_size == 0 {
             return Err(SqliteError::Configuration(
@@ -299,39 +296,17 @@ impl Sqlite {
                 .ok_or(SqliteError::MultipartObjectTooLarge)?;
             let size =
                 i64::try_from(chunk.len()).map_err(|_| SqliteError::MultipartObjectTooLarge)?;
-            let encrypted = encryption
-                .map(|encryption| {
-                    sse::encrypt_chunk(encryption, chunk).map_err(SqliteError::Configuration)
-                })
-                .transpose()?;
-            match encrypted {
-                Some(encrypted) => {
-                    stmt.execute((
-                        object_sequence,
-                        upload_id,
-                        part_number,
-                        chunk_number,
-                        sql_size(offset)?,
-                        sql_size(size)?,
-                        encrypted.ciphertext,
-                        Some(encrypted.nonce),
-                        Some(encrypted.tag),
-                    ))?;
-                }
-                None => {
-                    stmt.execute((
-                        object_sequence,
-                        upload_id,
-                        part_number,
-                        chunk_number,
-                        sql_size(offset)?,
-                        sql_size(size)?,
-                        chunk,
-                        Option::<Vec<u8>>::None,
-                        Option::<Vec<u8>>::None,
-                    ))?;
-                }
-            };
+            stmt.execute((
+                object_sequence,
+                upload_id,
+                part_number,
+                chunk_number,
+                sql_size(offset)?,
+                sql_size(size)?,
+                chunk,
+                Option::<Vec<u8>>::None,
+                Option::<Vec<u8>>::None,
+            ))?;
         }
 
         Ok(())
@@ -423,8 +398,7 @@ impl Sqlite {
         let KeyValue {
             key,
             value,
-            mut key_metadata,
-            encryption,
+            key_metadata,
             ..
         } = kv;
         let value = value.ok_or(SqliteError::ObjectBodyInconsistent)?;
@@ -434,9 +408,6 @@ impl Sqlite {
             return Err(SqliteError::ObjectBodyInconsistent);
         }
 
-        if let Some(encryption) = encryption.as_ref() {
-            key_metadata.encryption = Some(encryption.stored.clone());
-        }
         let write_outcome = Self::put_object_version(transaction, &key, key_metadata)?;
         Self::put_object_storage_part(
             transaction,
@@ -452,7 +423,6 @@ impl Sqlite {
             &value,
             0,
             chunk_size,
-            encryption.as_ref(),
         )?;
         Ok(write_outcome)
     }
@@ -460,7 +430,7 @@ impl Sqlite {
     /// Inserts an object version whose body chunks were encoded before the transaction.
     pub(crate) fn put_object_with_encoded_chunks<I>(
         transaction: &Transaction,
-        key: String,
+        key: &str,
         key_metadata: KeyMetadata,
         chunks: I,
     ) -> SqliteResult<ObjectWriteOutcome>
@@ -468,7 +438,7 @@ impl Sqlite {
         I: IntoIterator<Item = EncodedBlobChunk>,
     {
         let expected_size = key_metadata.size;
-        let write_outcome = Self::put_object_version(transaction, &key, key_metadata)?;
+        let write_outcome = Self::put_object_version(transaction, key, key_metadata)?;
         Self::put_object_storage_part(
             transaction,
             write_outcome.sequence,
@@ -496,7 +466,7 @@ mod tests {
     use time::OffsetDateTime;
 
     use crate::{
-        checksum::{FullObjectChecksum, StoredChecksum},
+        s3::{FullObjectChecksum, StoredChecksum},
         sqlite::{EncodedBlobChunk, KeyMetadata, KeyValue, Sqlite, SqliteError, SqliteResult},
     };
 
@@ -527,11 +497,10 @@ mod tests {
                 checksum: Some(StoredChecksum::Full(FullObjectChecksum::Crc64Nvme(
                     "crc".to_string(),
                 ))),
-                encryption: None,
+                stored_sse: None,
                 is_latest: true,
                 is_delete_marker: false,
             },
-            encryption: None,
         }
     }
 
@@ -598,12 +567,8 @@ mod tests {
             },
         ];
 
-        let outcome = Sqlite::put_object_with_encoded_chunks(
-            &transaction,
-            "key".to_string(),
-            metadata,
-            chunks,
-        )?;
+        let outcome =
+            Sqlite::put_object_with_encoded_chunks(&transaction, "key", metadata, chunks)?;
         let object = Sqlite::get_object(&transaction, "key")?.ok_or(SqliteError::ObjectNotFound)?;
 
         assert_eq!(object.value.as_deref(), Some(b"abcde".as_slice()));

@@ -17,11 +17,12 @@ use time::{Duration, OffsetDateTime};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-pub(crate) use crate::checksum::{
-    MultipartChecksumConfig, MultipartCompletionChecksum, PartChecksum, StoredChecksum,
-};
 use crate::database::BucketConnection;
-use crate::sse::{ActiveSse, SSE_S3_ALGORITHM_CODE, StoredSse};
+use crate::s3::{
+    ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKind, MultipartChecksumConfig,
+    MultipartCompletionChecksum, PartChecksum, SSE_S3_ALGORITHM_CODE, StoredChecksum, StoredSse,
+    decode_base64, encode_hex,
+};
 
 mod bucket;
 mod checksum;
@@ -33,8 +34,8 @@ mod multipart;
 mod put;
 
 use self::checksum::{
-    decode_base64, decode_md5_hex, encode_hex, optional_multipart_checksum_config,
-    optional_part_checksum, optional_stored_checksum, required_stored_checksum,
+    decode_md5_hex, optional_multipart_checksum_config, optional_part_checksum,
+    optional_stored_checksum, required_stored_checksum,
 };
 use self::error::{NegativeObjectSize, NegativeSqlLimit};
 pub use self::error::{SqliteError, SqliteResult};
@@ -379,9 +380,9 @@ fn optional_stored_sse(
             if algorithm == SSE_S3_ALGORITHM_CODE =>
         {
             Ok(Some(StoredSse {
-                key_nonce,
-                key_ciphertext,
-                key_tag,
+                nonce: key_nonce,
+                ciphertext: key_ciphertext,
+                tag: key_tag,
             }))
         }
         _ => Err(rusqlite::Error::InvalidQuery),
@@ -519,7 +520,6 @@ pub(crate) struct KeyValue {
     pub(crate) key: String,
     pub(crate) value: Option<Vec<u8>>,
     pub(crate) key_metadata: KeyMetadata,
-    pub(crate) encryption: Option<ActiveSse>,
 }
 
 /// Pre-encoded object blob chunk ready to insert into storage.
@@ -531,6 +531,30 @@ pub(crate) struct EncodedBlobChunk {
     pub(crate) body: Vec<u8>,
     pub(crate) sse_nonce: Option<Vec<u8>>,
     pub(crate) sse_tag: Option<Vec<u8>>,
+}
+
+/// Stored object blob chunk loaded directly from storage.
+#[derive(Debug)]
+pub(crate) struct StoredBlobChunk {
+    pub(crate) chunk_number: i32,
+    pub(crate) offset: i64,
+    pub(crate) size: i64,
+    pub(crate) body: Vec<u8>,
+    pub(crate) sse_nonce: Option<Vec<u8>>,
+    pub(crate) sse_tag: Option<Vec<u8>>,
+}
+
+impl From<EncodedBlobChunk> for StoredBlobChunk {
+    fn from(chunk: EncodedBlobChunk) -> Self {
+        Self {
+            chunk_number: chunk.chunk_number,
+            offset: chunk.offset,
+            size: chunk.size,
+            body: chunk.body,
+            sse_nonce: chunk.sse_nonce,
+            sse_tag: chunk.sse_tag,
+        }
+    }
 }
 
 /// Metadata plus rowid needed to stream an object body from `SQLite`.
@@ -578,7 +602,7 @@ pub(crate) struct MultipartUploadState {
     pub(crate) cache_control: Option<String>,
     pub(crate) expires: Option<OffsetDateTime>,
     pub(crate) checksum: Option<MultipartChecksumConfig>,
-    pub(crate) encryption: Option<StoredSse>,
+    pub(crate) stored_sse: Option<StoredSse>,
 }
 
 /// Active multipart upload row returned by multipart upload listing.
@@ -618,7 +642,7 @@ pub(crate) struct CompletedMultipartUploadOutcome {
     pub(crate) md5: String,
     pub(crate) returned_version_id: Option<String>,
     pub(crate) checksum: StoredChecksum,
-    pub(crate) encryption: Option<StoredSse>,
+    pub(crate) stored_sse: Option<StoredSse>,
 }
 
 /// Read-side multipart completion state.
@@ -635,7 +659,7 @@ pub(crate) struct PreparedMultipartUpload {
     md5: String,
     checksum: StoredChecksum,
     upload_checksum: Option<MultipartChecksumConfig>,
-    encryption: Option<StoredSse>,
+    stored_sse: Option<StoredSse>,
     parts: Vec<CompletedObjectPart>,
 }
 
@@ -652,7 +676,7 @@ pub(crate) struct KeyMetadata {
     pub(crate) last_modified: OffsetDateTime,
     pub(crate) md5: Option<String>,
     pub(crate) checksum: Option<StoredChecksum>,
-    pub(crate) encryption: Option<StoredSse>,
+    pub(crate) stored_sse: Option<StoredSse>,
     pub(crate) is_latest: bool,
     pub(crate) is_delete_marker: bool,
 }
@@ -685,7 +709,6 @@ pub(crate) struct Multipart {
     pub(crate) size: i64,
     pub(crate) md5: Option<String>,
     pub(crate) checksum: Option<PartChecksum>,
-    pub(crate) encryption: Option<ActiveSse>,
 }
 
 /// Metadata for a multipart part whose chunks are already encoded.
@@ -737,7 +760,7 @@ pub(crate) struct MultipartCompletionRequest {
     pub(crate) default_checksum: MultipartChecksumConfig,
     pub(crate) access_key: Option<String>,
     pub(crate) write_conditions: ObjectWriteConditions,
-    pub(crate) sse_s3_master_key: Option<[u8; 32]>,
+    pub(crate) precomputed_full_object_checksum: Option<StoredChecksum>,
 }
 
 /// SQLite-backed storage state and open bucket connections.
@@ -1858,7 +1881,7 @@ mod tests {
                         cache_control: None,
                         expires: None,
                         checksum: None,
-                        encryption: None,
+                        stored_sse: None,
                     },
                 )?;
                 transaction.execute(
@@ -1908,7 +1931,7 @@ mod tests {
 mod maintenance_tests {
     use rusqlite::Connection;
 
-    use crate::checksum::{FullObjectChecksum, StoredChecksum};
+    use crate::s3::{FullObjectChecksum, StoredChecksum};
 
     use super::{
         CompletedMultipartUploadRecord, Duration, Multipart, MultipartUploadState, NULL_VERSION_ID,
@@ -1941,7 +1964,7 @@ mod maintenance_tests {
                 cache_control: None,
                 expires: None,
                 checksum: None,
-                encryption: None,
+                stored_sse: None,
             },
         )?;
         transaction.execute(
@@ -1985,7 +2008,7 @@ mod maintenance_tests {
                 cache_control: None,
                 expires: None,
                 checksum: None,
-                encryption: None,
+                stored_sse: None,
             },
         )?;
         let multipart = Multipart {
@@ -1996,7 +2019,6 @@ mod maintenance_tests {
             size: 4,
             md5: None,
             checksum: None,
-            encryption: None,
         };
         Sqlite::put_multipart(&transaction, &multipart)?;
         transaction.execute(
