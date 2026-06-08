@@ -116,6 +116,7 @@ pub(super) async fn read_part_body_encrypted(
     })
 }
 
+/// Encrypts a streaming request body into ordered storage chunks.
 async fn encrypt_streaming_body(
     mut body: StreamingBlob,
     chunk_size: usize,
@@ -178,6 +179,7 @@ async fn encrypt_streaming_body(
     })
 }
 
+/// Encrypts and records one plaintext storage chunk at the next object offset.
 fn push_encrypted_chunk(
     chunks: &mut Vec<EncodedBlobChunk>,
     next_offset: &mut i64,
@@ -203,6 +205,7 @@ fn push_encrypted_chunk(
     Ok(())
 }
 
+/// Adds a streamed body fragment length to the plaintext object size.
 fn add_body_len(total_size: i64, len: usize) -> S3Result<i64> {
     let len = i64::try_from(len).map_err(S3Error::internal_error)?;
     total_size

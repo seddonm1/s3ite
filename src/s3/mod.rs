@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     fmt,
     ops::{Not, Range as ByteRange},
 };
@@ -59,25 +58,12 @@ use crate::sqlite::{
     ObjectBodyReference, ObjectDeleteOutcome, ObjectTagCondition, ObjectWriteConditions,
     PartChecksum, Sqlite, SqliteError, SqliteResult, StoredChecksum,
 };
-use crate::sse::{self, ActiveSse};
 
 const LIST_BATCH_SIZE: i64 = 1024;
 const CONTINUATION_TOKEN_PREFIX: &str = "s3ite:v1:";
 const OWNER_DISPLAY_NAME: &str = "s3ite";
 const OWNER_ID: &str = "s3ite";
 const S3_SINGLE_REQUEST_BODY_MAX: i64 = 5_i64 * 1024 * 1024 * 1024;
-const SSE_HEADER: &str = "x-amz-server-side-encryption";
-const UNSUPPORTED_SSE_HEADERS: &[&str] = &[
-    "x-amz-server-side-encryption-aws-kms-key-id",
-    "x-amz-server-side-encryption-context",
-    "x-amz-server-side-encryption-bucket-key-enabled",
-    "x-amz-server-side-encryption-customer-algorithm",
-    "x-amz-server-side-encryption-customer-key",
-    "x-amz-server-side-encryption-customer-key-md5",
-    "x-amz-copy-source-server-side-encryption-customer-algorithm",
-    "x-amz-copy-source-server-side-encryption-customer-key",
-    "x-amz-copy-source-server-side-encryption-customer-key-md5",
-];
 
 struct TraceOption<T>(Option<T>);
 
@@ -90,6 +76,7 @@ impl<T: fmt::Display> fmt::Display for TraceOption<T> {
     }
 }
 
+/// Wraps optional trace fields so missing values render as empty strings.
 fn trace_option<T: fmt::Display>(value: Option<T>) -> TraceOption<T> {
     TraceOption(value)
 }
@@ -114,13 +101,15 @@ mod bucket;
 mod checksum;
 mod copy;
 mod delete;
-mod encrypted_body;
+mod encrypted_upload_body;
 mod error;
 mod get;
 mod list;
+mod metadata;
 mod multipart;
 mod owner;
 mod put;
+mod sse_headers;
 
 use self::{
     checksum::{
@@ -131,7 +120,7 @@ use self::{
         multipart_checksum_config, object_checksum_for_part, object_write_checksum_from_value,
         part_checksum_accumulator, payload_checksum_accumulator, validate_content_md5,
     },
-    encrypted_body::{read_object_body_encrypted, read_part_body_encrypted},
+    encrypted_upload_body::{read_object_body_encrypted, read_part_body_encrypted},
     error::{
         not_found_delete_marker_error, not_modified_error, s3_error, s3_error_from_sqlite,
         s3_error_with_message,
@@ -141,187 +130,14 @@ use self::{
         encode_continuation_token, encode_list_value, is_url_encoding, list_limit,
         output_delimiter,
     },
+    metadata::{normalize_content_encoding, normalize_metadata},
     multipart::{requested_part_range, validate_part_number},
     owner::{BucketAclRequest, ObjectAclRequest, owner, validate_bucket_acl, validate_object_acl},
+    sse_headers::{
+        requested_sse_s3, require_sse_s3_master_key, resolve_write_encryption, sse_s3_output,
+        validate_no_sse_headers, validate_no_unsupported_sse_headers,
+    },
 };
-
-/// Stores HTTP content encodings while hiding S3's transport-only aws-chunked marker.
-pub(super) fn normalize_content_encoding(content_encoding: Option<String>) -> Option<String> {
-    let content_encoding = content_encoding?;
-    let values = content_encoding
-        .split(',')
-        .filter_map(|value| {
-            let value = value.trim();
-            (value.is_empty().not() && value.eq_ignore_ascii_case("aws-chunked").not())
-                .then(|| value.to_string())
-        })
-        .collect::<Vec<_>>();
-
-    values.is_empty().not().then(|| values.join(", "))
-}
-
-/// Decodes SDK-encoded UTF-8 metadata values before storing them.
-pub(super) fn normalize_metadata(
-    metadata: Option<HashMap<String, String>>,
-) -> Option<HashMap<String, String>> {
-    metadata.map(|metadata| {
-        metadata
-            .into_iter()
-            .map(|(key, value)| (key, decode_rfc2047_metadata_value(&value)))
-            .collect()
-    })
-}
-
-fn decode_rfc2047_metadata_value(value: &str) -> String {
-    decode_rfc2047_word(value).unwrap_or_else(|| value.to_string())
-}
-
-fn decode_rfc2047_word(value: &str) -> Option<String> {
-    let encoded = value.strip_prefix("=?")?.strip_suffix("?=")?;
-    let mut parts = encoded.splitn(3, '?');
-    let charset = parts.next()?;
-    let encoding = parts.next()?;
-    let payload = parts.next()?;
-    if charset.eq_ignore_ascii_case("utf-8").not() && charset.eq_ignore_ascii_case("us-ascii").not()
-    {
-        return None;
-    }
-
-    let bytes = match encoding {
-        encoding if encoding.eq_ignore_ascii_case("b") => {
-            use base64::Engine as _;
-            base64::engine::general_purpose::STANDARD
-                .decode(payload)
-                .ok()?
-        }
-        encoding if encoding.eq_ignore_ascii_case("q") => decode_rfc2047_q(payload)?,
-        _ => return None,
-    };
-    String::from_utf8(bytes).ok()
-}
-
-fn decode_rfc2047_q(payload: &str) -> Option<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(payload.len());
-    let mut iter = payload.as_bytes().iter().copied();
-    while let Some(byte) = iter.next() {
-        match byte {
-            b'_' => bytes.push(b' '),
-            b'=' => {
-                let high = iter.next()?;
-                let low = iter.next()?;
-                let high = hex_digit(high)?;
-                let low = hex_digit(low)?;
-                bytes.push((high << 4) | low);
-            }
-            byte => bytes.push(byte),
-        }
-    }
-    Some(bytes)
-}
-
-fn hex_digit(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// Rejects request-level SSE headers for operations where they do not apply.
-fn validate_no_sse_headers(headers: &HeaderMap) -> S3Result<()> {
-    if headers.contains_key(SSE_HEADER) {
-        return Err(s3_error_with_message(
-            S3ErrorCode::InvalidArgument,
-            "server-side encryption headers are not valid for this operation",
-        ));
-    }
-    validate_no_unsupported_sse_headers(headers)
-}
-
-/// Rejects SSE variants this backend does not implement.
-fn validate_no_unsupported_sse_headers(headers: &HeaderMap) -> S3Result<()> {
-    if UNSUPPORTED_SSE_HEADERS
-        .iter()
-        .any(|header| headers.contains_key(*header))
-    {
-        return Err(s3_error_with_message(
-            S3ErrorCode::InvalidArgument,
-            "only SSE-S3 with AES256 is supported",
-        ));
-    }
-    Ok(())
-}
-
-/// Validates object-write SSE settings and returns whether AES256 was requested.
-fn requested_sse_s3(
-    server_side_encryption: Option<&ServerSideEncryption>,
-    has_kms_settings: bool,
-    has_sse_customer_settings: bool,
-    has_bucket_key_setting: bool,
-) -> S3Result<bool> {
-    if has_sse_customer_settings || has_kms_settings || has_bucket_key_setting {
-        return Err(s3_error_with_message(
-            S3ErrorCode::InvalidArgument,
-            "only SSE-S3 with AES256 is supported",
-        ));
-    }
-
-    match server_side_encryption {
-        Some(algorithm) if algorithm.as_str() == sse::SSE_S3_ALGORITHM => Ok(true),
-        Some(_) => Err(s3_error_with_message(
-            S3ErrorCode::InvalidArgument,
-            "server-side encryption must be AES256",
-        )),
-        None => Ok(false),
-    }
-}
-
-/// Resolves explicit SSE-S3 and bucket default encryption for an object write.
-async fn resolve_write_encryption(
-    sqlite: &Sqlite,
-    bucket: &str,
-    explicit_sse_s3: bool,
-) -> S3Result<Option<ActiveSse>> {
-    let use_sse_s3 = if explicit_sse_s3 {
-        true
-    } else {
-        let connection = sqlite
-            .get_connection(bucket)
-            .await
-            .map_err(s3_error_from_sqlite)?;
-        connection
-            .read(|connection| {
-                let transaction = connection.transaction()?;
-                Sqlite::get_bucket_default_sse_s3(&transaction)
-            })
-            .await
-            .map_err(s3_error_from_sqlite)?
-    };
-
-    if use_sse_s3.not() {
-        return Ok(None);
-    }
-
-    let master_key = sqlite.config.sse_s3_master_key().ok_or_else(|| {
-        s3_error_with_message(S3ErrorCode::InvalidRequest, "SSE-S3 is not configured")
-    })?;
-    sse::new_active_sse(&master_key)
-        .map(Some)
-        .map_err(|_| s3_error_with_message(InternalError, "SSE-S3 encryption failed"))
-}
-
-/// Returns the response enum for encrypted object outputs.
-fn sse_s3_output(encrypted: bool) -> Option<ServerSideEncryption> {
-    encrypted.then(|| ServerSideEncryption::from_static(ServerSideEncryption::AES256))
-}
-
-/// Returns the configured SSE-S3 master key or a protocol error.
-fn require_sse_s3_master_key(sqlite: &Sqlite) -> S3Result<[u8; 32]> {
-    sqlite.config.sse_s3_master_key().ok_or_else(|| {
-        s3_error_with_message(S3ErrorCode::InvalidRequest, "SSE-S3 is not configured")
-    })
-}
 
 /// Returns whether request headers describe an AWS `SigV4` streaming body.
 fn is_aws_streaming_body(headers: &HeaderMap) -> bool {
@@ -1027,89 +843,6 @@ mod tests {
             modified_since,
             etag_none_matches,
             unmodified_since,
-        }
-    }
-
-    #[test]
-    fn normalizes_content_encoding_values() {
-        assert_eq!(normalize_content_encoding(None), None);
-        assert_eq!(
-            normalize_content_encoding(Some("gzip, aws-chunked, br".to_string())),
-            Some("gzip, br".to_string())
-        );
-        assert_eq!(
-            normalize_content_encoding(Some(" gzip , , br ".to_string())),
-            Some("gzip, br".to_string())
-        );
-        assert_eq!(
-            normalize_content_encoding(Some("AWS-CHUNKED, aws-chunked".to_string())),
-            None
-        );
-    }
-
-    #[test]
-    fn normalizes_rfc2047_metadata_values() {
-        let metadata = HashMap::from([
-            (
-                "base64".to_string(),
-                "=?UTF-8?B?SGVsbG8gV29ybGTDqQ==?=".to_string(),
-            ),
-            (
-                "quoted".to_string(),
-                "=?utf-8?q?Hello_World=C3=A9?=".to_string(),
-            ),
-            ("plain".to_string(), "Hello World".to_string()),
-            ("invalid".to_string(), "=?UTF-8?B?not base64!?=".to_string()),
-        ]);
-
-        let normalized = normalize_metadata(Some(metadata)).expect("metadata remains present");
-        assert_eq!(
-            normalized.get("base64").map(String::as_str),
-            Some("Hello World\u{e9}")
-        );
-        assert_eq!(
-            normalized.get("quoted").map(String::as_str),
-            Some("Hello World\u{e9}")
-        );
-        assert_eq!(
-            normalized.get("plain").map(String::as_str),
-            Some("Hello World")
-        );
-        assert_eq!(
-            normalized.get("invalid").map(String::as_str),
-            Some("=?UTF-8?B?not base64!?=")
-        );
-        assert_eq!(normalize_metadata(None), None);
-    }
-
-    #[test]
-    fn rejects_server_side_encryption_headers() {
-        let mut headers = HeaderMap::new();
-        assert!(validate_no_sse_headers(&headers).is_ok());
-
-        headers.insert(SSE_HEADER, hyper::http::HeaderValue::from_static("AES256"));
-        let error = validate_no_sse_headers(&headers).err();
-        assert!(matches!(
-            error.as_ref().map(S3Error::code),
-            Some(&S3ErrorCode::InvalidArgument)
-        ));
-        assert!(
-            format!("{error:?}").contains("not valid for this operation"),
-            "error should explain operation-level SSE rejection"
-        );
-
-        for header in UNSUPPORTED_SSE_HEADERS {
-            headers.clear();
-            headers.insert(*header, hyper::http::HeaderValue::from_static("AES256"));
-            let error = validate_no_sse_headers(&headers).err();
-            assert!(matches!(
-                error.as_ref().map(S3Error::code),
-                Some(&S3ErrorCode::InvalidArgument)
-            ));
-            assert!(
-                format!("{error:?}").contains("only SSE-S3 with AES256 is supported"),
-                "error should explain unsupported SSE header {header}"
-            );
         }
     }
 

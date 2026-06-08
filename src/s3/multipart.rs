@@ -48,14 +48,13 @@ pub(super) fn normalize_completion_parts(
             && previous.part_number == part_number
         {
             previous.md5 = e_tag;
-            previous.checksum = ChecksumInput {
-                crc32: part.checksum_crc32,
-                crc32c: part.checksum_crc32c,
-                crc64nvme: part.checksum_crc64nvme,
-                sha1: part.checksum_sha1,
-                sha256: part.checksum_sha256,
-                ..ChecksumInput::default()
-            }
+            previous.checksum = ChecksumInput::value_fields(
+                part.checksum_crc32,
+                part.checksum_crc32c,
+                part.checksum_crc64nvme,
+                part.checksum_sha1,
+                part.checksum_sha256,
+            )
             .into_part_checksum()?;
             continue;
         }
@@ -68,14 +67,13 @@ pub(super) fn normalize_completion_parts(
         normalized.push(MultipartCompletionPart {
             part_number,
             md5: e_tag,
-            checksum: ChecksumInput {
-                crc32: part.checksum_crc32,
-                crc32c: part.checksum_crc32c,
-                crc64nvme: part.checksum_crc64nvme,
-                sha1: part.checksum_sha1,
-                sha256: part.checksum_sha256,
-                ..ChecksumInput::default()
-            }
+            checksum: ChecksumInput::value_fields(
+                part.checksum_crc32,
+                part.checksum_crc32c,
+                part.checksum_crc64nvme,
+                part.checksum_sha1,
+                part.checksum_sha256,
+            )
             .into_part_checksum()?,
         });
     }
@@ -243,6 +241,30 @@ async fn read_multipart_upload_state(
         })
         .await
         .map_err(s3_error_from_sqlite)
+}
+
+/// Revalidates active upload state inside an `UploadPart` write transaction.
+fn validate_upload_part_write_state(
+    transaction: &rusqlite::Transaction<'_>,
+    upload_id: Uuid,
+    bucket: &str,
+    key: &str,
+    access_key: Option<&str>,
+    checksum_config: Option<MultipartChecksumConfig>,
+    expected_encryption: Option<&sse::StoredSse>,
+) -> SqliteResult<()> {
+    let upload_state = Sqlite::get_multipart_upload_state(transaction, upload_id, bucket, key)?
+        .ok_or(SqliteError::MultipartUploadNotFound)?;
+    Sqlite::validate_multipart_access(upload_state.access_key.as_ref(), access_key)?;
+    if upload_state.checksum != checksum_config {
+        return Err(SqliteError::ChecksumMismatch);
+    }
+    if upload_state.encryption.as_ref() != expected_encryption {
+        return Err(SqliteError::ObjectBodyInconsistent);
+    }
+
+    Sqlite::touch_multipart_upload(transaction, upload_id)?;
+    Ok(())
 }
 
 /// Reopens the multipart upload data key for encrypted part storage.
@@ -1020,15 +1042,14 @@ pub(super) async fn upload_part(
     validate_declared_object_write_length(&headers, content_length)?;
     let body = body.ok_or_else(|| s3_error(S3ErrorCode::IncompleteBody))?;
 
-    let checksum_input = ChecksumInput {
-        algorithm: checksum_algorithm,
-        crc32: request_checksum_crc32,
-        crc32c: request_checksum_crc32c,
-        crc64nvme: request_checksum_crc64nvme,
-        sha1: request_checksum_sha1,
-        sha256: request_checksum_sha256,
-        ..ChecksumInput::default()
-    };
+    let checksum_input = ChecksumInput::write_request(
+        checksum_algorithm,
+        request_checksum_crc32,
+        request_checksum_crc32c,
+        request_checksum_crc64nvme,
+        request_checksum_sha1,
+        request_checksum_sha256,
+    );
 
     let chunk_size = sqlite.blob_chunk_size();
     let upload_state = {
@@ -1066,22 +1087,15 @@ pub(super) async fn upload_part(
         connection
             .write(move |connection| {
                 let transaction = connection.transaction()?;
-
-                let upload_state =
-                    Sqlite::get_multipart_upload_state(&transaction, upload_id, &bucket, &key)?
-                        .ok_or(SqliteError::MultipartUploadNotFound)?;
-                Sqlite::validate_multipart_access(
-                    upload_state.access_key.as_ref(),
+                validate_upload_part_write_state(
+                    &transaction,
+                    upload_id,
+                    &bucket,
+                    &key,
                     access_key.as_deref(),
+                    checksum_config,
+                    expected_encryption.as_ref(),
                 )?;
-                if upload_state.checksum != checksum_config {
-                    return Err(SqliteError::ChecksumMismatch);
-                }
-                if upload_state.encryption != expected_encryption {
-                    return Err(SqliteError::ObjectBodyInconsistent);
-                }
-
-                Sqlite::touch_multipart_upload(&transaction, upload_id)?;
                 let part = MultipartPartWrite {
                     upload_id,
                     part_number,
@@ -1122,22 +1136,15 @@ pub(super) async fn upload_part(
     connection
         .write(move |connection| {
             let transaction = connection.transaction()?;
-
-            let upload_state =
-                Sqlite::get_multipart_upload_state(&transaction, upload_id, &bucket, &key)?
-                    .ok_or(SqliteError::MultipartUploadNotFound)?;
-            Sqlite::validate_multipart_access(
-                upload_state.access_key.as_ref(),
+            validate_upload_part_write_state(
+                &transaction,
+                upload_id,
+                &bucket,
+                &key,
                 access_key.as_deref(),
+                checksum_config,
+                expected_encryption.as_ref(),
             )?;
-            if upload_state.checksum != checksum_config {
-                return Err(SqliteError::ChecksumMismatch);
-            }
-            if upload_state.encryption != expected_encryption {
-                return Err(SqliteError::ObjectBodyInconsistent);
-            }
-
-            Sqlite::touch_multipart_upload(&transaction, upload_id)?;
             let multipart = Multipart {
                 upload_id,
                 part_number,
@@ -1387,15 +1394,14 @@ pub(super) async fn complete_multipart_upload(
     }
 
     let requested_parts = normalize_completion_parts(requested_parts)?;
-    let requested_checksum = ChecksumInput {
+    let requested_checksum = ChecksumInput::completion_request(
         checksum_type,
-        crc32: request_checksum_crc32,
-        crc32c: request_checksum_crc32c,
-        crc64nvme: request_checksum_crc64nvme,
-        sha1: request_checksum_sha1,
-        sha256: request_checksum_sha256,
-        ..ChecksumInput::default()
-    }
+        request_checksum_crc32,
+        request_checksum_crc32c,
+        request_checksum_crc64nvme,
+        request_checksum_sha1,
+        request_checksum_sha256,
+    )
     .into_completion_checksum()?;
 
     let request = MultipartCompletionRequest {

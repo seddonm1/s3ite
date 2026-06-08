@@ -112,6 +112,7 @@ pub(crate) fn decrypt_chunk(
     decrypt_bytes(&active.data_key, &nonce, &encrypted)
 }
 
+/// Encrypts bytes with AES-256-GCM and returns ciphertext plus tag.
 fn encrypt_bytes(
     key: &[u8; MASTER_KEY_LEN],
     nonce: &[u8; NONCE_LEN],
@@ -123,6 +124,7 @@ fn encrypt_bytes(
         .map_err(|err| err.to_string())
 }
 
+/// Decrypts bytes produced by `encrypt_bytes`.
 fn decrypt_bytes(
     key: &[u8; MASTER_KEY_LEN],
     nonce: &[u8; NONCE_LEN],
@@ -134,6 +136,7 @@ fn decrypt_bytes(
         .map_err(|err| err.to_string())
 }
 
+/// Splits AES-GCM output into storage ciphertext and authentication tag fields.
 fn split_ciphertext_tag(mut encrypted: Vec<u8>) -> Result<(Vec<u8>, Vec<u8>), String> {
     if encrypted.len() < TAG_LEN {
         return Err("SSE ciphertext is shorter than the authentication tag".to_string());
@@ -142,6 +145,7 @@ fn split_ciphertext_tag(mut encrypted: Vec<u8>) -> Result<(Vec<u8>, Vec<u8>), St
     Ok((encrypted, tag))
 }
 
+/// Joins storage ciphertext and authentication tag fields for AES-GCM decryption.
 fn join_ciphertext_tag(ciphertext: &[u8], tag: &[u8]) -> Vec<u8> {
     let mut encrypted = Vec::with_capacity(ciphertext.len() + tag.len());
     encrypted.extend_from_slice(ciphertext);
@@ -149,6 +153,7 @@ fn join_ciphertext_tag(ciphertext: &[u8], tag: &[u8]) -> Vec<u8> {
     encrypted
 }
 
+/// Validates and converts stored nonce bytes into AES-GCM nonce length.
 fn nonce_array(nonce: &[u8]) -> Result<[u8; NONCE_LEN], String> {
     nonce
         .try_into()

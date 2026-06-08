@@ -183,15 +183,14 @@ pub(super) async fn put_object(
             body,
             headers.contains_key(CONTENT_MD5),
             content_md5.as_deref(),
-            ChecksumInput {
-                algorithm: checksum_algorithm,
-                crc32: checksum_crc32,
-                crc32c: checksum_crc32c,
-                crc64nvme: checksum_crc64nvme,
-                sha1: checksum_sha1,
-                sha256: checksum_sha256,
-                ..ChecksumInput::default()
-            },
+            ChecksumInput::write_request(
+                checksum_algorithm,
+                checksum_crc32,
+                checksum_crc32c,
+                checksum_crc64nvme,
+                checksum_sha1,
+                checksum_sha256,
+            ),
             chunk_size,
             &encryption,
         )
@@ -251,15 +250,14 @@ pub(super) async fn put_object(
         body,
         headers.contains_key(CONTENT_MD5),
         content_md5.as_deref(),
-        ChecksumInput {
-            algorithm: checksum_algorithm,
-            crc32: checksum_crc32,
-            crc32c: checksum_crc32c,
-            crc64nvme: checksum_crc64nvme,
-            sha1: checksum_sha1,
-            sha256: checksum_sha256,
-            ..ChecksumInput::default()
-        },
+        ChecksumInput::write_request(
+            checksum_algorithm,
+            checksum_crc32,
+            checksum_crc32c,
+            checksum_crc64nvme,
+            checksum_sha1,
+            checksum_sha256,
+        ),
     )
     .await?;
 

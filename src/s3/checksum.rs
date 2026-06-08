@@ -60,6 +60,64 @@ pub(super) struct ChecksumInput {
 }
 
 impl ChecksumInput {
+    /// Builds checksum input from object or upload-part request fields.
+    pub(super) fn write_request(
+        algorithm: Option<ChecksumAlgorithm>,
+        crc32: Option<String>,
+        crc32c: Option<String>,
+        crc64nvme: Option<String>,
+        sha1: Option<String>,
+        sha256: Option<String>,
+    ) -> Self {
+        Self {
+            algorithm,
+            crc32,
+            crc32c,
+            crc64nvme,
+            sha1,
+            sha256,
+            ..Self::default()
+        }
+    }
+
+    /// Builds checksum input from completion request checksum fields.
+    pub(super) fn completion_request(
+        checksum_type: Option<ChecksumType>,
+        crc32: Option<String>,
+        crc32c: Option<String>,
+        crc64nvme: Option<String>,
+        sha1: Option<String>,
+        sha256: Option<String>,
+    ) -> Self {
+        Self {
+            checksum_type,
+            crc32,
+            crc32c,
+            crc64nvme,
+            sha1,
+            sha256,
+            ..Self::default()
+        }
+    }
+
+    /// Builds checksum input from checksum value fields without an algorithm hint.
+    pub(super) fn value_fields(
+        crc32: Option<String>,
+        crc32c: Option<String>,
+        crc64nvme: Option<String>,
+        sha1: Option<String>,
+        sha256: Option<String>,
+    ) -> Self {
+        Self {
+            crc32,
+            crc32c,
+            crc64nvme,
+            sha1,
+            sha256,
+            ..Self::default()
+        }
+    }
+
     /// Returns the explicitly requested algorithm or infers it from one value field.
     fn algorithm_kind(&self) -> S3Result<Option<ChecksumAlgorithmKind>> {
         if self.algorithm.is_some() {

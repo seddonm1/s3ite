@@ -7,3 +7,4 @@ pub mod fixtures;
 pub mod raw_http;
 pub mod sdk;
 pub mod server;
+pub mod sse;

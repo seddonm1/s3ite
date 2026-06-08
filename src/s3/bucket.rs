@@ -291,6 +291,7 @@ pub(super) async fn put_bucket_encryption(
     Ok(S3Response::new(PutBucketEncryptionOutput {}))
 }
 
+/// Builds the bucket encryption DTO for the supported SSE-S3 default.
 fn sse_s3_bucket_encryption_configuration() -> ServerSideEncryptionConfiguration {
     ServerSideEncryptionConfiguration {
         rules: vec![ServerSideEncryptionRule {
@@ -303,6 +304,7 @@ fn sse_s3_bucket_encryption_configuration() -> ServerSideEncryptionConfiguration
     }
 }
 
+/// Validates that a bucket encryption request enables only SSE-S3 AES256.
 fn validate_sse_s3_bucket_encryption_configuration(
     configuration: &ServerSideEncryptionConfiguration,
 ) -> S3Result<()> {
