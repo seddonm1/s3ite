@@ -18,29 +18,33 @@ use s3s::{
         CopyObjectResult, CopyPartResult, CopySource, CreateBucketInput, CreateBucketOutput,
         CreateMultipartUploadInput, CreateMultipartUploadOutput, DefaultRetention,
         DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketEncryptionInput,
-        DeleteBucketEncryptionOutput, DeleteBucketInput, DeleteBucketOutput,
-        DeleteBucketTaggingInput, DeleteBucketTaggingOutput, DeleteObjectInput, DeleteObjectOutput,
-        DeleteObjectTaggingInput, DeleteObjectTaggingOutput, DeleteObjectsInput,
-        DeleteObjectsOutput, DeletedObject, ETag, ETagCondition, Error as DeleteError,
-        GetBucketAclInput, GetBucketAclOutput, GetBucketCorsInput, GetBucketCorsOutput,
-        GetBucketEncryptionInput, GetBucketEncryptionOutput, GetBucketLocationInput,
-        GetBucketLocationOutput, GetBucketTaggingInput, GetBucketTaggingOutput,
-        GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectAclInput, GetObjectAclOutput,
-        GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectAttributesParts,
-        GetObjectInput, GetObjectLegalHoldInput, GetObjectLegalHoldOutput,
-        GetObjectLockConfigurationInput, GetObjectLockConfigurationOutput, GetObjectOutput,
-        GetObjectRetentionInput, GetObjectRetentionOutput, GetObjectTaggingInput,
-        GetObjectTaggingOutput, GetObjectTorrentInput, GetObjectTorrentOutput, Grant, Grantee,
-        HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, Initiator,
+        DeleteBucketEncryptionOutput, DeleteBucketInput, DeleteBucketLifecycleInput,
+        DeleteBucketLifecycleOutput, DeleteBucketOutput, DeleteBucketTaggingInput,
+        DeleteBucketTaggingOutput, DeleteObjectInput, DeleteObjectOutput, DeleteObjectTaggingInput,
+        DeleteObjectTaggingOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
+        ETagCondition, Error as DeleteError, ExpirationStatus, GetBucketAclInput,
+        GetBucketAclOutput, GetBucketCorsInput, GetBucketCorsOutput, GetBucketEncryptionInput,
+        GetBucketEncryptionOutput, GetBucketLifecycleConfigurationInput,
+        GetBucketLifecycleConfigurationOutput, GetBucketLocationInput, GetBucketLocationOutput,
+        GetBucketTaggingInput, GetBucketTaggingOutput, GetBucketVersioningInput,
+        GetBucketVersioningOutput, GetObjectAclInput, GetObjectAclOutput, GetObjectAttributesInput,
+        GetObjectAttributesOutput, GetObjectAttributesParts, GetObjectInput,
+        GetObjectLegalHoldInput, GetObjectLegalHoldOutput, GetObjectLockConfigurationInput,
+        GetObjectLockConfigurationOutput, GetObjectOutput, GetObjectRetentionInput,
+        GetObjectRetentionOutput, GetObjectTaggingInput, GetObjectTaggingOutput,
+        GetObjectTorrentInput, GetObjectTorrentOutput, Grant, Grantee, HeadBucketInput,
+        HeadBucketOutput, HeadObjectInput, HeadObjectOutput, Initiator, LifecycleExpiration,
+        LifecycleRule, LifecycleRuleAndOperator, LifecycleRuleFilter, LifecycleRules,
         ListBucketsInput, ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput,
         ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput,
         ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput, MFADelete,
-        MetadataDirective, MultipartUpload, ObjectAttributes, ObjectCannedACL,
-        ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
-        ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode, ObjectLockRule, ObjectPart,
-        Owner, Part, Permission, PostObjectInput, PostObjectOutput, PutBucketAclInput,
-        PutBucketAclOutput, PutBucketCorsInput, PutBucketCorsOutput, PutBucketEncryptionInput,
-        PutBucketEncryptionOutput, PutBucketTaggingInput, PutBucketTaggingOutput,
+        MetadataDirective, MultipartUpload, NoncurrentVersionExpiration, ObjectAttributes,
+        ObjectCannedACL, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold,
+        ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode,
+        ObjectLockRule, ObjectPart, Owner, Part, Permission, PostObjectInput, PostObjectOutput,
+        PutBucketAclInput, PutBucketAclOutput, PutBucketCorsInput, PutBucketCorsOutput,
+        PutBucketEncryptionInput, PutBucketEncryptionOutput, PutBucketLifecycleConfigurationInput,
+        PutBucketLifecycleConfigurationOutput, PutBucketTaggingInput, PutBucketTaggingOutput,
         PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectAclInput, PutObjectAclOutput,
         PutObjectInput, PutObjectLegalHoldInput, PutObjectLegalHoldOutput,
         PutObjectLockConfigurationInput, PutObjectLockConfigurationOutput, PutObjectOutput,
@@ -116,6 +120,7 @@ mod cors;
 mod delete;
 mod error;
 mod get;
+mod lifecycle;
 mod list;
 mod metadata;
 mod multipart;
@@ -133,9 +138,15 @@ pub(crate) use self::{
         encode_hex,
     },
     cors::{BucketCorsLayer, StoredCorsRule},
+    lifecycle::{
+        LifecycleExpirationHeader, StoredLifecycleAndFilter, StoredLifecycleExpiration,
+        StoredLifecycleFilter, StoredLifecycleRule, StoredNoncurrentVersionExpiration,
+        current_expiration_time, lifecycle_expiration_header, lifecycle_rule_matches_object,
+        noncurrent_expiration_time,
+    },
     object_lock::{
         StoredObjectLock, StoredObjectLockConfig, StoredObjectLockDefaultRetention,
-        StoredObjectLockMode, StoredObjectRetention,
+        StoredObjectLockMode, StoredObjectRetention, object_lock_allows_lifecycle_delete,
     },
     sse::{SSE_S3_ALGORITHM_CODE, StoredSse, parse_master_key},
     tagging::StoredTag,
@@ -400,6 +411,16 @@ impl S3 for Sqlite {
         cors::delete_bucket_cors(self, req).await
     }
 
+    /// Deletes a bucket's lifecycle configuration.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id(&req),
+            client_ip = %client_ip(&req), bucket = %req.input.bucket))]
+    async fn delete_bucket_lifecycle(
+        &self,
+        req: S3Request<DeleteBucketLifecycleInput>,
+    ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
+        lifecycle::delete_bucket_lifecycle(self, req).await
+    }
+
     /// Deletes a bucket's default encryption configuration.
     #[tracing::instrument(skip_all, fields(user_id = %user_id(&req),
             client_ip = %client_ip(&req), bucket = %req.input.bucket))]
@@ -491,6 +512,16 @@ impl S3 for Sqlite {
         req: S3Request<GetBucketCorsInput>,
     ) -> S3Result<S3Response<GetBucketCorsOutput>> {
         cors::get_bucket_cors(self, req).await
+    }
+
+    /// Returns a bucket's lifecycle configuration.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id(&req),
+            client_ip = %client_ip(&req), bucket = %req.input.bucket))]
+    async fn get_bucket_lifecycle_configuration(
+        &self,
+        req: S3Request<GetBucketLifecycleConfigurationInput>,
+    ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
+        lifecycle::get_bucket_lifecycle_configuration(self, req).await
     }
 
     /// Returns a bucket's default encryption configuration.
@@ -725,6 +756,16 @@ impl S3 for Sqlite {
         req: S3Request<PutBucketCorsInput>,
     ) -> S3Result<S3Response<PutBucketCorsOutput>> {
         cors::put_bucket_cors(self, req).await
+    }
+
+    /// Replaces a bucket's lifecycle configuration.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id(&req),
+            client_ip = %client_ip(&req), bucket = %req.input.bucket))]
+    async fn put_bucket_lifecycle_configuration(
+        &self,
+        req: S3Request<PutBucketLifecycleConfigurationInput>,
+    ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
+        lifecycle::put_bucket_lifecycle_configuration(self, req).await
     }
 
     /// Updates a bucket's default encryption configuration.

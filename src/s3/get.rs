@@ -6,7 +6,7 @@ use super::{
     Bytes, ChecksumMode, CompletedObjectPart, ETag, GetObjectAttributesInput,
     GetObjectAttributesOutput, GetObjectAttributesParts, GetObjectInput, GetObjectOutput,
     GetObjectTorrentInput, GetObjectTorrentOutput, HeadObjectInput, HeadObjectOutput, HeaderValue,
-    KeyMetadata, Not, ObjectAttributes, ObjectBodyReference, ObjectPart,
+    KeyMetadata, LifecycleExpirationHeader, Not, ObjectAttributes, ObjectBodyReference, ObjectPart,
     ObjectReadConditionFailure, ObjectReadConditions, S3Error, S3ErrorCode, S3Range, S3Request,
     S3Response, S3Result, Sqlite, SqliteError, SqliteResult, StorageClass, StoredChecksum,
     StreamExt, StreamingBlob, X_AMZ_TAGGING_COUNT, active_sse_from_stored, checksum_crc32,
@@ -55,6 +55,7 @@ struct ObjectBodyRead {
     completed_part: Option<CompletedObjectPart>,
     completed_part_count: i32,
     object_range: ByteRange<u64>,
+    expiration: Option<LifecycleExpirationHeader>,
     body: ObjectBodyReadBody,
 }
 
@@ -70,6 +71,7 @@ struct ObjectBodyReadFound {
     completed_part: Option<CompletedObjectPart>,
     completed_part_count: i32,
     object_range: ByteRange<u64>,
+    expiration: Option<LifecycleExpirationHeader>,
 }
 
 /// Result of resolving an object body read before opening the response stream.
@@ -93,6 +95,7 @@ struct ObjectMetadataRead {
     completed_part: Option<CompletedObjectPart>,
     completed_part_count: i32,
     tag_count: i32,
+    expiration: Option<LifecycleExpirationHeader>,
 }
 
 /// Validates S3 range and `partNumber` request parameters before storage access.
@@ -220,6 +223,14 @@ fn response_checksum(
     }
 }
 
+fn lifecycle_expiration_response_header(
+    expiration: Option<LifecycleExpirationHeader>,
+) -> S3Result<Option<String>> {
+    expiration
+        .map(|expiration| expiration.to_header_value())
+        .transpose()
+}
+
 /// Resolves object metadata and opens a bounded blob stream for `GetObject`.
 #[allow(clippy::too_many_lines)]
 async fn load_get_object(
@@ -276,6 +287,13 @@ async fn load_get_object(
                     object_range.clone(),
                 )?
             };
+            let expiration = Sqlite::lifecycle_expiration_header_for_object(
+                transaction,
+                &key,
+                &object.version_id,
+                object.key_metadata.size,
+                object.key_metadata.last_modified,
+            )?;
 
             Ok((
                 ObjectBodyReadStart::Found(Box::new(ObjectBodyReadFound {
@@ -283,6 +301,7 @@ async fn load_get_object(
                     completed_part,
                     completed_part_count,
                     object_range,
+                    expiration,
                 })),
                 requests,
             ))
@@ -338,6 +357,7 @@ async fn load_get_object(
                 completed_part: read.completed_part,
                 completed_part_count: read.completed_part_count,
                 object_range: read.object_range,
+                expiration: read.expiration,
                 body,
             })
         }
@@ -351,7 +371,7 @@ async fn load_head_object(
     version_id: Option<String>,
     part_number: Option<i32>,
 ) -> S3Result<ObjectMetadataRead> {
-    let (metadata, completed_part, completed_part_count, tag_count) = connection
+    let (metadata, completed_part, completed_part_count, tag_count, expiration) = connection
         .read(move |connection| {
             let transaction = connection.transaction()?;
             let metadata = match version_id.as_deref() {
@@ -363,10 +383,10 @@ async fn load_head_object(
                 None => Sqlite::get_current_metadata(&transaction, &key)?,
             };
             let Some(metadata) = metadata else {
-                return Ok((None, None, 0, 0));
+                return Ok((None, None, 0, 0, None));
             };
             if metadata.is_delete_marker {
-                return Ok((Some(metadata), None, 0, 0));
+                return Ok((Some(metadata), None, 0, 0, None));
             }
             let target = Sqlite::get_object_version_tagging_target(
                 &transaction,
@@ -375,6 +395,13 @@ async fn load_head_object(
             )?
             .ok_or(SqliteError::ObjectVersionNotFound)?;
             let tag_count = Sqlite::get_object_tag_count(&transaction, target.sequence)?;
+            let expiration = Sqlite::lifecycle_expiration_header_for_object(
+                &transaction,
+                &key,
+                &metadata.version_id,
+                metadata.size,
+                metadata.last_modified,
+            )?;
             let (completed_part, completed_part_count) =
                 load_completed_part_info(&transaction, &key, &metadata.version_id, part_number)?;
             Ok((
@@ -382,6 +409,7 @@ async fn load_head_object(
                 completed_part,
                 completed_part_count,
                 tag_count,
+                expiration,
             ))
         })
         .await
@@ -397,6 +425,7 @@ async fn load_head_object(
         completed_part,
         completed_part_count,
         tag_count,
+        expiration,
     })
 }
 
@@ -416,23 +445,9 @@ fn load_completed_part_info(
     }
 }
 
-/// Builds a `GetObject` response around the `SQLite` blob reader stream.
-fn get_object_output(
-    read: ObjectBodyRead,
-    range: Option<&S3Range>,
-    part_number: Option<i32>,
-    checksum_mode: Option<&ChecksumMode>,
-) -> S3Result<GetObjectOutput> {
-    let ObjectBodyReference {
-        version_id,
-        key_metadata,
-        ..
-    } = read.object;
-    let object_size = u64::try_from(key_metadata.size).map_err(S3Error::internal_error)?;
-    let object_range = read.object_range;
-    let content_length = object_range.end - object_range.start;
-    let content_length_i64 = i64::try_from(content_length).map_err(S3Error::internal_error)?;
-    let body = match read.body {
+/// Builds the streaming body for a `GetObject` response.
+fn get_object_response_body(body: ObjectBodyReadBody, content_length: u64) -> StreamingBlob {
+    match body {
         ObjectBodyReadBody::Blob(body) => StreamingBlob::wrap::<_, S3Error>(
             stream::unfold(
                 (body, content_length, false),
@@ -479,7 +494,26 @@ fn get_object_output(
         ObjectBodyReadBody::Bytes(bytes) => StreamingBlob::wrap::<_, S3Error>(
             stream::once(async move { Ok::<Bytes, S3Error>(bytes) }).fuse(),
         ),
-    };
+    }
+}
+
+/// Builds a `GetObject` response around the `SQLite` blob reader stream.
+fn get_object_output(
+    read: ObjectBodyRead,
+    range: Option<&S3Range>,
+    part_number: Option<i32>,
+    checksum_mode: Option<&ChecksumMode>,
+) -> S3Result<GetObjectOutput> {
+    let ObjectBodyReference {
+        version_id,
+        key_metadata,
+        ..
+    } = read.object;
+    let object_size = u64::try_from(key_metadata.size).map_err(S3Error::internal_error)?;
+    let object_range = read.object_range;
+    let content_length = object_range.end - object_range.start;
+    let content_length_i64 = i64::try_from(content_length).map_err(S3Error::internal_error)?;
+    let body = get_object_response_body(read.body, content_length);
     let response_checksum = response_checksum(
         key_metadata.checksum.as_ref(),
         read.completed_part.as_ref(),
@@ -491,6 +525,7 @@ fn get_object_output(
     let object_lock_legal_hold_status = object_lock_legal_hold_status(&key_metadata.object_lock);
     let object_lock_mode = object_lock_mode(&key_metadata.object_lock);
     let object_lock_retain_until_date = object_lock_retain_until_date(&key_metadata.object_lock);
+    let expiration = lifecycle_expiration_response_header(read.expiration)?;
 
     Ok(GetObjectOutput {
         body: Some(body),
@@ -515,6 +550,7 @@ fn get_object_output(
         last_modified: Some(key_metadata.last_modified.into()),
         metadata: key_metadata.metadata,
         e_tag: key_metadata.md5.map(ETag::Strong),
+        expiration,
         object_lock_legal_hold_status,
         object_lock_mode,
         object_lock_retain_until_date,
@@ -557,6 +593,7 @@ fn head_object_output(
     let object_lock_legal_hold_status = object_lock_legal_hold_status(&object.object_lock);
     let object_lock_mode = object_lock_mode(&object.object_lock);
     let object_lock_retain_until_date = object_lock_retain_until_date(&object.object_lock);
+    let expiration = lifecycle_expiration_response_header(read.expiration)?;
 
     Ok(HeadObjectOutput {
         accept_ranges: Some("bytes".to_string()),
@@ -577,6 +614,7 @@ fn head_object_output(
         ),
         content_type: Some(content_type),
         e_tag: object.md5.map(ETag::Strong),
+        expiration,
         expires: object.expires.map(Into::into),
         last_modified: Some(object.last_modified.into()),
         metadata: object.metadata,

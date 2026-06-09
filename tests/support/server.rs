@@ -32,6 +32,7 @@ pub struct TestServerOptions {
     pub config: Option<String>,
     pub cors: Option<String>,
     pub domain_name: Option<String>,
+    pub maintenance_interval_seconds: Option<u64>,
     pub rust_log: Option<String>,
 }
 
@@ -74,7 +75,12 @@ impl TestServer {
             .arg("--secret-key")
             .arg(SECRET_KEY)
             .arg("--maintenance-interval-seconds")
-            .arg("0");
+            .arg(
+                options
+                    .maintenance_interval_seconds
+                    .unwrap_or(0)
+                    .to_string(),
+            );
         if let Some(domain_name) = options.domain_name {
             command.arg("--domain-name").arg(domain_name);
         }

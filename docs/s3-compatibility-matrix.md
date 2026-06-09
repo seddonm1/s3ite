@@ -123,7 +123,7 @@ compatibility-limited, the note says so.
 | Multipart | UploadPartCopy | ✅ | ✅ | ✅ | ✅ | Includes ranges, conditions, special names, and versions. |
 | Multipart | Multipart idempotent complete retry | ✅ | ✅ | ✅ | ✅ | s3ite records completion results for retries. |
 | Multipart | Multipart re-upload part replacement | ✅ | ✅ | ✅ | ✅ | Covered by s3ite checksum and multipart tests. |
-| Multipart | AbortIncompleteMultipartUpload lifecycle action | ✅ | ✅ | ❌ | ❌ | MinIO documents this lifecycle action as unsupported. |
+| Multipart | AbortIncompleteMultipartUpload lifecycle action | ✅ | ✅ | ❌ | ✅ | s3ite applies matching lifecycle abort rules during bucket maintenance; MinIO documents this lifecycle action as unsupported. |
 | Checksums | Content-MD5 validation | ✅ | ✅ | ✅ | ✅ | Includes invalid short, malformed, bad, empty, and missing forms. |
 | Checksums | PutObject SHA256 checksum | ✅ | ✅ | ✅ | ✅ | s3ite validates and stores the checksum. |
 | Checksums | PutObject CRC64NVME checksum | ✅ | ✅ | ✅ | ✅ | s3ite validates and stores the checksum. |
@@ -157,11 +157,11 @@ compatibility-limited, the note says so.
 | Tagging | Object tags on PutObject | ✅ | ✅ | ✅ | ✅ | Covers PutObject, CopyObject tag directives, and multipart upload tags. |
 | Tagging | Object tags on POST Object | ✅ | ✅ | ✅ | ✅ | POST Object forwards `x-amz-tagging` through the normal object write path. |
 | Tagging | Tag-based bucket policy conditions | ✅ | ✅ | ✅ | ❌ | Requires bucket policy support. |
-| Lifecycle | Put/Get/DeleteBucketLifecycle | ✅ | ✅ | ✅ | ❌ | Out of scope for s3ite. |
-| Lifecycle | Current object expiration | ✅ | ✅ | ✅ | ❌ | Out of scope for s3ite. |
-| Lifecycle | Noncurrent version expiration | ✅ | ✅ | ✅ | ❌ | Out of scope for s3ite. |
-| Lifecycle | Delete-marker expiration | ✅ | ✅ | ✅ | ❌ | Out of scope for s3ite. |
-| Lifecycle | Lifecycle filters by prefix/tag/size | ✅ | ✅ | ✅ | ❌ | Out of scope for s3ite. |
+| Lifecycle | Put/Get/DeleteBucketLifecycle | ✅ | ✅ | ✅ | ✅ | s3ite stores normalized lifecycle rules in each bucket DB. |
+| Lifecycle | Current object expiration | ✅ | ✅ | ✅ | ✅ | Applied during startup and periodic bucket maintenance. |
+| Lifecycle | Noncurrent version expiration | ✅ | ✅ | ✅ | ✅ | Supports `NoncurrentDays` and `NewerNoncurrentVersions`. |
+| Lifecycle | Delete-marker expiration | ✅ | ✅ | ✅ | ✅ | Removes expired delete markers when they are the only remaining version. |
+| Lifecycle | Lifecycle filters by prefix/tag/size | ✅ | ✅ | ✅ | ✅ | Supports legacy prefix, filter prefix, tag, size, and `And` filters. |
 | Lifecycle | Storage-class transitions | ✅ | ✅ | ✅ | ❌ | Out of scope for s3ite. |
 | Lifecycle | RestoreObject from archive/tier | ✅ | ✅ | ✅ | ❌ | MinIO lists `RestoreObject`; s3ite has no restore/tiering. |
 | Lifecycle | Restore status in list outputs | ✅ | ✅ | ✅ | ❌ | Out of scope for s3ite. |
@@ -209,7 +209,7 @@ The largest compatibility gaps relative to AWS/MinIO and `ceph/s3-tests` are:
 
 - Auth and authorization: bucket policies, public/anonymous access, IAM, STS,
   cross-account behavior, and full ACL grant enforcement.
-- Object-management APIs: lifecycle, restore/tiering, PublicAccessBlock,
+- Object-management APIs: lifecycle transitions, restore/tiering, PublicAccessBlock,
   notifications, logging, website hosting, inventory, analytics, metrics, and
   request payment.
 - Encryption variants: SSE-KMS, SSE-C, DSSE-KMS, and S3 Bucket Keys.

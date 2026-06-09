@@ -28,7 +28,8 @@ impl Sqlite {
         let mut stmt = transaction.prepare_cached(
             "
             UPDATE object_version
-            SET is_latest = 1
+            SET is_latest = 1,
+                noncurrent_since = NULL
             WHERE sequence = (
                 SELECT sequence
                 FROM object_version

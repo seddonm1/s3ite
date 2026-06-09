@@ -19,10 +19,14 @@ use uuid::Uuid;
 
 use crate::database::BucketConnection;
 use crate::s3::{
-    ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKind, MultipartChecksumConfig,
-    MultipartCompletionChecksum, PartChecksum, SSE_S3_ALGORITHM_CODE, StoredChecksum,
-    StoredCorsRule, StoredObjectLock, StoredObjectLockConfig, StoredObjectLockDefaultRetention,
-    StoredObjectLockMode, StoredObjectRetention, StoredSse, StoredTag, decode_base64, encode_hex,
+    ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKind, LifecycleExpirationHeader,
+    MultipartChecksumConfig, MultipartCompletionChecksum, PartChecksum, SSE_S3_ALGORITHM_CODE,
+    StoredChecksum, StoredCorsRule, StoredLifecycleAndFilter, StoredLifecycleExpiration,
+    StoredLifecycleFilter, StoredLifecycleRule, StoredNoncurrentVersionExpiration,
+    StoredObjectLock, StoredObjectLockConfig, StoredObjectLockDefaultRetention,
+    StoredObjectLockMode, StoredObjectRetention, StoredSse, StoredTag, current_expiration_time,
+    decode_base64, encode_hex, lifecycle_expiration_header, lifecycle_rule_matches_object,
+    noncurrent_expiration_time, object_lock_allows_lifecycle_delete,
 };
 
 mod bucket;
@@ -31,6 +35,7 @@ mod cors;
 mod delete;
 mod error;
 mod get;
+mod lifecycle;
 mod list;
 mod multipart;
 mod object_lock;
@@ -122,6 +127,56 @@ CREATE TABLE bucket_cors_expose_header (
     FOREIGN KEY (rule_sequence) REFERENCES bucket_cors_rule (sequence) ON DELETE CASCADE
 ) STRICT;
 
+-- Bucket lifecycle rules for expiration and cleanup actions.
+CREATE TABLE bucket_lifecycle_rule (
+    sequence INTEGER PRIMARY KEY,
+    id TEXT,
+    enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+    expiration_days INTEGER CHECK(expiration_days IS NULL OR expiration_days > 0),
+    expiration_date TEXT,
+    expiration_delete_marker INTEGER NOT NULL DEFAULT 0 CHECK(expiration_delete_marker IN (0, 1)),
+    noncurrent_days INTEGER CHECK(noncurrent_days IS NULL OR noncurrent_days > 0),
+    newer_noncurrent_versions INTEGER CHECK(newer_noncurrent_versions IS NULL OR newer_noncurrent_versions BETWEEN 1 AND 100),
+    abort_incomplete_multipart_days INTEGER CHECK(abort_incomplete_multipart_days IS NULL OR abort_incomplete_multipart_days > 0),
+    CHECK (
+        (
+            expiration_days IS NULL
+            AND expiration_date IS NULL
+            AND expiration_delete_marker = 0
+        )
+        OR
+        (
+            (expiration_days IS NOT NULL) +
+            (expiration_date IS NOT NULL) +
+            (expiration_delete_marker = 1) = 1
+        )
+    ),
+    CHECK (
+        noncurrent_days IS NOT NULL
+        OR newer_noncurrent_versions IS NULL
+    )
+) STRICT;
+
+CREATE TABLE bucket_lifecycle_filter (
+    rule_sequence INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL CHECK(kind IN ('empty', 'legacy_prefix', 'prefix', 'tag', 'size_gt', 'size_lt', 'and')),
+    prefix TEXT,
+    tag_key TEXT,
+    tag_value TEXT,
+    object_size_greater_than INTEGER CHECK(object_size_greater_than IS NULL OR object_size_greater_than >= 0),
+    object_size_less_than INTEGER CHECK(object_size_less_than IS NULL OR object_size_less_than >= 0),
+    FOREIGN KEY (rule_sequence) REFERENCES bucket_lifecycle_rule (sequence) ON DELETE CASCADE
+) STRICT;
+
+CREATE TABLE bucket_lifecycle_and_tag (
+    rule_sequence INTEGER NOT NULL,
+    position INTEGER NOT NULL CHECK(position >= 0),
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY (rule_sequence, position),
+    FOREIGN KEY (rule_sequence) REFERENCES bucket_lifecycle_filter (rule_sequence) ON DELETE CASCADE
+) STRICT;
+
 -- Object metadata for every live version and delete marker.
 CREATE TABLE object_version (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -136,6 +191,7 @@ CREATE TABLE object_version (
     cache_control TEXT,
     expires TEXT,
     last_modified TEXT NOT NULL,
+    noncurrent_since TEXT,
     md5 TEXT,
     checksum_algorithm INTEGER CHECK(checksum_algorithm BETWEEN 1 AND 5),
     checksum_type INTEGER CHECK(checksum_type BETWEEN 1 AND 2),
@@ -1085,6 +1141,7 @@ impl Sqlite {
             multipart_expire_before,
             completed_multipart_expire_before,
         )?;
+        Self::apply_lifecycle_rules(&transaction, OffsetDateTime::now_utc())?;
         transaction.commit()?;
         connection.execute_batch("PRAGMA optimize=0x10002;")?;
         Ok(())
@@ -1146,6 +1203,7 @@ impl Sqlite {
                     multipart_expire_before,
                     completed_multipart_expire_before,
                 )?;
+                Self::apply_lifecycle_rules(&transaction, OffsetDateTime::now_utc())?;
                 transaction.commit()?;
 
                 connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
@@ -1469,6 +1527,9 @@ mod tests {
             "bucket_cors_allowed_method",
             "bucket_cors_allowed_header",
             "bucket_cors_expose_header",
+            "bucket_lifecycle_rule",
+            "bucket_lifecycle_filter",
+            "bucket_lifecycle_and_tag",
             "object_version",
             "object_tag",
             "multipart_upload",
@@ -1543,6 +1604,22 @@ mod tests {
                     && column.on_delete == "CASCADE"
             }));
         }
+
+        let lifecycle_filter_columns = foreign_key_columns(&connection, "bucket_lifecycle_filter")?;
+        assert!(lifecycle_filter_columns.iter().any(|column| {
+            column.table == "bucket_lifecycle_rule"
+                && column.from == "rule_sequence"
+                && column.to == "sequence"
+                && column.on_delete == "CASCADE"
+        }));
+
+        let lifecycle_tag_columns = foreign_key_columns(&connection, "bucket_lifecycle_and_tag")?;
+        assert!(lifecycle_tag_columns.iter().any(|column| {
+            column.table == "bucket_lifecycle_filter"
+                && column.from == "rule_sequence"
+                && column.to == "rule_sequence"
+                && column.on_delete == "CASCADE"
+        }));
 
         let blob_chunk_columns = foreign_key_columns(&connection, "object_blob_chunk")?;
         assert!(blob_chunk_columns.iter().any(|column| {

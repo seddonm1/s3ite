@@ -206,6 +206,22 @@ pub(super) fn validate_object_lock_delete(
     }
 }
 
+/// Returns whether background lifecycle cleanup may permanently delete stored object data.
+#[must_use]
+pub(crate) fn object_lock_allows_lifecycle_delete(
+    lock: &StoredObjectLock,
+    now: OffsetDateTime,
+) -> bool {
+    if lock.legal_hold.is_some_and(|legal_hold| legal_hold) {
+        return false;
+    }
+
+    let Some(retention) = lock.retention.as_ref() else {
+        return true;
+    };
+    retention.retain_until <= now
+}
+
 /// Returns whether a delete request will permanently remove data rather than create only a marker.
 #[must_use]
 pub(super) fn delete_requires_object_lock_check(

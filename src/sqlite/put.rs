@@ -68,10 +68,11 @@ impl Sqlite {
         let mut stmt = transaction.prepare_cached(
             "
             UPDATE object_version
-            SET is_latest = 0
-            WHERE key = ?1;",
+            SET is_latest = 0,
+                noncurrent_since = ?2
+            WHERE key = ?1 AND is_latest = 1;",
         )?;
-        Ok(stmt.execute([key])?)
+        Ok(stmt.execute((key, OffsetDateTime::now_utc()))?)
     }
 
     /// Checks object write preconditions against current metadata in the transaction.
