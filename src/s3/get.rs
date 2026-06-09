@@ -13,8 +13,8 @@ use super::{
     checksum_mode_enabled, checksum_sha1, checksum_sha256, checksum_struct, checksum_type_output,
     decrypt_stored_chunks, list_limit, not_found_delete_marker_error, not_modified_error,
     object_checksum_for_part, requested_part_range, s3_error, s3_error_from_sqlite,
-    s3_error_with_message, sse_s3_output, stream, validate_no_sse_headers, validate_part_number,
-    validate_read_conditions,
+    s3_error_with_message, sse_s3_output, stream, validate_expected_bucket_owner,
+    validate_no_sse_headers, validate_part_number, validate_read_conditions,
 };
 
 use crate::database::{BlobReadReceiver, BucketConnection};
@@ -22,8 +22,13 @@ use crate::database::{BlobReadReceiver, BucketConnection};
 /// Reports that `BitTorrent` metadata is unavailable for this object store.
 pub(super) fn get_object_torrent(
     _sqlite: &Sqlite,
-    _req: S3Request<GetObjectTorrentInput>,
+    req: S3Request<GetObjectTorrentInput>,
 ) -> S3Result<S3Response<GetObjectTorrentOutput>> {
+    let GetObjectTorrentInput {
+        expected_bucket_owner,
+        ..
+    } = req.input;
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
     Err(s3_error(S3ErrorCode::NoSuchKey))
 }
 
@@ -562,7 +567,9 @@ pub(super) async fn get_object(
     sqlite: &Sqlite,
     req: S3Request<GetObjectInput>,
 ) -> S3Result<S3Response<GetObjectOutput>> {
-    validate_no_sse_headers(&req.headers)?;
+    let S3Request { input, headers, .. } = req;
+    validate_expected_bucket_owner(input.expected_bucket_owner.as_deref())?;
+    validate_no_sse_headers(&headers)?;
     let GetObjectInput {
         bucket,
         key,
@@ -575,7 +582,7 @@ pub(super) async fn get_object(
         if_unmodified_since,
         checksum_mode,
         ..
-    } = req.input;
+    } = input;
     validate_range_request(range.as_ref(), part_number)?;
 
     let connection = sqlite
@@ -606,7 +613,9 @@ pub(super) async fn head_object(
     sqlite: &Sqlite,
     req: S3Request<HeadObjectInput>,
 ) -> S3Result<S3Response<HeadObjectOutput>> {
-    validate_no_sse_headers(&req.headers)?;
+    let S3Request { input, headers, .. } = req;
+    validate_expected_bucket_owner(input.expected_bucket_owner.as_deref())?;
+    validate_no_sse_headers(&headers)?;
     let HeadObjectInput {
         bucket,
         key,
@@ -619,7 +628,7 @@ pub(super) async fn head_object(
         if_unmodified_since,
         checksum_mode,
         ..
-    } = req.input;
+    } = input;
     validate_range_request(range.as_ref(), part_number)?;
 
     let connection = sqlite
@@ -688,7 +697,9 @@ pub(super) async fn get_object_attributes(
     sqlite: &Sqlite,
     req: S3Request<GetObjectAttributesInput>,
 ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
-    validate_no_sse_headers(&req.headers)?;
+    let S3Request { input, headers, .. } = req;
+    validate_expected_bucket_owner(input.expected_bucket_owner.as_deref())?;
+    validate_no_sse_headers(&headers)?;
     let GetObjectAttributesInput {
         bucket,
         key,
@@ -697,7 +708,7 @@ pub(super) async fn get_object_attributes(
         max_parts,
         part_number_marker,
         ..
-    } = req.input;
+    } = input;
 
     let max_parts = list_limit(max_parts, 1000, 1000)?;
     let part_number_marker = part_number_marker.unwrap_or(0);

@@ -13,8 +13,8 @@ use super::{
     decrypt_stored_chunks, encrypt_value_chunks, http_date_time, normalize_content_encoding,
     normalize_metadata, object_write_checksum_from_value, requested_sse_s3,
     resolve_write_encryption, s3_error, s3_error_from_sqlite, s3_error_with_message, sse_s3_output,
-    strong_etag_condition_matches, validate_no_unsupported_sse_headers, validate_object_acl,
-    weak_etag_condition_matches,
+    strong_etag_condition_matches, validate_expected_bucket_owner,
+    validate_no_unsupported_sse_headers, validate_object_acl, weak_etag_condition_matches,
 };
 
 /// Parsed copy request with source, destination, metadata, and checksum intent.
@@ -499,6 +499,8 @@ pub(super) async fn copy_object(
     req: S3Request<CopyObjectInput>,
 ) -> S3Result<S3Response<CopyObjectOutput>> {
     let S3Request { input, headers, .. } = req;
+    validate_expected_bucket_owner(input.expected_bucket_owner.as_deref())?;
+    validate_expected_bucket_owner(input.expected_source_bucket_owner.as_deref())?;
     validate_no_unsupported_sse_headers(&headers)?;
     let request = parse_copy_object_request(input)?;
 

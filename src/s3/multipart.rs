@@ -26,7 +26,8 @@ use super::{
     owner, part_checksum_accumulator, read_part_body_encrypted, requested_sse_s3,
     resolve_write_encryption, s3_error, s3_error_from_sqlite, s3_error_with_message, sse_s3_output,
     stored_tags_from_header, validate_content_md5, validate_declared_object_write_length,
-    validate_no_sse_headers, validate_no_unsupported_sse_headers, validate_object_acl,
+    validate_expected_bucket_owner, validate_no_sse_headers, validate_no_unsupported_sse_headers,
+    validate_object_acl,
 };
 
 /// Normalizes a completed multipart part list while preserving S3 ordering rules.
@@ -836,6 +837,7 @@ pub(super) async fn list_multipart_uploads(
 ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
     let ListMultipartUploadsInput {
         bucket,
+        expected_bucket_owner,
         mut prefix,
         mut delimiter,
         mut key_marker,
@@ -845,6 +847,7 @@ pub(super) async fn list_multipart_uploads(
         ..
     } = req.input;
 
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
     prefix = prefix.map(decode_list_input_value);
     delimiter = delimiter.map(decode_list_input_value);
     key_marker = key_marker.map(decode_list_input_value);
@@ -933,6 +936,7 @@ pub(super) async fn create_multipart_upload(
     sqlite: &Sqlite,
     req: S3Request<CreateMultipartUploadInput>,
 ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+    validate_expected_bucket_owner(req.input.expected_bucket_owner.as_deref())?;
     validate_no_unsupported_sse_headers(&req.headers)?;
     let CreateMultipartUploadInput {
         acl,
@@ -1049,6 +1053,7 @@ pub(super) async fn upload_part(
         credentials,
         ..
     } = req;
+    validate_expected_bucket_owner(input.expected_bucket_owner.as_deref())?;
     validate_no_sse_headers(&headers)?;
     let access_key = credentials.map(|credentials| credentials.access_key);
     let UploadPartInput {
@@ -1070,6 +1075,7 @@ pub(super) async fn upload_part(
         sse_customer_key_md5,
         ..
     } = input;
+
     if sse_customer_algorithm.is_some()
         || sse_customer_key.is_some()
         || sse_customer_key_md5.is_some()
@@ -1227,6 +1233,8 @@ pub(super) async fn upload_part_copy(
         credentials,
         ..
     } = req;
+    validate_expected_bucket_owner(input.expected_bucket_owner.as_deref())?;
+    validate_expected_bucket_owner(input.expected_source_bucket_owner.as_deref())?;
     validate_no_sse_headers(&headers)?;
     let access_key = credentials.map(|credentials| credentials.access_key);
     let request = parse_upload_part_copy_request(input, access_key)?;
@@ -1256,6 +1264,7 @@ pub(super) async fn list_parts(
 ) -> S3Result<S3Response<ListPartsOutput>> {
     let ListPartsInput {
         bucket,
+        expected_bucket_owner,
         key,
         upload_id,
         max_parts,
@@ -1263,6 +1272,7 @@ pub(super) async fn list_parts(
         ..
     } = req.input;
 
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
     let upload_id = parse_upload_id(&upload_id)?;
     let max_parts = list_limit(max_parts, 1000, 1000)?;
     let part_number_marker = part_number_marker.unwrap_or(0);
@@ -1356,11 +1366,13 @@ pub(super) async fn abort_multipart_upload(
 ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
     let AbortMultipartUploadInput {
         bucket,
+        expected_bucket_owner,
         key,
         upload_id,
         ..
     } = req.input;
 
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
     sqlite
         .validate_mutable_bucket(&bucket)
         .map_err(s3_error_from_sqlite)?;
@@ -1514,6 +1526,7 @@ pub(super) async fn complete_multipart_upload(
     sqlite: &Sqlite,
     req: S3Request<CompleteMultipartUploadInput>,
 ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+    validate_expected_bucket_owner(req.input.expected_bucket_owner.as_deref())?;
     validate_no_sse_headers(&req.headers)?;
     let CompleteMultipartUploadInput {
         multipart_upload,
@@ -1530,6 +1543,7 @@ pub(super) async fn complete_multipart_upload(
         checksum_type,
         ..
     } = req.input;
+
     let write_conditions = object_write_conditions(if_match, if_none_match);
 
     sqlite

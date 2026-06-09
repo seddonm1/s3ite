@@ -8,7 +8,7 @@ use super::{
     GetObjectTaggingInput, GetObjectTaggingOutput, PutBucketTaggingInput, PutBucketTaggingOutput,
     PutObjectTaggingInput, PutObjectTaggingOutput, S3ErrorCode, S3Request, S3Response, S3Result,
     Sqlite, Tag, TagSet, Tagging, TaggingDirective, TaggingHeader, s3_error, s3_error_from_sqlite,
-    s3_error_with_message,
+    s3_error_with_message, validate_expected_bucket_owner,
 };
 
 /// Maximum number of S3 tags allowed on one resource.
@@ -87,8 +87,12 @@ pub(super) async fn delete_bucket_tagging(
     sqlite: &Sqlite,
     req: S3Request<DeleteBucketTaggingInput>,
 ) -> S3Result<S3Response<DeleteBucketTaggingOutput>> {
-    let DeleteBucketTaggingInput { bucket, .. } = req.input;
+    let DeleteBucketTaggingInput {
+        bucket,
+        expected_bucket_owner,
+    } = req.input;
 
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
     sqlite
         .validate_mutable_bucket(&bucket)
         .map_err(s3_error_from_sqlite)?;
@@ -114,7 +118,11 @@ pub(super) async fn get_bucket_tagging(
     sqlite: &Sqlite,
     req: S3Request<GetBucketTaggingInput>,
 ) -> S3Result<S3Response<GetBucketTaggingOutput>> {
-    let GetBucketTaggingInput { bucket, .. } = req.input;
+    let GetBucketTaggingInput {
+        bucket,
+        expected_bucket_owner,
+    } = req.input;
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
 
     let connection = sqlite
         .get_connection(&bucket)
@@ -142,8 +150,13 @@ pub(super) async fn put_bucket_tagging(
     req: S3Request<PutBucketTaggingInput>,
 ) -> S3Result<S3Response<PutBucketTaggingOutput>> {
     let PutBucketTaggingInput {
-        bucket, tagging, ..
+        bucket,
+        expected_bucket_owner,
+        tagging,
+        ..
     } = req.input;
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
+
     let tags = stored_tags_from_tagging(tagging)?;
 
     sqlite
@@ -192,11 +205,13 @@ pub(super) async fn delete_object_tagging(
 ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
     let DeleteObjectTaggingInput {
         bucket,
+        expected_bucket_owner,
         key,
         version_id,
         ..
     } = req.input;
 
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
     sqlite
         .validate_mutable_bucket(&bucket)
         .map_err(s3_error_from_sqlite)?;
@@ -234,11 +249,13 @@ pub(super) async fn get_object_tagging(
 ) -> S3Result<S3Response<GetObjectTaggingOutput>> {
     let GetObjectTaggingInput {
         bucket,
+        expected_bucket_owner,
         key,
         version_id,
         ..
     } = req.input;
 
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
     let connection = sqlite
         .get_connection(&bucket)
         .await
@@ -273,11 +290,14 @@ pub(super) async fn put_object_tagging(
 ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
     let PutObjectTaggingInput {
         bucket,
+        expected_bucket_owner,
         key,
         tagging,
         version_id,
         ..
     } = req.input;
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
+
     let tags = stored_tags_from_tagging(tagging)?;
 
     sqlite

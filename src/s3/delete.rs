@@ -5,6 +5,7 @@ use super::{
     DeletedObject, ETagCondition, KeyMetadata, Not, ObjectDeleteOutcome, OffsetDateTime,
     S3ErrorCode, S3Request, S3Response, S3Result, Sqlite, SqliteError, http_date_time,
     s3_error_from_sqlite, s3_error_with_message, strong_etag_condition_matches,
+    validate_expected_bucket_owner,
 };
 
 #[derive(Clone, Debug)]
@@ -64,6 +65,7 @@ pub(super) async fn delete_object(
 ) -> S3Result<S3Response<DeleteObjectOutput>> {
     let DeleteObjectInput {
         bucket,
+        expected_bucket_owner,
         key,
         version_id,
         if_match,
@@ -71,6 +73,8 @@ pub(super) async fn delete_object(
         if_match_size,
         ..
     } = req.input;
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
+
     let conditions = ObjectDeleteConditions {
         etag_matches: if_match,
         last_modified_time: if_match_last_modified_time.map(Into::into),
@@ -121,8 +125,14 @@ pub(super) async fn delete_objects(
     sqlite: &Sqlite,
     req: S3Request<DeleteObjectsInput>,
 ) -> S3Result<S3Response<DeleteObjectsOutput>> {
-    let DeleteObjectsInput { bucket, delete, .. } = req.input;
+    let DeleteObjectsInput {
+        bucket,
+        delete,
+        expected_bucket_owner,
+        ..
+    } = req.input;
 
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
     sqlite
         .validate_mutable_bucket(&bucket)
         .map_err(s3_error_from_sqlite)?;

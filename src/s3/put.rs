@@ -10,7 +10,7 @@ use super::{
     payload_checksum_accumulator, read_object_body_encrypted, requested_sse_s3,
     resolve_write_encryption, s3_error, s3_error_from_sqlite, sse_s3_output,
     stored_tags_from_header, validate_content_md5, validate_declared_object_write_length,
-    validate_no_unsupported_sse_headers, validate_object_acl,
+    validate_expected_bucket_owner, validate_no_unsupported_sse_headers, validate_object_acl,
 };
 
 /// Fully buffered object body plus hashes needed by the storage write.
@@ -126,6 +126,7 @@ pub(super) async fn put_object(
     req: S3Request<PutObjectInput>,
 ) -> S3Result<S3Response<PutObjectOutput>> {
     let S3Request { input, headers, .. } = req;
+    validate_expected_bucket_owner(input.expected_bucket_owner.as_deref())?;
     validate_no_unsupported_sse_headers(&headers)?;
     validate_put_object_bucket(sqlite, &input.bucket).await?;
     validate_put_object_acl_input(&input)?;

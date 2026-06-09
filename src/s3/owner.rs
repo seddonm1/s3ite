@@ -2,8 +2,8 @@ use super::{
     BucketCannedACL, GetBucketAclInput, GetBucketAclOutput, GetObjectAclInput, GetObjectAclOutput,
     Grant, Grantee, Not, OWNER_DISPLAY_NAME, OWNER_ID, ObjectCannedACL, Owner, Permission,
     PutBucketAclInput, PutBucketAclOutput, PutObjectAclInput, PutObjectAclOutput, S3Error,
-    S3ErrorCode, S3Request, S3Response, S3Result, Sqlite, SqliteError, Type, s3_error_from_sqlite,
-    s3_error_with_message,
+    S3ErrorCode, S3Request, S3Response, S3Result, Sqlite, SqliteError, Type, s3_error,
+    s3_error_from_sqlite, s3_error_with_message,
 };
 
 /// Returns the canonical owner used by s3ite ACL and listing responses.
@@ -12,6 +12,14 @@ pub(super) fn owner() -> Owner {
         display_name: Some(OWNER_DISPLAY_NAME.to_string()),
         id: Some(OWNER_ID.to_string()),
     }
+}
+
+/// Validates an expected-owner precondition against s3ite's synthetic owner.
+pub(super) fn validate_expected_bucket_owner(expected_bucket_owner: Option<&str>) -> S3Result<()> {
+    if expected_bucket_owner.is_some_and(|expected| expected != OWNER_ID) {
+        return Err(s3_error(S3ErrorCode::AccessDenied));
+    }
+    Ok(())
 }
 
 /// Owner-equivalent bucket ACL request fields.
@@ -103,7 +111,12 @@ pub(super) async fn get_bucket_acl(
     sqlite: &Sqlite,
     req: S3Request<GetBucketAclInput>,
 ) -> S3Result<S3Response<GetBucketAclOutput>> {
-    let GetBucketAclInput { bucket, .. } = req.input;
+    let GetBucketAclInput {
+        bucket,
+        expected_bucket_owner,
+    } = req.input;
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
+
     sqlite
         .get_connection(&bucket)
         .await
@@ -123,11 +136,13 @@ pub(super) async fn get_object_acl(
 ) -> S3Result<S3Response<GetObjectAclOutput>> {
     let GetObjectAclInput {
         bucket,
+        expected_bucket_owner,
         key,
         version_id,
         ..
     } = req.input;
 
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
     let connection = sqlite
         .get_connection(&bucket)
         .await
@@ -167,6 +182,7 @@ pub(super) async fn put_bucket_acl(
         acl,
         access_control_policy,
         bucket,
+        expected_bucket_owner,
         grant_full_control,
         grant_read,
         grant_read_acp,
@@ -175,6 +191,7 @@ pub(super) async fn put_bucket_acl(
         ..
     } = req.input;
 
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
     sqlite
         .validate_mutable_bucket(&bucket)
         .map_err(s3_error_from_sqlite)?;
@@ -209,6 +226,7 @@ pub(super) async fn put_object_acl(
         acl,
         access_control_policy,
         bucket,
+        expected_bucket_owner,
         grant_full_control,
         grant_read,
         grant_read_acp,
@@ -219,6 +237,7 @@ pub(super) async fn put_object_acl(
         ..
     } = req.input;
 
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
     sqlite
         .validate_mutable_bucket(&bucket)
         .map_err(s3_error_from_sqlite)?;
@@ -290,6 +309,16 @@ mod tests {
         assert_eq!(
             grant.permission.as_ref().map(Permission::as_str),
             Some(Permission::FULL_CONTROL)
+        );
+    }
+
+    #[test]
+    fn validates_expected_owner_header() {
+        assert!(validate_expected_bucket_owner(None).is_ok());
+        assert!(validate_expected_bucket_owner(Some(OWNER_ID)).is_ok());
+        assert_error_code(
+            validate_expected_bucket_owner(Some("other-owner")),
+            &S3ErrorCode::AccessDenied,
         );
     }
 

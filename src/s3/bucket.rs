@@ -10,7 +10,7 @@ use super::{
     ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Sqlite, SqliteError, Timestamp,
     decode_continuation_token, encode_continuation_token, fs, list_limit,
     require_sse_s3_master_key, s3_error, s3_error_from_sqlite, s3_error_with_message,
-    validate_bucket_acl,
+    validate_bucket_acl, validate_expected_bucket_owner,
 };
 
 /// Returns whether a bucket name satisfies S3 DNS-compatible naming rules.
@@ -99,8 +99,12 @@ pub(super) async fn delete_bucket(
     sqlite: &Sqlite,
     req: S3Request<DeleteBucketInput>,
 ) -> S3Result<S3Response<DeleteBucketOutput>> {
-    let DeleteBucketInput { bucket, .. } = req.input;
+    let DeleteBucketInput {
+        bucket,
+        expected_bucket_owner,
+    } = req.input;
 
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
     sqlite
         .validate_mutable_bucket(&bucket)
         .map_err(s3_error_from_sqlite)?;
@@ -151,8 +155,12 @@ pub(super) async fn get_bucket_location(
     sqlite: &Sqlite,
     req: S3Request<GetBucketLocationInput>,
 ) -> S3Result<S3Response<GetBucketLocationOutput>> {
-    let GetBucketLocationInput { bucket, .. } = req.input;
+    let GetBucketLocationInput {
+        bucket,
+        expected_bucket_owner,
+    } = req.input;
 
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
     if sqlite.buckets.read().await.contains_key(&bucket).not() {
         return Err(s3_error(S3ErrorCode::NoSuchBucket));
     }
@@ -173,7 +181,12 @@ pub(super) async fn get_bucket_versioning(
     sqlite: &Sqlite,
     req: S3Request<GetBucketVersioningInput>,
 ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
-    let GetBucketVersioningInput { bucket, .. } = req.input;
+    let GetBucketVersioningInput {
+        bucket,
+        expected_bucket_owner,
+    } = req.input;
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
+
     let connection = sqlite
         .get_connection(&bucket)
         .await
@@ -207,8 +220,12 @@ pub(super) async fn delete_bucket_encryption(
     sqlite: &Sqlite,
     req: S3Request<DeleteBucketEncryptionInput>,
 ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
-    let DeleteBucketEncryptionInput { bucket, .. } = req.input;
+    let DeleteBucketEncryptionInput {
+        bucket,
+        expected_bucket_owner,
+    } = req.input;
 
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
     sqlite
         .validate_mutable_bucket(&bucket)
         .map_err(s3_error_from_sqlite)?;
@@ -233,7 +250,12 @@ pub(super) async fn get_bucket_encryption(
     sqlite: &Sqlite,
     req: S3Request<GetBucketEncryptionInput>,
 ) -> S3Result<S3Response<GetBucketEncryptionOutput>> {
-    let GetBucketEncryptionInput { bucket, .. } = req.input;
+    let GetBucketEncryptionInput {
+        bucket,
+        expected_bucket_owner,
+    } = req.input;
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
+
     let connection = sqlite
         .get_connection(&bucket)
         .await
@@ -265,10 +287,12 @@ pub(super) async fn put_bucket_encryption(
 ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
     let PutBucketEncryptionInput {
         bucket,
+        expected_bucket_owner,
         server_side_encryption_configuration,
         ..
     } = req.input;
 
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
     sqlite
         .validate_mutable_bucket(&bucket)
         .map_err(s3_error_from_sqlite)?;
@@ -347,10 +371,12 @@ pub(super) async fn put_bucket_versioning(
 ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
     let PutBucketVersioningInput {
         bucket,
+        expected_bucket_owner,
         versioning_configuration,
         ..
     } = req.input;
 
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
     sqlite
         .validate_mutable_bucket(&bucket)
         .map_err(s3_error_from_sqlite)?;
@@ -402,8 +428,12 @@ pub(super) async fn head_bucket(
     sqlite: &Sqlite,
     req: S3Request<HeadBucketInput>,
 ) -> S3Result<S3Response<HeadBucketOutput>> {
-    let HeadBucketInput { bucket, .. } = req.input;
+    let HeadBucketInput {
+        bucket,
+        expected_bucket_owner,
+    } = req.input;
 
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
     if sqlite.buckets.read().await.contains_key(&bucket).not() {
         return Err(s3_error(S3ErrorCode::NoSuchBucket));
     }

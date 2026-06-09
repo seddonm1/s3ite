@@ -148,7 +148,10 @@ use self::{
     },
     metadata::{normalize_content_encoding, normalize_metadata},
     multipart::{requested_part_range, validate_part_number},
-    owner::{BucketAclRequest, ObjectAclRequest, owner, validate_bucket_acl, validate_object_acl},
+    owner::{
+        BucketAclRequest, ObjectAclRequest, owner, validate_bucket_acl,
+        validate_expected_bucket_owner, validate_object_acl,
+    },
     sse::{
         ActiveSse, active_sse_from_stored, decrypt_stored_chunks, encrypt_value_chunks,
         read_object_body_encrypted, read_part_body_encrypted, requested_sse_s3,

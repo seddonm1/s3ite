@@ -59,7 +59,7 @@ compatibility-limited, the note says so.
 | Buckets | Bucket DNS naming validation | ✅ | ✅ | ✅ | ✅ | s3ite covers good and bad DNS-style names. |
 | Buckets | Long bucket names up to DNS limit | ✅ | ✅ | ✅ | ✅ | s3ite covers 60-63 character names and long listing. |
 | Buckets | Virtual-hosted-style addressing | ❌ | ✅ | ✅ | ✅ | s3ite supports this when `domain_name` is configured. |
-| Buckets | Expected bucket owner header behavior | ✅ | ✅ | ❌ | ❌ | Not part of s3ite's single-owner auth model. |
+| Buckets | Expected bucket owner header behavior | ✅ | ✅ | ❌ | ✅ | Validated against s3ite's synthetic owner ID `s3ite`; cross-account ownership remains out of scope. |
 | Objects | PutObject | ✅ | ✅ | ✅ | ✅ | Basic object write. |
 | Objects | PutObject with chunked transfer encoding | ✅ | ✅ | ✅ | ✅ | Includes AWS chunked content encoding behavior. |
 | Objects | Missing Content-Length rejection | ✅ | ✅ | ✅ | ✅ | s3ite rejects missing/invalid declared write lengths. |

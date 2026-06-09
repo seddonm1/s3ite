@@ -16,7 +16,7 @@ use crate::{
 
 use super::{
     CONTINUATION_TOKEN_PREFIX, LIST_BATCH_SIZE, hex, owner, s3_error, s3_error_from_sqlite,
-    s3_error_with_message,
+    s3_error_with_message, validate_expected_bucket_owner,
 };
 
 /// Returns the common prefix produced by applying an S3 delimiter to a key.
@@ -480,6 +480,7 @@ pub(super) async fn list_objects(
 ) -> S3Result<S3Response<ListObjectsOutput>> {
     let ListObjectsInput {
         bucket,
+        expected_bucket_owner,
         mut prefix,
         max_keys,
         mut marker,
@@ -488,6 +489,7 @@ pub(super) async fn list_objects(
         ..
     } = req.input;
 
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
     prefix = prefix.map(decode_list_input_value);
     marker = marker.map(decode_list_input_value);
     delimiter = delimiter.map(decode_list_input_value);
@@ -562,6 +564,7 @@ pub(super) async fn list_object_versions(
 ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
     let ListObjectVersionsInput {
         bucket,
+        expected_bucket_owner,
         mut prefix,
         max_keys,
         mut key_marker,
@@ -571,6 +574,7 @@ pub(super) async fn list_object_versions(
         ..
     } = req.input;
 
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
     prefix = prefix.map(decode_list_input_value);
     key_marker = key_marker.map(decode_list_input_value);
     delimiter = delimiter.map(decode_list_input_value);
@@ -654,6 +658,7 @@ pub(super) async fn list_objects_v2(
 ) -> S3Result<S3Response<ListObjectsV2Output>> {
     let ListObjectsV2Input {
         bucket,
+        expected_bucket_owner,
         mut prefix,
         max_keys,
         mut start_after,
@@ -664,6 +669,7 @@ pub(super) async fn list_objects_v2(
         ..
     } = req.input;
 
+    validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
     prefix = prefix.map(decode_list_input_value);
     start_after = start_after.map(decode_list_input_value);
     delimiter = delimiter.map(decode_list_input_value);
