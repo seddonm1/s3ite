@@ -11,15 +11,41 @@ from pathlib import Path
 TEST_ATTR = re.compile(r"^\s*#\[(?:tokio::test|test)\]")
 TEST_FN = re.compile(r"\b(?:async\s+)?fn\s+([A-Za-z0-9_]+)\s*\(")
 MIRROR = re.compile(r"Mirrors s3tests/functional/test_s3\.py::([^\s]+)")
+SUPPORTED_COPY_ENCRYPTIONS = ("unencrypted", "sse-s3")
+SUPPORTED_COPY_SIZES = (1, 1024, 1024 * 1024, 8 * 1024 * 1024)
+SUPPORTED_COPY_PART_SIZE = 8 * 1024 * 1024
+REQUIRED_SINGLE_TEST_PORTS = (
+    "test_versioning_obj_plain_null_version_overwrite",
+    "test_get_object_torrent",
+    "test_object_set_get_unicode_metadata",
+)
+
+
+MirrorRecord = tuple[str, Path, int, str]
 
 
 def is_parametrized_mirror(mirror: str) -> bool:
     return "[" in mirror and mirror.endswith("]")
 
 
-def audit_file(path: Path, display_path: Path) -> list[str]:
+def required_mirror_comments() -> set[str]:
+    required = set(REQUIRED_SINGLE_TEST_PORTS)
+    for source in SUPPORTED_COPY_ENCRYPTIONS:
+        for destination in SUPPORTED_COPY_ENCRYPTIONS:
+            for size in SUPPORTED_COPY_SIZES:
+                required.add(
+                    f"test_copy_enc[{source}-{destination}-STANDARD-STANDARD-{size}]"
+                )
+            required.add(
+                f"test_copy_part_enc[{source}-{destination}-STANDARD-STANDARD-{SUPPORTED_COPY_PART_SIZE}]"
+            )
+    return required
+
+
+def audit_file(path: Path, display_path: Path) -> tuple[list[str], list[MirrorRecord]]:
     lines = path.read_text(encoding="utf-8").splitlines()
     errors: list[str] = []
+    mirror_records: list[MirrorRecord] = []
     index = 0
     while index < len(lines):
         if not TEST_ATTR.match(lines[index]):
@@ -58,6 +84,7 @@ def audit_file(path: Path, display_path: Path) -> list[str]:
             )
         else:
             mirror = mirrors[0]
+            mirror_records.append((mirror, display_path, fn_line, fn_name))
             if not is_parametrized_mirror(mirror) and mirror != fn_name:
                 errors.append(
                     f"{display_path}:{fn_line}: {fn_name} mirrors {mirror}; non-parametrized mirrors must use the Ceph name"
@@ -65,14 +92,31 @@ def audit_file(path: Path, display_path: Path) -> list[str]:
 
         index = fn_line
 
-    return errors
+    return errors, mirror_records
 
 
 def main() -> int:
     repo = Path(__file__).resolve().parents[1]
     errors: list[str] = []
+    mirror_records: list[MirrorRecord] = []
     for path in sorted((repo / "tests").glob("conformance_*.rs")):
-        errors.extend(audit_file(path, path.relative_to(repo)))
+        file_errors, file_mirrors = audit_file(path, path.relative_to(repo))
+        errors.extend(file_errors)
+        mirror_records.extend(file_mirrors)
+
+    seen_mirrors: dict[str, MirrorRecord] = {}
+    for mirror, path, line, fn_name in mirror_records:
+        if mirror in seen_mirrors:
+            _, first_path, first_line, first_fn_name = seen_mirrors[mirror]
+            errors.append(
+                f"{path}:{line}: {fn_name} duplicates Ceph mirror {mirror}; first seen at {first_path}:{first_line} in {first_fn_name}"
+            )
+        else:
+            seen_mirrors[mirror] = (mirror, path, line, fn_name)
+
+    mirrored = {mirror for mirror, _, _, _ in mirror_records}
+    for missing in sorted(required_mirror_comments() - mirrored):
+        errors.append(f"tests: missing required Ceph mirror port {missing}")
 
     object_lock = repo / "tests" / "conformance_object_lock.rs"
     object_lock_count = len(

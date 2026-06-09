@@ -131,6 +131,173 @@ async fn assert_explicit_sse_s3_upload(size: usize, seed: u8) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CopyEncryption {
+    Plain,
+    SseS3,
+}
+
+impl CopyEncryption {
+    fn is_sse_s3(self) -> bool {
+        matches!(self, Self::SseS3)
+    }
+}
+
+async fn put_copy_source_object(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    body: Vec<u8>,
+    encryption: CopyEncryption,
+) -> Result<()> {
+    match encryption {
+        CopyEncryption::Plain => put_plain_object(client, bucket, key, body).await,
+        CopyEncryption::SseS3 => put_sse_s3_object(client, bucket, key, body).await,
+    }
+}
+
+fn assert_sse_output(actual: Option<&ServerSideEncryption>, expected: CopyEncryption) {
+    if expected.is_sse_s3() {
+        assert_eq!(actual, Some(&ServerSideEncryption::Aes256));
+    } else {
+        assert_eq!(actual, None);
+    }
+}
+
+fn assert_encrypted_storage_for_copy(
+    server: &TestServer,
+    source_bucket: &str,
+    destination_bucket: &str,
+    source_encryption: CopyEncryption,
+    destination_encryption: CopyEncryption,
+    body: &[u8],
+) -> Result<()> {
+    if source_encryption.is_sse_s3() {
+        assert_storage_does_not_contain_large_body(server, source_bucket, body)?;
+    }
+    if destination_encryption.is_sse_s3() {
+        assert_storage_does_not_contain_large_body(server, destination_bucket, body)?;
+    }
+    Ok(())
+}
+
+async fn assert_copy_enc_case(
+    source_encryption: CopyEncryption,
+    destination_encryption: CopyEncryption,
+    size: usize,
+    seed: u8,
+) -> Result<()> {
+    let server = spawn_sse_server().await?;
+    let client = sdk::client(&server);
+    let source_bucket = bucket_name("s3ite-sse-copy-src");
+    let destination_bucket = bucket_name("s3ite-sse-copy-dst");
+    let source_key = "source";
+    let destination_key = "destination";
+    let body = upload_body(size, seed);
+
+    create_bucket(&client, &source_bucket).await?;
+    create_bucket(&client, &destination_bucket).await?;
+    put_copy_source_object(
+        &client,
+        &source_bucket,
+        source_key,
+        body.clone(),
+        source_encryption,
+    )
+    .await?;
+
+    let mut request = client
+        .copy_object()
+        .bucket(&destination_bucket)
+        .key(destination_key)
+        .copy_source(copy_source(&source_bucket, source_key));
+    if destination_encryption.is_sse_s3() {
+        request = request.server_side_encryption(ServerSideEncryption::Aes256);
+    }
+    let output = request.send().await?;
+    assert_sse_output(output.server_side_encryption(), destination_encryption);
+
+    assert_eq!(
+        get_object_bytes(&client, &destination_bucket, destination_key).await?,
+        body
+    );
+    assert_object_sse(
+        &client,
+        &destination_bucket,
+        destination_key,
+        destination_encryption.is_sse_s3(),
+    )
+    .await?;
+    assert_encrypted_storage_for_copy(
+        &server,
+        &source_bucket,
+        &destination_bucket,
+        source_encryption,
+        destination_encryption,
+        &body,
+    )?;
+
+    Ok(())
+}
+
+async fn assert_copy_part_enc_case(
+    source_encryption: CopyEncryption,
+    destination_encryption: CopyEncryption,
+    seed: u8,
+) -> Result<()> {
+    let server = spawn_sse_server().await?;
+    let client = sdk::client(&server);
+    let source_bucket = bucket_name("s3ite-sse-upc-src");
+    let destination_bucket = bucket_name("s3ite-sse-upc-dst");
+    let source_key = "source";
+    let destination_key = "destination";
+    let body = patterned_body(8 * MIB, seed);
+
+    create_bucket(&client, &source_bucket).await?;
+    create_bucket(&client, &destination_bucket).await?;
+    put_copy_source_object(
+        &client,
+        &source_bucket,
+        source_key,
+        body.clone(),
+        source_encryption,
+    )
+    .await?;
+
+    let output = upload_part_copy_object(
+        &client,
+        &source_bucket,
+        source_key,
+        &destination_bucket,
+        destination_key,
+        destination_encryption.is_sse_s3(),
+    )
+    .await?;
+    assert_sse_output(output.server_side_encryption(), destination_encryption);
+
+    assert_eq!(
+        get_object_bytes(&client, &destination_bucket, destination_key).await?,
+        body
+    );
+    assert_object_sse(
+        &client,
+        &destination_bucket,
+        destination_key,
+        destination_encryption.is_sse_s3(),
+    )
+    .await?;
+    assert_encrypted_storage_for_copy(
+        &server,
+        &source_bucket,
+        &destination_bucket,
+        source_encryption,
+        destination_encryption,
+        &body,
+    )?;
+
+    Ok(())
+}
+
 /// Verifies PutBucketEncryption accepts an SSE-S3 default configuration.
 #[tokio::test]
 #[serial(conformance)]
@@ -395,242 +562,164 @@ async fn test_sse_s3_encrypted_upload_8mb() -> Result<()> {
     assert_explicit_sse_s3_upload(8 * MIB, b'I').await
 }
 
-/// Verifies CopyObject can copy plaintext into an SSE-S3 destination.
+/// Verifies CopyObject can copy a 1-byte plaintext source to a plaintext destination.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_sse_s3_copy_plaintext_to_encrypted_destination() -> Result<()> {
+async fn test_copy_enc_unencrypted_unencrypted_standard_standard_1() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_copy_enc[unencrypted-unencrypted-STANDARD-STANDARD-1]
+    assert_copy_enc_case(CopyEncryption::Plain, CopyEncryption::Plain, 1, b'A').await
+}
+
+/// Verifies CopyObject can copy a 1 KiB plaintext source to a plaintext destination.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_copy_enc_unencrypted_unencrypted_standard_standard_1024() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_copy_enc[unencrypted-unencrypted-STANDARD-STANDARD-1024]
+    assert_copy_enc_case(CopyEncryption::Plain, CopyEncryption::Plain, 1024, b'B').await
+}
+
+/// Verifies CopyObject can copy a 1 MiB plaintext source to a plaintext destination.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_copy_enc_unencrypted_unencrypted_standard_standard_1048576() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_copy_enc[unencrypted-unencrypted-STANDARD-STANDARD-1048576]
+    assert_copy_enc_case(CopyEncryption::Plain, CopyEncryption::Plain, MIB, b'C').await
+}
+
+/// Verifies CopyObject can copy an 8 MiB plaintext source to a plaintext destination.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_copy_enc_unencrypted_unencrypted_standard_standard_8388608() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_copy_enc[unencrypted-unencrypted-STANDARD-STANDARD-8388608]
+    assert_copy_enc_case(CopyEncryption::Plain, CopyEncryption::Plain, 8 * MIB, b'D').await
+}
+
+/// Verifies CopyObject can copy a 1-byte plaintext source to an SSE-S3 destination.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_copy_enc_unencrypted_sse_s3_standard_standard_1() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_copy_enc[unencrypted-sse-s3-STANDARD-STANDARD-1]
+    assert_copy_enc_case(CopyEncryption::Plain, CopyEncryption::SseS3, 1, b'E').await
+}
+
+/// Verifies CopyObject can copy a 1 KiB plaintext source to an SSE-S3 destination.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_copy_enc_unencrypted_sse_s3_standard_standard_1024() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_copy_enc[unencrypted-sse-s3-STANDARD-STANDARD-1024]
+    assert_copy_enc_case(CopyEncryption::Plain, CopyEncryption::SseS3, 1024, b'F').await
+}
+
+/// Verifies CopyObject can copy a 1 MiB plaintext source to an SSE-S3 destination.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_copy_enc_unencrypted_sse_s3_standard_standard_1048576() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_copy_enc[unencrypted-sse-s3-STANDARD-STANDARD-1048576]
+    assert_copy_enc_case(CopyEncryption::Plain, CopyEncryption::SseS3, MIB, b'G').await
+}
+
+/// Verifies CopyObject can copy an 8 MiB plaintext source to an SSE-S3 destination.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_copy_enc_unencrypted_sse_s3_standard_standard_8388608() -> Result<()> {
     // Mirrors s3tests/functional/test_s3.py::test_copy_enc[unencrypted-sse-s3-STANDARD-STANDARD-8388608]
-    let server = spawn_sse_server().await?;
-    let client = sdk::client(&server);
-    let source_bucket = bucket_name("s3ite-sse-copy-src-plain");
-    let destination_bucket = bucket_name("s3ite-sse-copy-dst-enc");
-    let source_key = "source";
-    let destination_key = "destination";
-    let body = patterned_body(8 * MIB, b'C');
-
-    create_bucket(&client, &source_bucket).await?;
-    create_bucket(&client, &destination_bucket).await?;
-    put_plain_object(&client, &source_bucket, source_key, body.clone()).await?;
-
-    let output = client
-        .copy_object()
-        .bucket(&destination_bucket)
-        .key(destination_key)
-        .copy_source(copy_source(&source_bucket, source_key))
-        .server_side_encryption(ServerSideEncryption::Aes256)
-        .send()
-        .await?;
-    assert_eq!(
-        output.server_side_encryption(),
-        Some(&ServerSideEncryption::Aes256)
-    );
-
-    assert_eq!(
-        get_object_bytes(&client, &destination_bucket, destination_key).await?,
-        body
-    );
-    assert_object_sse(&client, &destination_bucket, destination_key, true).await?;
-    assert_storage_does_not_contain(&server, &destination_bucket, &body)?;
-
-    Ok(())
+    assert_copy_enc_case(CopyEncryption::Plain, CopyEncryption::SseS3, 8 * MIB, b'H').await
 }
 
-/// Verifies CopyObject can copy an SSE-S3 source into a plaintext destination.
+/// Verifies CopyObject can copy a 1-byte SSE-S3 source to a plaintext destination.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_sse_s3_copy_encrypted_source_to_plaintext_destination() -> Result<()> {
+async fn test_copy_enc_sse_s3_unencrypted_standard_standard_1() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_copy_enc[sse-s3-unencrypted-STANDARD-STANDARD-1]
+    assert_copy_enc_case(CopyEncryption::SseS3, CopyEncryption::Plain, 1, b'I').await
+}
+
+/// Verifies CopyObject can copy a 1 KiB SSE-S3 source to a plaintext destination.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_copy_enc_sse_s3_unencrypted_standard_standard_1024() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_copy_enc[sse-s3-unencrypted-STANDARD-STANDARD-1024]
+    assert_copy_enc_case(CopyEncryption::SseS3, CopyEncryption::Plain, 1024, b'J').await
+}
+
+/// Verifies CopyObject can copy a 1 MiB SSE-S3 source to a plaintext destination.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_copy_enc_sse_s3_unencrypted_standard_standard_1048576() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_copy_enc[sse-s3-unencrypted-STANDARD-STANDARD-1048576]
+    assert_copy_enc_case(CopyEncryption::SseS3, CopyEncryption::Plain, MIB, b'K').await
+}
+
+/// Verifies CopyObject can copy an 8 MiB SSE-S3 source to a plaintext destination.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_copy_enc_sse_s3_unencrypted_standard_standard_8388608() -> Result<()> {
     // Mirrors s3tests/functional/test_s3.py::test_copy_enc[sse-s3-unencrypted-STANDARD-STANDARD-8388608]
-    let server = spawn_sse_server().await?;
-    let client = sdk::client(&server);
-    let source_bucket = bucket_name("s3ite-sse-copy-src-enc");
-    let destination_bucket = bucket_name("s3ite-sse-copy-dst-plain");
-    let source_key = "source";
-    let destination_key = "destination";
-    let body = patterned_body(8 * MIB, b'D');
-
-    create_bucket(&client, &source_bucket).await?;
-    create_bucket(&client, &destination_bucket).await?;
-    put_sse_s3_object(&client, &source_bucket, source_key, body.clone()).await?;
-
-    let output = client
-        .copy_object()
-        .bucket(&destination_bucket)
-        .key(destination_key)
-        .copy_source(copy_source(&source_bucket, source_key))
-        .send()
-        .await?;
-    assert_eq!(output.server_side_encryption(), None);
-
-    assert_eq!(
-        get_object_bytes(&client, &destination_bucket, destination_key).await?,
-        body
-    );
-    assert_object_sse(&client, &destination_bucket, destination_key, false).await?;
-    assert_storage_does_not_contain(&server, &source_bucket, &body)?;
-
-    Ok(())
+    assert_copy_enc_case(CopyEncryption::SseS3, CopyEncryption::Plain, 8 * MIB, b'L').await
 }
 
-/// Verifies CopyObject can copy an SSE-S3 source into an SSE-S3 destination.
+/// Verifies CopyObject can copy a 1-byte SSE-S3 source to an SSE-S3 destination.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_sse_s3_copy_encrypted_source_to_encrypted_destination() -> Result<()> {
+async fn test_copy_enc_sse_s3_sse_s3_standard_standard_1() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_copy_enc[sse-s3-sse-s3-STANDARD-STANDARD-1]
+    assert_copy_enc_case(CopyEncryption::SseS3, CopyEncryption::SseS3, 1, b'M').await
+}
+
+/// Verifies CopyObject can copy a 1 KiB SSE-S3 source to an SSE-S3 destination.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_copy_enc_sse_s3_sse_s3_standard_standard_1024() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_copy_enc[sse-s3-sse-s3-STANDARD-STANDARD-1024]
+    assert_copy_enc_case(CopyEncryption::SseS3, CopyEncryption::SseS3, 1024, b'N').await
+}
+
+/// Verifies CopyObject can copy a 1 MiB SSE-S3 source to an SSE-S3 destination.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_copy_enc_sse_s3_sse_s3_standard_standard_1048576() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_copy_enc[sse-s3-sse-s3-STANDARD-STANDARD-1048576]
+    assert_copy_enc_case(CopyEncryption::SseS3, CopyEncryption::SseS3, MIB, b'O').await
+}
+
+/// Verifies CopyObject can copy an 8 MiB SSE-S3 source to an SSE-S3 destination.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_copy_enc_sse_s3_sse_s3_standard_standard_8388608() -> Result<()> {
     // Mirrors s3tests/functional/test_s3.py::test_copy_enc[sse-s3-sse-s3-STANDARD-STANDARD-8388608]
-    let server = spawn_sse_server().await?;
-    let client = sdk::client(&server);
-    let source_bucket = bucket_name("s3ite-sse-copy-src-enc2");
-    let destination_bucket = bucket_name("s3ite-sse-copy-dst-enc2");
-    let source_key = "source";
-    let destination_key = "destination";
-    let body = patterned_body(8 * MIB, b'E');
-
-    create_bucket(&client, &source_bucket).await?;
-    create_bucket(&client, &destination_bucket).await?;
-    put_sse_s3_object(&client, &source_bucket, source_key, body.clone()).await?;
-
-    let output = client
-        .copy_object()
-        .bucket(&destination_bucket)
-        .key(destination_key)
-        .copy_source(copy_source(&source_bucket, source_key))
-        .server_side_encryption(ServerSideEncryption::Aes256)
-        .send()
-        .await?;
-    assert_eq!(
-        output.server_side_encryption(),
-        Some(&ServerSideEncryption::Aes256)
-    );
-
-    assert_eq!(
-        get_object_bytes(&client, &destination_bucket, destination_key).await?,
-        body
-    );
-    assert_object_sse(&client, &destination_bucket, destination_key, true).await?;
-    assert_storage_does_not_contain(&server, &source_bucket, &body)?;
-    assert_storage_does_not_contain(&server, &destination_bucket, &body)?;
-
-    Ok(())
+    assert_copy_enc_case(CopyEncryption::SseS3, CopyEncryption::SseS3, 8 * MIB, b'P').await
 }
 
-/// Verifies UploadPartCopy can copy plaintext into an SSE-S3 destination.
+/// Verifies UploadPartCopy can copy plaintext to a plaintext destination.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_sse_s3_upload_part_copy_plaintext_to_encrypted_destination() -> Result<()> {
+async fn test_copy_part_enc_unencrypted_unencrypted_standard_standard_8388608() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_copy_part_enc[unencrypted-unencrypted-STANDARD-STANDARD-8388608]
+    assert_copy_part_enc_case(CopyEncryption::Plain, CopyEncryption::Plain, b'Q').await
+}
+
+/// Verifies UploadPartCopy can copy plaintext to an SSE-S3 destination.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_copy_part_enc_unencrypted_sse_s3_standard_standard_8388608() -> Result<()> {
     // Mirrors s3tests/functional/test_s3.py::test_copy_part_enc[unencrypted-sse-s3-STANDARD-STANDARD-8388608]
-    let server = spawn_sse_server().await?;
-    let client = sdk::client(&server);
-    let source_bucket = bucket_name("s3ite-sse-upc-src-plain");
-    let destination_bucket = bucket_name("s3ite-sse-upc-dst-enc");
-    let source_key = "source";
-    let destination_key = "destination";
-    let body = patterned_body(8 * MIB, b'F');
-
-    create_bucket(&client, &source_bucket).await?;
-    create_bucket(&client, &destination_bucket).await?;
-    put_plain_object(&client, &source_bucket, source_key, body.clone()).await?;
-
-    let output = upload_part_copy_object(
-        &client,
-        &source_bucket,
-        source_key,
-        &destination_bucket,
-        destination_key,
-        true,
-    )
-    .await?;
-    assert_eq!(
-        output.server_side_encryption(),
-        Some(&ServerSideEncryption::Aes256)
-    );
-
-    assert_eq!(
-        get_object_bytes(&client, &destination_bucket, destination_key).await?,
-        body
-    );
-    assert_object_sse(&client, &destination_bucket, destination_key, true).await?;
-    assert_storage_does_not_contain(&server, &destination_bucket, &body)?;
-
-    Ok(())
+    assert_copy_part_enc_case(CopyEncryption::Plain, CopyEncryption::SseS3, b'R').await
 }
 
-/// Verifies UploadPartCopy can copy an SSE-S3 source into a plaintext destination.
+/// Verifies UploadPartCopy can copy an SSE-S3 source to a plaintext destination.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_sse_s3_upload_part_copy_encrypted_source_to_plaintext_destination() -> Result<()> {
+async fn test_copy_part_enc_sse_s3_unencrypted_standard_standard_8388608() -> Result<()> {
     // Mirrors s3tests/functional/test_s3.py::test_copy_part_enc[sse-s3-unencrypted-STANDARD-STANDARD-8388608]
-    let server = spawn_sse_server().await?;
-    let client = sdk::client(&server);
-    let source_bucket = bucket_name("s3ite-sse-upc-src-enc");
-    let destination_bucket = bucket_name("s3ite-sse-upc-dst-plain");
-    let source_key = "source";
-    let destination_key = "destination";
-    let body = patterned_body(8 * MIB, b'G');
-
-    create_bucket(&client, &source_bucket).await?;
-    create_bucket(&client, &destination_bucket).await?;
-    put_sse_s3_object(&client, &source_bucket, source_key, body.clone()).await?;
-
-    let output = upload_part_copy_object(
-        &client,
-        &source_bucket,
-        source_key,
-        &destination_bucket,
-        destination_key,
-        false,
-    )
-    .await?;
-    assert_eq!(output.server_side_encryption(), None);
-
-    assert_eq!(
-        get_object_bytes(&client, &destination_bucket, destination_key).await?,
-        body
-    );
-    assert_object_sse(&client, &destination_bucket, destination_key, false).await?;
-    assert_storage_does_not_contain(&server, &source_bucket, &body)?;
-
-    Ok(())
+    assert_copy_part_enc_case(CopyEncryption::SseS3, CopyEncryption::Plain, b'S').await
 }
 
-/// Verifies UploadPartCopy can copy an SSE-S3 source into an SSE-S3 destination.
+/// Verifies UploadPartCopy can copy an SSE-S3 source to an SSE-S3 destination.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_sse_s3_upload_part_copy_encrypted_source_to_encrypted_destination() -> Result<()> {
+async fn test_copy_part_enc_sse_s3_sse_s3_standard_standard_8388608() -> Result<()> {
     // Mirrors s3tests/functional/test_s3.py::test_copy_part_enc[sse-s3-sse-s3-STANDARD-STANDARD-8388608]
-    let server = spawn_sse_server().await?;
-    let client = sdk::client(&server);
-    let source_bucket = bucket_name("s3ite-sse-upc-src-enc2");
-    let destination_bucket = bucket_name("s3ite-sse-upc-dst-enc2");
-    let source_key = "source";
-    let destination_key = "destination";
-    let body = patterned_body(8 * MIB, b'H');
-
-    create_bucket(&client, &source_bucket).await?;
-    create_bucket(&client, &destination_bucket).await?;
-    put_sse_s3_object(&client, &source_bucket, source_key, body.clone()).await?;
-
-    let output = upload_part_copy_object(
-        &client,
-        &source_bucket,
-        source_key,
-        &destination_bucket,
-        destination_key,
-        true,
-    )
-    .await?;
-    assert_eq!(
-        output.server_side_encryption(),
-        Some(&ServerSideEncryption::Aes256)
-    );
-
-    assert_eq!(
-        get_object_bytes(&client, &destination_bucket, destination_key).await?,
-        body
-    );
-    assert_object_sse(&client, &destination_bucket, destination_key, true).await?;
-    assert_storage_does_not_contain(&server, &source_bucket, &body)?;
-    assert_storage_does_not_contain(&server, &destination_bucket, &body)?;
-
-    Ok(())
+    assert_copy_part_enc_case(CopyEncryption::SseS3, CopyEncryption::SseS3, b'T').await
 }
 
 /// Verifies unsupported SSE combinations are rejected without creating objects.

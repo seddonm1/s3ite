@@ -272,6 +272,66 @@ async fn test_versioning_obj_plain_null_version_removal() -> Result<()> {
     Ok(())
 }
 
+/// Verifies deleting a generated current version reveals and then removes the null version.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_versioning_obj_plain_null_version_overwrite() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_versioning_obj_plain_null_version_overwrite
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ver");
+    let key = "testobjfoo";
+
+    create_bucket(&client, &bucket).await?;
+    put_object(&client, &bucket, key, b"fooz").await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    let put = client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"zzz"))
+        .send()
+        .await?;
+    let current_version = put
+        .version_id()
+        .ok_or_else(|| anyhow::anyhow!("PutObject response missing version ID"))?
+        .to_owned();
+
+    assert_eq!(get_object_bytes(&client, &bucket, key).await?, b"zzz");
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .version_id(&current_version)
+        .send()
+        .await?;
+    assert_eq!(get_object_bytes(&client, &bucket, key).await?, b"fooz");
+
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .version_id("null")
+        .send()
+        .await?;
+    let error = match client.get_object().bucket(&bucket).key(key).send().await {
+        Ok(_) => bail!("deleted null version should not be readable"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "NoSuchKey");
+    assert!(
+        client
+            .list_object_versions()
+            .bucket(&bucket)
+            .send()
+            .await?
+            .versions()
+            .is_empty()
+    );
+
+    Ok(())
+}
+
 /// Verifies suspended versioning overwrites the null version and delete marker.
 #[tokio::test]
 #[serial(conformance)]

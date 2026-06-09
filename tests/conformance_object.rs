@@ -14,6 +14,7 @@ use aws_sdk_s3::{
     primitives::{ByteStream, DateTime, DateTimeFormat},
     types::{Delete, ObjectIdentifier},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use reqwest::{Method, StatusCode};
 use rusqlite::Connection;
 use serial_test::serial;
@@ -302,6 +303,45 @@ async fn test_object_metadata_replaced_on_put() -> Result<()> {
     Ok(())
 }
 
+/// Verifies RFC-2047 encoded Unicode metadata is visible as decoded user metadata.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_object_set_get_unicode_metadata() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_object_set_get_unicode_metadata
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-obj");
+    let key = "foo";
+
+    create_bucket(&client, &bucket).await?;
+    let response = raw_http::signed_request_with_headers(
+        &server,
+        Method::PUT,
+        &object_path(&bucket, key),
+        b"bar".to_vec(),
+        &[("x-amz-meta-meta1", "=?UTF-8?B?SGVsbG8gV29ybGTDqQ==?=")],
+    )
+    .await?;
+    assert_status(&response, StatusCode::OK);
+
+    let response =
+        raw_http::signed_request(&server, Method::GET, &object_path(&bucket, key), Vec::new())
+            .await?;
+    assert_status(&response, StatusCode::OK);
+    let metadata = response
+        .headers()
+        .get("x-amz-meta-meta1")
+        .ok_or_else(|| anyhow::anyhow!("GetObject response missing meta1 metadata"))?
+        .to_str()?;
+    assert_eq!(
+        decode_rfc2047_base64_metadata(metadata)?,
+        "Hello World\u{e9}"
+    );
+    assert_eq!(response.bytes().await?.as_ref(), b"bar");
+
+    Ok(())
+}
+
 /// Verifies copying a zero-byte object preserves an empty body.
 #[tokio::test]
 #[serial(conformance)]
@@ -579,6 +619,42 @@ async fn test_object_write_to_nonexist_bucket() -> Result<()> {
         Err(error) => error,
     };
     assert_error_contains(&error, "NoSuchBucket");
+
+    Ok(())
+}
+
+/// Verifies GetObjectTorrent reports unavailable torrent metadata as NoSuchKey.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_get_object_torrent() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_get_object_torrent
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-obj");
+    let key = "Avatar.mpg";
+
+    create_bucket(&client, &bucket).await?;
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(vec![b'A'; 7 * 1024 * 1024]))
+        .send()
+        .await?;
+
+    let response = raw_http::signed_request(
+        &server,
+        Method::GET,
+        &format!("{}?torrent", object_path(&bucket, key)),
+        Vec::new(),
+    )
+    .await?;
+    assert_status(&response, StatusCode::NOT_FOUND);
+    let error_body = response.text().await?;
+    assert!(
+        error_body.contains("NoSuchKey"),
+        "torrent response should report NoSuchKey, got {error_body}"
+    );
 
     Ok(())
 }
@@ -1242,6 +1318,14 @@ fn object_path(bucket: &str, key: &str) -> String {
         raw_http::path_segment(bucket),
         raw_http::path_segment(key)
     )
+}
+
+fn decode_rfc2047_base64_metadata(value: &str) -> Result<String> {
+    let payload = value
+        .strip_prefix("=?UTF-8?B?")
+        .and_then(|value| value.strip_suffix("?="))
+        .ok_or_else(|| anyhow::anyhow!("metadata value is not RFC-2047 base64: {value}"))?;
+    Ok(String::from_utf8(BASE64_STANDARD.decode(payload)?)?)
 }
 
 fn now_seconds() -> Result<i64> {
