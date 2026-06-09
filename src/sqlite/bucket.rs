@@ -96,6 +96,50 @@ impl Sqlite {
         Ok(false)
     }
 
+    /// Deletes an empty bucket database and its `SQLite` sidecar files.
+    pub(crate) async fn delete_bucket(&self, bucket: &str) -> SqliteResult<()> {
+        self.validate_mutable_bucket(bucket)?;
+
+        let connection = self.get_connection(bucket).await?;
+        let close_connection = connection.clone();
+        let has_objects = connection
+            .write(move |transaction| {
+                let has_objects = Self::has_objects(transaction)?;
+                if !has_objects {
+                    close_connection.close_to_writes();
+                }
+                Ok(has_objects)
+            })
+            .await?;
+        if has_objects {
+            return Err(SqliteError::BucketNotEmpty);
+        }
+
+        let connection = self
+            .buckets
+            .write()
+            .await
+            .remove(bucket)
+            .ok_or(SqliteError::BucketNotFound)?;
+        connection.close().await?;
+
+        let bucket_path = self.get_bucket_path(bucket)?;
+        Self::remove_bucket_files(&bucket_path).await?;
+
+        Ok(())
+    }
+
+    /// Removes a bucket database and best-effort sidecar files created by WAL mode.
+    async fn remove_bucket_files(bucket_path: &Path) -> SqliteResult<()> {
+        fs::remove_file(bucket_path).await?;
+        for suffix in ["-wal", "-shm"] {
+            let mut path = bucket_path.as_os_str().to_owned();
+            path.push(suffix);
+            fs::remove_file(PathBuf::from(path)).await.ok();
+        }
+        Ok(())
+    }
+
     /// Rejects mutations for read-only bucket configuration.
     pub(crate) fn validate_mutable_bucket(&self, bucket: &str) -> SqliteResult<()> {
         if self.config.read_only(Some(bucket)) {
@@ -156,6 +200,7 @@ impl Sqlite {
 mod tests {
     use std::fs;
 
+    use time::OffsetDateTime;
     use tokio::sync::RwLock;
 
     use crate::{Config, config::Bucket, sqlite::DEFAULT_OBJECT_BLOB_CHUNK_SIZE};
@@ -166,6 +211,15 @@ mod tests {
         Sqlite {
             root: PathBuf::new(),
             config,
+            buckets: Arc::new(RwLock::new(HashMap::new())),
+            blob_chunk_size: DEFAULT_OBJECT_BLOB_CHUNK_SIZE,
+        }
+    }
+
+    fn sqlite_with_root(root: PathBuf) -> Sqlite {
+        Sqlite {
+            root,
+            config: Config::default(),
             buckets: Arc::new(RwLock::new(HashMap::new())),
             blob_chunk_size: DEFAULT_OBJECT_BLOB_CHUNK_SIZE,
         }
@@ -233,6 +287,62 @@ mod tests {
             connection.close().await?;
         }
 
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_bucket_removes_empty_bucket_file_and_connection() -> SqliteResult<()> {
+        let root = temp_root("delete-empty-bucket")?;
+        let sqlite = sqlite_with_root(root.clone());
+
+        assert!(sqlite.create_bucket("bucket").await?);
+        let path = sqlite.get_bucket_path("bucket")?;
+        assert!(path.exists());
+
+        sqlite.delete_bucket("bucket").await?;
+
+        assert!(!path.exists());
+        assert!(!sqlite.buckets.read().await.contains_key("bucket"));
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_bucket_refuses_nonempty_bucket() -> SqliteResult<()> {
+        let root = temp_root("delete-nonempty-bucket")?;
+        let sqlite = sqlite_with_root(root.clone());
+
+        assert!(sqlite.create_bucket("bucket").await?);
+        let path = sqlite.get_bucket_path("bucket")?;
+        let connection = sqlite.get_connection("bucket").await?;
+        connection
+            .write(|transaction| {
+                transaction.execute(
+                    "
+                    INSERT INTO object_version (
+                        key,
+                        version_id,
+                        is_latest,
+                        is_delete_marker,
+                        size,
+                        last_modified,
+                        md5
+                    )
+                    VALUES ('key', 'null', 1, 1, 0, ?1, NULL);",
+                    [OffsetDateTime::now_utc()],
+                )?;
+                Ok(())
+            })
+            .await?;
+
+        let err = sqlite.delete_bucket("bucket").await.err();
+        assert!(matches!(err, Some(SqliteError::BucketNotEmpty)));
+        assert!(path.exists());
+        assert!(sqlite.buckets.read().await.contains_key("bucket"));
+
+        connection.close().await?;
         fs::remove_dir_all(root).ok();
         Ok(())
     }

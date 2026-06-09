@@ -7,6 +7,7 @@ use super::{
 pub(super) fn s3_error_from_sqlite(error: SqliteError) -> S3Error {
     with_request_id(match error {
         SqliteError::BucketNotFound => S3Error::new(S3ErrorCode::NoSuchBucket),
+        SqliteError::BucketNotEmpty => S3Error::new(S3ErrorCode::BucketNotEmpty),
         SqliteError::BucketReadOnly => S3Error::with_message(
             S3ErrorCode::MethodNotAllowed,
             "database is in read-only mode",
@@ -146,6 +147,7 @@ mod tests {
     #[test]
     fn maps_storage_errors_to_s3_error_codes() {
         assert_maps(SqliteError::BucketNotFound, &S3ErrorCode::NoSuchBucket);
+        assert_maps(SqliteError::BucketNotEmpty, &S3ErrorCode::BucketNotEmpty);
         assert_maps(SqliteError::ObjectNotFound, &S3ErrorCode::NoSuchKey);
         assert_maps(
             SqliteError::ObjectVersionNotFound,

@@ -7,7 +7,7 @@ use super::{
     ListBucketsOutput, MFADelete, Not, PutBucketEncryptionInput, PutBucketEncryptionOutput,
     PutBucketVersioningInput, PutBucketVersioningOutput, S3Error, S3ErrorCode, S3Request,
     S3Response, S3Result, ServerSideEncryption, ServerSideEncryptionByDefault,
-    ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Sqlite, SqliteError, Timestamp,
+    ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Sqlite, Timestamp,
     decode_continuation_token, encode_continuation_token, fs, list_limit,
     require_sse_s3_master_key, s3_error, s3_error_from_sqlite, s3_error_with_message,
     validate_bucket_acl, validate_expected_bucket_owner,
@@ -120,43 +120,9 @@ pub(super) async fn delete_bucket(
 
     validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
     sqlite
-        .validate_mutable_bucket(&bucket)
-        .map_err(s3_error_from_sqlite)?;
-
-    let connection = sqlite
-        .get_connection(&bucket)
+        .delete_bucket(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
-    let has_objects = connection
-        .read(Sqlite::has_objects)
-        .await
-        .map_err(s3_error_from_sqlite)?;
-    if has_objects {
-        return Err(s3_error(S3ErrorCode::BucketNotEmpty));
-    }
-
-    let connection = sqlite
-        .buckets
-        .write()
-        .await
-        .remove(&bucket)
-        .ok_or(SqliteError::BucketNotFound)
-        .map_err(s3_error_from_sqlite)?;
-
-    connection.close().await.map_err(s3_error_from_sqlite)?;
-
-    let bucket_path = sqlite
-        .get_bucket_path(&bucket)
-        .map_err(s3_error_from_sqlite)?;
-    fs::remove_file(&bucket_path)
-        .await
-        .map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
-    fs::remove_file(format!("{}-wal", bucket_path.to_string_lossy()))
-        .await
-        .ok();
-    fs::remove_file(format!("{}-shm", bucket_path.to_string_lossy()))
-        .await
-        .ok();
 
     Ok(S3Response::new(DeleteBucketOutput {}))
 }

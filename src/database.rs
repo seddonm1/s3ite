@@ -126,6 +126,7 @@ struct BucketConnectionInner {
     writer_sender: SyncSender<WorkerCommand>,
     reader_sender: SyncSender<WorkerCommand>,
     blob_reader_sender: SyncSender<WorkerCommand>,
+    closed: AtomicBool,
     writer_handle: Mutex<Option<JoinHandle<()>>>,
     reader_handles: Mutex<Vec<JoinHandle<()>>>,
     blob_reader_handles: Mutex<Vec<JoinHandle<()>>>,
@@ -223,14 +224,22 @@ impl BucketConnection {
         F: FnOnce(&Transaction<'_>) -> SqliteResult<R> + 'static + Send,
         R: Send + 'static,
     {
+        self.inner.reject_if_closed()?;
+        let inner = self.inner.clone();
         self.inner
             .call(&self.inner.writer_sender, move |connection| {
+                inner.reject_if_closed()?;
                 let transaction = connection.transaction()?;
                 let result = function(&transaction)?;
                 transaction.commit()?;
                 Ok(result)
             })
             .await
+    }
+
+    /// Prevents future writes through this connection.
+    pub(crate) fn close_to_writes(&self) {
+        self.inner.closed.store(true, Ordering::Release);
     }
 
     /// Runs a closure in a read transaction.
@@ -251,7 +260,6 @@ impl BucketConnection {
             .call(&self.inner.reader_sender, move |connection| {
                 let transaction = connection.transaction()?;
                 let result = function(&transaction)?;
-                transaction.commit()?;
                 Ok(result)
             })
             .await
@@ -266,7 +274,14 @@ impl BucketConnection {
         F: FnOnce(&mut rusqlite::Connection) -> SqliteResult<R> + 'static + Send,
         R: Send + 'static,
     {
-        self.inner.call(&self.inner.writer_sender, function).await
+        self.inner.reject_if_closed()?;
+        let inner = self.inner.clone();
+        self.inner
+            .call(&self.inner.writer_sender, move |connection| {
+                inner.reject_if_closed()?;
+                function(connection)
+            })
+            .await
     }
 
     /// Opens a read transaction, returns metadata, and streams selected BLOB spans.
@@ -346,6 +361,7 @@ impl BucketConnectionInner {
             writer_sender,
             reader_sender,
             blob_reader_sender,
+            closed: AtomicBool::new(false),
             writer_handle: Mutex::new(Some(writer_handle)),
             reader_handles: Mutex::new(reader_handles),
             blob_reader_handles: Mutex::new(blob_reader_handles),
@@ -655,8 +671,17 @@ impl BucketConnectionInner {
         }
     }
 
+    /// Rejects new writes once the bucket is closing.
+    fn reject_if_closed(&self) -> SqliteResult<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SqliteError::DatabaseQueueClosed);
+        }
+        Ok(())
+    }
+
     /// Signals workers to close and joins their threads.
     fn close_blocking(&self) -> SqliteResult<()> {
+        self.closed.store(true, Ordering::Release);
         let reader_count = self
             .reader_handles
             .lock()
@@ -936,6 +961,7 @@ mod tests {
             writer_sender: sender_without_receiver(),
             reader_sender: sender_without_receiver(),
             blob_reader_sender: sender_without_receiver(),
+            closed: AtomicBool::new(false),
             writer_handle: Mutex::new(writer_handle),
             reader_handles: Mutex::new(reader_handles),
             blob_reader_handles: Mutex::new(blob_reader_handles),
@@ -1271,6 +1297,20 @@ mod tests {
         let err = connection.read(|_| Ok(())).await.err();
         assert!(matches!(err, Some(SqliteError::DatabaseQueueClosed)));
 
+        remove_sqlite_files(&path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn close_to_writes_rejects_later_writes() -> SqliteResult<()> {
+        let path = temp_path();
+        let connection = BucketConnection::open(&path, &Config::default(), "bucket").await?;
+
+        connection.close_to_writes();
+        let err = connection.write(|_| Ok(())).await.err();
+        assert!(matches!(err, Some(SqliteError::DatabaseQueueClosed)));
+
+        connection.close().await?;
         remove_sqlite_files(&path);
         Ok(())
     }

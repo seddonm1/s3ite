@@ -19,6 +19,9 @@ pub enum SqliteError {
     /// A requested bucket database is not open.
     #[error("bucket does not exist")]
     BucketNotFound,
+    /// A requested bucket still contains stored object versions.
+    #[error("bucket is not empty")]
+    BucketNotEmpty,
     /// A requested bucket is configured as read-only.
     #[error("database is in read-only mode")]
     BucketReadOnly,
