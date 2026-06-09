@@ -32,14 +32,15 @@ use s3s::{
         ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput,
         ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput, MFADelete,
         MetadataDirective, MultipartUpload, ObjectAttributes, ObjectCannedACL, ObjectPart, Owner,
-        Part, Permission, PutBucketAclInput, PutBucketAclOutput, PutBucketEncryptionInput,
-        PutBucketEncryptionOutput, PutBucketTaggingInput, PutBucketTaggingOutput,
-        PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectAclInput, PutObjectAclOutput,
-        PutObjectInput, PutObjectOutput, PutObjectTaggingInput, PutObjectTaggingOutput,
-        Range as S3Range, ServerSideEncryption, ServerSideEncryptionByDefault,
-        ServerSideEncryptionConfiguration, ServerSideEncryptionRule, StorageClass, StreamingBlob,
-        Tag, TagSet, Tagging, TaggingDirective, TaggingHeader, Timestamp, Type,
-        UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
+        Part, Permission, PostObjectInput, PostObjectOutput, PutBucketAclInput, PutBucketAclOutput,
+        PutBucketEncryptionInput, PutBucketEncryptionOutput, PutBucketTaggingInput,
+        PutBucketTaggingOutput, PutBucketVersioningInput, PutBucketVersioningOutput,
+        PutObjectAclInput, PutObjectAclOutput, PutObjectInput, PutObjectOutput,
+        PutObjectTaggingInput, PutObjectTaggingOutput, Range as S3Range, ServerSideEncryption,
+        ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
+        StorageClass, StreamingBlob, Tag, TagSet, Tagging, TaggingDirective, TaggingHeader,
+        Timestamp, Type, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput,
+        UploadPartOutput,
     },
     header::{
         CONTENT_MD5, CONTENT_TYPE, ETAG, X_AMZ_CONTENT_SHA256, X_AMZ_DECODED_CONTENT_LENGTH,
@@ -109,6 +110,7 @@ mod list;
 mod metadata;
 mod multipart;
 mod owner;
+mod post;
 mod put;
 mod sse;
 mod tagging;
@@ -761,6 +763,24 @@ impl S3 for Sqlite {
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
         put::put_object(self, req).await
+    }
+
+    /// Stores an object from a browser-form POST upload.
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            content_length = %trace_option(req.input.content_length)
+        )
+    )]
+    async fn post_object(
+        &self,
+        req: S3Request<PostObjectInput>,
+    ) -> S3Result<S3Response<PostObjectOutput>> {
+        post::post_object(self, req).await
     }
 
     /// Accepts owner-equivalent object ACL writes as no-ops.

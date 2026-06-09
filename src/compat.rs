@@ -86,13 +86,17 @@ where
         }
 
         let rewrite_object_attributes = is_get_object_attributes(&req);
+        let rewrite_post_policy_condition = is_post_object_form(&req);
         if let Some(response) = sig_v2_header_compat(&mut req, self.secret_key.as_deref()) {
             return Box::pin(async move { Ok(response) });
         }
 
         let future = self.inner.call(req);
         Box::pin(async move {
-            let response = future.await?;
+            let mut response = future.await?;
+            if rewrite_post_policy_condition {
+                response = rewrite_post_policy_condition_status(response).await?;
+            }
             if rewrite_object_attributes {
                 rewrite_get_object_attributes_etag(response).await
             } else {
@@ -109,6 +113,50 @@ where
 /// response.
 fn is_get_object_attributes<B>(req: &Request<B>) -> bool {
     req.method() == Method::GET && req.headers().contains_key("x-amz-object-attributes")
+}
+
+/// Detects browser-form `POST Object` requests before `s3s` routes them.
+fn is_post_object_form<B>(req: &Request<B>) -> bool {
+    if req.method() != Method::POST {
+        return false;
+    }
+    req.headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|media_type| media_type.eq_ignore_ascii_case("multipart/form-data"))
+        })
+}
+
+/// Maps POST Object response statuses to the Ceph/AWS-compatible shape.
+///
+/// Malformed policy documents still return `400 InvalidPolicyDocument`; this
+/// only rewrites parsed policies whose conditions reject the submitted form.
+async fn rewrite_post_policy_condition_status(
+    response: HttpResponse,
+) -> Result<HttpResponse, HttpError> {
+    if response.status() != StatusCode::BAD_REQUEST && response.status() != StatusCode::FORBIDDEN {
+        return Ok(response);
+    }
+
+    let (mut parts, body) = response.into_parts();
+    let bytes = body.collect().await.map_err(HttpError::new)?.to_bytes();
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return Ok(HttpResponse::from_parts(parts, Body::from(bytes)));
+    };
+    if text.contains("<Code>InvalidPolicyDocument</Code>") && text.contains("Policy condition") {
+        parts.status = StatusCode::FORBIDDEN;
+    } else if parts.status == StatusCode::FORBIDDEN
+        && text.contains("<Code>AccessDenied</Code>")
+        && !text.contains("Request has expired")
+        && !text.contains("Each form field")
+    {
+        parts.status = StatusCode::BAD_REQUEST;
+    }
+    Ok(HttpResponse::from_parts(parts, Body::from(bytes)))
 }
 
 /// Removes XML quotes around `GetObjectAttributes` `ETag` values.

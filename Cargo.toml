@@ -78,12 +78,14 @@ aws-config = { version = "=1.8.15", default-features = false }
 aws-credential-types = { version = "=1.2.14", features = ["test-util"] }
 aws-sdk-s3 = { version = "=1.129.0", features = ["behavior-version-latest"] }
 aws-sigv4 = "=1.4.2"
+hmac = "0.12"
 reqwest = { version = "0.12", default-features = false, features = [
     "http2",
     "rustls-tls",
     "stream",
 ] }
 serial_test = "3"
+sha2 = "0.10"
 tempfile = "3"
 
 [profile.release]

@@ -155,7 +155,7 @@ compatibility-limited, the note says so.
 | Tagging | Bucket tagging API | ✅ | ✅ | ✅ | ✅ | Covers Get/Put/DeleteBucketTagging. |
 | Tagging | Object tagging API | ✅ | ✅ | ✅ | ✅ | Covers Get/Put/DeleteObjectTagging with version-specific tags. |
 | Tagging | Object tags on PutObject | ✅ | ✅ | ✅ | ✅ | Covers PutObject, CopyObject tag directives, and multipart upload tags. |
-| Tagging | Object tags on POST Object | ✅ | ✅ | ✅ | ❌ | POST Object is out of scope for s3ite. |
+| Tagging | Object tags on POST Object | ✅ | ✅ | ✅ | ✅ | POST Object forwards `x-amz-tagging` through the normal object write path. |
 | Tagging | Tag-based bucket policy conditions | ✅ | ✅ | ✅ | ❌ | Requires bucket policy support. |
 | Lifecycle | Put/Get/DeleteBucketLifecycle | ✅ | ✅ | ✅ | ❌ | Out of scope for s3ite. |
 | Lifecycle | Current object expiration | ✅ | ✅ | ✅ | ❌ | Out of scope for s3ite. |
@@ -167,9 +167,9 @@ compatibility-limited, the note says so.
 | Lifecycle | Restore status in list outputs | ✅ | ✅ | ✅ | ❌ | Out of scope for s3ite. |
 | CORS | Bucket CORS API | ✅ | ✅ | ❌ | ❌ | MinIO documents bucket CORS APIs as unsupported because CORS is enabled by default; s3ite has server-level CORS config only. |
 | CORS | CORS preflight behavior | ✅ | ✅ | ✅ | ✅ | s3ite supports configurable server-level CORS, not S3 bucket CORS resources. |
-| POST | POST Object form uploads | ✅ | ✅ | ✅ | ❌ | s3ite does not implement browser form uploads. |
-| POST | POST Object policy validation | ✅ | ✅ | ✅ | ❌ | Requires POST Object support. |
-| POST | POST Object success redirects/status codes | ✅ | ✅ | ✅ | ❌ | Requires POST Object support. |
+| POST | POST Object form uploads | ✅ | ✅ | ✅ | ✅ | Browser form uploads reuse the normal object write path. |
+| POST | POST Object policy validation | ✅ | ✅ | ✅ | ✅ | SigV4 POST policy validation is handled by `s3s`. |
+| POST | POST Object success redirects/status codes | ✅ | ✅ | ✅ | ✅ | Covers default 204, 200/201 statuses, and 303 redirects. |
 | Object Lock | Bucket Object Lock configuration | ✅ | ✅ | ✅ | ❌ | Out of scope for s3ite. |
 | Object Lock | Object retention governance/compliance | ✅ | ✅ | ✅ | ❌ | Out of scope for s3ite. |
 | Object Lock | Object legal hold | ✅ | ✅ | ✅ | ❌ | Out of scope for s3ite. |
@@ -209,7 +209,7 @@ The largest compatibility gaps relative to AWS/MinIO and `ceph/s3-tests` are:
 
 - Auth and authorization: bucket policies, public/anonymous access, IAM, STS,
   cross-account behavior, and full ACL grant enforcement.
-- Object-management APIs: POST Object, lifecycle, restore/tiering, Object Lock,
+- Object-management APIs: lifecycle, restore/tiering, Object Lock,
   PublicAccessBlock, notifications, logging, website hosting, inventory,
   analytics, metrics, and request payment.
 - Encryption variants: SSE-KMS, SSE-C, DSSE-KMS, and S3 Bucket Keys.
