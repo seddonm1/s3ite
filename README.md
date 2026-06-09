@@ -40,9 +40,9 @@ The supported S3 surface is intentionally focused:
   cases, and owner-only ACL reads or owner-equivalent ACL writes.
 
 Out of scope surfaces include IAM, STS, SNS, S3 Select, S3 Control, torrent,
-public or anonymous access, public ACL grants, bucket policies, per-bucket CORS
-APIs, lifecycle and restore, SSE/encryption, object lock, S3 logging, object
-ownership controls, public access block, and multi-owner behavior.
+public or anonymous access, public ACL grants, bucket policies, lifecycle and
+restore, SSE/encryption, object lock, S3 logging, object ownership controls,
+public access block, and multi-owner behavior.
 
 ## Storage Model
 
@@ -216,6 +216,10 @@ buckets:
 ```
 
 ### CORS
+
+S3 bucket CORS APIs are supported and store rules in the bucket database.
+Server-level CORS remains the fallback for buckets without a bucket CORS
+configuration and for non-bucket requests.
 
 `cors.mode` can be:
 

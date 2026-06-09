@@ -20,12 +20,13 @@ use uuid::Uuid;
 use crate::database::BucketConnection;
 use crate::s3::{
     ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKind, MultipartChecksumConfig,
-    MultipartCompletionChecksum, PartChecksum, SSE_S3_ALGORITHM_CODE, StoredChecksum, StoredSse,
-    StoredTag, decode_base64, encode_hex,
+    MultipartCompletionChecksum, PartChecksum, SSE_S3_ALGORITHM_CODE, StoredChecksum,
+    StoredCorsRule, StoredSse, StoredTag, decode_base64, encode_hex,
 };
 
 mod bucket;
 mod checksum;
+mod cors;
 mod delete;
 mod error;
 mod get;
@@ -43,7 +44,7 @@ pub use self::error::{SqliteError, SqliteResult};
 
 pub(crate) const NULL_VERSION_ID: &str = "null";
 
-const BUCKET_SCHEMA_VERSION: i32 = 10;
+const BUCKET_SCHEMA_VERSION: i32 = 11;
 pub(crate) const DEFAULT_OBJECT_BLOB_CHUNK_SIZE: usize = 128 * 1024 * 1024;
 const BUCKET_SCHEMA_SQL: &str = "
 -- Singleton bucket metadata, currently the object versioning state.
@@ -57,6 +58,45 @@ CREATE TABLE bucket_state (
 CREATE TABLE bucket_tag (
     key TEXT NOT NULL PRIMARY KEY,
     value TEXT NOT NULL
+) STRICT;
+
+-- Bucket CORS rules for this bucket database.
+CREATE TABLE bucket_cors_rule (
+    sequence INTEGER PRIMARY KEY,
+    id TEXT,
+    max_age_seconds INTEGER CHECK(max_age_seconds IS NULL OR max_age_seconds >= 0)
+) STRICT;
+
+CREATE TABLE bucket_cors_allowed_origin (
+    rule_sequence INTEGER NOT NULL,
+    position INTEGER NOT NULL CHECK(position >= 0),
+    value TEXT NOT NULL,
+    PRIMARY KEY (rule_sequence, position),
+    FOREIGN KEY (rule_sequence) REFERENCES bucket_cors_rule (sequence) ON DELETE CASCADE
+) STRICT;
+
+CREATE TABLE bucket_cors_allowed_method (
+    rule_sequence INTEGER NOT NULL,
+    position INTEGER NOT NULL CHECK(position >= 0),
+    value TEXT NOT NULL,
+    PRIMARY KEY (rule_sequence, position),
+    FOREIGN KEY (rule_sequence) REFERENCES bucket_cors_rule (sequence) ON DELETE CASCADE
+) STRICT;
+
+CREATE TABLE bucket_cors_allowed_header (
+    rule_sequence INTEGER NOT NULL,
+    position INTEGER NOT NULL CHECK(position >= 0),
+    value TEXT NOT NULL,
+    PRIMARY KEY (rule_sequence, position),
+    FOREIGN KEY (rule_sequence) REFERENCES bucket_cors_rule (sequence) ON DELETE CASCADE
+) STRICT;
+
+CREATE TABLE bucket_cors_expose_header (
+    rule_sequence INTEGER NOT NULL,
+    position INTEGER NOT NULL CHECK(position >= 0),
+    value TEXT NOT NULL,
+    PRIMARY KEY (rule_sequence, position),
+    FOREIGN KEY (rule_sequence) REFERENCES bucket_cors_rule (sequence) ON DELETE CASCADE
 ) STRICT;
 
 -- Object metadata for every live version and delete marker.
@@ -355,7 +395,7 @@ CREATE INDEX completed_multipart_upload_expiry
 INSERT INTO bucket_state (id, versioning_state)
 VALUES (1, 0);
 
-PRAGMA user_version = 10;
+PRAGMA user_version = 11;
 ";
 
 /// Reads a nonnegative object size column from a row.
@@ -796,7 +836,7 @@ pub(crate) struct MultipartCompletionRequest {
 }
 
 /// SQLite-backed storage state and open bucket connections.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Sqlite {
     pub(crate) root: PathBuf,
     pub(crate) config: crate::Config,
@@ -1338,6 +1378,11 @@ mod tests {
         for table in [
             "bucket_state",
             "bucket_tag",
+            "bucket_cors_rule",
+            "bucket_cors_allowed_origin",
+            "bucket_cors_allowed_method",
+            "bucket_cors_allowed_header",
+            "bucket_cors_expose_header",
             "object_version",
             "object_tag",
             "multipart_upload",
@@ -1388,6 +1433,21 @@ mod tests {
                 && column.to == "sequence"
                 && column.on_delete == "CASCADE"
         }));
+
+        for table in [
+            "bucket_cors_allowed_origin",
+            "bucket_cors_allowed_method",
+            "bucket_cors_allowed_header",
+            "bucket_cors_expose_header",
+        ] {
+            let columns = foreign_key_columns(&connection, table)?;
+            assert!(columns.iter().any(|column| {
+                column.table == "bucket_cors_rule"
+                    && column.from == "rule_sequence"
+                    && column.to == "sequence"
+                    && column.on_delete == "CASCADE"
+            }));
+        }
 
         let blob_chunk_columns = foreign_key_columns(&connection, "object_blob_chunk")?;
         assert!(blob_chunk_columns.iter().any(|column| {

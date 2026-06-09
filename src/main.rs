@@ -20,7 +20,6 @@ use s3s::{
 };
 use tokio::net::TcpListener;
 use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer};
-use tower_http::cors::CorsLayer;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
 
@@ -59,8 +58,8 @@ async fn main() -> MainResult<()> {
 
     let config = Config::from_args()?;
     let auth_compat = HeaderAuthCompatLayer::new(config.secret_key.clone());
-    let cors_layer = config.cors_layer()?;
     let sqlite = Sqlite::new(&config).await?;
+    let cors_layer = s3::BucketCorsLayer::new(sqlite.clone(), &config);
     let svc = build_s3_service(&config, sqlite)?;
     let listener = bind_listener(&config).await?;
 
@@ -110,7 +109,7 @@ async fn serve(
     listener: TcpListener,
     svc: S3Service,
     auth_compat: HeaderAuthCompatLayer,
-    cors_layer: Option<CorsLayer>,
+    cors_layer: s3::BucketCorsLayer,
     concurrency_limit: u16,
 ) -> MainResult<()> {
     let local_addr = listener.local_addr()?;
@@ -145,9 +144,9 @@ async fn serve(
                         request.extensions_mut().insert(ClientAddress(remote_addr));
                         request
                     })
-                    .option_layer(cors_layer.clone())
-                    .layer(auth_compat.clone())
                     .layer(ConcurrencyLimitLayer::new(concurrency_limit.into()))
+                    .layer(cors_layer.clone())
+                    .layer(auth_compat.clone())
                     .service(svc.clone()),
             ),
         );

@@ -165,8 +165,8 @@ compatibility-limited, the note says so.
 | Lifecycle | Storage-class transitions | ✅ | ✅ | ✅ | ❌ | Out of scope for s3ite. |
 | Lifecycle | RestoreObject from archive/tier | ✅ | ✅ | ✅ | ❌ | MinIO lists `RestoreObject`; s3ite has no restore/tiering. |
 | Lifecycle | Restore status in list outputs | ✅ | ✅ | ✅ | ❌ | Out of scope for s3ite. |
-| CORS | Bucket CORS API | ✅ | ✅ | ❌ | ❌ | MinIO documents bucket CORS APIs as unsupported because CORS is enabled by default; s3ite has server-level CORS config only. |
-| CORS | CORS preflight behavior | ✅ | ✅ | ✅ | ✅ | s3ite supports configurable server-level CORS, not S3 bucket CORS resources. |
+| CORS | Bucket CORS API | ✅ | ✅ | ❌ | ✅ | s3ite stores per-bucket CORS rules in each bucket DB; MinIO documents bucket CORS APIs as unsupported because CORS is enabled by default. |
+| CORS | CORS preflight behavior | ✅ | ✅ | ✅ | ✅ | s3ite applies bucket CORS first and falls back to configurable server-level CORS when no bucket config exists. |
 | POST | POST Object form uploads | ✅ | ✅ | ✅ | ✅ | Browser form uploads reuse the normal object write path. |
 | POST | POST Object policy validation | ✅ | ✅ | ✅ | ✅ | SigV4 POST policy validation is handled by `s3s`. |
 | POST | POST Object success redirects/status codes | ✅ | ✅ | ✅ | ✅ | Covers default 204, 200/201 statuses, and 303 redirects. |

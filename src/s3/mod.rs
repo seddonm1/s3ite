@@ -16,12 +16,13 @@ use s3s::{
         BucketVersioningStatus, ChecksumMode, CommonPrefix, CompleteMultipartUploadInput,
         CompleteMultipartUploadOutput, CompletedPart, CopyObjectInput, CopyObjectOutput,
         CopyObjectResult, CopyPartResult, CopySource, CreateBucketInput, CreateBucketOutput,
-        CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketEncryptionInput,
-        DeleteBucketEncryptionOutput, DeleteBucketInput, DeleteBucketOutput,
-        DeleteBucketTaggingInput, DeleteBucketTaggingOutput, DeleteObjectInput, DeleteObjectOutput,
-        DeleteObjectTaggingInput, DeleteObjectTaggingOutput, DeleteObjectsInput,
-        DeleteObjectsOutput, DeletedObject, ETag, ETagCondition, Error as DeleteError,
-        GetBucketAclInput, GetBucketAclOutput, GetBucketEncryptionInput, GetBucketEncryptionOutput,
+        CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketCorsInput,
+        DeleteBucketCorsOutput, DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput,
+        DeleteBucketInput, DeleteBucketOutput, DeleteBucketTaggingInput, DeleteBucketTaggingOutput,
+        DeleteObjectInput, DeleteObjectOutput, DeleteObjectTaggingInput, DeleteObjectTaggingOutput,
+        DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag, ETagCondition,
+        Error as DeleteError, GetBucketAclInput, GetBucketAclOutput, GetBucketCorsInput,
+        GetBucketCorsOutput, GetBucketEncryptionInput, GetBucketEncryptionOutput,
         GetBucketLocationInput, GetBucketLocationOutput, GetBucketTaggingInput,
         GetBucketTaggingOutput, GetBucketVersioningInput, GetBucketVersioningOutput,
         GetObjectAclInput, GetObjectAclOutput, GetObjectAttributesInput, GetObjectAttributesOutput,
@@ -33,14 +34,14 @@ use s3s::{
         ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput, MFADelete,
         MetadataDirective, MultipartUpload, ObjectAttributes, ObjectCannedACL, ObjectPart, Owner,
         Part, Permission, PostObjectInput, PostObjectOutput, PutBucketAclInput, PutBucketAclOutput,
-        PutBucketEncryptionInput, PutBucketEncryptionOutput, PutBucketTaggingInput,
-        PutBucketTaggingOutput, PutBucketVersioningInput, PutBucketVersioningOutput,
-        PutObjectAclInput, PutObjectAclOutput, PutObjectInput, PutObjectOutput,
-        PutObjectTaggingInput, PutObjectTaggingOutput, Range as S3Range, ServerSideEncryption,
-        ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
-        StorageClass, StreamingBlob, Tag, TagSet, Tagging, TaggingDirective, TaggingHeader,
-        Timestamp, Type, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput,
-        UploadPartOutput,
+        PutBucketCorsInput, PutBucketCorsOutput, PutBucketEncryptionInput,
+        PutBucketEncryptionOutput, PutBucketTaggingInput, PutBucketTaggingOutput,
+        PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectAclInput, PutObjectAclOutput,
+        PutObjectInput, PutObjectOutput, PutObjectTaggingInput, PutObjectTaggingOutput,
+        Range as S3Range, ServerSideEncryption, ServerSideEncryptionByDefault,
+        ServerSideEncryptionConfiguration, ServerSideEncryptionRule, StorageClass, StreamingBlob,
+        Tag, TagSet, Tagging, TaggingDirective, TaggingHeader, Timestamp, Type,
+        UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
     },
     header::{
         CONTENT_MD5, CONTENT_TYPE, ETAG, X_AMZ_CONTENT_SHA256, X_AMZ_DECODED_CONTENT_LENGTH,
@@ -103,6 +104,7 @@ fn client_ip<T>(req: &S3Request<T>) -> TraceOption<std::net::IpAddr> {
 mod bucket;
 mod checksum;
 mod copy;
+mod cors;
 mod delete;
 mod error;
 mod get;
@@ -121,6 +123,7 @@ pub(crate) use self::{
         MultipartCompletionChecksum, PartChecksum, StoredChecksum, decode_base64, decode_md5_hex,
         encode_hex,
     },
+    cors::{BucketCorsLayer, StoredCorsRule},
     sse::{SSE_S3_ALGORITHM_CODE, StoredSse, parse_master_key},
     tagging::StoredTag,
 };
@@ -368,6 +371,16 @@ impl S3 for Sqlite {
         bucket::delete_bucket(self, req).await
     }
 
+    /// Deletes a bucket's CORS configuration.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id(&req),
+            client_ip = %client_ip(&req), bucket = %req.input.bucket))]
+    async fn delete_bucket_cors(
+        &self,
+        req: S3Request<DeleteBucketCorsInput>,
+    ) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
+        cors::delete_bucket_cors(self, req).await
+    }
+
     /// Deletes a bucket's default encryption configuration.
     #[tracing::instrument(skip_all, fields(user_id = %user_id(&req),
             client_ip = %client_ip(&req), bucket = %req.input.bucket))]
@@ -449,6 +462,16 @@ impl S3 for Sqlite {
         req: S3Request<GetBucketLocationInput>,
     ) -> S3Result<S3Response<GetBucketLocationOutput>> {
         bucket::get_bucket_location(self, req).await
+    }
+
+    /// Returns a bucket's CORS configuration.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id(&req),
+            client_ip = %client_ip(&req), bucket = %req.input.bucket))]
+    async fn get_bucket_cors(
+        &self,
+        req: S3Request<GetBucketCorsInput>,
+    ) -> S3Result<S3Response<GetBucketCorsOutput>> {
+        cors::get_bucket_cors(self, req).await
     }
 
     /// Returns a bucket's default encryption configuration.
@@ -627,6 +650,16 @@ impl S3 for Sqlite {
         req: S3Request<PutBucketAclInput>,
     ) -> S3Result<S3Response<PutBucketAclOutput>> {
         owner::put_bucket_acl(self, req).await
+    }
+
+    /// Replaces a bucket's CORS configuration.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id(&req),
+            client_ip = %client_ip(&req), bucket = %req.input.bucket))]
+    async fn put_bucket_cors(
+        &self,
+        req: S3Request<PutBucketCorsInput>,
+    ) -> S3Result<S3Response<PutBucketCorsOutput>> {
+        cors::put_bucket_cors(self, req).await
     }
 
     /// Updates a bucket's default encryption configuration.
