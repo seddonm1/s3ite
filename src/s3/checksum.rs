@@ -1820,6 +1820,7 @@ mod tests {
                 md5: Some("md5".to_string()),
                 checksum: None,
                 stored_sse: None,
+                object_lock: crate::s3::StoredObjectLock::default(),
                 is_latest: true,
                 is_delete_marker: false,
             },

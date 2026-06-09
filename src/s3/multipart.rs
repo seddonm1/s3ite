@@ -21,9 +21,10 @@ use super::{
     checksum_sha256, checksum_type_output, common_prefix_for_key, configured_part_checksum,
     copy_bytes, decode_list_input_value, decrypt_stored_chunks,
     default_crc64nvme_full_object_checksum, encode_list_value, encrypt_value_chunks,
-    finish_part_checksum, hex, is_url_encoding, multipart_checksum_config,
-    normalize_content_encoding, normalize_metadata, object_write_conditions, output_delimiter,
-    owner, part_checksum_accumulator, read_part_body_encrypted, requested_sse_s3,
+    finish_part_checksum, hex, is_url_encoding, load_bucket_object_lock_config,
+    multipart_checksum_config, normalize_content_encoding, normalize_metadata,
+    object_lock_for_new_version, object_lock_write_headers, object_write_conditions,
+    output_delimiter, owner, part_checksum_accumulator, read_part_body_encrypted, requested_sse_s3,
     resolve_write_encryption, s3_error, s3_error_from_sqlite, s3_error_with_message, sse_s3_output,
     stored_tags_from_header, validate_content_md5, validate_declared_object_write_length,
     validate_expected_bucket_owner, validate_no_sse_headers, validate_no_unsupported_sse_headers,
@@ -932,14 +933,30 @@ pub(super) async fn list_multipart_uploads(
 }
 
 /// Creates multipart upload state for a future object.
+fn validate_create_multipart_upload_acl(input: &CreateMultipartUploadInput) -> S3Result<()> {
+    validate_object_acl(&ObjectAclRequest {
+        acl: input.acl.as_ref(),
+        has_access_control_policy: false,
+        grant_header_count: [
+            input.grant_full_control.is_some(),
+            input.grant_read.is_some(),
+            input.grant_read_acp.is_some(),
+            input.grant_write_acp.is_some(),
+        ]
+        .into_iter()
+        .filter(|value| *value)
+        .count(),
+    })
+}
+
 pub(super) async fn create_multipart_upload(
     sqlite: &Sqlite,
     req: S3Request<CreateMultipartUploadInput>,
 ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
     validate_expected_bucket_owner(req.input.expected_bucket_owner.as_deref())?;
     validate_no_unsupported_sse_headers(&req.headers)?;
+    validate_create_multipart_upload_acl(&req.input)?;
     let CreateMultipartUploadInput {
-        acl,
         bucket,
         key,
         cache_control,
@@ -949,11 +966,10 @@ pub(super) async fn create_multipart_upload(
         checksum_algorithm,
         checksum_type,
         expires,
-        grant_full_control,
-        grant_read,
-        grant_read_acp,
-        grant_write_acp,
         metadata,
+        object_lock_legal_hold_status,
+        object_lock_mode,
+        object_lock_retain_until_date,
         server_side_encryption,
         sse_customer_algorithm,
         sse_customer_key,
@@ -967,22 +983,20 @@ pub(super) async fn create_multipart_upload(
     sqlite
         .validate_mutable_bucket(&bucket)
         .map_err(s3_error_from_sqlite)?;
-    validate_object_acl(&ObjectAclRequest {
-        acl: acl.as_ref(),
-        has_access_control_policy: false,
-        grant_header_count: [
-            grant_full_control.is_some(),
-            grant_read.is_some(),
-            grant_read_acp.is_some(),
-            grant_write_acp.is_some(),
-        ]
-        .into_iter()
-        .filter(|value| *value)
-        .count(),
-    })?;
 
     let upload_id = Uuid::new_v4();
     let tags = stored_tags_from_header(tagging)?;
+    let object_lock_headers = object_lock_write_headers(
+        object_lock_legal_hold_status,
+        object_lock_mode,
+        object_lock_retain_until_date,
+    )?;
+    let object_lock_config = load_bucket_object_lock_config(sqlite, &bucket).await?;
+    let object_lock = object_lock_for_new_version(
+        &object_lock_config,
+        object_lock_headers,
+        OffsetDateTime::now_utc(),
+    )?;
     let checksum = multipart_checksum_config(checksum_algorithm.clone(), checksum_type)?;
     let explicit_sse_s3 = requested_sse_s3(
         server_side_encryption.as_ref(),
@@ -1020,6 +1034,7 @@ pub(super) async fn create_multipart_upload(
                     stored_sse: encryption
                         .as_ref()
                         .map(|encryption| encryption.stored.clone()),
+                    object_lock,
                 },
             )?;
             Sqlite::put_multipart_upload_tags(&transaction, upload_id, &tags)?;
@@ -1658,7 +1673,10 @@ pub(super) async fn complete_multipart_upload(
 mod tests {
     use super::*;
 
-    use crate::{s3::PartChecksum, sqlite::KeyMetadata};
+    use crate::{
+        s3::{PartChecksum, StoredObjectLock},
+        sqlite::KeyMetadata,
+    };
 
     fn assert_error_code<T>(result: S3Result<T>, code: &S3ErrorCode) {
         let err = result.err();
@@ -1692,6 +1710,7 @@ mod tests {
                 md5: Some("md5".to_string()),
                 checksum: None,
                 stored_sse: None,
+                object_lock: StoredObjectLock::default(),
                 is_latest: true,
                 is_delete_marker: false,
             },

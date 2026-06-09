@@ -170,11 +170,11 @@ compatibility-limited, the note says so.
 | POST | POST Object form uploads | ✅ | ✅ | ✅ | ✅ | Browser form uploads reuse the normal object write path. |
 | POST | POST Object policy validation | ✅ | ✅ | ✅ | ✅ | SigV4 POST policy validation is handled by `s3s`. |
 | POST | POST Object success redirects/status codes | ✅ | ✅ | ✅ | ✅ | Covers default 204, 200/201 statuses, and 303 redirects. |
-| Object Lock | Bucket Object Lock configuration | ✅ | ✅ | ✅ | ❌ | Out of scope for s3ite. |
-| Object Lock | Object retention governance/compliance | ✅ | ✅ | ✅ | ❌ | Out of scope for s3ite. |
-| Object Lock | Object legal hold | ✅ | ✅ | ✅ | ❌ | Out of scope for s3ite. |
-| Object Lock | Delete blocked by retention/legal hold | ✅ | ✅ | ✅ | ❌ | Out of scope for s3ite. |
-| Object Lock | Retention metadata on HeadObject/GetObject | ✅ | ✅ | ✅ | ❌ | Out of scope for s3ite. |
+| Object Lock | Bucket Object Lock configuration | ✅ | ✅ | ✅ | ✅ | s3ite supports configuration for buckets created with Object Lock enabled. |
+| Object Lock | Object retention governance/compliance | ✅ | ✅ | ✅ | ✅ | Includes default retention, explicit retention, extension, and active-retention shortening rules. |
+| Object Lock | Object legal hold | ✅ | ✅ | ✅ | ✅ | Legal hold is stored per object version and exposed through the S3 APIs. |
+| Object Lock | Delete blocked by retention/legal hold | ✅ | ✅ | ✅ | ✅ | Exact-version deletes are blocked by legal hold, compliance retention, and governance retention unless bypass is supplied. |
+| Object Lock | Retention metadata on HeadObject/GetObject | ✅ | ✅ | ✅ | ✅ | s3ite returns Object Lock mode, retain-until date, and legal-hold headers on read metadata. |
 | Policy/Security | PublicAccessBlock APIs | ✅ | ✅ | ❌ | ❌ | MinIO documents these APIs as unsupported. |
 | Policy/Security | Bucket policy status API | ✅ | ✅ | ✅ | ❌ | Requires bucket policy support. |
 | Policy/Security | Requester Pays / request payment | ✅ | ✅ | ❌ | ❌ | MinIO documents request-payment APIs as unsupported. |
@@ -209,9 +209,9 @@ The largest compatibility gaps relative to AWS/MinIO and `ceph/s3-tests` are:
 
 - Auth and authorization: bucket policies, public/anonymous access, IAM, STS,
   cross-account behavior, and full ACL grant enforcement.
-- Object-management APIs: lifecycle, restore/tiering, Object Lock,
-  PublicAccessBlock, notifications, logging, website hosting, inventory,
-  analytics, metrics, and request payment.
+- Object-management APIs: lifecycle, restore/tiering, PublicAccessBlock,
+  notifications, logging, website hosting, inventory, analytics, metrics, and
+  request payment.
 - Encryption variants: SSE-KMS, SSE-C, DSSE-KMS, and S3 Bucket Keys.
 - AWS managed/control-plane features: S3 Control, access points,
   Multi-Region Access Points, S3 Express/directory buckets, S3 on Outposts,

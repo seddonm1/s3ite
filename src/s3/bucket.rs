@@ -62,6 +62,7 @@ pub(super) async fn create_bucket(
         grant_read_acp,
         grant_write,
         grant_write_acp,
+        object_lock_enabled_for_bucket,
         ..
     } = req.input;
 
@@ -83,10 +84,24 @@ pub(super) async fn create_bucket(
         .count(),
     })?;
 
-    sqlite
+    let created = sqlite
         .create_bucket(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
+    if created && object_lock_enabled_for_bucket.unwrap_or(false) {
+        let connection = sqlite
+            .get_connection(&bucket)
+            .await
+            .map_err(s3_error_from_sqlite)?;
+        connection
+            .write(|connection| {
+                let transaction = connection.transaction()?;
+                Sqlite::enable_bucket_object_lock(&transaction)?;
+                Ok(transaction.commit()?)
+            })
+            .await
+            .map_err(s3_error_from_sqlite)?;
+    }
 
     let output = CreateBucketOutput {
         location: Some(format!("/{bucket}")),
@@ -414,11 +429,20 @@ pub(super) async fn put_bucket_versioning(
     connection
         .write(move |connection| {
             let transaction = connection.transaction()?;
+            if state == BucketVersioningState::Suspended
+                && Sqlite::get_bucket_object_lock_config(&transaction)?.enabled
+            {
+                return Ok(Err(s3_error_with_message(
+                    S3ErrorCode::InvalidBucketState,
+                    "Object Lock buckets cannot suspend versioning",
+                )));
+            }
             Sqlite::put_bucket_versioning_state(&transaction, state)?;
-            Ok(transaction.commit()?)
+            transaction.commit()?;
+            Ok(Ok(()))
         })
         .await
-        .map_err(s3_error_from_sqlite)?;
+        .map_err(s3_error_from_sqlite)??;
 
     Ok(S3Response::new(PutBucketVersioningOutput::default()))
 }

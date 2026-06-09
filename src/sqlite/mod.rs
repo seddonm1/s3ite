@@ -21,7 +21,8 @@ use crate::database::BucketConnection;
 use crate::s3::{
     ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKind, MultipartChecksumConfig,
     MultipartCompletionChecksum, PartChecksum, SSE_S3_ALGORITHM_CODE, StoredChecksum,
-    StoredCorsRule, StoredSse, StoredTag, decode_base64, encode_hex,
+    StoredCorsRule, StoredObjectLock, StoredObjectLockConfig, StoredObjectLockDefaultRetention,
+    StoredObjectLockMode, StoredObjectRetention, StoredSse, StoredTag, decode_base64, encode_hex,
 };
 
 mod bucket;
@@ -32,6 +33,7 @@ mod error;
 mod get;
 mod list;
 mod multipart;
+mod object_lock;
 mod put;
 mod tagging;
 
@@ -51,7 +53,28 @@ const BUCKET_SCHEMA_SQL: &str = "
 CREATE TABLE bucket_state (
     id INTEGER PRIMARY KEY CHECK(id = 1),
     versioning_state INTEGER NOT NULL CHECK(versioning_state IN (0, 1, 2)),
-    default_sse_algorithm INTEGER CHECK(default_sse_algorithm IN (1))
+    default_sse_algorithm INTEGER CHECK(default_sse_algorithm IN (1)),
+    object_lock_enabled INTEGER NOT NULL DEFAULT 0 CHECK(object_lock_enabled IN (0, 1)),
+    object_lock_default_retention_mode TEXT CHECK(object_lock_default_retention_mode IN ('GOVERNANCE', 'COMPLIANCE')),
+    object_lock_default_retention_days INTEGER CHECK(object_lock_default_retention_days IS NULL OR object_lock_default_retention_days > 0),
+    object_lock_default_retention_years INTEGER CHECK(object_lock_default_retention_years IS NULL OR object_lock_default_retention_years > 0),
+    CHECK (
+        (
+            object_lock_default_retention_mode IS NULL
+            AND object_lock_default_retention_days IS NULL
+            AND object_lock_default_retention_years IS NULL
+        )
+        OR
+        (
+            object_lock_enabled = 1
+            AND object_lock_default_retention_mode IS NOT NULL
+            AND (
+                (object_lock_default_retention_days IS NOT NULL AND object_lock_default_retention_years IS NULL)
+                OR
+                (object_lock_default_retention_days IS NULL AND object_lock_default_retention_years IS NOT NULL)
+            )
+        )
+    )
 ) STRICT;
 
 -- Bucket tags for this bucket database.
@@ -121,6 +144,9 @@ CREATE TABLE object_version (
     sse_key_nonce BLOB,
     sse_key_ciphertext BLOB,
     sse_key_tag BLOB,
+    object_lock_legal_hold INTEGER CHECK(object_lock_legal_hold IN (0, 1)),
+    object_lock_retention_mode TEXT CHECK(object_lock_retention_mode IN ('GOVERNANCE', 'COMPLIANCE')),
+    object_lock_retain_until TEXT,
     UNIQUE(key, version_id),
     CHECK (
         (
@@ -135,6 +161,17 @@ CREATE TABLE object_version (
             AND length(sse_key_nonce) = 12
             AND length(sse_key_ciphertext) = 32
             AND length(sse_key_tag) = 16
+        )
+    ),
+    CHECK (
+        (
+            object_lock_retention_mode IS NULL
+            AND object_lock_retain_until IS NULL
+        )
+        OR
+        (
+            object_lock_retention_mode IS NOT NULL
+            AND object_lock_retain_until IS NOT NULL
         )
     ),
     CHECK (
@@ -162,6 +199,9 @@ CREATE TABLE object_version (
             AND sse_key_nonce IS NULL
             AND sse_key_ciphertext IS NULL
             AND sse_key_tag IS NULL
+            AND object_lock_legal_hold IS NULL
+            AND object_lock_retention_mode IS NULL
+            AND object_lock_retain_until IS NULL
         )
     )
 ) STRICT;
@@ -204,6 +244,9 @@ CREATE TABLE multipart_upload (
     sse_key_nonce BLOB,
     sse_key_ciphertext BLOB,
     sse_key_tag BLOB,
+    object_lock_legal_hold INTEGER CHECK(object_lock_legal_hold IN (0, 1)),
+    object_lock_retention_mode TEXT CHECK(object_lock_retention_mode IN ('GOVERNANCE', 'COMPLIANCE')),
+    object_lock_retain_until TEXT,
     UNIQUE(upload_id, bucket, key),
     CHECK (
         (
@@ -218,6 +261,17 @@ CREATE TABLE multipart_upload (
             AND length(sse_key_nonce) = 12
             AND length(sse_key_ciphertext) = 32
             AND length(sse_key_tag) = 16
+        )
+    ),
+    CHECK (
+        (
+            object_lock_retention_mode IS NULL
+            AND object_lock_retain_until IS NULL
+        )
+        OR
+        (
+            object_lock_retention_mode IS NOT NULL
+            AND object_lock_retain_until IS NOT NULL
         )
     ),
     CHECK (
@@ -454,6 +508,32 @@ fn optional_stored_sse(
     }
 }
 
+/// Reads nullable Object Lock metadata from row columns.
+fn optional_stored_object_lock(
+    legal_hold: Option<i64>,
+    retention_mode: Option<String>,
+    retain_until: Option<OffsetDateTime>,
+) -> rusqlite::Result<StoredObjectLock> {
+    let legal_hold = match legal_hold {
+        Some(0) => Some(false),
+        Some(1) => Some(true),
+        None => None,
+        Some(_) => return Err(rusqlite::Error::InvalidQuery),
+    };
+    let retention = match (retention_mode, retain_until) {
+        (None, None) => None,
+        (Some(mode), Some(retain_until)) => Some(StoredObjectRetention {
+            mode: StoredObjectLockMode::from_sql(&mode).ok_or(rusqlite::Error::InvalidQuery)?,
+            retain_until,
+        }),
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    Ok(StoredObjectLock {
+        legal_hold,
+        retention,
+    })
+}
+
 /// Converts a configured TTL into an expiration cutoff timestamp.
 fn expiration_threshold(ttl_seconds: u64) -> Option<OffsetDateTime> {
     if ttl_seconds == 0 {
@@ -668,6 +748,7 @@ pub(crate) struct MultipartUploadState {
     pub(crate) expires: Option<OffsetDateTime>,
     pub(crate) checksum: Option<MultipartChecksumConfig>,
     pub(crate) stored_sse: Option<StoredSse>,
+    pub(crate) object_lock: StoredObjectLock,
 }
 
 /// Active multipart upload row returned by multipart upload listing.
@@ -742,6 +823,7 @@ pub(crate) struct KeyMetadata {
     pub(crate) md5: Option<String>,
     pub(crate) checksum: Option<StoredChecksum>,
     pub(crate) stored_sse: Option<StoredSse>,
+    pub(crate) object_lock: StoredObjectLock,
     pub(crate) is_latest: bool,
     pub(crate) is_delete_marker: bool,
 }
@@ -761,6 +843,12 @@ pub(crate) struct ObjectWriteOutcome {
 pub(crate) struct ObjectTaggingTarget {
     pub(crate) sequence: i64,
     pub(crate) version_id: String,
+}
+
+/// Object version selected for metadata updates.
+#[derive(Debug)]
+pub(crate) struct ObjectVersionTarget {
+    pub(crate) sequence: i64,
 }
 
 /// Result of deleting an object or object version.
@@ -1137,8 +1225,8 @@ mod tests {
 
     use super::{
         BucketVersioningState, Duration, MultipartUploadState, OffsetDateTime, Sqlite, SqliteError,
-        SqliteResult, Uuid, expiration_threshold, reader_connection_pragmas, row_size, sql_limit,
-        sql_size, writer_connection_pragmas,
+        SqliteResult, StoredObjectLock, Uuid, expiration_threshold, reader_connection_pragmas,
+        row_size, sql_limit, sql_size, writer_connection_pragmas,
     };
 
     fn open_schema() -> SqliteResult<Connection> {
@@ -1985,6 +2073,7 @@ mod tests {
                         expires: None,
                         checksum: None,
                         stored_sse: None,
+                        object_lock: StoredObjectLock::default(),
                     },
                 )?;
                 transaction.execute(
@@ -2034,7 +2123,7 @@ mod tests {
 mod maintenance_tests {
     use rusqlite::Connection;
 
-    use crate::s3::{FullObjectChecksum, StoredChecksum};
+    use crate::s3::{FullObjectChecksum, StoredChecksum, StoredObjectLock};
 
     use super::{
         CompletedMultipartUploadRecord, Duration, Multipart, MultipartUploadState, NULL_VERSION_ID,
@@ -2068,6 +2157,7 @@ mod maintenance_tests {
                 expires: None,
                 checksum: None,
                 stored_sse: None,
+                object_lock: StoredObjectLock::default(),
             },
         )?;
         transaction.execute(
@@ -2112,6 +2202,7 @@ mod maintenance_tests {
                 expires: None,
                 checksum: None,
                 stored_sse: None,
+                object_lock: StoredObjectLock::default(),
             },
         )?;
         let multipart = Multipart {

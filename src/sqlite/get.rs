@@ -12,7 +12,7 @@ use crate::database::BlobReadRequest;
 use super::KeyValue;
 use super::{
     KeyMetadata, ObjectBodyReference, Sqlite, SqliteError, SqliteResult, StoredBlobChunk,
-    optional_stored_checksum, optional_stored_sse, row_bool, row_size,
+    optional_stored_checksum, optional_stored_object_lock, optional_stored_sse, row_bool, row_size,
 };
 
 impl Sqlite {
@@ -78,6 +78,9 @@ impl Sqlite {
                 ov.sse_key_nonce,
                 ov.sse_key_ciphertext,
                 ov.sse_key_tag,
+                ov.object_lock_legal_hold,
+                ov.object_lock_retention_mode,
+                ov.object_lock_retain_until,
                 ov.is_latest,
                 ov.is_delete_marker
             FROM object_version AS ov
@@ -125,8 +128,13 @@ impl Sqlite {
                                 row.get(16)?,
                                 row.get(17)?,
                             )?,
-                            is_latest: row_bool(row, 18)?,
-                            is_delete_marker: row_bool(row, 19)?,
+                            object_lock: optional_stored_object_lock(
+                                row.get(18)?,
+                                row.get(19)?,
+                                row.get(20)?,
+                            )?,
+                            is_latest: row_bool(row, 21)?,
+                            is_delete_marker: row_bool(row, 22)?,
                         },
                     },
                 ))
@@ -348,6 +356,9 @@ impl Sqlite {
                 sse_key_nonce,
                 sse_key_ciphertext,
                 sse_key_tag,
+                object_lock_legal_hold,
+                object_lock_retention_mode,
+                object_lock_retain_until,
                 is_latest,
                 is_delete_marker
             FROM object_version
@@ -394,8 +405,13 @@ impl Sqlite {
                             row.get(15)?,
                             row.get(16)?,
                         )?,
-                        is_latest: row_bool(row, 17)?,
-                        is_delete_marker: row_bool(row, 18)?,
+                        object_lock: optional_stored_object_lock(
+                            row.get(17)?,
+                            row.get(18)?,
+                            row.get(19)?,
+                        )?,
+                        is_latest: row_bool(row, 20)?,
+                        is_delete_marker: row_bool(row, 21)?,
                     },
                 })
             })
@@ -453,6 +469,9 @@ impl Sqlite {
                 sse_key_nonce,
                 sse_key_ciphertext,
                 sse_key_tag,
+                object_lock_legal_hold,
+                object_lock_retention_mode,
+                object_lock_retain_until,
                 is_latest,
                 is_delete_marker
             FROM object_version
@@ -491,8 +510,13 @@ impl Sqlite {
                         row.get(14)?,
                         row.get(15)?,
                     )?,
-                    is_latest: row_bool(row, 16)?,
-                    is_delete_marker: row_bool(row, 17)?,
+                    object_lock: optional_stored_object_lock(
+                        row.get(16)?,
+                        row.get(17)?,
+                        row.get(18)?,
+                    )?,
+                    is_latest: row_bool(row, 19)?,
+                    is_delete_marker: row_bool(row, 20)?,
                 })
             })
             .optional()?)

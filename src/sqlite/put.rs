@@ -163,9 +163,12 @@ impl Sqlite {
                 sse_algorithm,
                 sse_key_nonce,
                 sse_key_ciphertext,
-                sse_key_tag
+                sse_key_tag,
+                object_lock_legal_hold,
+                object_lock_retention_mode,
+                object_lock_retain_until
             )
-            VALUES (?1, ?2, 1, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17);",
+            VALUES (?1, ?2, 1, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20);",
         )?;
 
         let size = sql_size(key_metadata.size)?;
@@ -207,6 +210,17 @@ impl Sqlite {
                 .stored_sse
                 .as_ref()
                 .map(|stored_sse| stored_sse.tag.as_slice()),
+            key_metadata.object_lock.legal_hold,
+            key_metadata
+                .object_lock
+                .retention
+                .as_ref()
+                .map(|retention| retention.mode.as_str()),
+            key_metadata
+                .object_lock
+                .retention
+                .as_ref()
+                .map(|retention| retention.retain_until),
         ])?;
         drop(stmt);
 
@@ -466,7 +480,7 @@ mod tests {
     use time::OffsetDateTime;
 
     use crate::{
-        s3::{FullObjectChecksum, StoredChecksum},
+        s3::{FullObjectChecksum, StoredChecksum, StoredObjectLock},
         sqlite::{EncodedBlobChunk, KeyMetadata, KeyValue, Sqlite, SqliteError, SqliteResult},
     };
 
@@ -498,6 +512,7 @@ mod tests {
                     "crc".to_string(),
                 ))),
                 stored_sse: None,
+                object_lock: StoredObjectLock::default(),
                 is_latest: true,
                 is_delete_marker: false,
             },

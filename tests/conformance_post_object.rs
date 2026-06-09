@@ -18,7 +18,7 @@ mod support;
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
-use aws_sdk_s3::types::{ChecksumMode, Tag};
+use aws_sdk_s3::types::{ChecksumMode, ObjectLockLegalHoldStatus, ObjectLockMode, Tag};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use hmac::{Hmac, Mac};
 use reqwest::{Response, StatusCode, Url, header};
@@ -541,6 +541,47 @@ async fn s3ite_post_object_checksum_and_tags() -> Result<()> {
             ("team".to_string(), "red".to_string()),
         ])
     );
+
+    Ok(())
+}
+
+/// Verifies POST form fields feed s3ite Object Lock metadata persistence.
+#[tokio::test]
+#[serial(conformance)]
+async fn s3ite_post_object_object_lock_headers() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-post-lock");
+    let key = "uploads/locked.txt";
+
+    client
+        .create_bucket()
+        .bucket(&bucket)
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await?;
+    let response = send_signed_post(
+        &server,
+        &bucket,
+        PostFormOptions::new(key, b"locked post body").extra_fields(vec![
+            field("x-amz-object-lock-mode", "GOVERNANCE"),
+            field(
+                "x-amz-object-lock-retain-until-date",
+                "2030-01-01T00:00:00Z",
+            ),
+            field("x-amz-object-lock-legal-hold", "ON"),
+        ]),
+    )
+    .await?;
+    assert_status(&response, StatusCode::NO_CONTENT);
+
+    let object = client.head_object().bucket(&bucket).key(key).send().await?;
+    assert_eq!(object.object_lock_mode(), Some(&ObjectLockMode::Governance));
+    assert_eq!(
+        object.object_lock_legal_hold_status(),
+        Some(&ObjectLockLegalHoldStatus::On)
+    );
+    assert!(object.object_lock_retain_until_date().is_some());
 
     Ok(())
 }

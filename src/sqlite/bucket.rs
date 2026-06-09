@@ -73,11 +73,11 @@ impl Sqlite {
     }
 
     /// Creates or opens a bucket database and registers its connection.
-    pub(crate) async fn create_bucket(&self, bucket: &str) -> SqliteResult<()> {
+    pub(crate) async fn create_bucket(&self, bucket: &str) -> SqliteResult<bool> {
         self.validate_mutable_bucket(bucket)?;
 
         if self.buckets.read().await.contains_key(bucket) {
-            return Ok(());
+            return Ok(false);
         }
 
         let file_path = self.get_bucket_path(bucket)?;
@@ -90,9 +90,10 @@ impl Sqlite {
         let mut buckets = self.buckets.write().await;
         if buckets.contains_key(&bucket).not() {
             buckets.insert(bucket, Arc::new(connection));
+            return Ok(true);
         }
 
-        Ok(())
+        Ok(false)
     }
 
     /// Rejects mutations for read-only bucket configuration.

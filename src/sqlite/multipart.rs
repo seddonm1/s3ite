@@ -13,8 +13,8 @@ use super::{
     MultipartMetadata, MultipartPartWrite, MultipartUploadState, MultipartUploadSummary,
     PartChecksum, PreparedMultipartUpload, Sqlite, SqliteError, SqliteResult, StoredBlobChunk,
     StoredChecksum, StoredSse, decode_base64, decode_md5_hex, encode_hex,
-    optional_multipart_checksum_config, optional_part_checksum, optional_stored_sse,
-    required_stored_checksum, row_size, sql_limit, sql_size,
+    optional_multipart_checksum_config, optional_part_checksum, optional_stored_object_lock,
+    optional_stored_sse, required_stored_checksum, row_size, sql_limit, sql_size,
 };
 
 #[derive(Clone, Copy)]
@@ -141,6 +141,7 @@ impl Sqlite {
                 md5: Some(prepared.md5.clone()),
                 checksum: Some(prepared.checksum.clone()),
                 stored_sse: prepared.stored_sse.clone(),
+                object_lock: upload_state.object_lock,
                 is_latest: true,
                 is_delete_marker: false,
             },
@@ -561,9 +562,12 @@ impl Sqlite {
                 sse_algorithm,
                 sse_key_nonce,
                 sse_key_ciphertext,
-                sse_key_tag
+                sse_key_tag,
+                object_lock_legal_hold,
+                object_lock_retention_mode,
+                object_lock_retain_until
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18);",
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21);",
         )?;
 
         let now = OffsetDateTime::now_utc();
@@ -602,6 +606,17 @@ impl Sqlite {
                 .stored_sse
                 .as_ref()
                 .map(|stored_sse| stored_sse.tag.as_slice()),
+            state.object_lock.legal_hold,
+            state
+                .object_lock
+                .retention
+                .as_ref()
+                .map(|retention| retention.mode.as_str()),
+            state
+                .object_lock
+                .retention
+                .as_ref()
+                .map(|retention| retention.retain_until),
         ])?)
     }
 
@@ -627,7 +642,10 @@ impl Sqlite {
                 sse_algorithm,
                 sse_key_nonce,
                 sse_key_ciphertext,
-                sse_key_tag
+                sse_key_tag,
+                object_lock_legal_hold,
+                object_lock_retention_mode,
+                object_lock_retain_until
             FROM multipart_upload
             WHERE upload_id = ?1 AND bucket = ?2 AND key = ?3;",
         )?;
@@ -661,6 +679,11 @@ impl Sqlite {
                         row.get(10)?,
                         row.get(11)?,
                         row.get(12)?,
+                    )?,
+                    object_lock: optional_stored_object_lock(
+                        row.get(13)?,
+                        row.get(14)?,
+                        row.get(15)?,
                     )?,
                 })
             })
@@ -1335,7 +1358,7 @@ mod tests {
     use crate::{
         s3::{
             ChecksumAlgorithmKind, ChecksumTypeKind, FullObjectChecksum, MultipartChecksumConfig,
-            MultipartCompletionChecksum, StoredChecksum,
+            MultipartCompletionChecksum, StoredChecksum, StoredObjectLock,
         },
         sqlite::{
             CompletedMultipartUploadRecord, CompletedObjectPart, EncodedBlobChunk,
@@ -1366,6 +1389,7 @@ mod tests {
             expires: None,
             checksum: None,
             stored_sse: None,
+            object_lock: StoredObjectLock::default(),
         }
     }
 

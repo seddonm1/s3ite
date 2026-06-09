@@ -15,20 +15,102 @@
   - Remove `multipart_upload_part`.
   - Remove `completed_object_part`.
   - Keep `object_version`, `multipart_upload`, and `completed_multipart_upload`.
-  - Add `object_part` for part metadata owned by exactly one of `object_sequence` or `upload_id`.
-  - Add `object_blob_chunk` for bytes owned by exactly one of `object_sequence` or `upload_id`.
+  - Add `object_part` for storage part metadata owned by exactly one of `object_sequence` or `upload_id`.
+  - Add `object_blob_chunk` for bytes owned by exactly one declared `object_part`.
+  - Bump the bucket schema version to reject any previous incompatible chunk-storage layout.
 
 - `object_part` stores:
-  - `object_sequence`, `upload_id`, `part_number`, `start`, `size`, `last_modified`, `md5`, checksum fields.
+  - `object_sequence`, `upload_id`, `is_multipart_part`, `part_number`, `start`, `size`, `last_modified`, `md5`, checksum fields.
+  - Single-request object rows use `object_sequence`, `is_multipart_part = 0`, `part_number = 1`, and `start = 0`.
   - Active multipart rows use `upload_id` and `start IS NULL`.
-  - Completed multipart rows use `object_sequence` and `start IS NOT NULL`.
-  - Add partial unique indexes for `(upload_id, part_number)` and `(object_sequence, part_number)`.
+  - Completed multipart rows use `object_sequence`, `is_multipart_part = 1`, and `start IS NOT NULL`.
+  - Add unique indexes for `(upload_id, part_number)` and `(object_sequence, part_number)` so chunks can reference their owning part.
 
 - `object_blob_chunk` stores:
   - `object_sequence`, `upload_id`, `part_number`, `chunk_number`, `offset`, `size`, `body`.
   - Upload-owned chunk `offset` is part-local.
   - Object-owned chunk `offset` is object-global.
   - Add indexes for upload part replacement/completion and object range reads, especially `(object_sequence, offset)`.
+  - Add deferred composite foreign keys from `(object_sequence, part_number)` and `(upload_id, part_number)` to `object_part`.
+
+## ER Diagram
+
+```mermaid
+erDiagram
+    BUCKET_STATE {
+        integer id PK
+        integer versioning_state
+    }
+
+    OBJECT_VERSION {
+        integer sequence PK
+        text key
+        text version_id
+        integer is_latest
+        integer is_delete_marker
+        integer size
+        text md5
+        integer checksum_algorithm
+        integer checksum_type
+        text checksum_value
+    }
+
+    MULTIPART_UPLOAD {
+        blob upload_id PK
+        text bucket
+        text key
+        text initiated
+        text last_modified
+        text access_key
+        integer checksum_algorithm
+        integer checksum_type
+        text checksum_value
+    }
+
+    OBJECT_PART {
+        integer object_sequence FK
+        blob upload_id FK
+        integer is_multipart_part
+        integer part_number
+        integer start
+        integer size
+        text md5
+        integer checksum_algorithm
+        integer checksum_type
+        text checksum_value
+    }
+
+    OBJECT_BLOB_CHUNK {
+        integer chunk_id PK
+        integer object_sequence FK
+        blob upload_id FK
+        integer part_number FK
+        integer chunk_number
+        integer offset
+        integer size
+        blob body
+    }
+
+    COMPLETED_MULTIPART_UPLOAD {
+        blob upload_id PK
+        text bucket
+        text key
+        text access_key
+        text md5
+        text version_id
+        text returned_version_id
+        integer checksum_algorithm
+        integer checksum_type
+        text checksum_value
+        text last_modified
+    }
+
+    OBJECT_VERSION ||--o{ OBJECT_PART : "owns committed parts"
+    MULTIPART_UPLOAD ||--o{ OBJECT_PART : "owns active parts"
+    OBJECT_PART ||--o{ OBJECT_BLOB_CHUNK : "owns chunks"
+```
+
+`object_part` has exactly one owner: either `object_sequence` for committed object storage or `upload_id` for active multipart upload storage. `object_blob_chunk` repeats that owner and `part_number` so SQLite can enforce a composite foreign key to the exact owning part row. Those chunk-to-part foreign keys are deferred because multipart completion re-owns active part rows and chunk rows inside the same writer transaction. Single PUT/COPY objects still are not S3 multipart objects; they have one storage part with `is_multipart_part = 0`, which S3 multipart metadata queries ignore.
 
 - Write flow:
   - `PutObject` and `CopyObject` create `object_version`, then insert one or more object-owned chunks with `part_number = 1`.
@@ -60,4 +142,5 @@
 - Single PUT and UploadPart still buffer request bodies because of the current `s3s` body flow; this change fixes SQLite BLOB limits and multipart completion concatenation, not streaming upload ingestion.
 - S3 protocol limits remain: single PUT/copy/upload-part max is `5 GiB`; multipart completion can store larger final objects through chunks.
 - New schema tables are `STRICT` and not `WITHOUT ROWID`.
+- Referential integrity is enforced by foreign keys wherever SQLite can express it; aggregate shape invariants such as contiguous chunk offsets and total part size matching object size remain validated by storage readback code and transaction tests.
 - New local/storage tests do not receive Ceph `s3-tests` mirror comments.

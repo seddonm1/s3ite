@@ -16,32 +16,40 @@ use s3s::{
         BucketVersioningStatus, ChecksumMode, CommonPrefix, CompleteMultipartUploadInput,
         CompleteMultipartUploadOutput, CompletedPart, CopyObjectInput, CopyObjectOutput,
         CopyObjectResult, CopyPartResult, CopySource, CreateBucketInput, CreateBucketOutput,
-        CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketCorsInput,
-        DeleteBucketCorsOutput, DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput,
-        DeleteBucketInput, DeleteBucketOutput, DeleteBucketTaggingInput, DeleteBucketTaggingOutput,
-        DeleteObjectInput, DeleteObjectOutput, DeleteObjectTaggingInput, DeleteObjectTaggingOutput,
-        DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag, ETagCondition,
-        Error as DeleteError, GetBucketAclInput, GetBucketAclOutput, GetBucketCorsInput,
-        GetBucketCorsOutput, GetBucketEncryptionInput, GetBucketEncryptionOutput,
-        GetBucketLocationInput, GetBucketLocationOutput, GetBucketTaggingInput,
-        GetBucketTaggingOutput, GetBucketVersioningInput, GetBucketVersioningOutput,
-        GetObjectAclInput, GetObjectAclOutput, GetObjectAttributesInput, GetObjectAttributesOutput,
-        GetObjectAttributesParts, GetObjectInput, GetObjectOutput, GetObjectTaggingInput,
+        CreateMultipartUploadInput, CreateMultipartUploadOutput, DefaultRetention,
+        DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketEncryptionInput,
+        DeleteBucketEncryptionOutput, DeleteBucketInput, DeleteBucketOutput,
+        DeleteBucketTaggingInput, DeleteBucketTaggingOutput, DeleteObjectInput, DeleteObjectOutput,
+        DeleteObjectTaggingInput, DeleteObjectTaggingOutput, DeleteObjectsInput,
+        DeleteObjectsOutput, DeletedObject, ETag, ETagCondition, Error as DeleteError,
+        GetBucketAclInput, GetBucketAclOutput, GetBucketCorsInput, GetBucketCorsOutput,
+        GetBucketEncryptionInput, GetBucketEncryptionOutput, GetBucketLocationInput,
+        GetBucketLocationOutput, GetBucketTaggingInput, GetBucketTaggingOutput,
+        GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectAclInput, GetObjectAclOutput,
+        GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectAttributesParts,
+        GetObjectInput, GetObjectLegalHoldInput, GetObjectLegalHoldOutput,
+        GetObjectLockConfigurationInput, GetObjectLockConfigurationOutput, GetObjectOutput,
+        GetObjectRetentionInput, GetObjectRetentionOutput, GetObjectTaggingInput,
         GetObjectTaggingOutput, GetObjectTorrentInput, GetObjectTorrentOutput, Grant, Grantee,
         HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, Initiator,
         ListBucketsInput, ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput,
         ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput,
         ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput, MFADelete,
-        MetadataDirective, MultipartUpload, ObjectAttributes, ObjectCannedACL, ObjectPart, Owner,
-        Part, Permission, PostObjectInput, PostObjectOutput, PutBucketAclInput, PutBucketAclOutput,
-        PutBucketCorsInput, PutBucketCorsOutput, PutBucketEncryptionInput,
+        MetadataDirective, MultipartUpload, ObjectAttributes, ObjectCannedACL,
+        ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
+        ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode, ObjectLockRule, ObjectPart,
+        Owner, Part, Permission, PostObjectInput, PostObjectOutput, PutBucketAclInput,
+        PutBucketAclOutput, PutBucketCorsInput, PutBucketCorsOutput, PutBucketEncryptionInput,
         PutBucketEncryptionOutput, PutBucketTaggingInput, PutBucketTaggingOutput,
         PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectAclInput, PutObjectAclOutput,
-        PutObjectInput, PutObjectOutput, PutObjectTaggingInput, PutObjectTaggingOutput,
-        Range as S3Range, ServerSideEncryption, ServerSideEncryptionByDefault,
-        ServerSideEncryptionConfiguration, ServerSideEncryptionRule, StorageClass, StreamingBlob,
-        Tag, TagSet, Tagging, TaggingDirective, TaggingHeader, Timestamp, Type,
-        UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
+        PutObjectInput, PutObjectLegalHoldInput, PutObjectLegalHoldOutput,
+        PutObjectLockConfigurationInput, PutObjectLockConfigurationOutput, PutObjectOutput,
+        PutObjectRetentionInput, PutObjectRetentionOutput, PutObjectTaggingInput,
+        PutObjectTaggingOutput, Range as S3Range, ServerSideEncryption,
+        ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
+        StorageClass, StreamingBlob, Tag, TagSet, Tagging, TaggingDirective, TaggingHeader,
+        Timestamp, Type, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput,
+        UploadPartOutput,
     },
     header::{
         CONTENT_MD5, CONTENT_TYPE, ETAG, X_AMZ_CONTENT_SHA256, X_AMZ_DECODED_CONTENT_LENGTH,
@@ -111,6 +119,7 @@ mod get;
 mod list;
 mod metadata;
 mod multipart;
+mod object_lock;
 mod owner;
 mod post;
 mod put;
@@ -124,6 +133,10 @@ pub(crate) use self::{
         encode_hex,
     },
     cors::{BucketCorsLayer, StoredCorsRule},
+    object_lock::{
+        StoredObjectLock, StoredObjectLockConfig, StoredObjectLockDefaultRetention,
+        StoredObjectLockMode, StoredObjectRetention,
+    },
     sse::{SSE_S3_ALGORITHM_CODE, StoredSse, parse_master_key},
     tagging::StoredTag,
 };
@@ -151,6 +164,12 @@ use self::{
     },
     metadata::{normalize_content_encoding, normalize_metadata},
     multipart::{requested_part_range, validate_part_number},
+    object_lock::{
+        ObjectLockWriteHeaders, delete_requires_object_lock_check, load_bucket_object_lock_config,
+        object_lock_for_copied_version, object_lock_for_new_version, object_lock_legal_hold_status,
+        object_lock_mode, object_lock_retain_until_date, object_lock_write_headers,
+        validate_object_lock_delete,
+    },
     owner::{
         BucketAclRequest, ObjectAclRequest, owner, validate_bucket_acl,
         validate_expected_bucket_owner, validate_object_acl,
@@ -544,6 +563,52 @@ impl S3 for Sqlite {
         get::get_object(self, req).await
     }
 
+    /// Returns an object's legal hold metadata.
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            version_id = %req.input.version_id.as_deref().unwrap_or("")
+        )
+    )]
+    async fn get_object_legal_hold(
+        &self,
+        req: S3Request<GetObjectLegalHoldInput>,
+    ) -> S3Result<S3Response<GetObjectLegalHoldOutput>> {
+        object_lock::get_object_legal_hold(self, req).await
+    }
+
+    /// Returns a bucket's Object Lock configuration.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id(&req),
+            client_ip = %client_ip(&req), bucket = %req.input.bucket))]
+    async fn get_object_lock_configuration(
+        &self,
+        req: S3Request<GetObjectLockConfigurationInput>,
+    ) -> S3Result<S3Response<GetObjectLockConfigurationOutput>> {
+        object_lock::get_object_lock_configuration(self, req).await
+    }
+
+    /// Returns an object's retention metadata.
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            version_id = %req.input.version_id.as_deref().unwrap_or("")
+        )
+    )]
+    async fn get_object_retention(
+        &self,
+        req: S3Request<GetObjectRetentionInput>,
+    ) -> S3Result<S3Response<GetObjectRetentionOutput>> {
+        object_lock::get_object_retention(self, req).await
+    }
+
     /// Returns tags for an existing object version.
     #[tracing::instrument(
         skip_all,
@@ -837,6 +902,52 @@ impl S3 for Sqlite {
         owner::put_object_acl(self, req).await
     }
 
+    /// Replaces an object's legal hold metadata.
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            version_id = %req.input.version_id.as_deref().unwrap_or("")
+        )
+    )]
+    async fn put_object_legal_hold(
+        &self,
+        req: S3Request<PutObjectLegalHoldInput>,
+    ) -> S3Result<S3Response<PutObjectLegalHoldOutput>> {
+        object_lock::put_object_legal_hold(self, req).await
+    }
+
+    /// Replaces a bucket's Object Lock configuration.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id(&req),
+            client_ip = %client_ip(&req), bucket = %req.input.bucket))]
+    async fn put_object_lock_configuration(
+        &self,
+        req: S3Request<PutObjectLockConfigurationInput>,
+    ) -> S3Result<S3Response<PutObjectLockConfigurationOutput>> {
+        object_lock::put_object_lock_configuration(self, req).await
+    }
+
+    /// Replaces an object's retention metadata.
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            version_id = %req.input.version_id.as_deref().unwrap_or("")
+        )
+    )]
+    async fn put_object_retention(
+        &self,
+        req: S3Request<PutObjectRetentionInput>,
+    ) -> S3Result<S3Response<PutObjectRetentionOutput>> {
+        object_lock::put_object_retention(self, req).await
+    }
+
     /// Replaces tags on an existing object version.
     #[tracing::instrument(
         skip_all,
@@ -984,6 +1095,7 @@ mod tests {
             md5: md5.map(str::to_string),
             checksum: None,
             stored_sse: None,
+            object_lock: StoredObjectLock::default(),
             is_latest: true,
             is_delete_marker: false,
         }

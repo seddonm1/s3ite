@@ -5,16 +5,18 @@ use std::collections::HashMap;
 use super::{
     ChecksumAlgorithmKind, CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource,
     CopyTaggingDirective, ETag, InternalError, KeyMetadata, KeyValue, MetadataDirective, Not,
-    ObjectAclRequest, ObjectBodyReference, ObjectReadConditions, OffsetDateTime,
-    S3_SINGLE_REQUEST_BODY_MAX, S3ErrorCode, S3Request, S3Response, S3Result, Sqlite, SqliteError,
-    SqliteResult, StoredChecksum, StoredSse, StoredTag, active_sse_from_stored,
-    checksum_algorithm_from_request, checksum_crc32, checksum_crc32c, checksum_crc64nvme,
-    checksum_sha1, checksum_sha256, checksum_type_output, copy_tagging_directive,
-    decrypt_stored_chunks, encrypt_value_chunks, http_date_time, normalize_content_encoding,
-    normalize_metadata, object_write_checksum_from_value, requested_sse_s3,
-    resolve_write_encryption, s3_error, s3_error_from_sqlite, s3_error_with_message, sse_s3_output,
-    strong_etag_condition_matches, validate_expected_bucket_owner,
-    validate_no_unsupported_sse_headers, validate_object_acl, weak_etag_condition_matches,
+    ObjectAclRequest, ObjectBodyReference, ObjectLockWriteHeaders, ObjectReadConditions,
+    OffsetDateTime, S3_SINGLE_REQUEST_BODY_MAX, S3ErrorCode, S3Request, S3Response, S3Result,
+    Sqlite, SqliteError, SqliteResult, StoredChecksum, StoredSse, StoredTag,
+    active_sse_from_stored, checksum_algorithm_from_request, checksum_crc32, checksum_crc32c,
+    checksum_crc64nvme, checksum_sha1, checksum_sha256, checksum_type_output,
+    copy_tagging_directive, decrypt_stored_chunks, encrypt_value_chunks, http_date_time,
+    load_bucket_object_lock_config, normalize_content_encoding, normalize_metadata,
+    object_lock_for_copied_version, object_lock_write_headers, object_write_checksum_from_value,
+    requested_sse_s3, resolve_write_encryption, s3_error, s3_error_from_sqlite,
+    s3_error_with_message, sse_s3_output, strong_etag_condition_matches,
+    validate_expected_bucket_owner, validate_no_unsupported_sse_headers, validate_object_acl,
+    weak_etag_condition_matches,
 };
 
 /// Parsed copy request with source, destination, metadata, and checksum intent.
@@ -34,6 +36,7 @@ struct CopyObjectRequest {
     target_checksum_kind: Option<ChecksumAlgorithmKind>,
     explicit_sse_s3: bool,
     tagging_directive: CopyTaggingDirective,
+    object_lock_headers: ObjectLockWriteHeaders,
 }
 
 /// Source object body plus tags used by `CopyObject`.
@@ -82,6 +85,21 @@ fn validate_copy_source_size(metadata: &KeyMetadata) -> SqliteResult<()> {
     Ok(())
 }
 
+fn parse_copy_source(source: CopySource) -> S3Result<(String, String, Option<String>)> {
+    match source {
+        CopySource::AccessPoint { .. } => Err(s3_error(S3ErrorCode::NotImplemented)),
+        CopySource::Bucket {
+            bucket,
+            key,
+            version_id,
+        } => Ok((
+            bucket.to_string(),
+            key.to_string(),
+            version_id.map(|version_id| version_id.to_string()),
+        )),
+    }
+}
+
 /// Normalizes an S3 `CopyObject` input into the local copy operation shape.
 fn parse_copy_object_request(input: CopyObjectInput) -> S3Result<CopyObjectRequest> {
     let CopyObjectInput {
@@ -100,6 +118,9 @@ fn parse_copy_object_request(input: CopyObjectInput) -> S3Result<CopyObjectReque
         expires,
         metadata,
         metadata_directive,
+        object_lock_legal_hold_status,
+        object_lock_mode,
+        object_lock_retain_until_date,
         tagging,
         tagging_directive,
         bucket_key_enabled,
@@ -119,23 +140,17 @@ fn parse_copy_object_request(input: CopyObjectInput) -> S3Result<CopyObjectReque
         ..
     } = input;
 
-    let (source_bucket, source_key, source_version_id) = match copy_source {
-        CopySource::AccessPoint { .. } => return Err(s3_error(S3ErrorCode::NotImplemented)),
-        CopySource::Bucket {
-            bucket,
-            key,
-            version_id,
-        } => (
-            bucket,
-            key,
-            version_id.map(|version_id| version_id.to_string()),
-        ),
-    };
+    let (source_bucket, source_key, source_version_id) = parse_copy_source(copy_source)?;
     let replace_metadata = metadata_directive
         .as_ref()
         .is_some_and(|directive| directive.as_str() == MetadataDirective::REPLACE);
     let tagging_directive = copy_tagging_directive(tagging_directive.as_ref(), tagging)?;
     let target_checksum_kind = checksum_algorithm_from_request(checksum_algorithm)?;
+    let object_lock_headers = object_lock_write_headers(
+        object_lock_legal_hold_status,
+        object_lock_mode,
+        object_lock_retain_until_date,
+    )?;
     let explicit_sse_s3 = requested_sse_s3(
         server_side_encryption.as_ref(),
         ssekms_key_id.is_some() || ssekms_encryption_context.is_some(),
@@ -164,8 +179,8 @@ fn parse_copy_object_request(input: CopyObjectInput) -> S3Result<CopyObjectReque
     Ok(CopyObjectRequest {
         target_bucket,
         target_key,
-        source_bucket: source_bucket.to_string(),
-        source_key: source_key.to_string(),
+        source_bucket,
+        source_key,
         source_version_id,
         replace_metadata,
         metadata: normalize_metadata(metadata),
@@ -182,6 +197,7 @@ fn parse_copy_object_request(input: CopyObjectInput) -> S3Result<CopyObjectReque
         target_checksum_kind,
         explicit_sse_s3,
         tagging_directive,
+        object_lock_headers,
     })
 }
 
@@ -205,6 +221,7 @@ fn prepare_copied_object(
     mut object: KeyValue,
     request: &CopyObjectRequest,
     target_stored_sse: Option<StoredSse>,
+    target_object_lock: super::StoredObjectLock,
 ) -> SqliteResult<(KeyValue, StoredChecksum)> {
     object.key.clone_from(&request.target_key);
     object.key_metadata.last_modified = OffsetDateTime::now_utc();
@@ -237,6 +254,7 @@ fn prepare_copied_object(
     let checksum = object_write_checksum_from_value(checksum_kind, &object)?;
     object.key_metadata.checksum = Some(checksum.clone());
     object.key_metadata.stored_sse = target_stored_sse;
+    object.key_metadata.object_lock = target_object_lock;
     Ok((object, checksum))
 }
 
@@ -368,13 +386,26 @@ async fn copy_object_same_bucket(
     };
     let target_encryption =
         resolve_write_encryption(sqlite, &request.target_bucket, request.explicit_sse_s3).await?;
+    let target_object_lock_config =
+        load_bucket_object_lock_config(sqlite, &request.target_bucket).await?;
     let encrypted = target_encryption.is_some();
     let chunk_size = sqlite.blob_chunk_size();
     let target_stored_sse = target_encryption
         .as_ref()
         .map(|encryption| encryption.stored.clone());
-    let (object, checksum) = prepare_copied_object(object.object, &request, target_stored_sse)
-        .map_err(s3_error_from_sqlite)?;
+    let target_object_lock = object_lock_for_copied_version(
+        &object.object.key_metadata.object_lock,
+        &target_object_lock_config,
+        request.object_lock_headers.clone(),
+        OffsetDateTime::now_utc(),
+    )?;
+    let (object, checksum) = prepare_copied_object(
+        object.object,
+        &request,
+        target_stored_sse,
+        target_object_lock,
+    )
+    .map_err(s3_error_from_sqlite)?;
     let encrypted_chunks = target_encryption
         .as_ref()
         .map(|encryption| {
@@ -449,13 +480,26 @@ async fn copy_object_cross_bucket(
     };
     let target_encryption =
         resolve_write_encryption(sqlite, &request.target_bucket, request.explicit_sse_s3).await?;
+    let target_object_lock_config =
+        load_bucket_object_lock_config(sqlite, &request.target_bucket).await?;
     let encrypted = target_encryption.is_some();
     let chunk_size = sqlite.blob_chunk_size();
     let target_stored_sse = target_encryption
         .as_ref()
         .map(|encryption| encryption.stored.clone());
-    let (object, checksum) = prepare_copied_object(object.object, &request, target_stored_sse)
-        .map_err(s3_error_from_sqlite)?;
+    let target_object_lock = object_lock_for_copied_version(
+        &object.object.key_metadata.object_lock,
+        &target_object_lock_config,
+        request.object_lock_headers.clone(),
+        OffsetDateTime::now_utc(),
+    )?;
+    let (object, checksum) = prepare_copied_object(
+        object.object,
+        &request,
+        target_stored_sse,
+        target_object_lock,
+    )
+    .map_err(s3_error_from_sqlite)?;
     let encrypted_chunks = target_encryption
         .as_ref()
         .map(|encryption| {
@@ -532,7 +576,7 @@ mod tests {
     use super::*;
 
     use crate::{
-        s3::{ChecksumAlgorithmKind, FullObjectChecksum},
+        s3::{ChecksumAlgorithmKind, FullObjectChecksum, StoredObjectLock},
         sqlite::KeyMetadata,
     };
     use s3s::dto::{ChecksumAlgorithm, ETagCondition, ObjectCannedACL, Timestamp};
@@ -594,6 +638,7 @@ mod tests {
                 md5: Some("md5".to_string()),
                 checksum,
                 stored_sse: None,
+                object_lock: StoredObjectLock::default(),
                 is_latest: true,
                 is_delete_marker: false,
             },
@@ -865,6 +910,7 @@ mod tests {
             object(b"payload".to_vec(), Some(source_checksum)),
             &request,
             None,
+            StoredObjectLock::default(),
         ) {
             Ok(result) => result,
             Err(err) => panic!("unexpected error: {err:?}"),
@@ -913,11 +959,15 @@ mod tests {
             Err(err) => panic!("unexpected error: {err:?}"),
         };
 
-        let (copied, checksum) =
-            match prepare_copied_object(object(b"payload".to_vec(), None), &request, None) {
-                Ok(result) => result,
-                Err(err) => panic!("unexpected error: {err:?}"),
-            };
+        let (copied, checksum) = match prepare_copied_object(
+            object(b"payload".to_vec(), None),
+            &request,
+            None,
+            StoredObjectLock::default(),
+        ) {
+            Ok(result) => result,
+            Err(err) => panic!("unexpected error: {err:?}"),
+        };
 
         assert_eq!(copied.key, "target-key");
         assert_eq!(

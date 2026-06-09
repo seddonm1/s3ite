@@ -161,7 +161,7 @@ mod tests {
     use rusqlite::Connection;
 
     use crate::{
-        s3::{FullObjectChecksum, StoredChecksum},
+        s3::{FullObjectChecksum, StoredChecksum, StoredObjectLock},
         sqlite::{BucketVersioningState, KeyMetadata, KeyValue, SqliteError},
     };
 
@@ -205,6 +205,7 @@ mod tests {
                     format!("crc64-{key}"),
                 ))),
                 stored_sse: None,
+                object_lock: StoredObjectLock::default(),
                 is_latest: true,
                 is_delete_marker: false,
             },

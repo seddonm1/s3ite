@@ -6,7 +6,8 @@ use super::{
     S3ErrorCode, S3Request, S3Response, S3Result, Sqlite, StorageClass, StoredChecksum,
     StreamingBlob, TryStreamExt, checksum_crc32, checksum_crc32c, checksum_crc64nvme,
     checksum_sha1, checksum_sha256, checksum_type_output, copy_bytes, finish_payload_checksum, hex,
-    normalize_content_encoding, normalize_metadata, object_write_conditions,
+    load_bucket_object_lock_config, normalize_content_encoding, normalize_metadata,
+    object_lock_for_new_version, object_lock_write_headers, object_write_conditions,
     payload_checksum_accumulator, read_object_body_encrypted, requested_sse_s3,
     resolve_write_encryption, s3_error, s3_error_from_sqlite, sse_s3_output,
     stored_tags_from_header, validate_content_md5, validate_declared_object_write_length,
@@ -151,6 +152,9 @@ pub(super) async fn put_object(
         expires,
         if_match,
         if_none_match,
+        object_lock_legal_hold_status,
+        object_lock_mode,
+        object_lock_retain_until_date,
         server_side_encryption,
         sse_customer_algorithm,
         sse_customer_key,
@@ -173,6 +177,17 @@ pub(super) async fn put_object(
     let content_encoding = normalize_content_encoding(content_encoding);
     let metadata = normalize_metadata(metadata);
     let tags = stored_tags_from_header(tagging)?;
+    let object_lock_headers = object_lock_write_headers(
+        object_lock_legal_hold_status,
+        object_lock_mode,
+        object_lock_retain_until_date,
+    )?;
+    let object_lock_config = load_bucket_object_lock_config(sqlite, &bucket).await?;
+    let object_lock = object_lock_for_new_version(
+        &object_lock_config,
+        object_lock_headers,
+        OffsetDateTime::now_utc(),
+    )?;
     validate_put_storage_class(storage_class.as_ref())?;
     validate_declared_object_write_length(&headers, content_length)?;
 
@@ -208,6 +223,7 @@ pub(super) async fn put_object(
         let stored_encryption = Some(encryption.stored.clone());
         let chunks = encrypted_body.chunks;
         let tags = tags.clone();
+        let object_lock = object_lock.clone();
         let connection = sqlite
             .get_connection(&bucket)
             .await
@@ -231,6 +247,7 @@ pub(super) async fn put_object(
                         md5: Some(md5_clone),
                         checksum: Some(checksum_clone),
                         stored_sse: stored_encryption,
+                        object_lock,
                         is_latest: true,
                         is_delete_marker: false,
                     },
@@ -294,6 +311,7 @@ pub(super) async fn put_object(
                         md5: Some(md5_clone),
                         checksum: Some(checksum_clone),
                         stored_sse: None,
+                        object_lock,
                         is_latest: true,
                         is_delete_marker: false,
                     },

@@ -12,7 +12,8 @@ use super::{
     active_sse_from_stored, checksum_crc32, checksum_crc32c, checksum_crc64nvme,
     checksum_mode_enabled, checksum_sha1, checksum_sha256, checksum_struct, checksum_type_output,
     decrypt_stored_chunks, list_limit, not_found_delete_marker_error, not_modified_error,
-    object_checksum_for_part, requested_part_range, s3_error, s3_error_from_sqlite,
+    object_checksum_for_part, object_lock_legal_hold_status, object_lock_mode,
+    object_lock_retain_until_date, requested_part_range, s3_error, s3_error_from_sqlite,
     s3_error_with_message, sse_s3_output, stream, validate_expected_bucket_owner,
     validate_no_sse_headers, validate_part_number, validate_read_conditions,
 };
@@ -472,6 +473,9 @@ fn get_object_output(
         range.is_some(),
     );
     let checksum_type = checksum_type_output(&response_checksum);
+    let object_lock_legal_hold_status = object_lock_legal_hold_status(&key_metadata.object_lock);
+    let object_lock_mode = object_lock_mode(&key_metadata.object_lock);
+    let object_lock_retain_until_date = object_lock_retain_until_date(&key_metadata.object_lock);
 
     Ok(GetObjectOutput {
         body: Some(body),
@@ -496,6 +500,9 @@ fn get_object_output(
         last_modified: Some(key_metadata.last_modified.into()),
         metadata: key_metadata.metadata,
         e_tag: key_metadata.md5.map(ETag::Strong),
+        object_lock_legal_hold_status,
+        object_lock_mode,
+        object_lock_retain_until_date,
         parts_count: (read.completed_part_count > 0).then_some(read.completed_part_count),
         server_side_encryption: sse_s3_output(key_metadata.stored_sse.is_some()),
         version_id: Some(version_id),
@@ -532,6 +539,9 @@ fn head_object_output(
         range.is_some(),
     );
     let checksum_type = checksum_type_output(&response_checksum);
+    let object_lock_legal_hold_status = object_lock_legal_hold_status(&object.object_lock);
+    let object_lock_mode = object_lock_mode(&object.object_lock);
+    let object_lock_retain_until_date = object_lock_retain_until_date(&object.object_lock);
 
     Ok(HeadObjectOutput {
         accept_ranges: Some("bytes".to_string()),
@@ -555,6 +565,9 @@ fn head_object_output(
         expires: object.expires.map(Into::into),
         last_modified: Some(object.last_modified.into()),
         metadata: object.metadata,
+        object_lock_legal_hold_status,
+        object_lock_mode,
+        object_lock_retain_until_date,
         parts_count: (read.completed_part_count > 0).then_some(read.completed_part_count),
         server_side_encryption: sse_s3_output(object.stored_sse.is_some()),
         version_id: Some(object.version_id),

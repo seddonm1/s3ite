@@ -3,10 +3,13 @@
 use super::{
     DeleteError, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput,
     DeletedObject, ETagCondition, KeyMetadata, Not, ObjectDeleteOutcome, OffsetDateTime,
-    S3ErrorCode, S3Request, S3Response, S3Result, Sqlite, SqliteError, http_date_time,
-    s3_error_from_sqlite, s3_error_with_message, strong_etag_condition_matches,
-    validate_expected_bucket_owner,
+    S3ErrorCode, S3Request, S3Response, S3Result, Sqlite, SqliteError,
+    delete_requires_object_lock_check, http_date_time, s3_error_from_sqlite, s3_error_with_message,
+    strong_etag_condition_matches, validate_expected_bucket_owner, validate_object_lock_delete,
 };
+use s3s::dto::Delete;
+
+type RequestedDeletion = (String, Option<String>, ObjectDeleteConditions);
 
 #[derive(Clone, Debug)]
 struct ObjectDeleteConditions {
@@ -58,6 +61,49 @@ fn validate_delete_conditions(
     Ok(())
 }
 
+fn requested_deletions(delete: Delete) -> S3Result<Vec<RequestedDeletion>> {
+    let deletions = delete
+        .objects
+        .into_iter()
+        .map(|object| {
+            (
+                object.key,
+                object.version_id,
+                ObjectDeleteConditions {
+                    etag_matches: object.e_tag.map(ETagCondition::ETag),
+                    last_modified_time: object.last_modified_time.map(Into::into),
+                    size: object.size,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    if deletions.len() > 1000 {
+        return Err(s3_error_with_message(
+            S3ErrorCode::MalformedXML,
+            "DeleteObjects supports at most 1000 keys",
+        ));
+    }
+    Ok(deletions)
+}
+
+fn access_denied_delete_error(key: String, version_id: Option<String>) -> DeleteError {
+    DeleteError {
+        key: Some(key),
+        version_id,
+        code: Some("AccessDenied".to_string()),
+        message: Some("Access Denied".to_string()),
+    }
+}
+
+fn precondition_failed_delete_error(key: String) -> DeleteError {
+    DeleteError {
+        key: Some(key),
+        version_id: None,
+        code: Some("PreconditionFailed".to_string()),
+        message: Some("At least one precondition failed".to_string()),
+    }
+}
+
 /// Deletes an object by key.
 pub(super) async fn delete_object(
     sqlite: &Sqlite,
@@ -66,6 +112,7 @@ pub(super) async fn delete_object(
     let DeleteObjectInput {
         bucket,
         expected_bucket_owner,
+        bypass_governance_retention,
         key,
         version_id,
         if_match,
@@ -80,6 +127,7 @@ pub(super) async fn delete_object(
         last_modified_time: if_match_last_modified_time.map(Into::into),
         size: if_match_size,
     };
+    let bypass_governance = bypass_governance_retention.unwrap_or(false);
 
     sqlite
         .validate_mutable_bucket(&bucket)
@@ -93,11 +141,22 @@ pub(super) async fn delete_object(
     let outcome = connection
         .write(move |connection| {
             let transaction = connection.transaction()?;
+            let versioning_state = Sqlite::get_bucket_versioning_state(&transaction)?;
             let metadata = match version_id.as_deref() {
                 Some(version_id) => Sqlite::get_version_metadata(&transaction, &key, version_id)?,
                 None => Sqlite::get_current_metadata(&transaction, &key)?,
             };
             validate_delete_conditions(metadata.as_ref(), &conditions)?;
+            if let Some(metadata) = metadata.as_ref()
+                && delete_requires_object_lock_check(versioning_state, version_id.as_deref())
+                && let Err(err) = validate_object_lock_delete(
+                    metadata,
+                    bypass_governance,
+                    OffsetDateTime::now_utc(),
+                )
+            {
+                return Ok(Err(err));
+            }
             let outcome = if version_id.is_none() && metadata.is_none() && conditions.has_any() {
                 ObjectDeleteOutcome {
                     version_id: None,
@@ -108,10 +167,10 @@ pub(super) async fn delete_object(
                 Sqlite::delete_object(&transaction, &key, version_id.as_deref())?
             };
             transaction.commit()?;
-            Ok(outcome)
+            Ok(Ok(outcome))
         })
         .await
-        .map_err(s3_error_from_sqlite)?;
+        .map_err(s3_error_from_sqlite)??;
 
     Ok(S3Response::new(DeleteObjectOutput {
         delete_marker: outcome.is_delete_marker.then_some(true),
@@ -128,6 +187,7 @@ pub(super) async fn delete_objects(
     let DeleteObjectsInput {
         bucket,
         delete,
+        bypass_governance_retention,
         expected_bucket_owner,
         ..
     } = req.input;
@@ -138,27 +198,8 @@ pub(super) async fn delete_objects(
         .map_err(s3_error_from_sqlite)?;
 
     let quiet = delete.quiet.unwrap_or(false);
-    let requested_deletions = delete
-        .objects
-        .into_iter()
-        .map(|object| {
-            (
-                object.key,
-                object.version_id,
-                ObjectDeleteConditions {
-                    etag_matches: object.e_tag.map(ETagCondition::ETag),
-                    last_modified_time: object.last_modified_time.map(Into::into),
-                    size: object.size,
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-    if requested_deletions.len() > 1000 {
-        return Err(s3_error_with_message(
-            S3ErrorCode::MalformedXML,
-            "DeleteObjects supports at most 1000 keys",
-        ));
-    }
+    let bypass_governance = bypass_governance_retention.unwrap_or(false);
+    let requested_deletions = requested_deletions(delete)?;
 
     let connection = sqlite
         .get_connection(&bucket)
@@ -168,6 +209,7 @@ pub(super) async fn delete_objects(
     let (deleted_entries, errors) = connection
         .write(move |connection| {
             let transaction = connection.transaction()?;
+            let versioning_state = Sqlite::get_bucket_versioning_state(&transaction)?;
             let mut deleted_entries = Vec::new();
             let mut errors = Vec::new();
 
@@ -180,6 +222,21 @@ pub(super) async fn delete_objects(
                 };
                 match validate_delete_conditions(metadata.as_ref(), &conditions) {
                     Ok(()) => {
+                        if let Some(metadata) = metadata.as_ref()
+                            && delete_requires_object_lock_check(
+                                versioning_state,
+                                version_id.as_deref(),
+                            )
+                            && validate_object_lock_delete(
+                                metadata,
+                                bypass_governance,
+                                OffsetDateTime::now_utc(),
+                            )
+                            .is_err()
+                        {
+                            errors.push(access_denied_delete_error(key, version_id));
+                            continue;
+                        }
                         let outcome =
                             if version_id.is_none() && metadata.is_none() && conditions.has_any() {
                                 ObjectDeleteOutcome {
@@ -192,12 +249,9 @@ pub(super) async fn delete_objects(
                             };
                         deleted_entries.push((key, outcome));
                     }
-                    Err(SqliteError::PreconditionFailed) => errors.push(DeleteError {
-                        key: Some(key),
-                        code: Some("PreconditionFailed".to_string()),
-                        message: Some("At least one precondition failed".to_string()),
-                        ..Default::default()
-                    }),
+                    Err(SqliteError::PreconditionFailed) => {
+                        errors.push(precondition_failed_delete_error(key));
+                    }
                     Err(err) => return Err(err),
                 }
             }
@@ -232,6 +286,7 @@ pub(super) async fn delete_objects(
 mod tests {
     use super::*;
 
+    use crate::s3::StoredObjectLock;
     use s3s::dto::{ETag, ETagCondition};
     use time::Duration;
 
@@ -248,6 +303,7 @@ mod tests {
             md5: md5.map(str::to_string),
             checksum: None,
             stored_sse: None,
+            object_lock: StoredObjectLock::default(),
             is_latest: true,
             is_delete_marker: false,
         }

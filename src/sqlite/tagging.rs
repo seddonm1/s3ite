@@ -183,7 +183,7 @@ mod tests {
     use uuid::Uuid;
 
     use crate::{
-        s3::{FullObjectChecksum, StoredChecksum, StoredTag},
+        s3::{FullObjectChecksum, StoredChecksum, StoredObjectLock, StoredTag},
         sqlite::{
             KeyMetadata, KeyValue, MultipartUploadState, NULL_VERSION_ID, Sqlite, SqliteResult,
         },
@@ -232,6 +232,7 @@ mod tests {
                     "crc".to_string(),
                 ))),
                 stored_sse: None,
+                object_lock: StoredObjectLock::default(),
                 is_latest: true,
                 is_delete_marker: false,
             },
@@ -324,6 +325,7 @@ mod tests {
                 expires: None,
                 checksum: None,
                 stored_sse: None,
+                object_lock: StoredObjectLock::default(),
             },
         )?;
         Sqlite::put_multipart_upload_tags(&transaction, upload_id, &tags())?;

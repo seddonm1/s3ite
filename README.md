@@ -34,6 +34,9 @@ The supported S3 surface is intentionally focused:
   create/read/replace/delete, version-specific object tags, `PutObject` tags,
   `CopyObject` tag directives, multipart upload tags, and POST form upload
   tags.
+- Object Lock: bucket Object Lock configuration, default retention, per-version
+  retention and legal hold metadata, read headers, copy/multipart propagation,
+  and delete enforcement for governance/compliance/legal hold.
 - POST form uploads: browser-form `POST Object`, SigV4 POST policy validation,
   success status responses, and success redirects.
 - Auth compatibility: signed owner requests, presigned URLs, SigV2/SigV4 edge
@@ -41,7 +44,7 @@ The supported S3 surface is intentionally focused:
 
 Out of scope surfaces include IAM, STS, SNS, S3 Select, S3 Control, torrent,
 public or anonymous access, public ACL grants, bucket policies, lifecycle and
-restore, SSE/encryption, object lock, S3 logging, object ownership controls,
+restore, SSE-KMS/SSE-C/DSSE-KMS encryption, S3 logging, object ownership controls,
 public access block, and multi-owner behavior.
 
 ## Storage Model
