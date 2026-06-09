@@ -9,10 +9,7 @@ use s3s::{
     },
 };
 
-use crate::{
-    database::BucketConnection,
-    sqlite::{ObjectSummary, Sqlite},
-};
+use crate::sqlite::{ObjectSummary, Sqlite};
 
 use super::{
     CONTINUATION_TOKEN_PREFIX, LIST_BATCH_SIZE, hex, owner, s3_error, s3_error_from_sqlite,
@@ -241,10 +238,9 @@ impl Sqlite {
                         .await
                         .map_err(s3_error_from_sqlite)?;
                     connection
-                        .read(move |connection| {
-                            let transaction = connection.transaction()?;
+                        .read(move |transaction| {
                             Self::list_objects(
-                                &transaction,
+                                transaction,
                                 Some(&prefix),
                                 after_key_query.as_deref(),
                                 LIST_BATCH_SIZE,
@@ -359,13 +355,17 @@ impl Sqlite {
                         .get_connection(bucket)
                         .await
                         .map_err(s3_error_from_sqlite)?;
-                    Self::list_version_page(
-                        &connection,
-                        prefix,
-                        after_key_query,
-                        after_version_id_query,
-                    )
-                    .await?
+                    connection
+                        .read(move |transaction| {
+                            Self::list_version_page(
+                                transaction,
+                                &prefix,
+                                after_key_query.as_deref(),
+                                after_version_id_query.as_deref(),
+                            )
+                        })
+                        .await
+                        .map_err(s3_error_from_sqlite)?
                 };
 
                 if summaries.is_empty() {
@@ -451,25 +451,19 @@ impl Sqlite {
     }
 
     /// Reads one storage page for `ListObjectVersions`.
-    async fn list_version_page(
-        connection: &BucketConnection,
-        prefix: String,
-        after_key: Option<String>,
-        after_version_id: Option<String>,
-    ) -> S3Result<Vec<ObjectSummary>> {
-        connection
-            .read(move |connection| {
-                let transaction = connection.transaction()?;
-                Self::list_object_versions(
-                    &transaction,
-                    Some(&prefix),
-                    after_key.as_deref(),
-                    after_version_id.as_deref(),
-                    LIST_BATCH_SIZE,
-                )
-            })
-            .await
-            .map_err(s3_error_from_sqlite)
+    fn list_version_page(
+        transaction: &rusqlite::Transaction<'_>,
+        prefix: &str,
+        after_key: Option<&str>,
+        after_version_id: Option<&str>,
+    ) -> rusqlite::Result<Vec<ObjectSummary>, crate::sqlite::SqliteError> {
+        Self::list_object_versions(
+            transaction,
+            Some(prefix),
+            after_key,
+            after_version_id,
+            LIST_BATCH_SIZE,
+        )
     }
 }
 

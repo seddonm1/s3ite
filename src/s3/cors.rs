@@ -141,10 +141,8 @@ pub(super) async fn delete_bucket_cors(
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
-        .write(move |connection| {
-            let transaction = connection.transaction()?;
-            Sqlite::replace_bucket_cors_rules(&transaction, &[])?;
-            transaction.commit()?;
+        .write(move |transaction| {
+            Sqlite::replace_bucket_cors_rules(transaction, &[])?;
             Ok(())
         })
         .await
@@ -169,10 +167,7 @@ pub(super) async fn get_bucket_cors(
         .await
         .map_err(s3_error_from_sqlite)?;
     let rules = connection
-        .read(move |connection| {
-            let transaction = connection.transaction()?;
-            Sqlite::get_bucket_cors_rules(&transaction)
-        })
+        .read(Sqlite::get_bucket_cors_rules)
         .await
         .map_err(s3_error_from_sqlite)?;
     if rules.is_empty() {
@@ -207,10 +202,8 @@ pub(super) async fn put_bucket_cors(
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
-        .write(move |connection| {
-            let transaction = connection.transaction()?;
-            Sqlite::replace_bucket_cors_rules(&transaction, &rules)?;
-            transaction.commit()?;
+        .write(move |transaction| {
+            Sqlite::replace_bucket_cors_rules(transaction, &rules)?;
             Ok(())
         })
         .await
@@ -426,13 +419,7 @@ fn empty_response(status: StatusCode) -> HttpResponse {
 async fn bucket_cors_rules(sqlite: &Sqlite, bucket: Option<&str>) -> Option<Vec<StoredCorsRule>> {
     let bucket = bucket?;
     let connection = sqlite.get_connection(bucket).await.ok()?;
-    connection
-        .read(move |connection| {
-            let transaction = connection.transaction()?;
-            Sqlite::get_bucket_cors_rules(&transaction)
-        })
-        .await
-        .ok()
+    connection.read(Sqlite::get_bucket_cors_rules).await.ok()
 }
 
 fn request_bucket(req: &Request<Incoming>, domain_name: Option<&str>) -> Option<String> {

@@ -19,7 +19,7 @@ use super::{
     validate_read_conditions,
 };
 
-use crate::database::{BlobReadReceiver, BucketConnection};
+use crate::database::{BlobReadReceiver, BlobReadRequest};
 
 /// Reports that `BitTorrent` metadata is unavailable for this object store.
 pub(super) fn get_object_torrent(
@@ -86,7 +86,12 @@ enum ObjectBodyReadStart {
         md5: Option<String>,
     },
     /// The object exists and has an associated blob read request.
-    Found(Box<ObjectBodyReadFound>),
+    Found {
+        read: Box<ObjectBodyReadFound>,
+        decrypted_body: Option<Vec<u8>>,
+    },
+    /// The object is encrypted but the server has no configured SSE-S3 key.
+    SseNotConfigured,
 }
 
 /// Object metadata selected for `HeadObject` and attribute responses.
@@ -231,123 +236,125 @@ fn lifecycle_expiration_response_header(
         .transpose()
 }
 
-/// Resolves object metadata and opens a bounded blob stream for `GetObject`.
+/// Resolves object metadata and body reads inside one storage transaction.
 #[allow(clippy::too_many_lines)]
-async fn load_get_object(
-    connection: &BucketConnection,
-    key: String,
-    version_id: Option<String>,
+fn resolve_get_object_read(
+    transaction: &rusqlite::Transaction<'_>,
+    key: &str,
+    version_id: Option<&str>,
     part_number: Option<i32>,
-    range: Option<S3Range>,
-    conditions: ObjectReadConditions,
+    range: Option<&S3Range>,
+    conditions: &ObjectReadConditions,
     sse_s3_master_key: Option<[u8; 32]>,
-) -> S3Result<ObjectBodyRead> {
-    let (start, body) = connection
-        .read_blob(move |transaction| {
-            let object = match version_id.as_deref() {
-                Some(version_id) => Some(
-                    Sqlite::get_object_version_body_reference(transaction, &key, version_id)?
-                        .ok_or(SqliteError::ObjectVersionNotFound)?,
-                ),
-                None => Sqlite::get_current_object_body_reference(transaction, &key)?,
-            };
-            let Some(object) = object else {
-                return Ok((ObjectBodyReadStart::Missing, Vec::new()));
-            };
-            if object.key_metadata.is_delete_marker {
-                return Ok((ObjectBodyReadStart::DeleteMarker, Vec::new()));
-            }
-            if let Err(failure) = validate_read_conditions(&object.key_metadata, &conditions) {
-                return Ok((
-                    ObjectBodyReadStart::ConditionFailed {
-                        failure,
-                        md5: object.key_metadata.md5.clone(),
-                    },
-                    Vec::new(),
-                ));
-            }
+) -> SqliteResult<(ObjectBodyReadStart, Vec<BlobReadRequest>)> {
+    let object = match version_id {
+        Some(version_id) => Some(
+            Sqlite::get_object_version_body_reference(transaction, key, version_id)?
+                .ok_or(SqliteError::ObjectVersionNotFound)?,
+        ),
+        None => Sqlite::get_current_object_body_reference(transaction, key)?,
+    };
+    let Some(object) = object else {
+        return Ok((ObjectBodyReadStart::Missing, Vec::new()));
+    };
+    if object.key_metadata.is_delete_marker {
+        return Ok((ObjectBodyReadStart::DeleteMarker, Vec::new()));
+    }
+    if let Err(failure) = validate_read_conditions(&object.key_metadata, conditions) {
+        return Ok((
+            ObjectBodyReadStart::ConditionFailed {
+                failure,
+                md5: object.key_metadata.md5.clone(),
+            },
+            Vec::new(),
+        ));
+    }
 
-            let object_size = u64::try_from(object.key_metadata.size)
-                .map_err(|_| SqliteError::ObjectBodyInconsistent)?;
-            let (completed_part, completed_part_count) =
-                load_completed_part_info(transaction, &key, &object.version_id, part_number)?;
-            let object_range = requested_object_range_sqlite(
-                part_number,
-                range.as_ref(),
-                completed_part.as_ref(),
+    let object_size =
+        u64::try_from(object.key_metadata.size).map_err(|_| SqliteError::ObjectBodyInconsistent)?;
+    let (completed_part, completed_part_count) =
+        load_completed_part_info(transaction, key, &object.version_id, part_number)?;
+    let object_range = requested_object_range_sqlite(
+        part_number,
+        range,
+        completed_part.as_ref(),
+        completed_part_count,
+        object_size,
+    )?;
+    let expiration = Sqlite::lifecycle_expiration_header_for_object(
+        transaction,
+        key,
+        &object.version_id,
+        object.key_metadata.size,
+        object.key_metadata.last_modified,
+    )?;
+
+    let decrypted_body = if let Some(stored) = object.key_metadata.stored_sse.clone() {
+        let Some(master_key) = sse_s3_master_key else {
+            return Ok((ObjectBodyReadStart::SseNotConfigured, Vec::new()));
+        };
+        let active =
+            active_sse_from_stored(&master_key, stored).map_err(SqliteError::Configuration)?;
+        let chunks =
+            Sqlite::get_object_blob_chunks(transaction, object.sequence, object.key_metadata.size)?;
+        let value = decrypt_stored_chunks(&active, chunks)?;
+        let start =
+            usize::try_from(object_range.start).map_err(|_| SqliteError::InvalidObjectRange)?;
+        let end = usize::try_from(object_range.end).map_err(|_| SqliteError::InvalidObjectRange)?;
+        Some(
+            value
+                .get(start..end)
+                .map(<[u8]>::to_vec)
+                .ok_or(SqliteError::InvalidObjectRange)?,
+        )
+    } else {
+        None
+    };
+
+    let requests = if decrypted_body.is_some() {
+        Vec::new()
+    } else {
+        Sqlite::object_blob_read_requests(transaction, object.sequence, object_range.clone())?
+    };
+
+    Ok((
+        ObjectBodyReadStart::Found {
+            read: Box::new(ObjectBodyReadFound {
+                object,
+                completed_part,
                 completed_part_count,
-                object_size,
-            )?;
-            let requests = if object.key_metadata.stored_sse.is_some() {
-                Vec::new()
-            } else {
-                Sqlite::object_blob_read_requests(
-                    transaction,
-                    object.sequence,
-                    object_range.clone(),
-                )?
-            };
-            let expiration = Sqlite::lifecycle_expiration_header_for_object(
-                transaction,
-                &key,
-                &object.version_id,
-                object.key_metadata.size,
-                object.key_metadata.last_modified,
-            )?;
+                object_range,
+                expiration,
+            }),
+            decrypted_body,
+        },
+        requests,
+    ))
+}
 
-            Ok((
-                ObjectBodyReadStart::Found(Box::new(ObjectBodyReadFound {
-                    object,
-                    completed_part,
-                    completed_part_count,
-                    object_range,
-                    expiration,
-                })),
-                requests,
-            ))
-        })
-        .await
-        .map_err(s3_error_from_sqlite)?;
-
+/// Builds the `GetObject` read state after storage metadata has been resolved.
+fn finish_get_object_read(
+    start: ObjectBodyReadStart,
+    body: BlobReadReceiver,
+) -> S3Result<ObjectBodyRead> {
     match start {
         ObjectBodyReadStart::Missing => Err(not_found_delete_marker_error(false)),
         ObjectBodyReadStart::DeleteMarker => Err(not_found_delete_marker_error(true)),
+        ObjectBodyReadStart::SseNotConfigured => Err(s3_error_with_message(
+            S3ErrorCode::InvalidRequest,
+            "SSE-S3 is not configured",
+        )),
         ObjectBodyReadStart::ConditionFailed { failure, md5 } => Err(match failure {
             ObjectReadConditionFailure::PreconditionFailed => {
                 s3_error(S3ErrorCode::PreconditionFailed)
             }
             ObjectReadConditionFailure::NotModified => not_modified_error(md5.as_deref())?,
         }),
-        ObjectBodyReadStart::Found(read) => {
-            let body = if let Some(stored) = read.object.key_metadata.stored_sse.clone() {
-                let master_key = sse_s3_master_key.ok_or_else(|| {
-                    s3_error_with_message(S3ErrorCode::InvalidRequest, "SSE-S3 is not configured")
-                })?;
-                let object_sequence = read.object.sequence;
-                let object_size = read.object.key_metadata.size;
-                let object_range = read.object_range.clone();
-                let bytes = connection
-                    .read(move |connection| {
-                        let transaction = connection.transaction()?;
-                        let active = active_sse_from_stored(&master_key, stored)
-                            .map_err(SqliteError::Configuration)?;
-                        let chunks = Sqlite::get_object_blob_chunks(
-                            &transaction,
-                            object_sequence,
-                            object_size,
-                        )?;
-                        let value = decrypt_stored_chunks(&active, chunks)?;
-                        let start = usize::try_from(object_range.start)
-                            .map_err(|_| SqliteError::InvalidObjectRange)?;
-                        let end = usize::try_from(object_range.end)
-                            .map_err(|_| SqliteError::InvalidObjectRange)?;
-                        value
-                            .get(start..end)
-                            .map(<[u8]>::to_vec)
-                            .ok_or(SqliteError::InvalidObjectRange)
-                    })
-                    .await
-                    .map_err(s3_error_from_sqlite)?;
+        ObjectBodyReadStart::Found {
+            read,
+            decrypted_body,
+        } => {
+            let body = if let Some(bytes) = decrypted_body {
                 ObjectBodyReadBody::Bytes(Bytes::from(bytes))
             } else {
                 ObjectBodyReadBody::Blob(body)
@@ -365,68 +372,51 @@ async fn load_get_object(
 }
 
 /// Loads metadata and completed-part state for `HeadObject`.
-async fn load_head_object(
-    connection: &BucketConnection,
-    key: String,
-    version_id: Option<String>,
+fn load_head_object(
+    transaction: &rusqlite::Transaction<'_>,
+    key: &str,
+    version_id: Option<&str>,
     part_number: Option<i32>,
-) -> S3Result<ObjectMetadataRead> {
-    let (metadata, completed_part, completed_part_count, tag_count, expiration) = connection
-        .read(move |connection| {
-            let transaction = connection.transaction()?;
-            let metadata = match version_id.as_deref() {
-                Some(version_id) => Some(
-                    Sqlite::get_version_metadata(&transaction, &key, version_id)?
-                        .filter(|metadata| metadata.is_delete_marker.not())
-                        .ok_or(SqliteError::ObjectVersionNotFound)?,
-                ),
-                None => Sqlite::get_current_metadata(&transaction, &key)?,
-            };
-            let Some(metadata) = metadata else {
-                return Ok((None, None, 0, 0, None));
-            };
-            if metadata.is_delete_marker {
-                return Ok((Some(metadata), None, 0, 0, None));
-            }
-            let target = Sqlite::get_object_version_tagging_target(
-                &transaction,
-                &key,
-                &metadata.version_id,
-            )?
-            .ok_or(SqliteError::ObjectVersionNotFound)?;
-            let tag_count = Sqlite::get_object_tag_count(&transaction, target.sequence)?;
-            let expiration = Sqlite::lifecycle_expiration_header_for_object(
-                &transaction,
-                &key,
-                &metadata.version_id,
-                metadata.size,
-                metadata.last_modified,
-            )?;
-            let (completed_part, completed_part_count) =
-                load_completed_part_info(&transaction, &key, &metadata.version_id, part_number)?;
-            Ok((
-                Some(metadata),
-                completed_part,
-                completed_part_count,
-                tag_count,
-                expiration,
-            ))
-        })
-        .await
-        .map_err(s3_error_from_sqlite)?;
+) -> SqliteResult<Option<ObjectMetadataRead>> {
+    let metadata = match version_id {
+        Some(version_id) => Some(
+            Sqlite::get_version_metadata(transaction, key, version_id)?
+                .filter(|metadata| metadata.is_delete_marker.not())
+                .ok_or(SqliteError::ObjectVersionNotFound)?,
+        ),
+        None => Sqlite::get_current_metadata(transaction, key)?,
+    };
     let Some(metadata) = metadata else {
-        return Err(not_found_delete_marker_error(false));
+        return Ok(None);
     };
     if metadata.is_delete_marker {
-        return Err(not_found_delete_marker_error(true));
+        return Ok(Some(ObjectMetadataRead {
+            metadata,
+            completed_part: None,
+            completed_part_count: 0,
+            tag_count: 0,
+            expiration: None,
+        }));
     }
-    Ok(ObjectMetadataRead {
+    let target = Sqlite::get_object_version_tagging_target(transaction, key, &metadata.version_id)?
+        .ok_or(SqliteError::ObjectVersionNotFound)?;
+    let tag_count = Sqlite::get_object_tag_count(transaction, target.sequence)?;
+    let expiration = Sqlite::lifecycle_expiration_header_for_object(
+        transaction,
+        key,
+        &metadata.version_id,
+        metadata.size,
+        metadata.last_modified,
+    )?;
+    let (completed_part, completed_part_count) =
+        load_completed_part_info(transaction, key, &metadata.version_id, part_number)?;
+    Ok(Some(ObjectMetadataRead {
         metadata,
         completed_part,
         completed_part_count,
         tag_count,
         expiration,
-    })
+    }))
 }
 
 /// Loads completed multipart part metadata when `partNumber` was requested.
@@ -651,25 +641,33 @@ pub(super) async fn get_object(
     } = input;
     validate_range_request(range.as_ref(), part_number)?;
 
+    let range_for_read = range;
+    let conditions = ObjectReadConditions {
+        etag_matches: if_match,
+        modified_since: if_modified_since.map(Into::into),
+        etag_none_matches: if_none_match,
+        unmodified_since: if_unmodified_since.map(Into::into),
+    };
+    let sse_s3_master_key = sqlite.config.sse_s3_master_key();
     let connection = sqlite
         .get_connection(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
-    let read = load_get_object(
-        &connection,
-        key,
-        version_id,
-        part_number,
-        range,
-        ObjectReadConditions {
-            etag_matches: if_match,
-            modified_since: if_modified_since.map(Into::into),
-            etag_none_matches: if_none_match,
-            unmodified_since: if_unmodified_since.map(Into::into),
-        },
-        sqlite.config.sse_s3_master_key(),
-    )
-    .await?;
+    let (start, body) = connection
+        .read_blob(move |transaction| {
+            resolve_get_object_read(
+                transaction,
+                &key,
+                version_id.as_deref(),
+                part_number,
+                range_for_read.as_ref(),
+                &conditions,
+                sse_s3_master_key,
+            )
+        })
+        .await
+        .map_err(s3_error_from_sqlite)?;
+    let read = finish_get_object_read(start, body)?;
     let output = get_object_output(read, range.as_ref(), part_number, checksum_mode.as_ref())?;
     Ok(S3Response::new(output))
 }
@@ -701,7 +699,18 @@ pub(super) async fn head_object(
         .get_connection(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
-    let read = load_head_object(&connection, key, version_id, part_number).await?;
+    let read = connection
+        .read(move |transaction| {
+            load_head_object(transaction, &key, version_id.as_deref(), part_number)
+        })
+        .await
+        .map_err(s3_error_from_sqlite)?;
+    let Some(read) = read else {
+        return Err(not_found_delete_marker_error(false));
+    };
+    if read.metadata.is_delete_marker {
+        return Err(not_found_delete_marker_error(true));
+    }
     validate_loaded_read_conditions(
         &read.metadata,
         &ObjectReadConditions {
@@ -806,15 +815,14 @@ pub(super) async fn get_object_attributes(
         .await
         .map_err(s3_error_from_sqlite)?;
     let (object, parts, total_parts_count) = connection
-        .read(move |connection| {
-            let transaction = connection.transaction()?;
+        .read(move |transaction| {
             let object = match version_id.as_deref() {
                 Some(version_id) => Some(
-                    Sqlite::get_version_metadata(&transaction, &key, version_id)?
+                    Sqlite::get_version_metadata(transaction, &key, version_id)?
                         .filter(|metadata| metadata.is_delete_marker.not())
                         .ok_or(SqliteError::ObjectVersionNotFound)?,
                 ),
-                None => Sqlite::get_current_metadata(&transaction, &key)?,
+                None => Sqlite::get_current_metadata(transaction, &key)?,
             };
             let Some(object) = object else {
                 return Ok((None, Vec::new(), 0));
@@ -824,10 +832,10 @@ pub(super) async fn get_object_attributes(
             }
 
             let total_parts_count =
-                Sqlite::count_completed_object_parts(&transaction, &key, &object.version_id)?;
+                Sqlite::count_completed_object_parts(transaction, &key, &object.version_id)?;
             let parts = if wants_object_parts && total_parts_count > 0 {
                 Sqlite::list_completed_object_parts(
-                    &transaction,
+                    transaction,
                     &key,
                     &object.version_id,
                     part_number_marker,

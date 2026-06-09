@@ -107,10 +107,8 @@ pub(super) async fn delete_bucket_lifecycle(
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
-        .write(move |connection| {
-            let transaction = connection.transaction()?;
-            Sqlite::replace_bucket_lifecycle_rules(&transaction, &[])?;
-            transaction.commit()?;
+        .write(move |transaction| {
+            Sqlite::replace_bucket_lifecycle_rules(transaction, &[])?;
             Ok(())
         })
         .await
@@ -135,10 +133,7 @@ pub(super) async fn get_bucket_lifecycle_configuration(
         .await
         .map_err(s3_error_from_sqlite)?;
     let rules = connection
-        .read(move |connection| {
-            let transaction = connection.transaction()?;
-            Sqlite::get_bucket_lifecycle_rules(&transaction)
-        })
+        .read(Sqlite::get_bucket_lifecycle_rules)
         .await
         .map_err(s3_error_from_sqlite)?;
     if rules.is_empty() {
@@ -174,10 +169,8 @@ pub(super) async fn put_bucket_lifecycle_configuration(
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
-        .write(move |connection| {
-            let transaction = connection.transaction()?;
-            Sqlite::replace_bucket_lifecycle_rules(&transaction, &rules)?;
-            transaction.commit()?;
+        .write(move |transaction| {
+            Sqlite::replace_bucket_lifecycle_rules(transaction, &rules)?;
             Ok(())
         })
         .await

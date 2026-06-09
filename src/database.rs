@@ -117,9 +117,7 @@ pub struct BucketConnection {
 
 impl Debug for BucketConnection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BucketConnection")
-            .field("closed", &self.inner.closed)
-            .finish_non_exhaustive()
+        f.debug_struct("BucketConnection").finish_non_exhaustive()
     }
 }
 
@@ -132,7 +130,6 @@ struct BucketConnectionInner {
     reader_handles: Mutex<Vec<JoinHandle<()>>>,
     blob_reader_handles: Mutex<Vec<JoinHandle<()>>>,
     blob_read_timeout: Option<Duration>,
-    closed: AtomicBool,
 }
 
 impl Drop for BucketConnection {
@@ -212,10 +209,10 @@ impl BucketConnection {
         })
     }
 
-    /// Runs a closure on the writer connection.
+    /// Runs a closure in a write transaction.
     ///
-    /// The closure runs on the dedicated writer thread and its result is
-    /// returned asynchronously to the caller.
+    /// The closure runs on the dedicated writer thread. The transaction commits
+    /// only when the closure succeeds; otherwise it rolls back when dropped.
     ///
     /// # Errors
     ///
@@ -223,16 +220,23 @@ impl BucketConnection {
     /// full, the response channel closes, or the closure returns an error.
     pub(crate) async fn write<F, R>(&self, function: F) -> SqliteResult<R>
     where
-        F: FnOnce(&mut rusqlite::Connection) -> SqliteResult<R> + 'static + Send,
+        F: FnOnce(&Transaction<'_>) -> SqliteResult<R> + 'static + Send,
         R: Send + 'static,
     {
-        self.inner.call(&self.inner.writer_sender, function).await
+        self.inner
+            .call(&self.inner.writer_sender, move |connection| {
+                let transaction = connection.transaction()?;
+                let result = function(&transaction)?;
+                transaction.commit()?;
+                Ok(result)
+            })
+            .await
     }
 
-    /// Runs a closure on a reader connection.
+    /// Runs a closure in a read transaction.
     ///
-    /// The closure runs on one of the dedicated reader threads and its result is
-    /// returned asynchronously to the caller.
+    /// The closure runs on one of the dedicated reader threads and receives only
+    /// the transaction, not the raw worker connection.
     ///
     /// # Errors
     ///
@@ -240,10 +244,29 @@ impl BucketConnection {
     /// full, the response channel closes, or the closure returns an error.
     pub(crate) async fn read<F, R>(&self, function: F) -> SqliteResult<R>
     where
+        F: FnOnce(&Transaction<'_>) -> SqliteResult<R> + 'static + Send,
+        R: Send + 'static,
+    {
+        self.inner
+            .call(&self.inner.reader_sender, move |connection| {
+                let transaction = connection.transaction()?;
+                let result = function(&transaction)?;
+                transaction.commit()?;
+                Ok(result)
+            })
+            .await
+    }
+
+    /// Runs infrastructure work on the writer connection without wrapping it.
+    ///
+    /// This is only for `SQLite` operations that must happen outside the normal
+    /// transaction boundary, such as checkpoints, vacuum, and pragma maintenance.
+    pub(crate) async fn write_raw_connection<F, R>(&self, function: F) -> SqliteResult<R>
+    where
         F: FnOnce(&mut rusqlite::Connection) -> SqliteResult<R> + 'static + Send,
         R: Send + 'static,
     {
-        self.inner.call(&self.inner.reader_sender, function).await
+        self.inner.call(&self.inner.writer_sender, function).await
     }
 
     /// Opens a read transaction, returns metadata, and streams selected BLOB spans.
@@ -327,7 +350,6 @@ impl BucketConnectionInner {
             reader_handles: Mutex::new(reader_handles),
             blob_reader_handles: Mutex::new(blob_reader_handles),
             blob_read_timeout,
-            closed: AtomicBool::new(false),
         })
     }
 
@@ -361,20 +383,12 @@ impl BucketConnectionInner {
     {
         let (sender, receiver) = oneshot::channel::<SqliteResult<R>>();
 
-        if self.closed.load(Ordering::Acquire) {
-            return Err(SqliteError::DatabaseQueueClosed);
-        }
-
         queue
             .try_send(WorkerCommand::Execute(Box::new(move |conn| {
                 let value = function(conn);
                 _ = sender.send(value);
             })))
             .map_err(Self::queue_send_error)?;
-
-        if self.closed.load(Ordering::Acquire) {
-            return Err(SqliteError::DatabaseQueueClosed);
-        }
 
         receiver.await.map_err(|_| SqliteError::ThreadJoin)?
     }
@@ -397,10 +411,6 @@ impl BucketConnectionInner {
         let blob_read_timeout = self.blob_read_timeout;
         let runtime = Handle::current();
 
-        if self.closed.load(Ordering::Acquire) {
-            return Err(SqliteError::DatabaseQueueClosed);
-        }
-
         queue
             .try_send(WorkerCommand::Execute(Box::new(move |conn| {
                 Self::execute_blob_read(
@@ -414,10 +424,6 @@ impl BucketConnectionInner {
                 );
             })))
             .map_err(Self::queue_send_error)?;
-
-        if self.closed.load(Ordering::Acquire) {
-            return Err(SqliteError::DatabaseQueueClosed);
-        }
 
         let result = result_receiver
             .await
@@ -651,31 +657,24 @@ impl BucketConnectionInner {
 
     /// Signals workers to close and joins their threads.
     fn close_blocking(&self) -> SqliteResult<()> {
-        let should_signal = self
-            .closed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-
-        if should_signal {
-            let reader_count = self
-                .reader_handles
-                .lock()
-                .map_err(|_| SqliteError::ThreadJoin)?
-                .len();
-            let blob_reader_count = self
-                .blob_reader_handles
-                .lock()
-                .map_err(|_| SqliteError::ThreadJoin)?
-                .len();
-            for _ in 0..reader_count {
-                self.reader_sender.send(WorkerCommand::Close).ok();
-            }
-            for _ in 0..blob_reader_count {
-                self.blob_reader_sender.send(WorkerCommand::Close).ok();
-            }
-
-            self.writer_sender.send(WorkerCommand::Close).ok();
+        let reader_count = self
+            .reader_handles
+            .lock()
+            .map_err(|_| SqliteError::ThreadJoin)?
+            .len();
+        let blob_reader_count = self
+            .blob_reader_handles
+            .lock()
+            .map_err(|_| SqliteError::ThreadJoin)?
+            .len();
+        for _ in 0..reader_count {
+            self.reader_sender.send(WorkerCommand::Close).ok();
         }
+        for _ in 0..blob_reader_count {
+            self.blob_reader_sender.send(WorkerCommand::Close).ok();
+        }
+
+        self.writer_sender.send(WorkerCommand::Close).ok();
 
         let mut join_failed = false;
 
@@ -941,7 +940,6 @@ mod tests {
             reader_handles: Mutex::new(reader_handles),
             blob_reader_handles: Mutex::new(blob_reader_handles),
             blob_read_timeout: None,
-            closed: AtomicBool::new(true),
         }
     }
 

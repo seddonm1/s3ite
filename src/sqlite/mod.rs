@@ -1196,7 +1196,7 @@ impl Sqlite {
         vacuum_pages: u32,
     ) -> SqliteResult<()> {
         connection
-            .write(move |connection| {
+            .write_raw_connection(move |connection| {
                 let transaction = connection.transaction()?;
                 Self::delete_expired_multipart_uploads(
                     &transaction,
@@ -1805,10 +1805,8 @@ mod tests {
         let path = root.join("bucket.sqlite3");
         let connection = BucketConnection::open(&path, &Config::default(), "bucket").await?;
         connection
-            .write(|connection| {
-                let transaction = connection.transaction()?;
-                Sqlite::create_tables(&transaction)?;
-                transaction.commit()?;
+            .write(|transaction| {
+                Sqlite::create_tables(transaction)?;
                 Ok(())
             })
             .await?;
@@ -2139,12 +2137,11 @@ mod tests {
         let connection =
             Arc::new(BucketConnection::open(&path, &Config::default(), "bucket").await?);
         connection
-            .write(|connection| {
-                let transaction = connection.transaction()?;
-                Sqlite::create_tables(&transaction)?;
+            .write(|transaction| {
+                Sqlite::create_tables(transaction)?;
                 let upload_id = Uuid::new_v4();
                 Sqlite::create_multipart_upload(
-                    &transaction,
+                    transaction,
                     upload_id,
                     "bucket",
                     "key",
@@ -2167,7 +2164,6 @@ mod tests {
                         OffsetDateTime::now_utc().saturating_sub(Duration::hours(2)),
                     ),
                 )?;
-                transaction.commit()?;
                 Ok(())
             })
             .await?;

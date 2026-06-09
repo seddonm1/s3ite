@@ -229,11 +229,10 @@ pub(super) async fn put_object(
             .await
             .map_err(s3_error_from_sqlite)?;
         let write_outcome = connection
-            .write(move |connection| {
-                let transaction = connection.transaction()?;
-                Sqlite::check_object_write_conditions(&transaction, &key, &write_conditions)?;
+            .write(move |transaction| {
+                Sqlite::check_object_write_conditions(transaction, &key, &write_conditions)?;
                 let outcome = Sqlite::put_object_with_encoded_chunks(
-                    &transaction,
+                    transaction,
                     &key,
                     KeyMetadata {
                         version_id: String::new(),
@@ -253,8 +252,7 @@ pub(super) async fn put_object(
                     },
                     chunks,
                 )?;
-                Sqlite::replace_object_tags(&transaction, outcome.sequence, &tags)?;
-                transaction.commit()?;
+                Sqlite::replace_object_tags(transaction, outcome.sequence, &tags)?;
                 Ok(outcome)
             })
             .await
@@ -291,11 +289,10 @@ pub(super) async fn put_object(
         .await
         .map_err(s3_error_from_sqlite)?;
     let write_outcome = connection
-        .write(move |connection| {
-            let transaction = connection.transaction()?;
-            Sqlite::check_object_write_conditions(&transaction, &key, &write_conditions)?;
+        .write(move |transaction| {
+            Sqlite::check_object_write_conditions(transaction, &key, &write_conditions)?;
             let outcome = Sqlite::put_object_with_chunk_size(
-                &transaction,
+                transaction,
                 KeyValue {
                     key,
                     value: Some(value),
@@ -318,8 +315,7 @@ pub(super) async fn put_object(
                 },
                 chunk_size,
             )?;
-            Sqlite::replace_object_tags(&transaction, outcome.sequence, &tags)?;
-            transaction.commit()?;
+            Sqlite::replace_object_tags(transaction, outcome.sequence, &tags)?;
             Ok(outcome)
         })
         .await

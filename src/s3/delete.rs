@@ -139,12 +139,11 @@ pub(super) async fn delete_object(
         .map_err(s3_error_from_sqlite)?;
 
     let outcome = connection
-        .write(move |connection| {
-            let transaction = connection.transaction()?;
-            let versioning_state = Sqlite::get_bucket_versioning_state(&transaction)?;
+        .write(move |transaction| {
+            let versioning_state = Sqlite::get_bucket_versioning_state(transaction)?;
             let metadata = match version_id.as_deref() {
-                Some(version_id) => Sqlite::get_version_metadata(&transaction, &key, version_id)?,
-                None => Sqlite::get_current_metadata(&transaction, &key)?,
+                Some(version_id) => Sqlite::get_version_metadata(transaction, &key, version_id)?,
+                None => Sqlite::get_current_metadata(transaction, &key)?,
             };
             validate_delete_conditions(metadata.as_ref(), &conditions)?;
             if let Some(metadata) = metadata.as_ref()
@@ -164,9 +163,8 @@ pub(super) async fn delete_object(
                     delete_marker_version_id: None,
                 }
             } else {
-                Sqlite::delete_object(&transaction, &key, version_id.as_deref())?
+                Sqlite::delete_object(transaction, &key, version_id.as_deref())?
             };
-            transaction.commit()?;
             Ok(Ok(outcome))
         })
         .await
@@ -207,18 +205,17 @@ pub(super) async fn delete_objects(
         .map_err(s3_error_from_sqlite)?;
 
     let (deleted_entries, errors) = connection
-        .write(move |connection| {
-            let transaction = connection.transaction()?;
-            let versioning_state = Sqlite::get_bucket_versioning_state(&transaction)?;
+        .write(move |transaction| {
+            let versioning_state = Sqlite::get_bucket_versioning_state(transaction)?;
             let mut deleted_entries = Vec::new();
             let mut errors = Vec::new();
 
             for (key, version_id, conditions) in requested_deletions {
                 let metadata = match version_id.as_deref() {
                     Some(version_id) => {
-                        Sqlite::get_version_metadata(&transaction, &key, version_id)?
+                        Sqlite::get_version_metadata(transaction, &key, version_id)?
                     }
-                    None => Sqlite::get_current_metadata(&transaction, &key)?,
+                    None => Sqlite::get_current_metadata(transaction, &key)?,
                 };
                 match validate_delete_conditions(metadata.as_ref(), &conditions) {
                     Ok(()) => {
@@ -245,7 +242,7 @@ pub(super) async fn delete_objects(
                                     delete_marker_version_id: None,
                                 }
                             } else {
-                                Sqlite::delete_object(&transaction, &key, version_id.as_deref())?
+                                Sqlite::delete_object(transaction, &key, version_id.as_deref())?
                             };
                         deleted_entries.push((key, outcome));
                     }
@@ -256,7 +253,6 @@ pub(super) async fn delete_objects(
                 }
             }
 
-            transaction.commit()?;
             Ok((deleted_entries, errors))
         })
         .await

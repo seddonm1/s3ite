@@ -148,14 +148,13 @@ pub(super) async fn get_object_acl(
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
-        .read(move |connection| {
-            let transaction = connection.transaction()?;
+        .read(move |transaction| {
             match version_id.as_deref() {
-                Some(version_id) => Sqlite::get_version_metadata(&transaction, &key, version_id)?
+                Some(version_id) => Sqlite::get_version_metadata(transaction, &key, version_id)?
                     .filter(|metadata| metadata.is_delete_marker.not())
                     .ok_or(SqliteError::ObjectVersionNotFound)?,
                 None => {
-                    Sqlite::get_metadata(&transaction, &key)?.ok_or(SqliteError::ObjectNotFound)?
+                    Sqlite::get_metadata(transaction, &key)?.ok_or(SqliteError::ObjectNotFound)?
                 }
             };
             Ok(())
@@ -261,14 +260,13 @@ pub(super) async fn put_object_acl(
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
-        .read(move |connection| {
-            let transaction = connection.transaction()?;
+        .read(move |transaction| {
             match version_id.as_deref() {
-                Some(version_id) => Sqlite::get_version_metadata(&transaction, &key, version_id)?
+                Some(version_id) => Sqlite::get_version_metadata(transaction, &key, version_id)?
                     .filter(|metadata| metadata.is_delete_marker.not())
                     .ok_or(SqliteError::ObjectVersionNotFound)?,
                 None => {
-                    Sqlite::get_metadata(&transaction, &key)?.ok_or(SqliteError::ObjectNotFound)?
+                    Sqlite::get_metadata(transaction, &key)?.ok_or(SqliteError::ObjectNotFound)?
                 }
             };
             Ok(())

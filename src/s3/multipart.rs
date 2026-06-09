@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::{database::BucketConnection, sqlite::EncodedBlobChunk};
+use crate::sqlite::EncodedBlobChunk;
 
 use super::copy::{load_copy_source_object, validate_copy_source_conditions};
 use super::{
@@ -222,30 +222,17 @@ async fn read_upload_part_body(
 }
 
 /// Loads active upload state after validating upload ownership.
-async fn read_multipart_upload_state(
-    connection: &BucketConnection,
+fn load_multipart_upload_state(
+    transaction: &rusqlite::Transaction<'_>,
     upload_id: Uuid,
     bucket: &str,
     key: &str,
     access_key: Option<&str>,
-) -> S3Result<MultipartUploadState> {
-    let bucket = bucket.to_string();
-    let key = key.to_string();
-    let access_key = access_key.map(str::to_string);
-    connection
-        .read(move |connection| {
-            let transaction = connection.transaction()?;
-            let upload_state =
-                Sqlite::get_multipart_upload_state(&transaction, upload_id, &bucket, &key)?
-                    .ok_or(SqliteError::MultipartUploadNotFound)?;
-            Sqlite::validate_multipart_access(
-                upload_state.access_key.as_ref(),
-                access_key.as_deref(),
-            )?;
-            Ok(upload_state)
-        })
-        .await
-        .map_err(s3_error_from_sqlite)
+) -> SqliteResult<MultipartUploadState> {
+    let upload_state = Sqlite::get_multipart_upload_state(transaction, upload_id, bucket, key)?
+        .ok_or(SqliteError::MultipartUploadNotFound)?;
+    Sqlite::validate_multipart_access(upload_state.access_key.as_ref(), access_key)?;
+    Ok(upload_state)
 }
 
 /// Revalidates active upload state inside an `UploadPart` write transaction.
@@ -547,10 +534,9 @@ async fn upload_part_copy_same_bucket(
             .await
             .map_err(s3_error_from_sqlite)?;
         connection
-            .read(move |connection| {
-                let transaction = connection.transaction()?;
+            .read(move |transaction| {
                 load_upload_part_copy_source(
-                    &transaction,
+                    transaction,
                     &source_request,
                     sse_s3_master_key.as_ref(),
                 )
@@ -560,18 +546,26 @@ async fn upload_part_copy_same_bucket(
     };
 
     let upload_state = {
+        let upload_id = request.upload_id;
+        let bucket = request.bucket.clone();
+        let key = request.key.clone();
+        let access_key = request.access_key.clone();
         let connection = sqlite
             .get_connection(&request.bucket)
             .await
             .map_err(s3_error_from_sqlite)?;
-        read_multipart_upload_state(
-            &connection,
-            request.upload_id,
-            &request.bucket,
-            &request.key,
-            request.access_key.as_deref(),
-        )
-        .await?
+        connection
+            .read(move |transaction| {
+                load_multipart_upload_state(
+                    transaction,
+                    upload_id,
+                    &bucket,
+                    &key,
+                    access_key.as_deref(),
+                )
+            })
+            .await
+            .map_err(s3_error_from_sqlite)?
     };
     let checksum_config = upload_state.checksum;
     let expected_encryption = upload_state.stored_sse.clone();
@@ -588,10 +582,9 @@ async fn upload_part_copy_same_bucket(
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
-        .write(move |connection| {
-            let transaction = connection.transaction()?;
+        .write(move |transaction| {
             let copy_part_result = store_upload_part_copy(
-                &transaction,
+                transaction,
                 UploadPartCopyWrite {
                     request: &request,
                     copied_part,
@@ -602,7 +595,6 @@ async fn upload_part_copy_same_bucket(
                     chunk_size,
                 },
             )?;
-            transaction.commit()?;
             Ok((copy_part_result, encrypted))
         })
         .await
@@ -634,10 +626,9 @@ async fn upload_part_copy_cross_bucket(
             .await
             .map_err(s3_error_from_sqlite)?;
         source_connection
-            .read(move |connection| {
-                let transaction = connection.transaction()?;
+            .read(move |transaction| {
                 load_upload_part_copy_source(
-                    &transaction,
+                    transaction,
                     &source_request,
                     sse_s3_master_key.as_ref(),
                 )
@@ -647,18 +638,26 @@ async fn upload_part_copy_cross_bucket(
     };
 
     let upload_state = {
+        let upload_id = request.upload_id;
+        let bucket = request.bucket.clone();
+        let key = request.key.clone();
+        let access_key = request.access_key.clone();
         let connection = sqlite
             .get_connection(&request.bucket)
             .await
             .map_err(s3_error_from_sqlite)?;
-        read_multipart_upload_state(
-            &connection,
-            request.upload_id,
-            &request.bucket,
-            &request.key,
-            request.access_key.as_deref(),
-        )
-        .await?
+        connection
+            .read(move |transaction| {
+                load_multipart_upload_state(
+                    transaction,
+                    upload_id,
+                    &bucket,
+                    &key,
+                    access_key.as_deref(),
+                )
+            })
+            .await
+            .map_err(s3_error_from_sqlite)?
     };
     let checksum_config = upload_state.checksum;
     let expected_encryption = upload_state.stored_sse.clone();
@@ -675,10 +674,9 @@ async fn upload_part_copy_cross_bucket(
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
-        .write(move |connection| {
-            let transaction = connection.transaction()?;
+        .write(move |transaction| {
             let copy_part_result = store_upload_part_copy(
-                &transaction,
+                transaction,
                 UploadPartCopyWrite {
                     request: &request,
                     copied_part,
@@ -689,7 +687,6 @@ async fn upload_part_copy_cross_bucket(
                     chunk_size,
                 },
             )?;
-            transaction.commit()?;
             Ok((copy_part_result, encrypted))
         })
         .await
@@ -741,10 +738,9 @@ impl Sqlite {
                         .await
                         .map_err(s3_error_from_sqlite)?;
                     connection
-                        .read(move |connection| {
-                            let transaction = connection.transaction()?;
+                        .read(move |transaction| {
                             Self::list_multipart_uploads(
-                                &transaction,
+                                transaction,
                                 Some(&prefix),
                                 after_key_query.as_deref(),
                                 after_upload_id_query,
@@ -1016,10 +1012,9 @@ pub(super) async fn create_multipart_upload(
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
-        .write(move |connection| {
-            let transaction = connection.transaction()?;
+        .write(move |transaction| {
             Sqlite::create_multipart_upload(
-                &transaction,
+                transaction,
                 upload_id,
                 &bucket_clone,
                 &key_clone,
@@ -1037,8 +1032,8 @@ pub(super) async fn create_multipart_upload(
                     object_lock,
                 },
             )?;
-            Sqlite::put_multipart_upload_tags(&transaction, upload_id, &tags)?;
-            Ok(transaction.commit()?)
+            Sqlite::put_multipart_upload_tags(transaction, upload_id, &tags)?;
+            Ok(())
         })
         .await
         .map_err(s3_error_from_sqlite)?;
@@ -1121,12 +1116,26 @@ pub(super) async fn upload_part(
 
     let chunk_size = sqlite.blob_chunk_size();
     let upload_state = {
+        let upload_id_for_read = upload_id;
+        let bucket = bucket.clone();
+        let key = key.clone();
+        let access_key = access_key.clone();
         let connection = sqlite
             .get_connection(&bucket)
             .await
             .map_err(s3_error_from_sqlite)?;
-        read_multipart_upload_state(&connection, upload_id, &bucket, &key, access_key.as_deref())
-            .await?
+        connection
+            .read(move |transaction| {
+                load_multipart_upload_state(
+                    transaction,
+                    upload_id_for_read,
+                    &bucket,
+                    &key,
+                    access_key.as_deref(),
+                )
+            })
+            .await
+            .map_err(s3_error_from_sqlite)?
     };
     let checksum_config = upload_state.checksum;
     let expected_encryption = upload_state.stored_sse.clone();
@@ -1153,10 +1162,9 @@ pub(super) async fn upload_part(
             .await
             .map_err(s3_error_from_sqlite)?;
         connection
-            .write(move |connection| {
-                let transaction = connection.transaction()?;
+            .write(move |transaction| {
                 validate_upload_part_write_state(
-                    &transaction,
+                    transaction,
                     upload_id,
                     &bucket,
                     &key,
@@ -1172,9 +1180,8 @@ pub(super) async fn upload_part(
                     md5: Some(md5_clone),
                     checksum: checksum_write,
                 };
-                Sqlite::put_multipart_with_encoded_chunks(&transaction, &part, chunks)?;
+                Sqlite::put_multipart_with_encoded_chunks(transaction, &part, chunks)?;
 
-                transaction.commit()?;
                 Ok(())
             })
             .await
@@ -1202,10 +1209,9 @@ pub(super) async fn upload_part(
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
-        .write(move |connection| {
-            let transaction = connection.transaction()?;
+        .write(move |transaction| {
             validate_upload_part_write_state(
-                &transaction,
+                transaction,
                 upload_id,
                 &bucket,
                 &key,
@@ -1222,9 +1228,8 @@ pub(super) async fn upload_part(
                 md5: Some(md5_clone),
                 checksum: checksum_write,
             };
-            Sqlite::put_multipart_with_chunk_size(&transaction, &multipart, chunk_size)?;
+            Sqlite::put_multipart_with_chunk_size(transaction, &multipart, chunk_size)?;
 
-            transaction.commit()?;
             Ok(())
         })
         .await
@@ -1305,11 +1310,9 @@ pub(super) async fn list_parts(
         .await
         .map_err(s3_error_from_sqlite)?;
     let (upload_checksum, parts) = connection
-        .read(move |connection| {
-            let transaction = connection.transaction()?;
-
+        .read(move |transaction| {
             let upload_state = Sqlite::get_multipart_upload_state(
-                &transaction,
+                transaction,
                 upload_id,
                 &bucket_clone,
                 &key_clone,
@@ -1323,7 +1326,7 @@ pub(super) async fn list_parts(
             )?;
 
             let parts = Sqlite::list_multipart(
-                &transaction,
+                transaction,
                 upload_id,
                 part_number_marker,
                 i64::from(max_parts) + 1,
@@ -1399,10 +1402,9 @@ pub(super) async fn abort_multipart_upload(
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
-        .write(move |connection| {
-            let transaction = connection.transaction()?;
+        .write(move |transaction| {
             let upload_state =
-                Sqlite::get_multipart_upload_state(&transaction, upload_id, &bucket, &key)?
+                Sqlite::get_multipart_upload_state(transaction, upload_id, &bucket, &key)?
                     .ok_or(SqliteError::MultipartUploadNotFound)?;
             Sqlite::validate_multipart_access(
                 upload_state.access_key.as_ref(),
@@ -1411,12 +1413,11 @@ pub(super) async fn abort_multipart_upload(
                     .map(|credentials| credentials.access_key.as_str()),
             )?;
 
-            let deleted = Sqlite::delete_multipart(&transaction, upload_id)?;
+            let deleted = Sqlite::delete_multipart(transaction, upload_id)?;
             if deleted == 0 {
                 return Err(SqliteError::MultipartUploadNotFound);
             }
 
-            transaction.commit()?;
             Ok(())
         })
         .await
@@ -1475,10 +1476,9 @@ async fn precompute_encrypted_full_object_checksum(
         .map_err(s3_error_from_sqlite)?;
 
     connection
-        .read(move |connection| {
-            let transaction = connection.transaction()?;
+        .read(move |transaction| {
             let Some(upload_state) =
-                Sqlite::get_multipart_upload_state(&transaction, upload_id, &bucket, &key)?
+                Sqlite::get_multipart_upload_state(transaction, upload_id, &bucket, &key)?
             else {
                 return Ok(None);
             };
@@ -1506,7 +1506,7 @@ async fn precompute_encrypted_full_object_checksum(
                 .map_err(|_| SqliteError::MultipartObjectTooLarge)?
                 .checked_add(1)
                 .ok_or(SqliteError::MultipartObjectTooLarge)?;
-            let parts = Sqlite::list_multipart(&transaction, upload_id, 0, limit)?;
+            let parts = Sqlite::list_multipart(transaction, upload_id, 0, limit)?;
             if parts.len() != requested_part_numbers.len() {
                 return Ok(None);
             }
@@ -1517,7 +1517,7 @@ async fn precompute_encrypted_full_object_checksum(
                     return Ok(None);
                 }
                 let chunks = Sqlite::get_upload_part_blob_chunks(
-                    &transaction,
+                    transaction,
                     upload_id,
                     part.part_number,
                     part.size,
@@ -1623,10 +1623,9 @@ pub(super) async fn complete_multipart_upload(
             .await
             .map_err(s3_error_from_sqlite)?;
         connection
-            .read(move |connection| {
-                let transaction = connection.transaction()?;
+            .read(move |transaction| {
                 let completion =
-                    Sqlite::prepare_multipart_upload_completion(&transaction, &request)?;
+                    Sqlite::prepare_multipart_upload_completion(transaction, &request)?;
                 Ok((request, completion))
             })
             .await
@@ -1640,11 +1639,9 @@ pub(super) async fn complete_multipart_upload(
                 .await
                 .map_err(s3_error_from_sqlite)?;
             connection
-                .write(move |connection| {
-                    let transaction = connection.transaction()?;
+                .write(move |transaction| {
                     let completed =
-                        Sqlite::put_prepared_multipart_upload(&transaction, &request, prepared)?;
-                    transaction.commit()?;
+                        Sqlite::put_prepared_multipart_upload(transaction, &request, prepared)?;
                     Ok(completed)
                 })
                 .await

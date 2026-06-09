@@ -94,10 +94,9 @@ pub(super) async fn create_bucket(
             .await
             .map_err(s3_error_from_sqlite)?;
         connection
-            .write(|connection| {
-                let transaction = connection.transaction()?;
-                Sqlite::enable_bucket_object_lock(&transaction)?;
-                Ok(transaction.commit()?)
+            .write(|transaction| {
+                Sqlite::enable_bucket_object_lock(transaction)?;
+                Ok(())
             })
             .await
             .map_err(s3_error_from_sqlite)?;
@@ -129,10 +128,7 @@ pub(super) async fn delete_bucket(
         .await
         .map_err(s3_error_from_sqlite)?;
     let has_objects = connection
-        .read(|connection| {
-            let transaction = connection.transaction()?;
-            Sqlite::has_objects(&transaction)
-        })
+        .read(Sqlite::has_objects)
         .await
         .map_err(s3_error_from_sqlite)?;
     if has_objects {
@@ -207,10 +203,7 @@ pub(super) async fn get_bucket_versioning(
         .await
         .map_err(s3_error_from_sqlite)?;
     let state = connection
-        .read(|connection| {
-            let transaction = connection.transaction()?;
-            Sqlite::get_bucket_versioning_state(&transaction)
-        })
+        .read(Sqlite::get_bucket_versioning_state)
         .await
         .map_err(s3_error_from_sqlite)?;
 
@@ -249,10 +242,9 @@ pub(super) async fn delete_bucket_encryption(
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
-        .write(|connection| {
-            let transaction = connection.transaction()?;
-            Sqlite::put_bucket_default_sse_s3(&transaction, false)?;
-            Ok(transaction.commit()?)
+        .write(|transaction| {
+            Sqlite::put_bucket_default_sse_s3(transaction, false)?;
+            Ok(())
         })
         .await
         .map_err(s3_error_from_sqlite)?;
@@ -276,10 +268,7 @@ pub(super) async fn get_bucket_encryption(
         .await
         .map_err(s3_error_from_sqlite)?;
     let enabled = connection
-        .read(|connection| {
-            let transaction = connection.transaction()?;
-            Sqlite::get_bucket_default_sse_s3(&transaction)
-        })
+        .read(Sqlite::get_bucket_default_sse_s3)
         .await
         .map_err(s3_error_from_sqlite)?;
 
@@ -319,10 +308,9 @@ pub(super) async fn put_bucket_encryption(
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
-        .write(|connection| {
-            let transaction = connection.transaction()?;
-            Sqlite::put_bucket_default_sse_s3(&transaction, true)?;
-            Ok(transaction.commit()?)
+        .write(|transaction| {
+            Sqlite::put_bucket_default_sse_s3(transaction, true)?;
+            Ok(())
         })
         .await
         .map_err(s3_error_from_sqlite)?;
@@ -427,18 +415,16 @@ pub(super) async fn put_bucket_versioning(
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
-        .write(move |connection| {
-            let transaction = connection.transaction()?;
+        .write(move |transaction| {
             if state == BucketVersioningState::Suspended
-                && Sqlite::get_bucket_object_lock_config(&transaction)?.enabled
+                && Sqlite::get_bucket_object_lock_config(transaction)?.enabled
             {
                 return Ok(Err(s3_error_with_message(
                     S3ErrorCode::InvalidBucketState,
                     "Object Lock buckets cannot suspend versioning",
                 )));
             }
-            Sqlite::put_bucket_versioning_state(&transaction, state)?;
-            transaction.commit()?;
+            Sqlite::put_bucket_versioning_state(transaction, state)?;
             Ok(Ok(()))
         })
         .await

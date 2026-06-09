@@ -251,10 +251,7 @@ pub(super) async fn resolve_write_encryption(
             .await
             .map_err(s3_error_from_sqlite)?;
         connection
-            .read(|connection| {
-                let transaction = connection.transaction()?;
-                Sqlite::get_bucket_default_sse_s3(&transaction)
-            })
+            .read(Sqlite::get_bucket_default_sse_s3)
             .await
             .map_err(s3_error_from_sqlite)?
     };

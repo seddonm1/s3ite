@@ -100,10 +100,8 @@ pub(super) async fn delete_bucket_tagging(
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
-        .write(move |connection| {
-            let transaction = connection.transaction()?;
-            Sqlite::replace_bucket_tags(&transaction, &[])?;
-            transaction.commit()?;
+        .write(move |transaction| {
+            Sqlite::replace_bucket_tags(transaction, &[])?;
             Ok(())
         })
         .await
@@ -128,10 +126,7 @@ pub(super) async fn get_bucket_tagging(
         .await
         .map_err(s3_error_from_sqlite)?;
     let tags = connection
-        .read(move |connection| {
-            let transaction = connection.transaction()?;
-            Sqlite::get_bucket_tags(&transaction)
-        })
+        .read(Sqlite::get_bucket_tags)
         .await
         .map_err(s3_error_from_sqlite)?;
     if tags.is_empty() {
@@ -166,10 +161,8 @@ pub(super) async fn put_bucket_tagging(
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
-        .write(move |connection| {
-            let transaction = connection.transaction()?;
-            Sqlite::replace_bucket_tags(&transaction, &tags)?;
-            transaction.commit()?;
+        .write(move |transaction| {
+            Sqlite::replace_bucket_tags(transaction, &tags)?;
             Ok(())
         })
         .await
@@ -219,18 +212,16 @@ pub(super) async fn delete_object_tagging(
         .await
         .map_err(s3_error_from_sqlite)?;
     let version_id = connection
-        .write(move |connection| {
-            let transaction = connection.transaction()?;
+        .write(move |transaction| {
             let target = match version_id.as_deref() {
                 Some(version_id) => {
-                    Sqlite::get_object_version_tagging_target(&transaction, &key, version_id)?
+                    Sqlite::get_object_version_tagging_target(transaction, &key, version_id)?
                         .ok_or(super::SqliteError::ObjectVersionNotFound)?
                 }
-                None => Sqlite::get_current_object_tagging_target(&transaction, &key)?
+                None => Sqlite::get_current_object_tagging_target(transaction, &key)?
                     .ok_or(super::SqliteError::ObjectNotFound)?,
             };
-            Sqlite::replace_object_tags(&transaction, target.sequence, &[])?;
-            transaction.commit()?;
+            Sqlite::replace_object_tags(transaction, target.sequence, &[])?;
             Ok(target.version_id)
         })
         .await
@@ -260,17 +251,16 @@ pub(super) async fn get_object_tagging(
         .await
         .map_err(s3_error_from_sqlite)?;
     let (version_id, tags) = connection
-        .read(move |connection| {
-            let transaction = connection.transaction()?;
+        .read(move |transaction| {
             let target = match version_id.as_deref() {
                 Some(version_id) => {
-                    Sqlite::get_object_version_tagging_target(&transaction, &key, version_id)?
+                    Sqlite::get_object_version_tagging_target(transaction, &key, version_id)?
                         .ok_or(super::SqliteError::ObjectVersionNotFound)?
                 }
-                None => Sqlite::get_current_object_tagging_target(&transaction, &key)?
+                None => Sqlite::get_current_object_tagging_target(transaction, &key)?
                     .ok_or(super::SqliteError::ObjectNotFound)?,
             };
-            let tags = Sqlite::get_object_tags(&transaction, target.sequence)?;
+            let tags = Sqlite::get_object_tags(transaction, target.sequence)?;
             Ok((target.version_id, tags))
         })
         .await
@@ -307,18 +297,16 @@ pub(super) async fn put_object_tagging(
         .await
         .map_err(s3_error_from_sqlite)?;
     let version_id = connection
-        .write(move |connection| {
-            let transaction = connection.transaction()?;
+        .write(move |transaction| {
             let target = match version_id.as_deref() {
                 Some(version_id) => {
-                    Sqlite::get_object_version_tagging_target(&transaction, &key, version_id)?
+                    Sqlite::get_object_version_tagging_target(transaction, &key, version_id)?
                         .ok_or(super::SqliteError::ObjectVersionNotFound)?
                 }
-                None => Sqlite::get_current_object_tagging_target(&transaction, &key)?
+                None => Sqlite::get_current_object_tagging_target(transaction, &key)?
                     .ok_or(super::SqliteError::ObjectNotFound)?,
             };
-            Sqlite::replace_object_tags(&transaction, target.sequence, &tags)?;
-            transaction.commit()?;
+            Sqlite::replace_object_tags(transaction, target.sequence, &tags)?;
             Ok(target.version_id)
         })
         .await

@@ -241,10 +241,7 @@ pub(super) async fn load_bucket_object_lock_config(
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
-        .read(|connection| {
-            let transaction = connection.transaction()?;
-            Sqlite::get_bucket_object_lock_config(&transaction)
-        })
+        .read(Sqlite::get_bucket_object_lock_config)
         .await
         .map_err(s3_error_from_sqlite)
 }
@@ -292,11 +289,10 @@ pub(super) async fn put_object_lock_configuration(
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
-        .write(move |connection| {
-            let transaction = connection.transaction()?;
-            let current = Sqlite::get_bucket_object_lock_config(&transaction)?;
+        .write(move |transaction| {
+            let current = Sqlite::get_bucket_object_lock_config(transaction)?;
             if !current.enabled
-                && Sqlite::get_bucket_versioning_state(&transaction)?
+                && Sqlite::get_bucket_versioning_state(transaction)?
                     != BucketVersioningState::Enabled
             {
                 return Ok(Err(s3_error_with_message(
@@ -304,8 +300,7 @@ pub(super) async fn put_object_lock_configuration(
                     "Object Lock can only be configured after versioning is enabled",
                 )));
             }
-            Sqlite::put_bucket_object_lock_config(&transaction, &config)?;
-            transaction.commit()?;
+            Sqlite::put_bucket_object_lock_config(transaction, &config)?;
             Ok(Ok(()))
         })
         .await
@@ -358,12 +353,11 @@ pub(super) async fn put_object_legal_hold(
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
-        .write(move |connection| {
-            let transaction = connection.transaction()?;
-            if !Sqlite::get_bucket_object_lock_config(&transaction)?.enabled {
+        .write(move |transaction| {
+            if !Sqlite::get_bucket_object_lock_config(transaction)?.enabled {
                 return Ok(Err(object_lock_not_enabled()));
             }
-            let target = Sqlite::get_object_lock_target(&transaction, &key, version_id.as_deref())?
+            let target = Sqlite::get_object_lock_target(transaction, &key, version_id.as_deref())?
                 .ok_or_else(|| {
                     if version_id.is_some() {
                         SqliteError::ObjectVersionNotFound
@@ -371,8 +365,7 @@ pub(super) async fn put_object_legal_hold(
                         SqliteError::ObjectNotFound
                     }
                 })?;
-            Sqlite::put_object_legal_hold(&transaction, target.sequence, legal_hold)?;
-            transaction.commit()?;
+            Sqlite::put_object_legal_hold(transaction, target.sequence, legal_hold)?;
             Ok(Ok(()))
         })
         .await
@@ -432,16 +425,15 @@ pub(super) async fn put_object_retention(
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
-        .write(move |connection| {
-            let transaction = connection.transaction()?;
-            if !Sqlite::get_bucket_object_lock_config(&transaction)?.enabled {
+        .write(move |transaction| {
+            if !Sqlite::get_bucket_object_lock_config(transaction)?.enabled {
                 return Ok(Err(object_lock_not_enabled()));
             }
             let metadata = match version_id.as_deref() {
-                Some(version_id) => Sqlite::get_version_metadata(&transaction, &key, version_id)?
+                Some(version_id) => Sqlite::get_version_metadata(transaction, &key, version_id)?
                     .ok_or(SqliteError::ObjectVersionNotFound)?,
                 None => {
-                    Sqlite::get_metadata(&transaction, &key)?.ok_or(SqliteError::ObjectNotFound)?
+                    Sqlite::get_metadata(transaction, &key)?.ok_or(SqliteError::ObjectNotFound)?
                 }
             };
             if metadata.is_delete_marker {
@@ -455,10 +447,9 @@ pub(super) async fn put_object_retention(
             ) {
                 return Ok(Err(err));
             }
-            let target = Sqlite::get_object_lock_target(&transaction, &key, version_id.as_deref())?
+            let target = Sqlite::get_object_lock_target(transaction, &key, version_id.as_deref())?
                 .ok_or(SqliteError::ObjectNotFound)?;
-            Sqlite::put_object_retention(&transaction, target.sequence, retention.as_ref())?;
-            transaction.commit()?;
+            Sqlite::put_object_retention(transaction, target.sequence, retention.as_ref())?;
             Ok(Ok(()))
         })
         .await
@@ -491,14 +482,13 @@ async fn load_object_lock_metadata(
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
-        .read(move |connection| {
-            let transaction = connection.transaction()?;
-            require_bucket_object_lock_enabled(&transaction)?;
+        .read(move |transaction| {
+            require_bucket_object_lock_enabled(transaction)?;
             let metadata = match version_id.as_deref() {
-                Some(version_id) => Sqlite::get_version_metadata(&transaction, &key, version_id)?
+                Some(version_id) => Sqlite::get_version_metadata(transaction, &key, version_id)?
                     .ok_or(SqliteError::ObjectVersionNotFound)?,
                 None => {
-                    Sqlite::get_metadata(&transaction, &key)?.ok_or(SqliteError::ObjectNotFound)?
+                    Sqlite::get_metadata(transaction, &key)?.ok_or(SqliteError::ObjectNotFound)?
                 }
             };
             if metadata.is_delete_marker {

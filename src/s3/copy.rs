@@ -364,10 +364,9 @@ async fn copy_object_same_bucket(
             .await
             .map_err(s3_error_from_sqlite)?;
         connection
-            .read(move |connection| {
-                let transaction = connection.transaction()?;
+            .read(move |transaction| {
                 let source = load_copy_source_object_and_tags(
-                    &transaction,
+                    transaction,
                     &source_key,
                     source_version_id.as_deref(),
                     sse_s3_master_key.as_ref(),
@@ -420,23 +419,21 @@ async fn copy_object_same_bucket(
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
-        .write(move |connection| {
-            let transaction = connection.transaction()?;
+        .write(move |transaction| {
             let write_outcome = if let Some(chunks) = encrypted_chunks {
                 let KeyValue {
                     key, key_metadata, ..
                 } = object;
-                Sqlite::put_object_with_encoded_chunks(&transaction, &key, key_metadata, chunks)?
+                Sqlite::put_object_with_encoded_chunks(transaction, &key, key_metadata, chunks)?
             } else {
-                Sqlite::put_object_with_chunk_size(&transaction, object, chunk_size)?
+                Sqlite::put_object_with_chunk_size(transaction, object, chunk_size)?
             };
-            Sqlite::replace_object_tags(&transaction, write_outcome.sequence, &target_tags)?;
+            Sqlite::replace_object_tags(transaction, write_outcome.sequence, &target_tags)?;
             let result = copy_object_result(
                 &checksum,
                 write_outcome.md5.clone(),
                 write_outcome.last_modified,
             );
-            transaction.commit()?;
             Ok((result, write_outcome.returned_version_id, encrypted))
         })
         .await
@@ -458,10 +455,9 @@ async fn copy_object_cross_bucket(
             .await
             .map_err(s3_error_from_sqlite)?;
         source_connection
-            .read(move |connection| {
-                let transaction = connection.transaction()?;
+            .read(move |transaction| {
                 let source = load_copy_source_object_and_tags(
-                    &transaction,
+                    transaction,
                     &source_key,
                     source_version_id.as_deref(),
                     sse_s3_master_key.as_ref(),
@@ -514,23 +510,21 @@ async fn copy_object_cross_bucket(
         .await
         .map_err(s3_error_from_sqlite)?;
     target_connection
-        .write(move |connection| {
-            let transaction = connection.transaction()?;
+        .write(move |transaction| {
             let write_outcome = if let Some(chunks) = encrypted_chunks {
                 let KeyValue {
                     key, key_metadata, ..
                 } = object;
-                Sqlite::put_object_with_encoded_chunks(&transaction, &key, key_metadata, chunks)?
+                Sqlite::put_object_with_encoded_chunks(transaction, &key, key_metadata, chunks)?
             } else {
-                Sqlite::put_object_with_chunk_size(&transaction, object, chunk_size)?
+                Sqlite::put_object_with_chunk_size(transaction, object, chunk_size)?
             };
-            Sqlite::replace_object_tags(&transaction, write_outcome.sequence, &target_tags)?;
+            Sqlite::replace_object_tags(transaction, write_outcome.sequence, &target_tags)?;
             let result = copy_object_result(
                 &checksum,
                 write_outcome.md5.clone(),
                 write_outcome.last_modified,
             );
-            transaction.commit()?;
             Ok((result, write_outcome.returned_version_id, encrypted))
         })
         .await
