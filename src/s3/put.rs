@@ -8,9 +8,9 @@ use super::{
     checksum_sha1, checksum_sha256, checksum_type_output, copy_bytes, finish_payload_checksum, hex,
     normalize_content_encoding, normalize_metadata, object_write_conditions,
     payload_checksum_accumulator, read_object_body_encrypted, requested_sse_s3,
-    resolve_write_encryption, s3_error, s3_error_from_sqlite, sse_s3_output, validate_content_md5,
-    validate_declared_object_write_length, validate_no_unsupported_sse_headers,
-    validate_object_acl,
+    resolve_write_encryption, s3_error, s3_error_from_sqlite, sse_s3_output,
+    stored_tags_from_header, validate_content_md5, validate_declared_object_write_length,
+    validate_no_unsupported_sse_headers, validate_object_acl,
 };
 
 /// Fully buffered object body plus hashes needed by the storage write.
@@ -157,6 +157,7 @@ pub(super) async fn put_object(
         ssekms_encryption_context,
         ssekms_key_id,
         storage_class,
+        tagging,
         ..
     } = input;
     let explicit_sse_s3 = requested_sse_s3(
@@ -170,6 +171,7 @@ pub(super) async fn put_object(
     let write_conditions = object_write_conditions(if_match, if_none_match);
     let content_encoding = normalize_content_encoding(content_encoding);
     let metadata = normalize_metadata(metadata);
+    let tags = stored_tags_from_header(tagging)?;
     validate_put_storage_class(storage_class.as_ref())?;
     validate_declared_object_write_length(&headers, content_length)?;
 
@@ -204,6 +206,7 @@ pub(super) async fn put_object(
         let checksum_clone = checksum.clone();
         let stored_encryption = Some(encryption.stored.clone());
         let chunks = encrypted_body.chunks;
+        let tags = tags.clone();
         let connection = sqlite
             .get_connection(&bucket)
             .await
@@ -232,6 +235,7 @@ pub(super) async fn put_object(
                     },
                     chunks,
                 )?;
+                Sqlite::replace_object_tags(&transaction, outcome.sequence, &tags)?;
                 transaction.commit()?;
                 Ok(outcome)
             })
@@ -295,6 +299,7 @@ pub(super) async fn put_object(
                 },
                 chunk_size,
             )?;
+            Sqlite::replace_object_tags(&transaction, outcome.sequence, &tags)?;
             transaction.commit()?;
             Ok(outcome)
         })

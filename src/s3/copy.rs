@@ -3,17 +3,18 @@
 use std::collections::HashMap;
 
 use super::{
-    ChecksumAlgorithmKind, CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource, ETag,
-    InternalError, KeyMetadata, KeyValue, MetadataDirective, Not, ObjectAclRequest,
-    ObjectBodyReference, ObjectReadConditions, OffsetDateTime, S3_SINGLE_REQUEST_BODY_MAX,
-    S3ErrorCode, S3Request, S3Response, S3Result, Sqlite, SqliteError, SqliteResult,
-    StoredChecksum, StoredSse, active_sse_from_stored, checksum_algorithm_from_request,
-    checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_sha1, checksum_sha256,
-    checksum_type_output, decrypt_stored_chunks, encrypt_value_chunks, http_date_time,
-    normalize_content_encoding, normalize_metadata, object_write_checksum_from_value,
-    requested_sse_s3, resolve_write_encryption, s3_error, s3_error_from_sqlite,
-    s3_error_with_message, sse_s3_output, strong_etag_condition_matches,
-    validate_no_unsupported_sse_headers, validate_object_acl, weak_etag_condition_matches,
+    ChecksumAlgorithmKind, CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource,
+    CopyTaggingDirective, ETag, InternalError, KeyMetadata, KeyValue, MetadataDirective, Not,
+    ObjectAclRequest, ObjectBodyReference, ObjectReadConditions, OffsetDateTime,
+    S3_SINGLE_REQUEST_BODY_MAX, S3ErrorCode, S3Request, S3Response, S3Result, Sqlite, SqliteError,
+    SqliteResult, StoredChecksum, StoredSse, StoredTag, active_sse_from_stored,
+    checksum_algorithm_from_request, checksum_crc32, checksum_crc32c, checksum_crc64nvme,
+    checksum_sha1, checksum_sha256, checksum_type_output, copy_tagging_directive,
+    decrypt_stored_chunks, encrypt_value_chunks, http_date_time, normalize_content_encoding,
+    normalize_metadata, object_write_checksum_from_value, requested_sse_s3,
+    resolve_write_encryption, s3_error, s3_error_from_sqlite, s3_error_with_message, sse_s3_output,
+    strong_etag_condition_matches, validate_no_unsupported_sse_headers, validate_object_acl,
+    weak_etag_condition_matches,
 };
 
 /// Parsed copy request with source, destination, metadata, and checksum intent.
@@ -32,6 +33,13 @@ struct CopyObjectRequest {
     source_conditions: ObjectReadConditions,
     target_checksum_kind: Option<ChecksumAlgorithmKind>,
     explicit_sse_s3: bool,
+    tagging_directive: CopyTaggingDirective,
+}
+
+/// Source object body plus tags used by `CopyObject`.
+struct CopySourceObject {
+    object: KeyValue,
+    tags: Vec<StoredTag>,
 }
 
 /// Applies copy-source conditional request semantics to loaded source metadata.
@@ -92,6 +100,8 @@ fn parse_copy_object_request(input: CopyObjectInput) -> S3Result<CopyObjectReque
         expires,
         metadata,
         metadata_directive,
+        tagging,
+        tagging_directive,
         bucket_key_enabled,
         grant_full_control,
         grant_read,
@@ -124,6 +134,7 @@ fn parse_copy_object_request(input: CopyObjectInput) -> S3Result<CopyObjectReque
     let replace_metadata = metadata_directive
         .as_ref()
         .is_some_and(|directive| directive.as_str() == MetadataDirective::REPLACE);
+    let tagging_directive = copy_tagging_directive(tagging_directive.as_ref(), tagging)?;
     let target_checksum_kind = checksum_algorithm_from_request(checksum_algorithm)?;
     let explicit_sse_s3 = requested_sse_s3(
         server_side_encryption.as_ref(),
@@ -170,6 +181,7 @@ fn parse_copy_object_request(input: CopyObjectInput) -> S3Result<CopyObjectReque
         },
         target_checksum_kind,
         explicit_sse_s3,
+        tagging_directive,
     })
 }
 
@@ -178,10 +190,11 @@ fn validate_copy_target(request: &CopyObjectRequest) -> S3Result<()> {
     if request.source_bucket.as_str() == request.target_bucket.as_str()
         && request.source_key.as_str() == request.target_key.as_str()
         && request.replace_metadata.not()
+        && !matches!(request.tagging_directive, CopyTaggingDirective::Replace(_))
     {
         return Err(s3_error_with_message(
             S3ErrorCode::InvalidRequest,
-            "copy source must be different from target unless replacing metadata",
+            "copy source must be different from target unless replacing metadata or tags",
         ));
     }
     Ok(())
@@ -234,6 +247,30 @@ pub(super) fn load_copy_source_object(
     version_id: Option<&str>,
     sse_s3_master_key: Option<&[u8; 32]>,
 ) -> SqliteResult<KeyValue> {
+    let (object, _) =
+        load_copy_source_object_with_sequence(transaction, key, version_id, sse_s3_master_key)?;
+    Ok(object)
+}
+
+/// Loads a copy source object and its tags for `CopyObject`.
+fn load_copy_source_object_and_tags(
+    transaction: &rusqlite::Transaction<'_>,
+    key: &str,
+    version_id: Option<&str>,
+    sse_s3_master_key: Option<&[u8; 32]>,
+) -> SqliteResult<CopySourceObject> {
+    let (object, sequence) =
+        load_copy_source_object_with_sequence(transaction, key, version_id, sse_s3_master_key)?;
+    let tags = Sqlite::get_object_tags(transaction, sequence)?;
+    Ok(CopySourceObject { object, tags })
+}
+
+fn load_copy_source_object_with_sequence(
+    transaction: &rusqlite::Transaction<'_>,
+    key: &str,
+    version_id: Option<&str>,
+    sse_s3_master_key: Option<&[u8; 32]>,
+) -> SqliteResult<(KeyValue, i64)> {
     let object = match version_id {
         Some(version_id) => {
             Sqlite::get_object_version_body_reference(transaction, key, version_id)?
@@ -265,11 +302,14 @@ pub(super) fn load_copy_source_object(
         Sqlite::get_object_bytes(transaction, sequence, key_metadata.size)?
     };
 
-    Ok(KeyValue {
-        key: key.to_string(),
-        value: Some(value),
-        key_metadata,
-    })
+    Ok((
+        KeyValue {
+            key: key.to_string(),
+            value: Some(value),
+            key_metadata,
+        },
+        sequence,
+    ))
 }
 
 /// Builds the S3 copy result from the stored target object metadata.
@@ -308,20 +348,24 @@ async fn copy_object_same_bucket(
         connection
             .read(move |connection| {
                 let transaction = connection.transaction()?;
-                let object = load_copy_source_object(
+                let source = load_copy_source_object_and_tags(
                     &transaction,
                     &source_key,
                     source_version_id.as_deref(),
                     sse_s3_master_key.as_ref(),
                 )?;
-                validate_copy_source_conditions(&object.key_metadata, &source_conditions)?;
-                validate_copy_source_size(&object.key_metadata)?;
-                Ok(object)
+                validate_copy_source_conditions(&source.object.key_metadata, &source_conditions)?;
+                validate_copy_source_size(&source.object.key_metadata)?;
+                Ok(source)
             })
             .await
             .map_err(s3_error_from_sqlite)?
     };
 
+    let target_tags = match &request.tagging_directive {
+        CopyTaggingDirective::Copy => object.tags.clone(),
+        CopyTaggingDirective::Replace(tags) => tags.clone(),
+    };
     let target_encryption =
         resolve_write_encryption(sqlite, &request.target_bucket, request.explicit_sse_s3).await?;
     let encrypted = target_encryption.is_some();
@@ -329,8 +373,8 @@ async fn copy_object_same_bucket(
     let target_stored_sse = target_encryption
         .as_ref()
         .map(|encryption| encryption.stored.clone());
-    let (object, checksum) =
-        prepare_copied_object(object, &request, target_stored_sse).map_err(s3_error_from_sqlite)?;
+    let (object, checksum) = prepare_copied_object(object.object, &request, target_stored_sse)
+        .map_err(s3_error_from_sqlite)?;
     let encrypted_chunks = target_encryption
         .as_ref()
         .map(|encryption| {
@@ -355,6 +399,7 @@ async fn copy_object_same_bucket(
             } else {
                 Sqlite::put_object_with_chunk_size(&transaction, object, chunk_size)?
             };
+            Sqlite::replace_object_tags(&transaction, write_outcome.sequence, &target_tags)?;
             let result = copy_object_result(
                 &checksum,
                 write_outcome.md5.clone(),
@@ -384,20 +429,24 @@ async fn copy_object_cross_bucket(
         source_connection
             .read(move |connection| {
                 let transaction = connection.transaction()?;
-                let object = load_copy_source_object(
+                let source = load_copy_source_object_and_tags(
                     &transaction,
                     &source_key,
                     source_version_id.as_deref(),
                     sse_s3_master_key.as_ref(),
                 )?;
-                validate_copy_source_conditions(&object.key_metadata, &source_conditions)?;
-                validate_copy_source_size(&object.key_metadata)?;
-                Ok(object)
+                validate_copy_source_conditions(&source.object.key_metadata, &source_conditions)?;
+                validate_copy_source_size(&source.object.key_metadata)?;
+                Ok(source)
             })
             .await
             .map_err(s3_error_from_sqlite)?
     };
 
+    let target_tags = match &request.tagging_directive {
+        CopyTaggingDirective::Copy => object.tags.clone(),
+        CopyTaggingDirective::Replace(tags) => tags.clone(),
+    };
     let target_encryption =
         resolve_write_encryption(sqlite, &request.target_bucket, request.explicit_sse_s3).await?;
     let encrypted = target_encryption.is_some();
@@ -405,8 +454,8 @@ async fn copy_object_cross_bucket(
     let target_stored_sse = target_encryption
         .as_ref()
         .map(|encryption| encryption.stored.clone());
-    let (object, checksum) =
-        prepare_copied_object(object, &request, target_stored_sse).map_err(s3_error_from_sqlite)?;
+    let (object, checksum) = prepare_copied_object(object.object, &request, target_stored_sse)
+        .map_err(s3_error_from_sqlite)?;
     let encrypted_chunks = target_encryption
         .as_ref()
         .map(|encryption| {
@@ -431,6 +480,7 @@ async fn copy_object_cross_bucket(
             } else {
                 Sqlite::put_object_with_chunk_size(&transaction, object, chunk_size)?
             };
+            Sqlite::replace_object_tags(&transaction, write_outcome.sequence, &target_tags)?;
             let result = copy_object_result(
                 &checksum,
                 write_outcome.md5.clone(),

@@ -25,8 +25,8 @@ use super::{
     normalize_content_encoding, normalize_metadata, object_write_conditions, output_delimiter,
     owner, part_checksum_accumulator, read_part_body_encrypted, requested_sse_s3,
     resolve_write_encryption, s3_error, s3_error_from_sqlite, s3_error_with_message, sse_s3_output,
-    validate_content_md5, validate_declared_object_write_length, validate_no_sse_headers,
-    validate_no_unsupported_sse_headers, validate_object_acl,
+    stored_tags_from_header, validate_content_md5, validate_declared_object_write_length,
+    validate_no_sse_headers, validate_no_unsupported_sse_headers, validate_object_acl,
 };
 
 /// Normalizes a completed multipart part list while preserving S3 ordering rules.
@@ -956,6 +956,7 @@ pub(super) async fn create_multipart_upload(
         sse_customer_key_md5,
         ssekms_encryption_context,
         ssekms_key_id,
+        tagging,
         ..
     } = req.input;
 
@@ -977,6 +978,7 @@ pub(super) async fn create_multipart_upload(
     })?;
 
     let upload_id = Uuid::new_v4();
+    let tags = stored_tags_from_header(tagging)?;
     let checksum = multipart_checksum_config(checksum_algorithm.clone(), checksum_type)?;
     let explicit_sse_s3 = requested_sse_s3(
         server_side_encryption.as_ref(),
@@ -1016,6 +1018,7 @@ pub(super) async fn create_multipart_upload(
                         .map(|encryption| encryption.stored.clone()),
                 },
             )?;
+            Sqlite::put_multipart_upload_tags(&transaction, upload_id, &tags)?;
             Ok(transaction.commit()?)
         })
         .await

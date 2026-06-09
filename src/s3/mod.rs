@@ -17,25 +17,29 @@ use s3s::{
         CompleteMultipartUploadOutput, CompletedPart, CopyObjectInput, CopyObjectOutput,
         CopyObjectResult, CopyPartResult, CopySource, CreateBucketInput, CreateBucketOutput,
         CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketEncryptionInput,
-        DeleteBucketEncryptionOutput, DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput,
-        DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
-        ETagCondition, Error as DeleteError, GetBucketAclInput, GetBucketAclOutput,
-        GetBucketEncryptionInput, GetBucketEncryptionOutput, GetBucketLocationInput,
-        GetBucketLocationOutput, GetBucketVersioningInput, GetBucketVersioningOutput,
+        DeleteBucketEncryptionOutput, DeleteBucketInput, DeleteBucketOutput,
+        DeleteBucketTaggingInput, DeleteBucketTaggingOutput, DeleteObjectInput, DeleteObjectOutput,
+        DeleteObjectTaggingInput, DeleteObjectTaggingOutput, DeleteObjectsInput,
+        DeleteObjectsOutput, DeletedObject, ETag, ETagCondition, Error as DeleteError,
+        GetBucketAclInput, GetBucketAclOutput, GetBucketEncryptionInput, GetBucketEncryptionOutput,
+        GetBucketLocationInput, GetBucketLocationOutput, GetBucketTaggingInput,
+        GetBucketTaggingOutput, GetBucketVersioningInput, GetBucketVersioningOutput,
         GetObjectAclInput, GetObjectAclOutput, GetObjectAttributesInput, GetObjectAttributesOutput,
-        GetObjectAttributesParts, GetObjectInput, GetObjectOutput, GetObjectTorrentInput,
-        GetObjectTorrentOutput, Grant, Grantee, HeadBucketInput, HeadBucketOutput, HeadObjectInput,
-        HeadObjectOutput, Initiator, ListBucketsInput, ListBucketsOutput,
-        ListMultipartUploadsInput, ListMultipartUploadsOutput, ListObjectVersionsInput,
-        ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
-        ListObjectsV2Output, ListPartsInput, ListPartsOutput, MFADelete, MetadataDirective,
-        MultipartUpload, ObjectAttributes, ObjectCannedACL, ObjectPart, Owner, Part, Permission,
-        PutBucketAclInput, PutBucketAclOutput, PutBucketEncryptionInput, PutBucketEncryptionOutput,
+        GetObjectAttributesParts, GetObjectInput, GetObjectOutput, GetObjectTaggingInput,
+        GetObjectTaggingOutput, GetObjectTorrentInput, GetObjectTorrentOutput, Grant, Grantee,
+        HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, Initiator,
+        ListBucketsInput, ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput,
+        ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput,
+        ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput, MFADelete,
+        MetadataDirective, MultipartUpload, ObjectAttributes, ObjectCannedACL, ObjectPart, Owner,
+        Part, Permission, PutBucketAclInput, PutBucketAclOutput, PutBucketEncryptionInput,
+        PutBucketEncryptionOutput, PutBucketTaggingInput, PutBucketTaggingOutput,
         PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectAclInput, PutObjectAclOutput,
-        PutObjectInput, PutObjectOutput, Range as S3Range, ServerSideEncryption,
-        ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
-        StorageClass, StreamingBlob, Timestamp, Type, UploadPartCopyInput, UploadPartCopyOutput,
-        UploadPartInput, UploadPartOutput,
+        PutObjectInput, PutObjectOutput, PutObjectTaggingInput, PutObjectTaggingOutput,
+        Range as S3Range, ServerSideEncryption, ServerSideEncryptionByDefault,
+        ServerSideEncryptionConfiguration, ServerSideEncryptionRule, StorageClass, StreamingBlob,
+        Tag, TagSet, Tagging, TaggingDirective, TaggingHeader, Timestamp, Type,
+        UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
     },
     header::{
         CONTENT_MD5, CONTENT_TYPE, ETAG, X_AMZ_CONTENT_SHA256, X_AMZ_DECODED_CONTENT_LENGTH,
@@ -107,6 +111,7 @@ mod multipart;
 mod owner;
 mod put;
 mod sse;
+mod tagging;
 
 pub(crate) use self::{
     checksum::{
@@ -115,6 +120,7 @@ pub(crate) use self::{
         encode_hex,
     },
     sse::{SSE_S3_ALGORITHM_CODE, StoredSse, parse_master_key},
+    tagging::StoredTag,
 };
 
 #[cfg(test)]
@@ -147,6 +153,7 @@ use self::{
         require_sse_s3_master_key, resolve_write_encryption, sse_s3_output,
         validate_no_sse_headers, validate_no_unsupported_sse_headers,
     },
+    tagging::{CopyTaggingDirective, copy_tagging_directive, stored_tags_from_header},
 };
 
 /// Returns whether request headers describe an AWS `SigV4` streaming body.
@@ -366,6 +373,16 @@ impl S3 for Sqlite {
         bucket::delete_bucket_encryption(self, req).await
     }
 
+    /// Deletes a bucket's tag set.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id(&req),
+            client_ip = %client_ip(&req), bucket = %req.input.bucket))]
+    async fn delete_bucket_tagging(
+        &self,
+        req: S3Request<DeleteBucketTaggingInput>,
+    ) -> S3Result<S3Response<DeleteBucketTaggingOutput>> {
+        tagging::delete_bucket_tagging(self, req).await
+    }
+
     /// Deletes an object by key.
     #[tracing::instrument(
         skip_all,
@@ -382,6 +399,24 @@ impl S3 for Sqlite {
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         delete::delete_object(self, req).await
+    }
+
+    /// Deletes all tags from an existing object version.
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            version_id = %req.input.version_id.as_deref().unwrap_or("")
+        )
+    )]
+    async fn delete_object_tagging(
+        &self,
+        req: S3Request<DeleteObjectTaggingInput>,
+    ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
+        tagging::delete_object_tagging(self, req).await
     }
 
     /// Deletes a batch of objects and returns S3 multi-delete results.
@@ -431,6 +466,16 @@ impl S3 for Sqlite {
         owner::get_bucket_acl(self, req).await
     }
 
+    /// Returns a bucket's tag set.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id(&req),
+            client_ip = %client_ip(&req), bucket = %req.input.bucket))]
+    async fn get_bucket_tagging(
+        &self,
+        req: S3Request<GetBucketTaggingInput>,
+    ) -> S3Result<S3Response<GetBucketTaggingOutput>> {
+        tagging::get_bucket_tagging(self, req).await
+    }
+
     /// Returns the bucket versioning state.
     #[tracing::instrument(skip_all, fields(user_id = %user_id(&req),
             client_ip = %client_ip(&req), bucket = %req.input.bucket))]
@@ -469,6 +514,24 @@ impl S3 for Sqlite {
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
         get::get_object(self, req).await
+    }
+
+    /// Returns tags for an existing object version.
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            version_id = %req.input.version_id.as_deref().unwrap_or("")
+        )
+    )]
+    async fn get_object_tagging(
+        &self,
+        req: S3Request<GetObjectTaggingInput>,
+    ) -> S3Result<S3Response<GetObjectTaggingOutput>> {
+        tagging::get_object_tagging(self, req).await
     }
 
     /// Reports that `BitTorrent` metadata is not available for the object.
@@ -569,6 +632,16 @@ impl S3 for Sqlite {
         req: S3Request<PutBucketEncryptionInput>,
     ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
         bucket::put_bucket_encryption(self, req).await
+    }
+
+    /// Replaces a bucket's tag set.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id(&req),
+            client_ip = %client_ip(&req), bucket = %req.input.bucket))]
+    async fn put_bucket_tagging(
+        &self,
+        req: S3Request<PutBucketTaggingInput>,
+    ) -> S3Result<S3Response<PutBucketTaggingOutput>> {
+        tagging::put_bucket_tagging(self, req).await
     }
 
     /// Lists all open bucket databases.
@@ -706,6 +779,24 @@ impl S3 for Sqlite {
         req: S3Request<PutObjectAclInput>,
     ) -> S3Result<S3Response<PutObjectAclOutput>> {
         owner::put_object_acl(self, req).await
+    }
+
+    /// Replaces tags on an existing object version.
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            user_id = %user_id(&req),
+            client_ip = %client_ip(&req),
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            version_id = %req.input.version_id.as_deref().unwrap_or("")
+        )
+    )]
+    async fn put_object_tagging(
+        &self,
+        req: S3Request<PutObjectTaggingInput>,
+    ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
+        tagging::put_object_tagging(self, req).await
     }
 
     /// Creates multipart upload state for a future object.

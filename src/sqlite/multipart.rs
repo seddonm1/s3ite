@@ -151,6 +151,11 @@ impl Sqlite {
             write_outcome.sequence,
             &prepared.parts,
         )?;
+        Self::copy_multipart_upload_tags_to_object(
+            transaction,
+            request.upload_id,
+            write_outcome.sequence,
+        )?;
 
         Self::delete_multipart(transaction, request.upload_id)?;
         Self::put_completed_multipart_upload(

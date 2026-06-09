@@ -21,7 +21,7 @@ use crate::database::BucketConnection;
 use crate::s3::{
     ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKind, MultipartChecksumConfig,
     MultipartCompletionChecksum, PartChecksum, SSE_S3_ALGORITHM_CODE, StoredChecksum, StoredSse,
-    decode_base64, encode_hex,
+    StoredTag, decode_base64, encode_hex,
 };
 
 mod bucket;
@@ -32,6 +32,7 @@ mod get;
 mod list;
 mod multipart;
 mod put;
+mod tagging;
 
 use self::checksum::{
     decode_md5_hex, optional_multipart_checksum_config, optional_part_checksum,
@@ -42,7 +43,7 @@ pub use self::error::{SqliteError, SqliteResult};
 
 pub(crate) const NULL_VERSION_ID: &str = "null";
 
-const BUCKET_SCHEMA_VERSION: i32 = 9;
+const BUCKET_SCHEMA_VERSION: i32 = 10;
 pub(crate) const DEFAULT_OBJECT_BLOB_CHUNK_SIZE: usize = 128 * 1024 * 1024;
 const BUCKET_SCHEMA_SQL: &str = "
 -- Singleton bucket metadata, currently the object versioning state.
@@ -50,6 +51,12 @@ CREATE TABLE bucket_state (
     id INTEGER PRIMARY KEY CHECK(id = 1),
     versioning_state INTEGER NOT NULL CHECK(versioning_state IN (0, 1, 2)),
     default_sse_algorithm INTEGER CHECK(default_sse_algorithm IN (1))
+) STRICT;
+
+-- Bucket tags for this bucket database.
+CREATE TABLE bucket_tag (
+    key TEXT NOT NULL PRIMARY KEY,
+    value TEXT NOT NULL
 ) STRICT;
 
 -- Object metadata for every live version and delete marker.
@@ -128,6 +135,15 @@ CREATE INDEX object_version_current_list
 CREATE INDEX object_version_list
     ON object_version(key, sequence DESC);
 
+-- Object tags attached to a specific object version.
+CREATE TABLE object_tag (
+    object_sequence INTEGER NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY (object_sequence, key),
+    FOREIGN KEY (object_sequence) REFERENCES object_version (sequence) ON DELETE CASCADE
+) STRICT;
+
 -- Active multipart upload metadata, ownership, and checksum configuration.
 CREATE TABLE multipart_upload (
     upload_id BLOB NOT NULL PRIMARY KEY,
@@ -183,6 +199,15 @@ CREATE INDEX multipart_upload_list
     ON multipart_upload(key, upload_id);
 CREATE INDEX multipart_upload_expiry
     ON multipart_upload(DATETIME(last_modified));
+
+-- Tags captured at CreateMultipartUpload time until completion materializes an object version.
+CREATE TABLE multipart_upload_tag (
+    upload_id BLOB NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY (upload_id, key),
+    FOREIGN KEY (upload_id) REFERENCES multipart_upload (upload_id) ON DELETE CASCADE
+) STRICT;
 
 -- Logical storage part metadata for object bytes and S3 multipart boundaries.
 CREATE TABLE object_part (
@@ -330,7 +355,7 @@ CREATE INDEX completed_multipart_upload_expiry
 INSERT INTO bucket_state (id, versioning_state)
 VALUES (1, 0);
 
-PRAGMA user_version = 9;
+PRAGMA user_version = 10;
 ";
 
 /// Reads a nonnegative object size column from a row.
@@ -689,6 +714,13 @@ pub(crate) struct ObjectWriteOutcome {
     pub(crate) returned_version_id: Option<String>,
     pub(crate) md5: Option<String>,
     pub(crate) last_modified: OffsetDateTime,
+}
+
+/// Object version selected for tag reads or writes.
+#[derive(Debug)]
+pub(crate) struct ObjectTaggingTarget {
+    pub(crate) sequence: i64,
+    pub(crate) version_id: String,
 }
 
 /// Result of deleting an object or object version.
@@ -1305,8 +1337,11 @@ mod tests {
 
         for table in [
             "bucket_state",
+            "bucket_tag",
             "object_version",
+            "object_tag",
             "multipart_upload",
+            "multipart_upload_tag",
             "object_part",
             "object_blob_chunk",
             "completed_multipart_upload",
@@ -1321,7 +1356,7 @@ mod tests {
     fn schema_foreign_keys_cover_dependent_rows() -> SqliteResult<()> {
         let connection = open_schema()?;
 
-        for table in ["object_part", "object_blob_chunk"] {
+        for table in ["object_part", "object_blob_chunk", "multipart_upload_tag"] {
             let columns = foreign_key_columns(&connection, table)?;
             assert!(
                 columns.contains(&ForeignKeyColumn {
@@ -1345,6 +1380,14 @@ mod tests {
                     && column.on_delete == "CASCADE"
             }));
         }
+
+        let object_tag_columns = foreign_key_columns(&connection, "object_tag")?;
+        assert!(object_tag_columns.iter().any(|column| {
+            column.table == "object_version"
+                && column.from == "object_sequence"
+                && column.to == "sequence"
+                && column.on_delete == "CASCADE"
+        }));
 
         let blob_chunk_columns = foreign_key_columns(&connection, "object_blob_chunk")?;
         assert!(blob_chunk_columns.iter().any(|column| {

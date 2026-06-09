@@ -30,13 +30,16 @@ The supported S3 surface is intentionally focused:
   complete, abort, completed-part reads, and idempotent completion responses.
 - Checksums: `CRC32`, `CRC32C`, `CRC64NVME`, `SHA1`, and `SHA256` request,
   storage, copy, multipart, and response behavior.
+- Tagging: bucket tag create/read/replace/delete, object tag
+  create/read/replace/delete, version-specific object tags, `PutObject` tags,
+  `CopyObject` tag directives, and multipart upload tags.
 - Auth compatibility: signed owner requests, presigned URLs, SigV2/SigV4 edge
   cases, and owner-only ACL reads or owner-equivalent ACL writes.
 
 Out of scope surfaces include IAM, STS, SNS, S3 Select, S3 Control, torrent,
 public or anonymous access, public ACL grants, bucket policies, POST form
-uploads, per-bucket CORS APIs, lifecycle and restore, SSE/encryption, tagging,
-object lock, S3 logging, object ownership controls, public access block, and
+uploads, per-bucket CORS APIs, lifecycle and restore, SSE/encryption, object
+lock, S3 logging, object ownership controls, public access block, and
 multi-owner behavior.
 
 ## Storage Model
