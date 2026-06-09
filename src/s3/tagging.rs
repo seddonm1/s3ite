@@ -512,10 +512,13 @@ mod tests {
     }
 
     #[test]
-    fn header_tags_reject_malformed_pairs_and_percent_encoding() {
-        assert_error_code(
-            stored_tags_from_header(Some("missing-value".to_string())),
-            &S3ErrorCode::InvalidTag,
+    fn header_tags_accept_missing_value_and_reject_bad_percent_encoding() {
+        assert_eq!(
+            require_ok(stored_tags_from_header(Some("missing-value".to_string()))),
+            vec![StoredTag {
+                key: "missing-value".to_string(),
+                value: String::new(),
+            }]
         );
         assert_error_code(
             stored_tags_from_header(Some("bad=%xx".to_string())),

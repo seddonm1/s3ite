@@ -681,7 +681,6 @@ pub(crate) struct EncodedBlobChunk {
 /// Stored object blob chunk loaded directly from storage.
 #[derive(Debug)]
 pub(crate) struct StoredBlobChunk {
-    pub(crate) chunk_number: i32,
     pub(crate) offset: i64,
     pub(crate) size: i64,
     pub(crate) body: Vec<u8>,
@@ -692,7 +691,6 @@ pub(crate) struct StoredBlobChunk {
 impl From<EncodedBlobChunk> for StoredBlobChunk {
     fn from(chunk: EncodedBlobChunk) -> Self {
         Self {
-            chunk_number: chunk.chunk_number,
             offset: chunk.offset,
             size: chunk.size,
             body: chunk.body,
@@ -1489,7 +1487,7 @@ mod tests {
     fn schema_foreign_keys_cover_dependent_rows() -> SqliteResult<()> {
         let connection = open_schema()?;
 
-        for table in ["object_part", "object_blob_chunk", "multipart_upload_tag"] {
+        for table in ["object_part", "object_blob_chunk"] {
             let columns = foreign_key_columns(&connection, table)?;
             assert!(
                 columns.contains(&ForeignKeyColumn {
@@ -1513,6 +1511,15 @@ mod tests {
                     && column.on_delete == "CASCADE"
             }));
         }
+
+        let multipart_upload_tag_columns =
+            foreign_key_columns(&connection, "multipart_upload_tag")?;
+        assert!(multipart_upload_tag_columns.iter().any(|column| {
+            column.table == "multipart_upload"
+                && column.from == "upload_id"
+                && column.to == "upload_id"
+                && column.on_delete == "CASCADE"
+        }));
 
         let object_tag_columns = foreign_key_columns(&connection, "object_tag")?;
         assert!(object_tag_columns.iter().any(|column| {

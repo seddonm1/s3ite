@@ -44,7 +44,7 @@ async fn graceful_shutdown_is_logged() -> Result<()> {
 
     create_bucket(&client, &bucket).await?;
 
-    let log = server.shutdown_and_read_log()?;
+    let log = normalize_log(&server.shutdown_and_read_log()?);
     assert!(log.contains("graceful shutdown completed"));
     assert!(log.contains("server is stopped"));
     assert!(!log.contains("DEBUG"));
@@ -58,24 +58,12 @@ async fn graceful_shutdown_is_logged() -> Result<()> {
 #[serial(conformance)]
 async fn bucket_creation_and_put_object_are_logged() -> Result<()> {
     let server = logged_server().await?;
-    let user_id = server.access_key();
+    let user_id = server.access_key().to_string();
     let client_ip = "127.0.0.1";
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-log");
 
     create_bucket(&client, &bucket).await?;
-    let log = wait_for_log_span_closes(
-        &server,
-        &[format!(
-            "create_bucket{{user_id={user_id} client_ip={client_ip} bucket={bucket}}}"
-        )],
-    )
-    .await?;
-    assert!(log.contains(&bucket));
-    assert!(log.contains(user_id));
-    assert!(log.contains("client_ip=127.0.0.1"));
-    assert!(!log.contains("created bucket"));
-
     client
         .put_object()
         .bucket(&bucket)
@@ -83,30 +71,33 @@ async fn bucket_creation_and_put_object_are_logged() -> Result<()> {
         .body(ByteStream::from_static(b"body"))
         .send()
         .await?;
-    let log = wait_for_log_span_closes(
-        &server,
-        &[format!(
-            "put_object{{user_id={user_id} client_ip={client_ip} bucket={bucket} key=logged-object content_length=4}}"
-        )],
-    )
-    .await?;
-    assert!(log.contains("logged-object"));
-    assert!(!log.contains("write file"));
-    assert!(!log.contains("841a2d689ad86bd1611447453c22c6fc"));
-
     client
         .get_object()
         .bucket(&bucket)
         .key("logged-object")
         .send()
         .await?;
-    let log = wait_for_log_span_closes(
-        &server,
-        &[format!(
-            "get_object{{user_id={user_id} client_ip={client_ip} bucket={bucket} key=logged-object version_id= part_number= range=}}"
-        )],
-    )
-    .await?;
+
+    let log = normalize_log(&server.shutdown_and_read_log()?);
+    assert_log_span_closes(
+        &log,
+        &[
+            format!("create_bucket{{user_id={user_id} client_ip={client_ip} bucket={bucket}}}"),
+            format!(
+                "put_object{{user_id={user_id} client_ip={client_ip} bucket={bucket} key=logged-object content_length=4}}"
+            ),
+            format!(
+                "get_object{{user_id={user_id} client_ip={client_ip} bucket={bucket} key=logged-object version_id= part_number= range=}}"
+            ),
+        ],
+    )?;
+    assert!(log.contains(&bucket));
+    assert!(log.contains(&user_id));
+    assert!(log.contains("client_ip=127.0.0.1"));
+    assert!(log.contains("logged-object"));
+    assert!(!log.contains("created bucket"));
+    assert!(!log.contains("write file"));
+    assert!(!log.contains("841a2d689ad86bd1611447453c22c6fc"));
     assert!(!log.contains("secret-key-for-tests"));
 
     Ok(())
@@ -116,7 +107,7 @@ async fn bucket_creation_and_put_object_are_logged() -> Result<()> {
 #[serial(conformance)]
 async fn multipart_completion_is_logged() -> Result<()> {
     let server = logged_server().await?;
-    let user_id = server.access_key();
+    let user_id = server.access_key().to_string();
     let client_ip = "127.0.0.1";
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-log");
@@ -127,13 +118,13 @@ async fn multipart_completion_is_logged() -> Result<()> {
     let part = upload_part(&client, &bucket, key, &upload_id, 1, b"part-body").await?;
     complete_upload(&client, &bucket, key, &upload_id, vec![part]).await?;
 
-    let log = wait_for_log_span_closes(
-        &server,
+    let log = normalize_log(&server.shutdown_and_read_log()?);
+    assert_log_span_closes(
+        &log,
         &[format!(
             "complete_multipart_upload{{user_id={user_id} client_ip={client_ip} bucket={bucket} key={key} upload_id={upload_id}}}"
         )],
-    )
-    .await?;
+    )?;
     assert!(!log.contains("completed multipart upload"));
     assert!(!log.contains("version_id=null"));
 
@@ -144,7 +135,7 @@ async fn multipart_completion_is_logged() -> Result<()> {
 #[serial(conformance)]
 async fn all_s3_endpoint_trace_closes_are_logged() -> Result<()> {
     let server = logged_server().await?;
-    let user_id = server.access_key();
+    let user_id = server.access_key().to_string();
     let client_ip = "127.0.0.1";
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-log-all");
@@ -405,7 +396,8 @@ async fn all_s3_endpoint_trace_closes_are_logged() -> Result<()> {
             "complete_multipart_upload{{user_id={user_id} client_ip={client_ip} bucket={bucket} key={multipart_key} upload_id={upload_id}}}"
         ),
     ];
-    let log = wait_for_log_span_closes(&server, &expected_spans).await?;
+    let log = normalize_log(&server.shutdown_and_read_log()?);
+    assert_log_span_closes(&log, &expected_spans)?;
     assert!(log.contains("time.busy="));
     assert!(log.contains("time.idle="));
     assert!(!log.contains("secret-key-for-tests"));
@@ -437,6 +429,7 @@ where
         let log = tokio::fs::read_to_string(server.log_path())
             .await
             .with_context(|| format!("read {}", server.log_path().display()))?;
+        let log = normalize_log(&log);
         let missing = needles
             .iter()
             .map(AsRef::as_ref)
@@ -452,48 +445,86 @@ where
     }
 }
 
-async fn wait_for_log_span_closes<S>(server: &TestServer, spans: &[S]) -> Result<String>
+fn assert_log_span_closes<S>(log: &str, spans: &[S]) -> Result<()>
 where
     S: AsRef<str>,
 {
-    // `cargo llvm-cov` instruments both the test and child server process. In
-    // GitHub Actions the synthetic fmt-span close events are not reliably
-    // observable before the coverage run times out, even though normal test
-    // runs see them. Keep exercising the endpoints under coverage, but assert
-    // formatter close lines only in the ordinary logging test path.
-    if coverage_run() {
-        return tokio::fs::read_to_string(server.log_path())
-            .await
-            .with_context(|| format!("read {}", server.log_path().display()));
-    }
-
-    let deadline = Instant::now() + log_timeout();
-    loop {
-        let log = tokio::fs::read_to_string(server.log_path())
-            .await
-            .with_context(|| format!("read {}", server.log_path().display()))?;
-        let missing = spans
-            .iter()
-            .map(AsRef::as_ref)
-            .filter(|span| !has_span_close(&log, span))
-            .collect::<Vec<_>>();
-        if missing.is_empty() {
-            return Ok(log);
-        }
-        if Instant::now() >= deadline {
-            bail!("timed out waiting for span close entries {missing:?}; current log:\n{log}");
-        }
-        tokio::time::sleep(LOG_POLL_INTERVAL).await;
+    let missing = spans
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|span| !has_span_close(log, span))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        bail!("missing span close entries {missing:?}; current log:\n{log}");
     }
 }
 
 fn has_span_close(log: &str, span: &str) -> bool {
+    let Some((span_name, fields)) = expected_span_parts(span) else {
+        return false;
+    };
+
     log.lines().any(|line| {
-        line.contains(span)
+        let line = strip_ansi(line);
+        line.contains(span_name)
+            && fields.iter().all(|field| line.contains(field))
             && line.contains(": close")
             && line.contains("time.busy=")
             && line.contains("time.idle=")
     })
+}
+
+fn expected_span_parts(span: &str) -> Option<(&str, Vec<&str>)> {
+    let (span_name, fields) = span.split_once('{')?;
+    let fields = fields.strip_suffix('}')?;
+    Some((
+        span_name,
+        fields
+            .split(' ')
+            .filter(|field| !field.is_empty())
+            .collect(),
+    ))
+}
+
+fn normalize_log(log: &str) -> String {
+    strip_ansi(log)
+}
+
+fn strip_ansi(value: &str) -> String {
+    let mut stripped = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if matches!(chars.next(), Some('[')) {
+                for ch in chars.by_ref() {
+                    if ('@'..='~').contains(&ch) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            stripped.push(ch);
+        }
+    }
+    stripped
+}
+
+#[test]
+fn span_close_matcher_accepts_formatted_close_line() {
+    let span = "complete_multipart_upload{user_id=s3ite-access-key client_ip=127.0.0.1 bucket=s3ite-log-96a7d607-627d-49f5-a13c-6db07b83c47d key=logged-multipart upload_id=436adf9b-8976-4a58-ac5a-33ab8888e4a2}";
+    let log = "2026-06-09T07:03:32.937262Z  INFO complete_multipart_upload{user_id=s3ite-access-key client_ip=127.0.0.1 bucket=s3ite-log-96a7d607-627d-49f5-a13c-6db07b83c47d key=logged-multipart upload_id=436adf9b-8976-4a58-ac5a-33ab8888e4a2}: s3ite::s3: close time.busy=72.0us time.idle=1.16ms";
+
+    assert!(has_span_close(log, span));
+}
+
+#[test]
+fn span_close_matcher_ignores_ansi_formatting() {
+    let span = "put_object{user_id=s3ite-access-key client_ip=127.0.0.1 bucket=s3ite-log key=logged-object content_length=4}";
+    let log = "\u{1b}[32mINFO\u{1b}[0m put_object{user_id=s3ite-access-key client_ip=127.0.0.1 bucket=s3ite-log key=logged-object content_length=4}: s3ite::s3: close time.busy=1ms time.idle=2ms";
+
+    assert!(has_span_close(log, span));
 }
 
 fn log_timeout() -> Duration {

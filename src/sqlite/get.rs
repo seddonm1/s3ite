@@ -189,7 +189,6 @@ impl Sqlite {
         let mut stmt = transaction.prepare_cached(
             "
             SELECT
-                chunk_number,
                 offset,
                 size,
                 body,
@@ -201,36 +200,30 @@ impl Sqlite {
         )?;
         let mut rows = stmt.query([object_sequence])?;
         let mut chunks = Vec::new();
-        let mut expected_chunk_number = 1;
         let mut expected_offset = 0usize;
 
         while let Some(row) = rows.next()? {
-            let chunk_number = row.get::<_, i32>(0)?;
-            let offset = usize::try_from(row_size(row, 1)?)
+            let offset = usize::try_from(row_size(row, 0)?)
                 .map_err(|_| SqliteError::ObjectBodyInconsistent)?;
-            let size = usize::try_from(row_size(row, 2)?)
+            let size = usize::try_from(row_size(row, 1)?)
                 .map_err(|_| SqliteError::ObjectBodyInconsistent)?;
-            let body = row.get::<_, Vec<u8>>(3)?;
-            let sse_nonce = row.get::<_, Option<Vec<u8>>>(4)?;
-            let sse_tag = row.get::<_, Option<Vec<u8>>>(5)?;
+            let body = row.get::<_, Vec<u8>>(2)?;
+            let sse_nonce = row.get::<_, Option<Vec<u8>>>(3)?;
+            let sse_tag = row.get::<_, Option<Vec<u8>>>(4)?;
 
-            if chunk_number != expected_chunk_number || offset != expected_offset {
+            if offset != expected_offset {
                 return Err(SqliteError::ObjectBodyInconsistent);
             }
             if body.len() != size {
                 return Err(SqliteError::ObjectBodyInconsistent);
             }
             chunks.push(StoredBlobChunk {
-                chunk_number,
                 offset: i64::try_from(offset).map_err(|_| SqliteError::ObjectBodyInconsistent)?,
                 size: i64::try_from(size).map_err(|_| SqliteError::ObjectBodyInconsistent)?,
                 body,
                 sse_nonce,
                 sse_tag,
             });
-            expected_chunk_number = expected_chunk_number
-                .checked_add(1)
-                .ok_or(SqliteError::ObjectBodyInconsistent)?;
             expected_offset = expected_offset
                 .checked_add(size)
                 .ok_or(SqliteError::ObjectBodyInconsistent)?;

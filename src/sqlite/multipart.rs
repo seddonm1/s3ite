@@ -427,7 +427,6 @@ impl Sqlite {
                 return Err(SqliteError::ObjectBodyInconsistent);
             }
             chunks.push(StoredBlobChunk {
-                chunk_number,
                 offset: i64::try_from(offset).map_err(|_| SqliteError::ObjectBodyInconsistent)?,
                 size: i64::try_from(size).map_err(|_| SqliteError::ObjectBodyInconsistent)?,
                 body,

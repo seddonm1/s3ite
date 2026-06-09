@@ -409,10 +409,9 @@ pub(super) fn decrypt_stored_chunks(
     chunks: Vec<StoredBlobChunk>,
 ) -> SqliteResult<Vec<u8>> {
     let mut value = Vec::new();
-    let mut expected_chunk_number = 1_i32;
     let mut expected_offset = 0_i64;
     for chunk in chunks {
-        if chunk.chunk_number != expected_chunk_number || chunk.offset != expected_offset {
+        if chunk.offset != expected_offset {
             return Err(SqliteError::ObjectBodyInconsistent);
         }
         let (Some(nonce), Some(tag)) = (chunk.sse_nonce.as_deref(), chunk.sse_tag.as_deref())
@@ -429,9 +428,6 @@ pub(super) fn decrypt_stored_chunks(
         value.extend_from_slice(&plaintext);
         expected_offset = expected_offset
             .checked_add(chunk.size)
-            .ok_or(SqliteError::ObjectBodyInconsistent)?;
-        expected_chunk_number = expected_chunk_number
-            .checked_add(1)
             .ok_or(SqliteError::ObjectBodyInconsistent)?;
     }
     Ok(value)
