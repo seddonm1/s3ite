@@ -5,7 +5,7 @@ use std::{
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
-use hyper::http::HeaderMap;
+use hyper::http::{HeaderMap, HeaderValue};
 use md5::{Digest, Md5};
 use s3s::{
     S3, S3Error, S3ErrorCode,
@@ -53,7 +53,7 @@ use s3s::{
     },
     header::{
         CONTENT_MD5, CONTENT_TYPE, ETAG, X_AMZ_CONTENT_SHA256, X_AMZ_DECODED_CONTENT_LENGTH,
-        X_AMZ_DELETE_MARKER, X_AMZ_REQUEST_ID,
+        X_AMZ_DELETE_MARKER, X_AMZ_REQUEST_ID, X_AMZ_TAGGING_COUNT,
     },
 };
 use time::OffsetDateTime;

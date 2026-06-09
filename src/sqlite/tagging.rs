@@ -83,6 +83,21 @@ impl Sqlite {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Counts tags for an object version.
+    pub(crate) fn get_object_tag_count(
+        transaction: &Transaction,
+        object_sequence: i64,
+    ) -> SqliteResult<i32> {
+        let mut stmt = transaction.prepare_cached(
+            "
+            SELECT COUNT(*)
+            FROM object_tag
+            WHERE object_sequence = ?1;",
+        )?;
+
+        Ok(stmt.query_row((object_sequence,), |row| row.get(0))?)
+    }
+
     /// Replaces all tags for an object version.
     pub(crate) fn replace_object_tags(
         transaction: &Transaction,

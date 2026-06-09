@@ -450,8 +450,7 @@ async fn test_versioning_obj_suspended_copy() -> Result<()> {
 /// Verifies unversioned buckets list null object versions with pagination.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_list_object_versions_for_unversioned_bucket() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_versioning_obj_plain_null_version_overwrite
+async fn s3ite_list_object_versions_for_unversioned_bucket() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-ver");
@@ -1198,7 +1197,7 @@ async fn test_delete_marker_suspended() -> Result<()> {
 /// Verifies deleted ListObjectVersions markers can still advance pagination.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_list_object_versions_deleted_marker_continues_listing() -> Result<()> {
+async fn s3ite_list_object_versions_deleted_marker_continues_listing() -> Result<()> {
     // Mirrors the s3-tests cleanup pattern that deletes a page before using its version marker.
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);

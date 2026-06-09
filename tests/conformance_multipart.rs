@@ -150,7 +150,7 @@ async fn test_multipart_upload_small() -> Result<()> {
 /// Verifies UploadPart rejects oversized declared bodies before bytes are sent.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_upload_part_oversized_content_length() -> Result<()> {
+async fn s3ite_upload_part_oversized_content_length() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-mpu");
@@ -257,7 +257,7 @@ async fn test_list_multipart_upload_owner() -> Result<()> {
 /// Verifies ListParts paginates parts and rejects malformed or missing upload IDs.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_list_parts_pagination_etags_and_upload_id_errors() -> Result<()> {
+async fn s3ite_list_parts_pagination_etags_and_upload_id_errors() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-mpu");
@@ -330,7 +330,7 @@ async fn test_list_parts_pagination_etags_and_upload_id_errors() -> Result<()> {
 /// Verifies ListMultipartUploads pagination, filtering, and delimiter grouping.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_list_multipart_uploads_prefix_delimiter_and_pagination() -> Result<()> {
+async fn s3ite_list_multipart_uploads_prefix_delimiter_and_pagination() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-mpu");
@@ -505,7 +505,7 @@ async fn test_multipart_upload_size_too_small() -> Result<()> {
 /// Verifies multipart completion reports ETag part counts and rejects out-of-order parts.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_multipart_completion_etag_and_part_order() -> Result<()> {
+async fn s3ite_multipart_completion_etag_and_part_order() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-mpu");
@@ -797,7 +797,7 @@ async fn test_multipart_copy_without_range() -> Result<()> {
 /// Verifies UploadPartCopy source conditionals and missing upload errors.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_upload_part_copy_conditions_and_missing_upload() -> Result<()> {
+async fn s3ite_upload_part_copy_conditions_and_missing_upload() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let source_bucket = bucket_name("s3ite-mpu-src");
@@ -1167,7 +1167,7 @@ async fn test_multipart_single_get_part() -> Result<()> {
 /// Verifies overwrites clear completed multipart part boundaries.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_multipart_part_boundaries_are_cleared_by_put_and_copy() -> Result<()> {
+async fn s3ite_multipart_part_boundaries_are_cleared_by_put_and_copy() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-mpu");
@@ -1323,7 +1323,7 @@ async fn test_multipart_upload_resend_part() -> Result<()> {
 /// Verifies malformed upload IDs map to NoSuchUpload across multipart APIs.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_malformed_upload_ids_are_no_such_upload() -> Result<()> {
+async fn s3ite_malformed_upload_ids_are_no_such_upload() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-mpu");

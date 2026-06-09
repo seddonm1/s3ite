@@ -113,7 +113,7 @@ async fn test_object_checksum_sha256() -> Result<()> {
 /// Verifies explicit SHA256 PutObject checksums suppress default CRC64NVME.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_explicit_sha256_put_suppresses_default_crc64nvme() -> Result<()> {
+async fn s3ite_explicit_sha256_put_suppresses_default_crc64nvme() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-ck");
@@ -205,7 +205,7 @@ async fn test_object_checksum_crc64nvme() -> Result<()> {
 /// Verifies default CRC64NVME checksums appear through HeadObject and attributes.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_default_crc64nvme_for_put_and_attributes() -> Result<()> {
+async fn s3ite_default_crc64nvme_for_put_and_attributes() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-ck");
@@ -256,7 +256,7 @@ async fn test_default_crc64nvme_for_put_and_attributes() -> Result<()> {
 /// Verifies CopyObject gets a default CRC64NVME checksum when the source has no checksum.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_default_crc64nvme_for_copy_object() -> Result<()> {
+async fn s3ite_default_crc64nvme_for_copy_object() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-ck");
@@ -298,7 +298,7 @@ async fn test_default_crc64nvme_for_copy_object() -> Result<()> {
 /// Verifies CopyObject inherits the source checksum algorithm when unspecified.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_copy_object_inherits_source_checksum_algorithm() -> Result<()> {
+async fn s3ite_copy_object_inherits_source_checksum_algorithm() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-ck");
@@ -348,7 +348,7 @@ async fn test_copy_object_inherits_source_checksum_algorithm() -> Result<()> {
 /// Verifies default multipart completion exposes a full-object CRC64NVME checksum.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_default_crc64nvme_for_multipart_completion() -> Result<()> {
+async fn s3ite_default_crc64nvme_for_multipart_completion() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-ck");

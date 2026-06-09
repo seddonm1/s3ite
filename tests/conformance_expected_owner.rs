@@ -25,7 +25,44 @@ const SOURCE_EXPECTED_OWNER_HEADER: &str = "x-amz-source-expected-bucket-owner";
 /// Verifies HeadBucket applies expected-owner matching before bucket existence.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_expected_owner_head_bucket() -> Result<()> {
+async fn test_expected_bucket_owner() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_expected_bucket_owner
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-owner");
+
+    create_bucket(&client, &bucket).await?;
+    put_object(&client, &bucket, "foo", b"bar").await?;
+
+    let list_path = format!("/{}", raw_http::path_segment(&bucket));
+    let denied_list = raw_http::signed_request_with_headers(
+        &server,
+        Method::GET,
+        &list_path,
+        Vec::new(),
+        &[(EXPECTED_OWNER_HEADER, WRONG_OWNER)],
+    )
+    .await?;
+    assert_status(&denied_list, StatusCode::FORBIDDEN);
+
+    let denied_put = raw_http::signed_request_with_headers(
+        &server,
+        Method::PUT,
+        &object_path(&bucket, "bar"),
+        b"coffee".to_vec(),
+        &[(EXPECTED_OWNER_HEADER, WRONG_OWNER)],
+    )
+    .await?;
+    assert_status(&denied_put, StatusCode::FORBIDDEN);
+    assert_missing_raw(&server, &bucket, "bar").await?;
+
+    Ok(())
+}
+
+/// Verifies HeadBucket applies expected-owner matching before bucket existence.
+#[tokio::test]
+#[serial(conformance)]
+async fn s3ite_expected_owner_head_bucket() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-owner");
@@ -71,7 +108,7 @@ async fn test_expected_owner_head_bucket() -> Result<()> {
 /// Verifies expected-owner checks guard object reads and writes without mutation.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_expected_owner_object_io() -> Result<()> {
+async fn s3ite_expected_owner_object_io() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-owner");
@@ -149,7 +186,7 @@ async fn test_expected_owner_object_io() -> Result<()> {
 /// Verifies expected-owner checks guard bucket object listings.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_expected_owner_list_objects() -> Result<()> {
+async fn s3ite_expected_owner_list_objects() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-owner");
@@ -184,7 +221,7 @@ async fn test_expected_owner_list_objects() -> Result<()> {
 /// Verifies CopyObject validates both destination and source expected owners.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_expected_owner_copy_object() -> Result<()> {
+async fn s3ite_expected_owner_copy_object() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-owner");
@@ -251,7 +288,7 @@ async fn test_expected_owner_copy_object() -> Result<()> {
 /// Verifies expected-owner checks guard multipart upload creation.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_expected_owner_create_multipart_upload() -> Result<()> {
+async fn s3ite_expected_owner_create_multipart_upload() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-owner");

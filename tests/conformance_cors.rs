@@ -625,7 +625,7 @@ async fn test_cors_presigned_put_object_with_acl() -> Result<()> {
 /// s3ite-specific: validates rule shapes beyond the direct Ceph CORS ports.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_s3ite_bucket_cors_rejects_invalid_rules() -> Result<()> {
+async fn s3ite_bucket_cors_rejects_invalid_rules() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cors-invalid");
@@ -685,7 +685,7 @@ async fn test_s3ite_bucket_cors_rejects_invalid_rules() -> Result<()> {
 /// s3ite-specific: CORS APIs honor storage and owner guardrails.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_s3ite_bucket_cors_missing_read_only_and_expected_owner_errors() -> Result<()> {
+async fn s3ite_bucket_cors_missing_read_only_and_expected_owner_errors() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cors-errors");
@@ -753,7 +753,7 @@ async fn test_s3ite_bucket_cors_missing_read_only_and_expected_owner_errors() ->
 /// s3ite-specific: bucket CORS is isolated per bucket and overrides fallback.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_s3ite_bucket_cors_is_per_bucket() -> Result<()> {
+async fn s3ite_bucket_cors_is_per_bucket() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket_a = bucket_name("s3ite-cors-a");
@@ -811,7 +811,7 @@ async fn test_s3ite_bucket_cors_is_per_bucket() -> Result<()> {
 /// s3ite-specific: buckets without CORS config still use server-level fallback.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_s3ite_bucket_cors_falls_back_to_server_cors_when_unconfigured() -> Result<()> {
+async fn s3ite_bucket_cors_falls_back_to_server_cors_when_unconfigured() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cors-fallback");

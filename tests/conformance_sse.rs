@@ -6,7 +6,7 @@
 
 mod support;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use aws_sdk_s3::{
     primitives::ByteStream,
     types::{
@@ -19,6 +19,7 @@ use support::{
     assertions::{assert_error_contains, assert_status},
     fixtures::{bucket_name, create_bucket, get_object_bytes, put_object},
     sdk,
+    server::TestServer,
     sse::{
         MIB, assert_object_sse, assert_rejected_without_object, assert_storage_does_not_contain,
         copy_source, object_path, patterned_body, put_plain_object, put_sse_s3_object, signed,
@@ -26,54 +27,91 @@ use support::{
     },
 };
 
-/// Verifies explicit SSE-S3 writes round-trip while stored chunks are encrypted.
-#[tokio::test]
-#[serial(conformance)]
-async fn test_sse_s3_explicit_put_round_trips_and_encrypts_storage() -> Result<()> {
+async fn put_bucket_encryption_s3(client: &aws_sdk_s3::Client, bucket: &str) -> Result<()> {
+    client
+        .put_bucket_encryption()
+        .bucket(bucket)
+        .server_side_encryption_configuration(sse_s3_bucket_configuration()?)
+        .send()
+        .await?;
+    Ok(())
+}
+
+async fn assert_bucket_encryption_missing(client: &aws_sdk_s3::Client, bucket: &str) -> Result<()> {
+    let error = client
+        .get_bucket_encryption()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect_err("bucket encryption should be absent");
+    assert_error_contains(&error, "ServerSideEncryptionConfigurationNotFoundError");
+    Ok(())
+}
+
+fn upload_body(size: usize, seed: u8) -> Vec<u8> {
+    if size == 1 {
+        vec![seed]
+    } else {
+        patterned_body(size, seed)
+    }
+}
+
+fn assert_storage_does_not_contain_large_body(
+    server: &TestServer,
+    bucket: &str,
+    body: &[u8],
+) -> Result<()> {
+    if body.len() > 1 {
+        assert_storage_does_not_contain(server, bucket, body)?;
+    }
+    Ok(())
+}
+
+async fn assert_default_sse_s3_upload(size: usize, seed: u8) -> Result<()> {
     let server = spawn_sse_server().await?;
     let client = sdk::client(&server);
-    let bucket = bucket_name("s3ite-sse-explicit");
-    let key = "put-sse";
-    let body = b"plaintext payload that must not be stored as plaintext";
+    let bucket = bucket_name("s3ite-sse-default");
+    let key = "testobj";
+    let body = upload_body(size, seed);
 
     create_bucket(&client, &bucket).await?;
-    let output = client
+    put_bucket_encryption_s3(&client, &bucket).await?;
+
+    let put = client
         .put_object()
         .bucket(&bucket)
         .key(key)
-        .server_side_encryption(ServerSideEncryption::Aes256)
-        .body(ByteStream::from_static(body))
+        .body(ByteStream::from(body.clone()))
         .send()
         .await?;
     assert_eq!(
-        output.server_side_encryption(),
+        put.server_side_encryption(),
         Some(&ServerSideEncryption::Aes256)
     );
 
-    assert_eq!(get_object_bytes(&client, &bucket, key).await?, body);
-    let head = client.head_object().bucket(&bucket).key(key).send().await?;
+    let get = client.get_object().bucket(&bucket).key(key).send().await?;
     assert_eq!(
-        head.server_side_encryption(),
+        get.server_side_encryption(),
         Some(&ServerSideEncryption::Aes256)
     );
-    assert_storage_does_not_contain(&server, &bucket, body)?;
+    assert_eq!(
+        get.body.collect().await?.into_bytes().as_ref(),
+        body.as_slice()
+    );
+    assert_storage_does_not_contain_large_body(&server, &bucket, &body)?;
 
     Ok(())
 }
 
-/// Verifies explicit SSE-S3 writes an 8 MiB object as encrypted storage.
-#[tokio::test]
-#[serial(conformance)]
-async fn test_sse_s3_explicit_put_8mb_round_trips_and_encrypts_storage() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_sse_s3_encrypted_upload_8mb
+async fn assert_explicit_sse_s3_upload(size: usize, seed: u8) -> Result<()> {
     let server = spawn_sse_server().await?;
     let client = sdk::client(&server);
-    let bucket = bucket_name("s3ite-sse-explicit-8mb");
-    let key = "put-sse-8mb";
-    let body = patterned_body(8 * MIB, b'A');
+    let bucket = bucket_name("s3ite-sse-explicit");
+    let key = "testobj";
+    let body = upload_body(size, seed);
 
     create_bucket(&client, &bucket).await?;
-    let output = client
+    let put = client
         .put_object()
         .bucket(&bucket)
         .key(key)
@@ -82,32 +120,42 @@ async fn test_sse_s3_explicit_put_8mb_round_trips_and_encrypts_storage() -> Resu
         .send()
         .await?;
     assert_eq!(
-        output.server_side_encryption(),
+        put.server_side_encryption(),
         Some(&ServerSideEncryption::Aes256)
     );
 
     assert_eq!(get_object_bytes(&client, &bucket, key).await?, body);
     assert_object_sse(&client, &bucket, key, true).await?;
-    assert_storage_does_not_contain(&server, &bucket, &body)?;
+    assert_storage_does_not_contain_large_body(&server, &bucket, &body)?;
 
     Ok(())
 }
 
-/// Verifies bucket-default SSE-S3 applies to PutObject and multipart uploads.
+/// Verifies PutBucketEncryption accepts an SSE-S3 default configuration.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_sse_s3_bucket_default_put_and_multipart() -> Result<()> {
+async fn test_put_bucket_encryption_s3() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_bucket_encryption_s3
     let server = spawn_sse_server().await?;
     let client = sdk::client(&server);
-    let bucket = bucket_name("s3ite-sse-default");
+    let bucket = bucket_name("s3ite-sse-config");
 
     create_bucket(&client, &bucket).await?;
-    client
-        .put_bucket_encryption()
-        .bucket(&bucket)
-        .server_side_encryption_configuration(sse_s3_bucket_configuration()?)
-        .send()
-        .await?;
+    put_bucket_encryption_s3(&client, &bucket).await
+}
+
+/// Verifies GetBucketEncryption returns an SSE-S3 default configuration.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_get_bucket_encryption_s3() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_get_bucket_encryption_s3
+    let server = spawn_sse_server().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-sse-config");
+
+    create_bucket(&client, &bucket).await?;
+    assert_bucket_encryption_missing(&client, &bucket).await?;
+    put_bucket_encryption_s3(&client, &bucket).await?;
 
     let encryption = client
         .get_bucket_encryption()
@@ -121,27 +169,118 @@ async fn test_sse_s3_bucket_default_put_and_multipart() -> Result<()> {
         .context("bucket encryption response missing SSE default")?;
     assert_eq!(rule.sse_algorithm(), &ServerSideEncryption::Aes256);
 
-    let key = "default-put";
-    let body = b"default encrypted object";
-    let output = client
+    Ok(())
+}
+
+/// Verifies DeleteBucketEncryption removes an SSE-S3 default configuration.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_delete_bucket_encryption_s3() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_delete_bucket_encryption_s3
+    let server = spawn_sse_server().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-sse-config");
+
+    create_bucket(&client, &bucket).await?;
+    client
+        .delete_bucket_encryption()
+        .bucket(&bucket)
+        .send()
+        .await?;
+    put_bucket_encryption_s3(&client, &bucket).await?;
+    client
+        .delete_bucket_encryption()
+        .bucket(&bucket)
+        .send()
+        .await?;
+    assert_bucket_encryption_missing(&client, &bucket).await
+}
+
+/// Verifies bucket-default SSE-S3 writes a 1-byte object.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_sse_s3_default_upload_1b() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_sse_s3_default_upload_1b
+    assert_default_sse_s3_upload(1, b'A').await
+}
+
+/// Verifies bucket-default SSE-S3 writes a 1 KiB object.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_sse_s3_default_upload_1kb() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_sse_s3_default_upload_1kb
+    assert_default_sse_s3_upload(1024, b'B').await
+}
+
+/// Verifies bucket-default SSE-S3 writes a 1 MiB object.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_sse_s3_default_upload_1mb() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_sse_s3_default_upload_1mb
+    assert_default_sse_s3_upload(MIB, b'C').await
+}
+
+/// Verifies bucket-default SSE-S3 writes an 8 MiB object.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_sse_s3_default_upload_8mb() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_sse_s3_default_upload_8mb
+    assert_default_sse_s3_upload(8 * MIB, b'D').await
+}
+
+/// Verifies default SSE-S3 is visible on HeadObject and rejects write SSE headers on HEAD.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_sse_s3_default_method_head() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_sse_s3_default_method_head
+    let server = spawn_sse_server().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-sse-head");
+    let key = "testobj";
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_encryption_s3(&client, &bucket).await?;
+    client
         .put_object()
         .bucket(&bucket)
         .key(key)
-        .body(ByteStream::from_static(body))
+        .body(ByteStream::from(vec![b'A'; 1000]))
         .send()
         .await?;
-    assert_eq!(
-        output.server_side_encryption(),
-        Some(&ServerSideEncryption::Aes256)
-    );
-    assert_eq!(get_object_bytes(&client, &bucket, key).await?, body);
 
-    let multipart_key = "default-multipart";
-    let multipart_body = b"default encrypted multipart body";
+    assert_object_sse(&client, &bucket, key, true).await?;
+    let rejected = signed(
+        &server,
+        Method::HEAD,
+        &object_path(&bucket, key),
+        Vec::new(),
+        &[("x-amz-server-side-encryption", "AES256")],
+    )
+    .await?;
+    assert_status(&rejected, StatusCode::BAD_REQUEST);
+
+    Ok(())
+}
+
+/// Verifies bucket-default SSE-S3 applies to multipart uploads.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_sse_s3_default_multipart_upload() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_sse_s3_default_multipart_upload
+    let server = spawn_sse_server().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-sse-mpu");
+    let key = "multipart_enc";
+    let body = patterned_body(30 * MIB, b'E');
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_encryption_s3(&client, &bucket).await?;
     let create = client
         .create_multipart_upload()
         .bucket(&bucket)
-        .key(multipart_key)
+        .key(key)
+        .content_type("text/plain")
+        .metadata("foo", "bar")
         .send()
         .await?;
     assert_eq!(
@@ -154,91 +293,106 @@ async fn test_sse_s3_bucket_default_put_and_multipart() -> Result<()> {
     let part = client
         .upload_part()
         .bucket(&bucket)
-        .key(multipart_key)
+        .key(key)
         .upload_id(upload_id)
         .part_number(1)
-        .body(ByteStream::from_static(multipart_body))
+        .content_length(body.len().try_into()?)
+        .body(ByteStream::from(body.clone()))
         .send()
         .await?;
-    assert_eq!(
-        part.server_side_encryption(),
-        Some(&ServerSideEncryption::Aes256)
-    );
-    let etag = part
-        .e_tag()
-        .context("UploadPart response missing ETag")?
-        .to_string();
     let completed = CompletedMultipartUpload::builder()
-        .parts(CompletedPart::builder().part_number(1).e_tag(etag).build())
+        .parts(
+            CompletedPart::builder()
+                .part_number(1)
+                .e_tag(part.e_tag().context("UploadPart response missing ETag")?)
+                .build(),
+        )
         .build();
-    let complete = client
+    client
         .complete_multipart_upload()
         .bucket(&bucket)
-        .key(multipart_key)
+        .key(key)
         .upload_id(upload_id)
         .multipart_upload(completed)
         .send()
         .await?;
+
+    let listed = client
+        .list_objects_v2()
+        .bucket(&bucket)
+        .prefix(key)
+        .send()
+        .await?;
+    assert_eq!(listed.contents().len(), 1);
+    assert_eq!(listed.contents()[0].size(), Some(body.len().try_into()?));
+
+    let object = client.get_object().bucket(&bucket).key(key).send().await?;
     assert_eq!(
-        complete.server_side_encryption(),
+        object
+            .metadata()
+            .and_then(|metadata| metadata.get("foo"))
+            .map(String::as_str),
+        Some("bar")
+    );
+    assert_eq!(object.content_type(), Some("text/plain"));
+    assert_eq!(
+        object.server_side_encryption(),
         Some(&ServerSideEncryption::Aes256)
     );
     assert_eq!(
-        get_object_bytes(&client, &bucket, multipart_key).await?,
-        multipart_body
+        object.body.collect().await?.into_bytes().as_ref(),
+        body.as_slice()
     );
-    assert_storage_does_not_contain(&server, &bucket, multipart_body)?;
 
-    client
-        .delete_bucket_encryption()
-        .bucket(&bucket)
-        .send()
-        .await?;
-    let error = match client.get_bucket_encryption().bucket(&bucket).send().await {
-        Ok(_) => bail!("deleted bucket encryption should not be returned"),
-        Err(error) => error,
-    };
-    assert_error_contains(&error, "ServerSideEncryptionConfigurationNotFoundError");
+    for start in [1_000_000_usize, 10_000_000] {
+        let end = start + 999;
+        let ranged = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .range(format!("bytes={start}-{end}"))
+            .send()
+            .await?;
+        assert_eq!(
+            ranged.body.collect().await?.into_bytes().as_ref(),
+            &body[start..=end]
+        );
+    }
+    assert_storage_does_not_contain(&server, &bucket, &body)?;
 
     Ok(())
 }
 
-/// Verifies bucket-default SSE-S3 writes an 8 MiB object as encrypted storage.
+/// Verifies explicit SSE-S3 writes a 1-byte object.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_sse_s3_bucket_default_put_8mb_round_trips_and_encrypts_storage() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_sse_s3_default_upload_8mb
-    let server = spawn_sse_server().await?;
-    let client = sdk::client(&server);
-    let bucket = bucket_name("s3ite-sse-default-8mb");
-    let key = "default-put-8mb";
-    let body = patterned_body(8 * MIB, b'B');
+async fn test_sse_s3_encrypted_upload_1b() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_sse_s3_encrypted_upload_1b
+    assert_explicit_sse_s3_upload(1, b'F').await
+}
 
-    create_bucket(&client, &bucket).await?;
-    client
-        .put_bucket_encryption()
-        .bucket(&bucket)
-        .server_side_encryption_configuration(sse_s3_bucket_configuration()?)
-        .send()
-        .await?;
+/// Verifies explicit SSE-S3 writes a 1 KiB object.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_sse_s3_encrypted_upload_1kb() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_sse_s3_encrypted_upload_1kb
+    assert_explicit_sse_s3_upload(1024, b'G').await
+}
 
-    let output = client
-        .put_object()
-        .bucket(&bucket)
-        .key(key)
-        .body(ByteStream::from(body.clone()))
-        .send()
-        .await?;
-    assert_eq!(
-        output.server_side_encryption(),
-        Some(&ServerSideEncryption::Aes256)
-    );
+/// Verifies explicit SSE-S3 writes a 1 MiB object.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_sse_s3_encrypted_upload_1mb() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_sse_s3_encrypted_upload_1mb
+    assert_explicit_sse_s3_upload(MIB, b'H').await
+}
 
-    assert_eq!(get_object_bytes(&client, &bucket, key).await?, body);
-    assert_object_sse(&client, &bucket, key, true).await?;
-    assert_storage_does_not_contain(&server, &bucket, &body)?;
-
-    Ok(())
+/// Verifies explicit SSE-S3 writes an 8 MiB object.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_sse_s3_encrypted_upload_8mb() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_sse_s3_encrypted_upload_8mb
+    assert_explicit_sse_s3_upload(8 * MIB, b'I').await
 }
 
 /// Verifies CopyObject can copy plaintext into an SSE-S3 destination.
@@ -482,7 +636,7 @@ async fn test_sse_s3_upload_part_copy_encrypted_source_to_encrypted_destination(
 /// Verifies unsupported SSE combinations are rejected without creating objects.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_sse_s3_conflicts_are_rejected_without_side_effects() -> Result<()> {
+async fn s3ite_sse_s3_conflicts_are_rejected_without_side_effects() -> Result<()> {
     let server = spawn_sse_server().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-sse-conflict");

@@ -35,7 +35,7 @@ async fn test_bucket_list_empty() -> Result<()> {
 /// Verifies optional binary startup layers still serve ordinary path-style requests.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_server_domain_and_cors_startup_smoke() -> Result<()> {
+async fn s3ite_server_domain_and_cors_startup_smoke() -> Result<()> {
     let server = TestServer::spawn_with(TestServerOptions {
         domain_name: Some("localhost".to_string()),
         cors: Some("permissive".to_string()),
@@ -53,7 +53,7 @@ async fn test_server_domain_and_cors_startup_smoke() -> Result<()> {
 /// Verifies the binary serves requests when the optional CORS layer is disabled.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_server_without_cors_startup_smoke() -> Result<()> {
+async fn s3ite_server_without_cors_startup_smoke() -> Result<()> {
     let server = TestServer::spawn_with(TestServerOptions {
         cors: Some("disabled".to_string()),
         ..Default::default()
@@ -70,7 +70,7 @@ async fn test_server_without_cors_startup_smoke() -> Result<()> {
 /// Verifies custom CORS settings are applied to preflight and S3 responses.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_server_custom_cors_headers() -> Result<()> {
+async fn s3ite_server_custom_cors_headers() -> Result<()> {
     let server = TestServer::spawn_with(TestServerOptions {
         config: Some(
             "

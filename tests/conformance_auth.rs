@@ -51,7 +51,7 @@ async fn test_object_raw_authenticated() -> Result<()> {
 /// Verifies unsigned object reads are denied by the owner-only auth model.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_owner_unsigned_get_denied() -> Result<()> {
+async fn s3ite_owner_unsigned_get_denied() -> Result<()> {
     let (server, _client, bucket) = shared_object().await?;
 
     let unsigned = raw_http::unsigned_get(&server, &format!("/{bucket}/{SHARED_KEY}")).await?;
@@ -148,7 +148,7 @@ async fn test_object_raw_get_x_amz_expires_out_positive_range() -> Result<()> {
 /// Verifies already-expired presigned GET URLs are rejected.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_presigned_get_expired_start_time_fails() -> Result<()> {
+async fn s3ite_presigned_get_expired_start_time_fails() -> Result<()> {
     let (_server, client, bucket) = shared_object().await?;
     let expired = client
         .get_object()
@@ -170,7 +170,7 @@ async fn test_presigned_get_expired_start_time_fails() -> Result<()> {
 /// Verifies tampered presigned GET URLs are rejected.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_presigned_get_tampered_signature_fails() -> Result<()> {
+async fn s3ite_presigned_get_tampered_signature_fails() -> Result<()> {
     let (_server, client, bucket) = shared_object().await?;
     let presigned = client
         .get_object()
@@ -189,7 +189,7 @@ async fn test_presigned_get_tampered_signature_fails() -> Result<()> {
 /// Verifies presigned PUT accepts owner-equivalent private ACL headers.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_presigned_put_with_private_acl() -> Result<()> {
+async fn test_object_presigned_put_object_with_acl() -> Result<()> {
     // Mirrors s3tests/functional/test_s3.py::test_object_presigned_put_object_with_acl
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
@@ -277,7 +277,7 @@ async fn shared_object() -> Result<(TestServer, Client, String)> {
 /// Verifies synthetic bucket ACL reads return owner full control.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_get_bucket_acl_returns_owner_full_control() -> Result<()> {
+async fn test_bucket_acl_default() -> Result<()> {
     // Mirrors s3tests/functional/test_s3.py::test_bucket_acl_default
     let (_server, client, bucket) = owner_bucket().await?;
     let bucket_acl = client.get_bucket_acl().bucket(&bucket).send().await?;
@@ -311,7 +311,7 @@ async fn test_get_bucket_acl_returns_owner_full_control() -> Result<()> {
 /// Verifies private bucket ACL writes are accepted as owner no-ops.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_put_bucket_acl_private_is_noop() -> Result<()> {
+async fn test_bucket_acl_canned_private_to_private() -> Result<()> {
     // Mirrors s3tests/functional/test_s3.py::test_bucket_acl_canned_private_to_private
     let (_server, client, bucket) = owner_bucket().await?;
     client
@@ -327,7 +327,7 @@ async fn test_put_bucket_acl_private_is_noop() -> Result<()> {
 /// Verifies public bucket ACL writes are rejected as unsupported.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_put_bucket_acl_public_read_is_rejected() -> Result<()> {
+async fn s3ite_put_bucket_acl_public_read_is_rejected() -> Result<()> {
     let (_server, client, bucket) = owner_bucket().await?;
     let error = match client
         .put_bucket_acl()
@@ -347,7 +347,7 @@ async fn test_put_bucket_acl_public_read_is_rejected() -> Result<()> {
 /// Verifies explicit bucket grant ACL headers are rejected.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_put_bucket_acl_grant_header_is_rejected() -> Result<()> {
+async fn s3ite_put_bucket_acl_grant_header_is_rejected() -> Result<()> {
     let (_server, client, bucket) = owner_bucket().await?;
     let error = match client
         .put_bucket_acl()
@@ -367,7 +367,7 @@ async fn test_put_bucket_acl_grant_header_is_rejected() -> Result<()> {
 /// Verifies private object ACL writes are accepted as owner no-ops.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_put_object_private_acl_is_noop() -> Result<()> {
+async fn s3ite_put_object_private_acl_is_noop() -> Result<()> {
     let (_server, client, bucket) = owner_bucket().await?;
     client
         .put_object()
@@ -384,7 +384,7 @@ async fn test_put_object_private_acl_is_noop() -> Result<()> {
 /// Verifies owner-equivalent copy ACL writes are accepted as no-ops.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_copy_object_bucket_owner_full_control_acl_is_noop() -> Result<()> {
+async fn s3ite_copy_object_bucket_owner_full_control_acl_is_noop() -> Result<()> {
     let (_server, client, bucket) = owner_bucket().await?;
     put_object(&client, &bucket, "source.txt", b"owner-only").await?;
 
@@ -403,7 +403,7 @@ async fn test_copy_object_bucket_owner_full_control_acl_is_noop() -> Result<()> 
 /// Verifies synthetic object ACL reads return owner full control.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_get_object_acl_returns_owner_full_control() -> Result<()> {
+async fn test_object_acl_default() -> Result<()> {
     // Mirrors s3tests/functional/test_s3.py::test_object_acl_default
     let (_server, client, bucket, key) = owner_object().await?;
     let object_acl = client
@@ -504,7 +504,7 @@ async fn test_object_put_acl_mtime() -> Result<()> {
 /// Verifies private PutObjectAcl requests are accepted as owner no-ops.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_put_object_acl_private_is_noop() -> Result<()> {
+async fn s3ite_put_object_acl_private_is_noop() -> Result<()> {
     let (_server, client, bucket, key) = owner_object().await?;
     client
         .put_object_acl()
@@ -520,7 +520,7 @@ async fn test_put_object_acl_private_is_noop() -> Result<()> {
 /// Verifies bucket-owner PutObjectAcl requests are accepted as owner no-ops.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_put_object_acl_bucket_owner_full_control_is_noop() -> Result<()> {
+async fn s3ite_put_object_acl_bucket_owner_full_control_is_noop() -> Result<()> {
     let (_server, client, bucket, key) = owner_object().await?;
     client
         .put_object_acl()
@@ -536,7 +536,7 @@ async fn test_put_object_acl_bucket_owner_full_control_is_noop() -> Result<()> {
 /// Verifies public PutObjectAcl requests are rejected as unsupported.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_put_object_acl_public_read_is_rejected() -> Result<()> {
+async fn s3ite_put_object_acl_public_read_is_rejected() -> Result<()> {
     let (_server, client, bucket, key) = owner_object().await?;
     let error = match client
         .put_object_acl()
@@ -557,7 +557,7 @@ async fn test_put_object_acl_public_read_is_rejected() -> Result<()> {
 /// Verifies public object canned ACL writes are rejected.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_put_object_public_read_acl_is_rejected() -> Result<()> {
+async fn s3ite_put_object_public_read_acl_is_rejected() -> Result<()> {
     let (_server, client, bucket) = owner_bucket().await?;
     let error = match client
         .put_object()
@@ -579,7 +579,7 @@ async fn test_put_object_public_read_acl_is_rejected() -> Result<()> {
 /// Verifies public bucket canned ACL creation is rejected.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_create_bucket_public_read_acl_is_rejected() -> Result<()> {
+async fn s3ite_create_bucket_public_read_acl_is_rejected() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-auth-reject");

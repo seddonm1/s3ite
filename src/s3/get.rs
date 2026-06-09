@@ -5,17 +5,18 @@ use std::ops::Range as ByteRange;
 use super::{
     Bytes, ChecksumMode, CompletedObjectPart, ETag, GetObjectAttributesInput,
     GetObjectAttributesOutput, GetObjectAttributesParts, GetObjectInput, GetObjectOutput,
-    GetObjectTorrentInput, GetObjectTorrentOutput, HeadObjectInput, HeadObjectOutput, KeyMetadata,
-    Not, ObjectAttributes, ObjectBodyReference, ObjectPart, ObjectReadConditionFailure,
-    ObjectReadConditions, S3Error, S3ErrorCode, S3Range, S3Request, S3Response, S3Result, Sqlite,
-    SqliteError, SqliteResult, StorageClass, StoredChecksum, StreamExt, StreamingBlob,
-    active_sse_from_stored, checksum_crc32, checksum_crc32c, checksum_crc64nvme,
-    checksum_mode_enabled, checksum_sha1, checksum_sha256, checksum_struct, checksum_type_output,
-    decrypt_stored_chunks, list_limit, not_found_delete_marker_error, not_modified_error,
-    object_checksum_for_part, object_lock_legal_hold_status, object_lock_mode,
-    object_lock_retain_until_date, requested_part_range, s3_error, s3_error_from_sqlite,
-    s3_error_with_message, sse_s3_output, stream, validate_expected_bucket_owner,
-    validate_no_sse_headers, validate_part_number, validate_read_conditions,
+    GetObjectTorrentInput, GetObjectTorrentOutput, HeadObjectInput, HeadObjectOutput, HeaderValue,
+    KeyMetadata, Not, ObjectAttributes, ObjectBodyReference, ObjectPart,
+    ObjectReadConditionFailure, ObjectReadConditions, S3Error, S3ErrorCode, S3Range, S3Request,
+    S3Response, S3Result, Sqlite, SqliteError, SqliteResult, StorageClass, StoredChecksum,
+    StreamExt, StreamingBlob, X_AMZ_TAGGING_COUNT, active_sse_from_stored, checksum_crc32,
+    checksum_crc32c, checksum_crc64nvme, checksum_mode_enabled, checksum_sha1, checksum_sha256,
+    checksum_struct, checksum_type_output, decrypt_stored_chunks, list_limit,
+    not_found_delete_marker_error, not_modified_error, object_checksum_for_part,
+    object_lock_legal_hold_status, object_lock_mode, object_lock_retain_until_date,
+    requested_part_range, s3_error, s3_error_from_sqlite, s3_error_with_message, sse_s3_output,
+    stream, validate_expected_bucket_owner, validate_no_sse_headers, validate_part_number,
+    validate_read_conditions,
 };
 
 use crate::database::{BlobReadReceiver, BucketConnection};
@@ -91,6 +92,7 @@ struct ObjectMetadataRead {
     metadata: KeyMetadata,
     completed_part: Option<CompletedObjectPart>,
     completed_part_count: i32,
+    tag_count: i32,
 }
 
 /// Validates S3 range and `partNumber` request parameters before storage access.
@@ -349,7 +351,7 @@ async fn load_head_object(
     version_id: Option<String>,
     part_number: Option<i32>,
 ) -> S3Result<ObjectMetadataRead> {
-    let (metadata, completed_part, completed_part_count) = connection
+    let (metadata, completed_part, completed_part_count, tag_count) = connection
         .read(move |connection| {
             let transaction = connection.transaction()?;
             let metadata = match version_id.as_deref() {
@@ -361,14 +363,26 @@ async fn load_head_object(
                 None => Sqlite::get_current_metadata(&transaction, &key)?,
             };
             let Some(metadata) = metadata else {
-                return Ok((None, None, 0));
+                return Ok((None, None, 0, 0));
             };
             if metadata.is_delete_marker {
-                return Ok((Some(metadata), None, 0));
+                return Ok((Some(metadata), None, 0, 0));
             }
+            let target = Sqlite::get_object_version_tagging_target(
+                &transaction,
+                &key,
+                &metadata.version_id,
+            )?
+            .ok_or(SqliteError::ObjectVersionNotFound)?;
+            let tag_count = Sqlite::get_object_tag_count(&transaction, target.sequence)?;
             let (completed_part, completed_part_count) =
                 load_completed_part_info(&transaction, &key, &metadata.version_id, part_number)?;
-            Ok((Some(metadata), completed_part, completed_part_count))
+            Ok((
+                Some(metadata),
+                completed_part,
+                completed_part_count,
+                tag_count,
+            ))
         })
         .await
         .map_err(s3_error_from_sqlite)?;
@@ -382,6 +396,7 @@ async fn load_head_object(
         metadata,
         completed_part,
         completed_part_count,
+        tag_count,
     })
 }
 
@@ -658,8 +673,16 @@ pub(super) async fn head_object(
             unmodified_since: if_unmodified_since.map(Into::into),
         },
     )?;
+    let tag_count = read.tag_count;
     let output = head_object_output(read, range.as_ref(), part_number, checksum_mode.as_ref())?;
-    Ok(S3Response::new(output))
+    let mut response = S3Response::new(output);
+    if tag_count > 0 {
+        response.headers.insert(
+            X_AMZ_TAGGING_COUNT,
+            HeaderValue::from_str(&tag_count.to_string()).map_err(S3Error::internal_error)?,
+        );
+    }
+    Ok(response)
 }
 
 /// Builds paginated object-part attributes for `GetObjectAttributes`.

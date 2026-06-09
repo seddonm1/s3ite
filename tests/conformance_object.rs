@@ -128,7 +128,7 @@ async fn test_object_write_check_etag() -> Result<()> {
 /// Verifies PutObject accepts a valid Content-MD5 header.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_write_valid_content_md5() -> Result<()> {
+async fn s3ite_object_write_valid_content_md5() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-obj");
@@ -497,7 +497,7 @@ async fn test_ranged_request_invalid_range() -> Result<()> {
 /// Verifies objects whose key ends with a slash are ordinary objects.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_trailing_slash_round_trip() -> Result<()> {
+async fn s3ite_object_trailing_slash_round_trip() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-obj");
@@ -586,7 +586,7 @@ async fn test_object_write_to_nonexist_bucket() -> Result<()> {
 /// Verifies ordinary non-AWS chunked PutObject is rejected before storage.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_write_with_chunked_transfer_encoding() -> Result<()> {
+async fn s3ite_object_write_with_chunked_transfer_encoding() -> Result<()> {
     // Ceph s3-tests accepts this, but s3ite requires AWS-declared object size before reading bytes.
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
@@ -615,7 +615,7 @@ async fn test_object_write_with_chunked_transfer_encoding() -> Result<()> {
 /// Verifies PutObject rejects missing `Content-Length` without reading a body.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_write_missing_content_length() -> Result<()> {
+async fn s3ite_object_write_missing_content_length() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-obj");
@@ -637,7 +637,7 @@ async fn test_object_write_missing_content_length() -> Result<()> {
 /// Verifies PutObject rejects oversized declared bodies before bytes are sent.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_write_oversized_content_length() -> Result<()> {
+async fn s3ite_object_write_oversized_content_length() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-obj");
@@ -911,7 +911,7 @@ async fn test_object_set_get_metadata_overwrite_to_empty() -> Result<()> {
 /// Verifies RFC-2047 encoded user metadata is decoded before storage.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_rfc2047_metadata_is_decoded_before_storage() -> Result<()> {
+async fn s3ite_object_rfc2047_metadata_is_decoded_before_storage() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-obj");

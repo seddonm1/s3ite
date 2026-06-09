@@ -13,6 +13,10 @@ use super::{
 
 /// Maximum number of S3 tags allowed on one resource.
 const MAX_TAGS: usize = 10;
+/// Maximum S3 tag key length, counted in Unicode scalar values.
+const MAX_TAG_KEY_CHARS: usize = 128;
+/// Maximum S3 tag value length, counted in Unicode scalar values.
+const MAX_TAG_VALUE_CHARS: usize = 256;
 
 /// Normalized S3 tag persisted by storage.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,12 +62,7 @@ pub(super) fn stored_tags_from_header(header: Option<TaggingHeader>) -> S3Result
         header
             .split('&')
             .map(|pair| {
-                let Some((key, value)) = pair.split_once('=') else {
-                    return Err(s3_error_with_message(
-                        S3ErrorCode::InvalidTag,
-                        "tagging header contains a malformed tag",
-                    ));
-                };
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
                 let key = percent_decode_tag_component(key)?;
                 let value = percent_decode_tag_component(value)?;
                 Ok(StoredTag { key, value })
@@ -340,6 +339,14 @@ fn normalize_tags(mut tags: Vec<StoredTag>) -> S3Result<Vec<StoredTag>> {
 
     let mut keys = HashSet::with_capacity(tags.len());
     for tag in &tags {
+        if tag.key.chars().count() > MAX_TAG_KEY_CHARS
+            || tag.value.chars().count() > MAX_TAG_VALUE_CHARS
+        {
+            return Err(s3_error_with_message(
+                S3ErrorCode::InvalidTag,
+                "tag keys cannot exceed 128 characters and tag values cannot exceed 256 characters",
+            ));
+        }
         if !keys.insert(tag.key.as_str()) {
             return Err(s3_error_with_message(
                 S3ErrorCode::InvalidTag,

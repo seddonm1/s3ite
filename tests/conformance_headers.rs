@@ -28,7 +28,7 @@ const BODY: &[u8] = b"bar";
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_create_bad_md5_invalid_short() -> Result<()> {
+async fn s3ite_object_create_bad_md5_invalid_short() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_md5_invalid_short
     let response = put_object_with_header("Content-MD5", "YWJyYWNhZGFicmE=").await?;
     assert_error(response, StatusCode::BAD_REQUEST, "InvalidDigest").await
@@ -36,7 +36,7 @@ async fn test_object_create_bad_md5_invalid_short() -> Result<()> {
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_create_bad_md5_bad() -> Result<()> {
+async fn s3ite_object_create_bad_md5_bad() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_md5_bad
     let response = put_object_with_header("Content-MD5", "rL0Y20xC+Fzt72VPzMSk2A==").await?;
     assert_error(response, StatusCode::BAD_REQUEST, "BadDigest").await
@@ -44,7 +44,7 @@ async fn test_object_create_bad_md5_bad() -> Result<()> {
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_create_bad_md5_empty() -> Result<()> {
+async fn s3ite_object_create_bad_md5_empty() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_md5_empty
     let response = put_object_with_header("Content-MD5", "").await?;
     assert_error(response, StatusCode::BAD_REQUEST, "InvalidDigest").await
@@ -52,7 +52,7 @@ async fn test_object_create_bad_md5_empty() -> Result<()> {
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_create_bad_md5_none() -> Result<()> {
+async fn s3ite_object_create_bad_md5_none() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_md5_none
     let (server, client, bucket) = bucket("s3ite-header-object").await?;
     let key = "foo";
@@ -74,21 +74,21 @@ async fn test_object_create_bad_md5_none() -> Result<()> {
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_create_bad_expect_mismatch() -> Result<()> {
+async fn s3ite_object_create_bad_expect_mismatch() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_expect_mismatch
     assert_successful_put_with_header("Expect", "200").await
 }
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_create_bad_expect_empty() -> Result<()> {
+async fn s3ite_object_create_bad_expect_empty() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_expect_empty
     assert_successful_put_with_header("Expect", "").await
 }
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_create_bad_expect_none() -> Result<()> {
+async fn s3ite_object_create_bad_expect_none() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_expect_none
     let (server, client, bucket) = bucket("s3ite-header-object").await?;
     let key = "foo";
@@ -110,7 +110,7 @@ async fn test_object_create_bad_expect_none() -> Result<()> {
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_create_bad_contentlength_negative() -> Result<()> {
+async fn s3ite_object_create_bad_contentlength_negative() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_contentlength_negative
     let (server, _client, bucket) = bucket("s3ite-header-object").await?;
     let status = raw_http_status(
@@ -125,14 +125,14 @@ async fn test_object_create_bad_contentlength_negative() -> Result<()> {
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_create_bad_contenttype_invalid() -> Result<()> {
+async fn s3ite_object_create_bad_contenttype_invalid() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_contenttype_invalid
     assert_successful_put_with_header("Content-Type", "text/plain").await
 }
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_create_bad_contenttype_empty() -> Result<()> {
+async fn s3ite_object_create_bad_contenttype_empty() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_contenttype_empty
     let (_server, client, bucket) = bucket("s3ite-header-object").await?;
     client
@@ -149,7 +149,7 @@ async fn test_object_create_bad_contenttype_empty() -> Result<()> {
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_create_bad_contenttype_none() -> Result<()> {
+async fn s3ite_object_create_bad_contenttype_none() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_contenttype_none
     let (_server, client, bucket) = bucket("s3ite-header-object").await?;
     put_object(&client, &bucket, "foo", BODY).await?;
@@ -159,7 +159,7 @@ async fn test_object_create_bad_contenttype_none() -> Result<()> {
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_bucket_put_bad_canned_acl() -> Result<()> {
+async fn s3ite_bucket_put_bad_canned_acl() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_bucket_put_bad_canned_acl
     let (server, _client, bucket) = bucket("s3ite-header-bucket").await?;
     let response = raw_http::signed_request_with_headers(
@@ -176,21 +176,21 @@ async fn test_bucket_put_bad_canned_acl() -> Result<()> {
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_bucket_create_bad_expect_mismatch() -> Result<()> {
+async fn s3ite_bucket_create_bad_expect_mismatch() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_bucket_create_bad_expect_mismatch
     assert_successful_create_bucket_with_header("Expect", "200").await
 }
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_bucket_create_bad_expect_empty() -> Result<()> {
+async fn s3ite_bucket_create_bad_expect_empty() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_bucket_create_bad_expect_empty
     assert_successful_create_bucket_with_header("Expect", "").await
 }
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_bucket_create_bad_contentlength_negative() -> Result<()> {
+async fn s3ite_bucket_create_bad_contentlength_negative() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_bucket_create_bad_contentlength_negative
     let server = TestServer::spawn().await?;
     let bucket = bucket_name("s3ite-header-bucket");
@@ -202,7 +202,7 @@ async fn test_bucket_create_bad_contentlength_negative() -> Result<()> {
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_create_bad_md5_invalid_garbage_aws2() -> Result<()> {
+async fn s3ite_object_create_bad_md5_invalid_garbage_aws2() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_md5_invalid_garbage_aws2
     let (server, _client, bucket) = bucket("s3ite-header-object").await?;
     let response = sig_v2_request(
@@ -218,35 +218,35 @@ async fn test_object_create_bad_md5_invalid_garbage_aws2() -> Result<()> {
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_create_bad_ua_empty_aws2() -> Result<()> {
+async fn s3ite_object_create_bad_ua_empty_aws2() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_ua_empty_aws2
     assert_successful_sig_v2_put_with_headers(&[("User-Agent", "")]).await
 }
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_create_bad_ua_none_aws2() -> Result<()> {
+async fn s3ite_object_create_bad_ua_none_aws2() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_ua_none_aws2
     assert_successful_sig_v2_put_with_headers(&[]).await
 }
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_create_bad_date_invalid_aws2() -> Result<()> {
+async fn s3ite_object_create_bad_date_invalid_aws2() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_date_invalid_aws2
     assert_sig_v2_object_date_error("Bad Date", StatusCode::FORBIDDEN, "AccessDenied").await
 }
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_create_bad_date_empty_aws2() -> Result<()> {
+async fn s3ite_object_create_bad_date_empty_aws2() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_date_empty_aws2
     assert_sig_v2_object_date_error("", StatusCode::FORBIDDEN, "AccessDenied").await
 }
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_create_bad_date_before_today_aws2() -> Result<()> {
+async fn s3ite_object_create_bad_date_before_today_aws2() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_date_before_today_aws2
     assert_sig_v2_object_date_error(
         "Tue, 07 Jul 2010 21:53:04 GMT",
@@ -258,7 +258,7 @@ async fn test_object_create_bad_date_before_today_aws2() -> Result<()> {
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_create_bad_date_before_epoch_aws2() -> Result<()> {
+async fn s3ite_object_create_bad_date_before_epoch_aws2() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_date_before_epoch_aws2
     assert_sig_v2_object_date_error(
         "Tue, 07 Jul 1950 21:53:04 GMT",
@@ -270,7 +270,7 @@ async fn test_object_create_bad_date_before_epoch_aws2() -> Result<()> {
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_create_bad_date_after_end_aws2() -> Result<()> {
+async fn s3ite_object_create_bad_date_after_end_aws2() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_date_after_end_aws2
     assert_sig_v2_object_date_error(
         "Tue, 07 Jul 9999 21:53:04 GMT",
@@ -282,21 +282,21 @@ async fn test_object_create_bad_date_after_end_aws2() -> Result<()> {
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_bucket_create_bad_date_invalid_aws2() -> Result<()> {
+async fn s3ite_bucket_create_bad_date_invalid_aws2() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_bucket_create_bad_date_invalid_aws2
     assert_sig_v2_bucket_date_error("Bad Date", StatusCode::FORBIDDEN, "AccessDenied").await
 }
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_bucket_create_bad_date_empty_aws2() -> Result<()> {
+async fn s3ite_bucket_create_bad_date_empty_aws2() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_bucket_create_bad_date_empty_aws2
     assert_sig_v2_bucket_date_error("", StatusCode::FORBIDDEN, "AccessDenied").await
 }
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_bucket_create_bad_date_before_today_aws2() -> Result<()> {
+async fn s3ite_bucket_create_bad_date_before_today_aws2() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_bucket_create_bad_date_before_today_aws2
     assert_sig_v2_bucket_date_error(
         "Tue, 07 Jul 2010 21:53:04 GMT",
@@ -308,7 +308,7 @@ async fn test_bucket_create_bad_date_before_today_aws2() -> Result<()> {
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_bucket_create_bad_date_after_today_aws2() -> Result<()> {
+async fn s3ite_bucket_create_bad_date_after_today_aws2() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_bucket_create_bad_date_after_today_aws2
     assert_sig_v2_bucket_date_error(
         "Tue, 07 Jul 2030 21:53:04 GMT",
@@ -320,7 +320,7 @@ async fn test_bucket_create_bad_date_after_today_aws2() -> Result<()> {
 
 #[tokio::test]
 #[serial(conformance)]
-async fn test_bucket_create_bad_date_before_epoch_aws2() -> Result<()> {
+async fn s3ite_bucket_create_bad_date_before_epoch_aws2() -> Result<()> {
     // Mirrors s3tests/functional/test_headers.py::test_bucket_create_bad_date_before_epoch_aws2
     assert_sig_v2_bucket_date_error(
         "Tue, 07 Jul 1950 21:53:04 GMT",

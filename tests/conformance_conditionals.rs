@@ -195,7 +195,7 @@ async fn test_get_object_ifunmodifiedsince_failed() -> Result<()> {
 /// Verifies 304 conditional read errors preserve the object ETag header.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_get_object_not_modified_errors_include_etag() -> Result<()> {
+async fn s3ite_get_object_not_modified_errors_include_etag() -> Result<()> {
     let (_server, client, bucket, state) = seeded_object().await?;
 
     let error = match client
@@ -238,7 +238,7 @@ async fn test_get_object_not_modified_errors_include_etag() -> Result<()> {
 /// Verifies HeadObject honors the same conditional outcomes as GetObject.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_head_object_conditionals() -> Result<()> {
+async fn s3ite_head_object_conditionals() -> Result<()> {
     let (_server, client, bucket, state) = seeded_object().await?;
 
     client
@@ -317,7 +317,7 @@ async fn test_head_object_conditionals() -> Result<()> {
 /// Verifies a matching If-Match takes precedence over stale If-Unmodified-Since.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_get_object_if_match_allows_stale_if_unmodified_since() -> Result<()> {
+async fn s3ite_get_object_if_match_allows_stale_if_unmodified_since() -> Result<()> {
     let (_server, client, bucket, state) = seeded_object().await?;
 
     let output = client
@@ -1029,7 +1029,7 @@ async fn test_copy_object_ifnonematch_failed() -> Result<()> {
 /// Verifies CopyObject source date conditionals and ETag precedence.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_copy_object_source_date_conditionals() -> Result<()> {
+async fn s3ite_copy_object_source_date_conditionals() -> Result<()> {
     let (_server, client, bucket, state) = seeded_object().await?;
     let copy_source = format!("{bucket}/{KEY}");
 
@@ -1424,7 +1424,7 @@ async fn test_delete_object_if_match_last_modified_time() -> Result<()> {
 /// Verifies DeleteObject conditionals on missing objects remain idempotent.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_delete_object_if_match_missing_is_noop() -> Result<()> {
+async fn s3ite_delete_object_if_match_missing_is_noop() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cond");

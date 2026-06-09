@@ -18,7 +18,9 @@ mod support;
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
-use aws_sdk_s3::types::{ChecksumMode, ObjectLockLegalHoldStatus, ObjectLockMode, Tag};
+use aws_sdk_s3::types::{
+    ChecksumMode, ObjectLockLegalHoldStatus, ObjectLockMode, ServerSideEncryption, Tag,
+};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use hmac::{Hmac, Mac};
 use reqwest::{Response, StatusCode, Url, header};
@@ -30,6 +32,7 @@ use support::{
     fixtures::{bucket_name, create_bucket, get_object_bytes},
     sdk,
     server::TestServer,
+    sse::{spawn_sse_server, sse_s3_bucket_configuration},
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -463,6 +466,35 @@ async fn test_post_object_upload_larger_than_chunk() -> Result<()> {
     Ok(())
 }
 
+/// Verifies POST uploads across the historical RGW chunk boundary are stored.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_post_object_upload_size_rgw_chunk_size_bug() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_post_object_upload_size_rgw_chunk_size_bug
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-post-rgw-chunk");
+    let key = "foo.txt";
+    let rgw_max_chunk_size = 4 * 1024 * 1024;
+    let min_size = rgw_max_chunk_size;
+    let max_size = rgw_max_chunk_size * 3;
+    let body = b"x".repeat(rgw_max_chunk_size + 200);
+
+    create_bucket(&client, &bucket).await?;
+    let response = send_signed_post(
+        &server,
+        &bucket,
+        PostFormOptions::new(key, &body)
+            .extra_fields(vec![field("content-type", "text/plain")])
+            .content_length_range(min_size as u64, max_size as u64),
+    )
+    .await?;
+    assert_status(&response, StatusCode::NO_CONTENT);
+    assert_eq!(get_object_bytes(&client, &bucket, key).await?, body);
+
+    Ok(())
+}
+
 /// Verifies POST can store user metadata from form fields.
 #[tokio::test]
 #[serial(conformance)]
@@ -490,6 +522,158 @@ async fn test_post_object_user_specified_header() -> Result<()> {
         object.metadata().and_then(|metadata| metadata.get("foo")),
         Some(&"barclamp".to_string())
     );
+
+    Ok(())
+}
+
+/// Verifies authenticated POST uploads can persist object tags.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_post_object_tags_authenticated_request() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_post_object_tags_authenticated_request
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-post-tags");
+    let key = "foo.txt";
+    let credential = sigv4_credential(server.access_key());
+    let mut conditions = base_policy_conditions(
+        &bucket,
+        &credential,
+        Some(json!(["starts-with", "$key", "foo"])),
+    );
+    conditions.push(json!(["starts-with", "$Content-Type", "text/plain"]));
+    conditions.push(json!(["content-length-range", 0, 1024]));
+    conditions.push(json!(["starts-with", "$x-amz-tagging", ""]));
+
+    create_bucket(&client, &bucket).await?;
+    let response = send_signed_post(
+        &server,
+        &bucket,
+        PostFormOptions::new(key, b"bar")
+            .extra_fields(vec![
+                field("content-type", "text/plain"),
+                field("x-amz-tagging", "0=0&1=1"),
+            ])
+            .custom_policy(post_policy(conditions)),
+    )
+    .await?;
+    assert_status(&response, StatusCode::NO_CONTENT);
+    assert_eq!(get_object_bytes(&client, &bucket, key).await?, b"bar");
+
+    let tags = client
+        .get_object_tagging()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+    assert_eq!(
+        tag_map(tags.tag_set()),
+        BTreeMap::from([
+            ("0".to_string(), "0".to_string()),
+            ("1".to_string(), "1".to_string())
+        ])
+    );
+
+    Ok(())
+}
+
+/// Verifies POST uploads validate SHA256 checksum form fields.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_post_object_upload_checksum() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_post_object_upload_checksum
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-post-checksum");
+    let key = "foo_cksum_test.txt";
+    let body = b"x".repeat(2 * 1024 * 1024);
+    let checksum = sha256_base64(&body);
+
+    create_bucket(&client, &bucket).await?;
+    let response = send_signed_post(
+        &server,
+        &bucket,
+        PostFormOptions::new(key, &body)
+            .extra_fields(vec![
+                field("content-type", "text/plain"),
+                field("x-amz-checksum-sha256", &checksum),
+            ])
+            .content_length_range(0, 5 * 1024 * 1024),
+    )
+    .await?;
+    assert_status(&response, StatusCode::NO_CONTENT);
+
+    let object = client
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(object.checksum_sha256(), Some(checksum.as_str()));
+    assert_eq!(
+        object.body.collect().await?.into_bytes().as_ref(),
+        body.as_slice()
+    );
+
+    let response = send_signed_post(
+        &server,
+        &bucket,
+        PostFormOptions::new(key, &body)
+            .extra_fields(vec![
+                field("content-type", "text/plain"),
+                field("x-amz-checksum-sha256", "sailorjerry"),
+            ])
+            .content_length_range(0, 5 * 1024 * 1024),
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    Ok(())
+}
+
+/// Verifies bucket-default SSE-S3 applies to authenticated POST uploads.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_sse_s3_default_post_object_authenticated_request() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_sse_s3_default_post_object_authenticated_request
+    let server = spawn_sse_server().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-post-default-sse");
+    let key = "foo.txt";
+    let credential = sigv4_credential(server.access_key());
+    let mut conditions = base_policy_conditions(
+        &bucket,
+        &credential,
+        Some(json!(["starts-with", "$key", "foo"])),
+    );
+    conditions.push(json!(["starts-with", "$Content-Type", "text/plain"]));
+    conditions.push(json!(["starts-with", "$x-amz-server-side-encryption", ""]));
+    conditions.push(json!(["content-length-range", 0, 1024]));
+
+    create_bucket(&client, &bucket).await?;
+    client
+        .put_bucket_encryption()
+        .bucket(&bucket)
+        .server_side_encryption_configuration(sse_s3_bucket_configuration()?)
+        .send()
+        .await?;
+    let response = send_signed_post(
+        &server,
+        &bucket,
+        PostFormOptions::new(key, b"bar")
+            .extra_fields(vec![field("content-type", "text/plain")])
+            .custom_policy(post_policy(conditions)),
+    )
+    .await?;
+    assert_status(&response, StatusCode::NO_CONTENT);
+
+    let object = client.get_object().bucket(&bucket).key(key).send().await?;
+    assert_eq!(
+        object.server_side_encryption(),
+        Some(&ServerSideEncryption::Aes256)
+    );
+    assert_eq!(object.body.collect().await?.into_bytes().as_ref(), b"bar");
 
     Ok(())
 }
@@ -1284,6 +1468,31 @@ async fn test_post_object_missing_conditions_list() -> Result<()> {
         PostFormOptions::new(key, b"bar")
             .extra_fields(vec![field("content-type", "text/plain")])
             .custom_policy(json!({ "expiration": POST_EXPIRATION })),
+    )
+    .await?;
+    assert_post_error(response, StatusCode::BAD_REQUEST, "InvalidPolicyDocument").await?;
+    assert_object_absent(&client, &bucket, key).await?;
+
+    Ok(())
+}
+
+/// Verifies POST policies with an empty condition object are rejected.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_post_object_empty_conditions() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_post_object_empty_conditions
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-post-empty");
+    let key = "foo.txt";
+
+    create_bucket(&client, &bucket).await?;
+    let response = send_signed_post(
+        &server,
+        &bucket,
+        PostFormOptions::new(key, b"bar")
+            .extra_fields(vec![field("content-type", "text/plain")])
+            .custom_policy(post_policy(vec![json!({})])),
     )
     .await?;
     assert_post_error(response, StatusCode::BAD_REQUEST, "InvalidPolicyDocument").await?;

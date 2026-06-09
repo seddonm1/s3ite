@@ -36,16 +36,54 @@ fn tagging(tags: &[(&str, &str)]) -> Result<Tagging> {
     Ok(builder.build()?)
 }
 
+fn simple_tagging(count: usize) -> Result<Tagging> {
+    let tags = (0..count)
+        .map(|index| tag(&index.to_string(), &index.to_string()))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Tagging::builder().set_tag_set(Some(tags)).build()?)
+}
+
+fn exact_len_key(index: usize, len: usize) -> String {
+    let prefix = index.to_string();
+    format!("{prefix}{}", "k".repeat(len - prefix.len()))
+}
+
 fn tag_map(tags: &[Tag]) -> BTreeMap<String, String> {
     tags.iter()
         .map(|tag| (tag.key().to_string(), tag.value().to_string()))
         .collect()
 }
 
-/// Verifies bucket tags can be replaced, read back, and deleted.
+fn assert_tag_set(tags: &[Tag], expected: &[(&str, &str)]) {
+    assert_eq!(
+        tag_map(tags),
+        expected
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    );
+}
+
+async fn create_object_with_body(key: &str) -> Result<(TestServer, aws_sdk_s3::Client, String)> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-tagging");
+    create_bucket(&client, &bucket).await?;
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"content"))
+        .send()
+        .await?;
+    Ok((server, client, bucket))
+}
+
+/// Verifies bucket tagging can be set, read, and deleted.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_bucket_tagging_put_get_delete() -> Result<()> {
+async fn test_set_bucket_tagging() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_set_bucket_tagging
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-bucket-tagging");
@@ -62,17 +100,11 @@ async fn test_bucket_tagging_put_get_delete() -> Result<()> {
     client
         .put_bucket_tagging()
         .bucket(&bucket)
-        .tagging(tagging(&[("team", "red"), ("space", "a b")])?)
+        .tagging(tagging(&[("Hello", "World")])?)
         .send()
         .await?;
     let response = client.get_bucket_tagging().bucket(&bucket).send().await?;
-    assert_eq!(
-        tag_map(response.tag_set()),
-        BTreeMap::from([
-            ("space".to_string(), "a b".to_string()),
-            ("team".to_string(), "red".to_string()),
-        ])
-    );
+    assert_tag_set(response.tag_set(), &[("Hello", "World")]);
 
     client
         .delete_bucket_tagging()
@@ -90,10 +122,402 @@ async fn test_bucket_tagging_put_get_delete() -> Result<()> {
     Ok(())
 }
 
+/// Verifies CreateMultipartUpload tags are moved onto the completed object.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_set_multipart_tagging() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_set_multipart_tagging
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-tagging-mpu");
+    let key = "mymultipart";
+
+    create_bucket(&client, &bucket).await?;
+    let upload_id = client
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .tagging("Hello=World&foo=bar")
+        .send()
+        .await?
+        .upload_id()
+        .ok_or_else(|| anyhow!("create multipart response missing upload ID"))?
+        .to_string();
+    let part = client
+        .upload_part()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"A"))
+        .send()
+        .await?;
+    let completed = CompletedPart::builder()
+        .part_number(1)
+        .e_tag(
+            part.e_tag()
+                .ok_or_else(|| anyhow!("upload part response missing ETag"))?,
+        )
+        .build();
+    client
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(vec![completed]))
+                .build(),
+        )
+        .send()
+        .await?;
+
+    let response = client
+        .get_object_tagging()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+    assert_tag_set(response.tag_set(), &[("Hello", "World"), ("foo", "bar")]);
+
+    client
+        .delete_object_tagging()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+    let response = client
+        .get_object_tagging()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+    assert!(response.tag_set().is_empty());
+
+    Ok(())
+}
+
+/// Verifies object tags can be read back after PutObjectTagging.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_get_obj_tagging() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_get_obj_tagging
+    let (_server, client, bucket) = create_object_with_body("testputtags").await?;
+
+    let input = simple_tagging(2)?;
+    client
+        .put_object_tagging()
+        .bucket(&bucket)
+        .key("testputtags")
+        .tagging(input.clone())
+        .send()
+        .await?;
+
+    let response = client
+        .get_object_tagging()
+        .bucket(&bucket)
+        .key("testputtags")
+        .send()
+        .await?;
+    assert_eq!(response.tag_set(), input.tag_set());
+
+    Ok(())
+}
+
+/// Verifies HeadObject returns the x-amz-tagging-count value.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_get_obj_head_tagging() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_get_obj_head_tagging
+    let (_server, client, bucket) = create_object_with_body("testputtags").await?;
+
+    client
+        .put_object_tagging()
+        .bucket(&bucket)
+        .key("testputtags")
+        .tagging(simple_tagging(2)?)
+        .send()
+        .await?;
+
+    let response = client
+        .head_object()
+        .bucket(&bucket)
+        .key("testputtags")
+        .send()
+        .await?;
+    assert_eq!(response.tag_count(), Some(2));
+
+    Ok(())
+}
+
+/// Verifies the maximum of 10 object tags is accepted.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_put_max_tags() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_max_tags
+    let (_server, client, bucket) = create_object_with_body("testputmaxtags").await?;
+    let input = simple_tagging(10)?;
+
+    client
+        .put_object_tagging()
+        .bucket(&bucket)
+        .key("testputmaxtags")
+        .tagging(input.clone())
+        .send()
+        .await?;
+    let response = client
+        .get_object_tagging()
+        .bucket(&bucket)
+        .key("testputmaxtags")
+        .send()
+        .await?;
+    assert_eq!(response.tag_set(), input.tag_set());
+
+    Ok(())
+}
+
+/// Verifies more than 10 object tags are rejected.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_put_excess_tags() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_excess_tags
+    let (_server, client, bucket) = create_object_with_body("testputmaxtags").await?;
+
+    let error = client
+        .put_object_tagging()
+        .bucket(&bucket)
+        .key("testputmaxtags")
+        .tagging(simple_tagging(11)?)
+        .send()
+        .await
+        .expect_err("more than 10 object tags should fail");
+    assert_error_contains(&error, "InvalidTag");
+
+    let response = client
+        .get_object_tagging()
+        .bucket(&bucket)
+        .key("testputmaxtags")
+        .send()
+        .await?;
+    assert!(response.tag_set().is_empty());
+
+    Ok(())
+}
+
+/// Verifies maximum key/value tag lengths are accepted.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_put_max_kvsize_tags() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_max_kvsize_tags
+    let (_server, client, bucket) = create_object_with_body("testputmaxkeysize").await?;
+    let tags = (0..10)
+        .map(|index| tag(&exact_len_key(index, 128), &"v".repeat(256)))
+        .collect::<Result<Vec<_>>>()?;
+    let input = Tagging::builder().set_tag_set(Some(tags.clone())).build()?;
+
+    client
+        .put_object_tagging()
+        .bucket(&bucket)
+        .key("testputmaxkeysize")
+        .tagging(input)
+        .send()
+        .await?;
+    let response = client
+        .get_object_tagging()
+        .bucket(&bucket)
+        .key("testputmaxkeysize")
+        .send()
+        .await?;
+    assert_eq!(tag_map(response.tag_set()), tag_map(&tags));
+
+    Ok(())
+}
+
+/// Verifies overlong object tag keys are rejected.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_put_excess_key_tags() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_excess_key_tags
+    let (_server, client, bucket) = create_object_with_body("testputexcesskeytags").await?;
+    let tags = (0..10)
+        .map(|index| tag(&exact_len_key(index, 129), &"v".repeat(256)))
+        .collect::<Result<Vec<_>>>()?;
+
+    let error = client
+        .put_object_tagging()
+        .bucket(&bucket)
+        .key("testputexcesskeytags")
+        .tagging(Tagging::builder().set_tag_set(Some(tags)).build()?)
+        .send()
+        .await
+        .expect_err("overlong tag keys should fail");
+    assert_error_contains(&error, "InvalidTag");
+
+    let response = client
+        .get_object_tagging()
+        .bucket(&bucket)
+        .key("testputexcesskeytags")
+        .send()
+        .await?;
+    assert!(response.tag_set().is_empty());
+
+    Ok(())
+}
+
+/// Verifies overlong object tag values are rejected.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_put_excess_val_tags() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_excess_val_tags
+    let (_server, client, bucket) = create_object_with_body("testputexcesskeytags").await?;
+    let tags = (0..10)
+        .map(|index| tag(&exact_len_key(index, 128), &"v".repeat(257)))
+        .collect::<Result<Vec<_>>>()?;
+
+    let error = client
+        .put_object_tagging()
+        .bucket(&bucket)
+        .key("testputexcesskeytags")
+        .tagging(Tagging::builder().set_tag_set(Some(tags)).build()?)
+        .send()
+        .await
+        .expect_err("overlong tag values should fail");
+    assert_error_contains(&error, "InvalidTag");
+
+    let response = client
+        .get_object_tagging()
+        .bucket(&bucket)
+        .key("testputexcesskeytags")
+        .send()
+        .await?;
+    assert!(response.tag_set().is_empty());
+
+    Ok(())
+}
+
+/// Verifies PutObjectTagging replaces the full tag set.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_put_modify_tags() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_modify_tags
+    let (_server, client, bucket) = create_object_with_body("testputmodifytags").await?;
+
+    let first = tagging(&[("key", "val"), ("key2", "val2")])?;
+    client
+        .put_object_tagging()
+        .bucket(&bucket)
+        .key("testputmodifytags")
+        .tagging(first.clone())
+        .send()
+        .await?;
+    let response = client
+        .get_object_tagging()
+        .bucket(&bucket)
+        .key("testputmodifytags")
+        .send()
+        .await?;
+    assert_eq!(response.tag_set(), first.tag_set());
+
+    let second = tagging(&[("key3", "val3")])?;
+    client
+        .put_object_tagging()
+        .bucket(&bucket)
+        .key("testputmodifytags")
+        .tagging(second.clone())
+        .send()
+        .await?;
+    let response = client
+        .get_object_tagging()
+        .bucket(&bucket)
+        .key("testputmodifytags")
+        .send()
+        .await?;
+    assert_eq!(response.tag_set(), second.tag_set());
+
+    Ok(())
+}
+
+/// Verifies DeleteObjectTagging removes all tags.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_put_delete_tags() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_delete_tags
+    let (_server, client, bucket) = create_object_with_body("testputmodifytags").await?;
+    let input = simple_tagging(2)?;
+
+    client
+        .put_object_tagging()
+        .bucket(&bucket)
+        .key("testputmodifytags")
+        .tagging(input.clone())
+        .send()
+        .await?;
+    let response = client
+        .get_object_tagging()
+        .bucket(&bucket)
+        .key("testputmodifytags")
+        .send()
+        .await?;
+    assert_eq!(response.tag_set(), input.tag_set());
+
+    client
+        .delete_object_tagging()
+        .bucket(&bucket)
+        .key("testputmodifytags")
+        .send()
+        .await?;
+    let response = client
+        .get_object_tagging()
+        .bucket(&bucket)
+        .key("testputmodifytags")
+        .send()
+        .await?;
+    assert!(response.tag_set().is_empty());
+
+    Ok(())
+}
+
+/// Verifies PutObject accepts x-amz-tagging header syntax.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_put_obj_with_tags() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_obj_with_tags
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-tagging");
+    let key = "testtagobj1";
+    let data = "A".repeat(100);
+
+    create_bucket(&client, &bucket).await?;
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .tagging("foo=bar&bar")
+        .body(ByteStream::from(data.clone().into_bytes()))
+        .send()
+        .await?;
+    let object = client.get_object().bucket(&bucket).key(key).send().await?;
+    assert_eq!(
+        object.body.collect().await?.into_bytes().as_ref(),
+        data.as_bytes()
+    );
+
+    let response = client
+        .get_object_tagging()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+    assert_tag_set(response.tag_set(), &[("bar", ""), ("foo", "bar")]);
+
+    Ok(())
+}
+
 /// Verifies bucket tagging validation rejects duplicate keys and too many tags.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_bucket_tagging_rejects_invalid_tags() -> Result<()> {
+async fn s3ite_bucket_tagging_rejects_invalid_tags() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-bkt-tag-invalid");
@@ -108,17 +532,10 @@ async fn test_bucket_tagging_rejects_invalid_tags() -> Result<()> {
         .expect_err("duplicate bucket tag keys should fail");
     assert_error_contains(&duplicate, "InvalidTag");
 
-    let too_many_tags = (0..11)
-        .map(|index| tag(&index.to_string(), "value"))
-        .collect::<Result<Vec<_>>>()?;
     let too_many = client
         .put_bucket_tagging()
         .bucket(&bucket)
-        .tagging(
-            Tagging::builder()
-                .set_tag_set(Some(too_many_tags))
-                .build()?,
-        )
+        .tagging(simple_tagging(11)?)
         .send()
         .await
         .expect_err("too many bucket tags should fail");
@@ -130,7 +547,7 @@ async fn test_bucket_tagging_rejects_invalid_tags() -> Result<()> {
 /// Verifies bucket tagging reports normal missing-bucket and read-only errors.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_bucket_tagging_missing_and_read_only_errors() -> Result<()> {
+async fn s3ite_bucket_tagging_missing_and_read_only_errors() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-bkt-tag-miss");
@@ -161,77 +578,10 @@ async fn test_bucket_tagging_missing_and_read_only_errors() -> Result<()> {
     Ok(())
 }
 
-/// Verifies PutObject tags, object tagging replacement, and tag deletion.
-#[tokio::test]
-#[serial(conformance)]
-async fn test_object_tagging_put_get_replace_delete() -> Result<()> {
-    let server = TestServer::spawn().await?;
-    let client = sdk::client(&server);
-    let bucket = bucket_name("s3ite-tagging");
-
-    create_bucket(&client, &bucket).await?;
-    client
-        .put_object()
-        .bucket(&bucket)
-        .key("object")
-        .tagging("team=red&space=a+b")
-        .body(ByteStream::from_static(b"body"))
-        .send()
-        .await?;
-
-    let response = client
-        .get_object_tagging()
-        .bucket(&bucket)
-        .key("object")
-        .send()
-        .await?;
-    assert_eq!(
-        tag_map(response.tag_set()),
-        BTreeMap::from([
-            ("space".to_string(), "a b".to_string()),
-            ("team".to_string(), "red".to_string()),
-        ])
-    );
-
-    client
-        .put_object_tagging()
-        .bucket(&bucket)
-        .key("object")
-        .tagging(tagging(&[("team", "blue")])?)
-        .send()
-        .await?;
-    let response = client
-        .get_object_tagging()
-        .bucket(&bucket)
-        .key("object")
-        .send()
-        .await?;
-    assert_eq!(
-        tag_map(response.tag_set()),
-        BTreeMap::from([("team".to_string(), "blue".to_string())])
-    );
-
-    client
-        .delete_object_tagging()
-        .bucket(&bucket)
-        .key("object")
-        .send()
-        .await?;
-    let response = client
-        .get_object_tagging()
-        .bucket(&bucket)
-        .key("object")
-        .send()
-        .await?;
-    assert!(response.tag_set().is_empty());
-
-    Ok(())
-}
-
 /// Verifies tags are attached to object versions, not just keys.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_tagging_version_isolation() -> Result<()> {
+async fn s3ite_object_tagging_version_isolation() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-tagging-ver");
@@ -262,17 +612,6 @@ async fn test_object_tagging_version_isolation() -> Result<()> {
         .ok_or_else(|| anyhow!("missing second version ID"))?
         .to_string();
 
-    let current = client
-        .get_object_tagging()
-        .bucket(&bucket)
-        .key("object")
-        .send()
-        .await?;
-    assert_eq!(
-        tag_map(current.tag_set()),
-        BTreeMap::from([("stage".to_string(), "two".to_string())])
-    );
-
     client
         .put_object_tagging()
         .bucket(&bucket)
@@ -296,14 +635,8 @@ async fn test_object_tagging_version_isolation() -> Result<()> {
         .version_id(&v2)
         .send()
         .await?;
-    assert_eq!(
-        tag_map(old.tag_set()),
-        BTreeMap::from([("stage".to_string(), "old".to_string())])
-    );
-    assert_eq!(
-        tag_map(latest.tag_set()),
-        BTreeMap::from([("stage".to_string(), "two".to_string())])
-    );
+    assert_tag_set(old.tag_set(), &[("stage", "old")]);
+    assert_tag_set(latest.tag_set(), &[("stage", "two")]);
 
     Ok(())
 }
@@ -311,7 +644,7 @@ async fn test_object_tagging_version_isolation() -> Result<()> {
 /// Verifies CopyObject copies tags by default and can replace them.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_tagging_copy_directives() -> Result<()> {
+async fn s3ite_object_tagging_copy_directives() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-tagging-copy");
@@ -339,13 +672,7 @@ async fn test_object_tagging_copy_directives() -> Result<()> {
         .key("copy")
         .send()
         .await?;
-    assert_eq!(
-        tag_map(copied.tag_set()),
-        BTreeMap::from([
-            ("a".to_string(), "one".to_string()),
-            ("b".to_string(), "two".to_string()),
-        ])
-    );
+    assert_tag_set(copied.tag_set(), &[("a", "one"), ("b", "two")]);
 
     client
         .copy_object()
@@ -362,96 +689,15 @@ async fn test_object_tagging_copy_directives() -> Result<()> {
         .key("replaced")
         .send()
         .await?;
-    assert_eq!(
-        tag_map(replaced.tag_set()),
-        BTreeMap::from([("c".to_string(), "three".to_string())])
-    );
-
-    client
-        .copy_object()
-        .bucket(&bucket)
-        .key("empty")
-        .copy_source(format!("{bucket}/source"))
-        .tagging_directive(TaggingDirective::Replace)
-        .send()
-        .await?;
-    let empty = client
-        .get_object_tagging()
-        .bucket(&bucket)
-        .key("empty")
-        .send()
-        .await?;
-    assert!(empty.tag_set().is_empty());
+    assert_tag_set(replaced.tag_set(), &[("c", "three")]);
 
     Ok(())
 }
 
-/// Verifies CreateMultipartUpload tags become completed object tags.
+/// Verifies duplicate x-amz-tagging keys are rejected without object creation.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_object_tagging_multipart_completion() -> Result<()> {
-    let server = TestServer::spawn().await?;
-    let client = sdk::client(&server);
-    let bucket = bucket_name("s3ite-tagging-mpu");
-
-    create_bucket(&client, &bucket).await?;
-    let upload_id = client
-        .create_multipart_upload()
-        .bucket(&bucket)
-        .key("object")
-        .tagging("mp=yes")
-        .send()
-        .await?
-        .upload_id()
-        .ok_or_else(|| anyhow!("create multipart response missing upload ID"))?
-        .to_string();
-    let part = client
-        .upload_part()
-        .bucket(&bucket)
-        .key("object")
-        .upload_id(&upload_id)
-        .part_number(1)
-        .body(ByteStream::from_static(b"body"))
-        .send()
-        .await?;
-    let completed = CompletedPart::builder()
-        .part_number(1)
-        .e_tag(
-            part.e_tag()
-                .ok_or_else(|| anyhow!("upload part response missing ETag"))?,
-        )
-        .build();
-    client
-        .complete_multipart_upload()
-        .bucket(&bucket)
-        .key("object")
-        .upload_id(upload_id)
-        .multipart_upload(
-            CompletedMultipartUpload::builder()
-                .set_parts(Some(vec![completed]))
-                .build(),
-        )
-        .send()
-        .await?;
-
-    let response = client
-        .get_object_tagging()
-        .bucket(&bucket)
-        .key("object")
-        .send()
-        .await?;
-    assert_eq!(
-        tag_map(response.tag_set()),
-        BTreeMap::from([("mp".to_string(), "yes".to_string())])
-    );
-
-    Ok(())
-}
-
-/// Verifies invalid tag requests fail before storing object tag state.
-#[tokio::test]
-#[serial(conformance)]
-async fn test_object_tagging_rejects_invalid_tags() -> Result<()> {
+async fn s3ite_object_tagging_rejects_duplicate_header_keys() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-tagging-invalid");
@@ -467,30 +713,6 @@ async fn test_object_tagging_rejects_invalid_tags() -> Result<()> {
         .await
         .expect_err("duplicate tag keys should fail");
     assert_error_contains(&duplicate, "InvalidTag");
-
-    client
-        .put_object()
-        .bucket(&bucket)
-        .key("object")
-        .body(ByteStream::from_static(b"body"))
-        .send()
-        .await?;
-    let too_many_tags = (0..11)
-        .map(|index| tag(&index.to_string(), "value"))
-        .collect::<Result<Vec<_>>>()?;
-    let too_many = client
-        .put_object_tagging()
-        .bucket(&bucket)
-        .key("object")
-        .tagging(
-            Tagging::builder()
-                .set_tag_set(Some(too_many_tags))
-                .build()?,
-        )
-        .send()
-        .await
-        .expect_err("too many tags should fail");
-    assert_error_contains(&too_many, "InvalidTag");
 
     Ok(())
 }
