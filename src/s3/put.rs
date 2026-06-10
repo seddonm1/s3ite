@@ -125,6 +125,17 @@ fn validate_put_object_acl_input(input: &PutObjectInput) -> S3Result<()> {
     })
 }
 
+fn requested_put_object_sse_s3(input: &PutObjectInput) -> S3Result<bool> {
+    requested_sse_s3(
+        input.server_side_encryption.as_ref(),
+        input.ssekms_key_id.is_some() || input.ssekms_encryption_context.is_some(),
+        input.sse_customer_algorithm.is_some()
+            || input.sse_customer_key.is_some()
+            || input.sse_customer_key_md5.is_some(),
+        input.bucket_key_enabled.is_some(),
+    )
+}
+
 /// Builds the S3 `PutObject` response from the stored object identity.
 fn put_object_output(
     md5: String,
@@ -301,6 +312,40 @@ async fn put_plain_object(
     ))
 }
 
+async fn write_put_object(
+    sqlite: &Sqlite,
+    body: StreamingBlob,
+    content_md5: ContentMd5Input<'_>,
+    checksum_input: ChecksumInput,
+    context: PutObjectWriteContext,
+    explicit_sse_s3: bool,
+) -> S3Result<PutObjectOutput> {
+    let chunk_size = sqlite.blob_chunk_size();
+    let encryption = resolve_write_encryption(sqlite, &context.bucket, explicit_sse_s3).await?;
+    if let Some(encryption) = encryption {
+        put_encrypted_object(
+            sqlite,
+            body,
+            content_md5,
+            checksum_input,
+            chunk_size,
+            encryption,
+            context,
+        )
+        .await
+    } else {
+        put_plain_object(
+            sqlite,
+            body,
+            content_md5,
+            checksum_input,
+            chunk_size,
+            context,
+        )
+        .await
+    }
+}
+
 /// Stores an object body and metadata.
 pub(super) async fn put_object(
     sqlite: &Sqlite,
@@ -311,6 +356,7 @@ pub(super) async fn put_object(
     validate_no_unsupported_sse_headers(&headers)?;
     validate_put_object_bucket(sqlite, &input.bucket).await?;
     validate_put_object_acl_input(&input)?;
+    let explicit_sse_s3 = requested_put_object_sse_s3(&input)?;
 
     let PutObjectInput {
         body,
@@ -322,7 +368,6 @@ pub(super) async fn put_object(
         content_length,
         content_md5,
         content_type,
-        bucket_key_enabled,
         checksum_algorithm,
         checksum_crc32,
         checksum_crc32c,
@@ -335,24 +380,10 @@ pub(super) async fn put_object(
         object_lock_legal_hold_status,
         object_lock_mode,
         object_lock_retain_until_date,
-        server_side_encryption,
-        sse_customer_algorithm,
-        sse_customer_key,
-        sse_customer_key_md5,
-        ssekms_encryption_context,
-        ssekms_key_id,
         storage_class,
         tagging,
         ..
     } = input;
-    let explicit_sse_s3 = requested_sse_s3(
-        server_side_encryption.as_ref(),
-        ssekms_key_id.is_some() || ssekms_encryption_context.is_some(),
-        sse_customer_algorithm.is_some()
-            || sse_customer_key.is_some()
-            || sse_customer_key_md5.is_some(),
-        bucket_key_enabled.is_some(),
-    )?;
     let write_conditions = object_write_conditions(if_match, if_none_match);
     let content_encoding = normalize_content_encoding(content_encoding);
     let metadata = normalize_metadata(metadata);
@@ -399,29 +430,14 @@ pub(super) async fn put_object(
         tags,
         object_lock,
     };
-    let chunk_size = sqlite.blob_chunk_size();
-    let encryption = resolve_write_encryption(sqlite, &context.bucket, explicit_sse_s3).await?;
-    let output = if let Some(encryption) = encryption {
-        put_encrypted_object(
-            sqlite,
-            body,
-            content_md5,
-            checksum_input,
-            chunk_size,
-            encryption,
-            context,
-        )
-        .await?
-    } else {
-        put_plain_object(
-            sqlite,
-            body,
-            content_md5,
-            checksum_input,
-            chunk_size,
-            context,
-        )
-        .await?
-    };
+    let output = write_put_object(
+        sqlite,
+        body,
+        content_md5,
+        checksum_input,
+        context,
+        explicit_sse_s3,
+    )
+    .await?;
     Ok(S3Response::new(output))
 }

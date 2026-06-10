@@ -1,9 +1,239 @@
-use super::{Not, ObjectSummary, Sqlite, SqliteResult, Transaction, row_bool, row_size, sql_limit};
+use super::{
+    Not, ObjectSummary, ObjectVersionListEntry, ObjectVersionListPage, Sqlite, SqliteResult,
+    Transaction, row_bool, row_size, sql_limit,
+};
 
-#[derive(Debug)]
-enum VersionMarker {
-    Existing(i64),
-    Deleted,
+const MARKER_NONE: i64 = 0;
+const MARKER_KEY_ONLY: i64 = 1;
+const MARKER_EXISTING_VERSION: i64 = 2;
+const MARKER_DELETED_VERSION: i64 = 3;
+const OBJECT_ENTRY_KIND: i64 = 0;
+const COMMON_PREFIX_ENTRY_KIND: i64 = 1;
+
+const OBJECT_VERSION_ENTRY_LIST_SQL: &str = "
+WITH filtered AS (
+    SELECT
+        sequence,
+        key,
+        version_id,
+        size,
+        last_modified,
+        md5,
+        is_latest,
+        is_delete_marker,
+        CASE
+            WHEN :delimiter = '' THEN NULL
+            WHEN instr(substr(key, length(:prefix) + 1), :delimiter) = 0 THEN NULL
+            ELSE substr(
+                key,
+                1,
+                length(:prefix)
+                    + instr(substr(key, length(:prefix) + 1), :delimiter)
+                    + length(:delimiter)
+                    - 1
+            )
+        END AS common_prefix
+    FROM object_version
+    WHERE
+        (
+            :prefix = ''
+            OR (
+                key >= :prefix
+                AND substr(key, 1, length(:prefix)) = :prefix
+            )
+        )
+        AND (
+            :marker_kind = 0
+            OR (:marker_kind = 1 AND key > :after_key)
+            OR (
+                :marker_kind = 2
+                AND (
+                    key > :after_key
+                    OR (key = :after_key AND sequence < :after_sequence)
+                )
+            )
+            OR (:marker_kind = 3 AND key >= :after_key)
+        )
+),
+prefix_rows AS (
+    SELECT
+        *,
+        row_number() OVER (
+            PARTITION BY common_prefix
+            ORDER BY key, sequence DESC
+        ) AS prefix_rank
+    FROM filtered
+    WHERE common_prefix IS NOT NULL
+)
+SELECT
+    entry_kind,
+    key,
+    version_id,
+    size,
+    last_modified,
+    md5,
+    is_latest,
+    is_delete_marker,
+    common_prefix,
+    marker_key,
+    marker_version_id
+FROM (
+    SELECT
+        0 AS entry_kind,
+        key,
+        version_id,
+        size,
+        last_modified,
+        md5,
+        is_latest,
+        is_delete_marker,
+        NULL AS common_prefix,
+        key AS marker_key,
+        version_id AS marker_version_id,
+        key AS sort_key,
+        sequence AS sort_sequence
+    FROM filtered
+    WHERE common_prefix IS NULL
+
+    UNION ALL
+
+    SELECT
+        1 AS entry_kind,
+        NULL AS key,
+        NULL AS version_id,
+        NULL AS size,
+        NULL AS last_modified,
+        NULL AS md5,
+        NULL AS is_latest,
+        NULL AS is_delete_marker,
+        common_prefix,
+        key AS marker_key,
+        version_id AS marker_version_id,
+        common_prefix AS sort_key,
+        sequence AS sort_sequence
+    FROM prefix_rows
+    WHERE
+        prefix_rank = 1
+        AND (:after_key IS NULL OR common_prefix > :after_key)
+)
+ORDER BY sort_key, sort_sequence DESC
+LIMIT :limit;";
+
+impl ObjectVersionListEntry {
+    fn marker(&self) -> (&str, &str) {
+        match self {
+            Self::Object(summary) => (&summary.key, &summary.version_id),
+            Self::CommonPrefix {
+                marker_key,
+                marker_version_id,
+                ..
+            } => (marker_key, marker_version_id),
+        }
+    }
+}
+
+fn object_version_list_page(
+    mut entries: Vec<ObjectVersionListEntry>,
+    limit: i64,
+) -> ObjectVersionListPage {
+    if limit == 0 {
+        return ObjectVersionListPage {
+            entries: Vec::new(),
+            next_key_marker: None,
+            next_version_id_marker: None,
+            is_truncated: false,
+        };
+    }
+
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let is_truncated = entries.len() > limit;
+    if is_truncated {
+        entries.truncate(limit);
+    }
+    let (next_key_marker, next_version_id_marker) = if is_truncated {
+        entries.last().map_or((None, None), |entry| {
+            let (key, version_id) = entry.marker();
+            (Some(key.to_string()), Some(version_id.to_string()))
+        })
+    } else {
+        (None, None)
+    };
+
+    ObjectVersionListPage {
+        entries,
+        next_key_marker,
+        next_version_id_marker,
+        is_truncated,
+    }
+}
+
+fn object_version_marker_state(
+    transaction: &Transaction,
+    after_key: Option<&str>,
+    after_version_id: Option<&str>,
+) -> SqliteResult<(i64, Option<i64>)> {
+    let after_sequence = match (after_key, after_version_id) {
+        (Some(key), Some(version_id)) => {
+            Sqlite::find_version_sequence(transaction, key, version_id)?
+        }
+        _ => None,
+    };
+    let marker_kind = match (after_key, after_version_id, after_sequence) {
+        (Some(_), Some(_), Some(_)) => MARKER_EXISTING_VERSION,
+        (Some(_), Some(_), None) => MARKER_DELETED_VERSION,
+        (Some(_), None, _) => MARKER_KEY_ONLY,
+        (None, _, _) => MARKER_NONE,
+    };
+
+    Ok((marker_kind, after_sequence))
+}
+
+fn object_version_entry_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ObjectVersionListEntry> {
+    let entry_kind: i64 = row.get(0)?;
+    match entry_kind {
+        OBJECT_ENTRY_KIND => Ok(ObjectVersionListEntry::Object(ObjectSummary {
+            key: row.get(1)?,
+            version_id: row.get(2)?,
+            size: row_size(row, 3)?,
+            last_modified: row.get(4)?,
+            md5: row.get(5)?,
+            is_latest: row_bool(row, 6)?,
+            is_delete_marker: row_bool(row, 7)?,
+        })),
+        COMMON_PREFIX_ENTRY_KIND => Ok(ObjectVersionListEntry::CommonPrefix {
+            prefix: row.get(8)?,
+            marker_key: row.get(9)?,
+            marker_version_id: row.get(10)?,
+        }),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+fn query_object_version_entries(
+    transaction: &Transaction,
+    prefix: &str,
+    delimiter: &str,
+    marker_kind: i64,
+    after_key: Option<&str>,
+    after_sequence: Option<i64>,
+    fetch_limit: i64,
+) -> SqliteResult<Vec<ObjectVersionListEntry>> {
+    let mut stmt = transaction.prepare_cached(OBJECT_VERSION_ENTRY_LIST_SQL)?;
+    let rows = stmt.query_map(
+        rusqlite::named_params! {
+            ":prefix": prefix,
+            ":delimiter": delimiter,
+            ":marker_kind": marker_kind,
+            ":after_key": after_key,
+            ":after_sequence": after_sequence,
+            ":limit": fetch_limit,
+        },
+        object_version_entry_from_row,
+    )?;
+
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 impl Sqlite {
@@ -62,97 +292,36 @@ impl Sqlite {
         Ok(objects)
     }
 
-    /// Lists object versions ordered by key and newest version first.
-    pub(crate) fn list_object_versions(
+    /// Lists object versions and collapsed common prefixes as emitted page entries.
+    pub(crate) fn list_object_version_entries(
         transaction: &Transaction,
-        prefix: Option<&str>,
+        prefix: &str,
+        delimiter: Option<&str>,
         after_key: Option<&str>,
         after_version_id: Option<&str>,
         limit: i64,
-    ) -> SqliteResult<Vec<ObjectSummary>> {
-        let after_marker = match (after_key, after_version_id) {
-            (Some(key), Some(version_id)) => Some(
-                match Self::find_version_sequence(transaction, key, version_id)? {
-                    Some(sequence) => VersionMarker::Existing(sequence),
-                    None => VersionMarker::Deleted,
-                },
-            ),
-            _ => None,
-        };
+    ) -> SqliteResult<ObjectVersionListPage> {
         let limit = sql_limit(limit)?;
-        let prefix = prefix.and_then(|prefix| prefix.is_empty().not().then_some(prefix));
-        let map_summary = |row: &rusqlite::Row<'_>| {
-            Ok(ObjectSummary {
-                key: row.get(0)?,
-                version_id: row.get(1)?,
-                size: row_size(row, 2)?,
-                last_modified: row.get(3)?,
-                md5: row.get(4)?,
-                is_latest: row_bool(row, 5)?,
-                is_delete_marker: row_bool(row, 6)?,
-            })
-        };
+        if limit == 0 {
+            return Ok(object_version_list_page(Vec::new(), limit));
+        }
 
-        let versions = match (prefix, after_key, after_marker) {
-            (Some(prefix), Some(after_key), Some(VersionMarker::Existing(after_sequence))) => {
-                let mut stmt = transaction.prepare_cached(
-                    "SELECT key, version_id, size, last_modified, md5, is_latest, is_delete_marker FROM object_version WHERE key >= ?1 AND (key > ?2 OR (key = ?2 AND sequence < ?3)) ORDER BY key, sequence DESC LIMIT ?4;",
-                )?;
-                stmt.query_map((prefix, after_key, after_sequence, limit), map_summary)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            }
-            (Some(prefix), Some(after_key), Some(VersionMarker::Deleted)) => {
-                let mut stmt = transaction.prepare_cached(
-                    "SELECT key, version_id, size, last_modified, md5, is_latest, is_delete_marker FROM object_version WHERE key >= ?1 AND key >= ?2 ORDER BY key, sequence DESC LIMIT ?3;",
-                )?;
-                stmt.query_map((prefix, after_key, limit), map_summary)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            }
-            (Some(prefix), Some(after_key), None) => {
-                let mut stmt = transaction.prepare_cached(
-                    "SELECT key, version_id, size, last_modified, md5, is_latest, is_delete_marker FROM object_version WHERE key >= ?1 AND key > ?2 ORDER BY key, sequence DESC LIMIT ?3;",
-                )?;
-                stmt.query_map((prefix, after_key, limit), map_summary)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            }
-            (Some(prefix), None, _) => {
-                let mut stmt = transaction.prepare_cached(
-                    "SELECT key, version_id, size, last_modified, md5, is_latest, is_delete_marker FROM object_version WHERE key >= ?1 ORDER BY key, sequence DESC LIMIT ?2;",
-                )?;
-                stmt.query_map((prefix, limit), map_summary)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            }
-            (None, Some(after_key), Some(VersionMarker::Existing(after_sequence))) => {
-                let mut stmt = transaction.prepare_cached(
-                    "SELECT key, version_id, size, last_modified, md5, is_latest, is_delete_marker FROM object_version WHERE key > ?1 OR (key = ?1 AND sequence < ?2) ORDER BY key, sequence DESC LIMIT ?3;",
-                )?;
-                stmt.query_map((after_key, after_sequence, limit), map_summary)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            }
-            (None, Some(after_key), Some(VersionMarker::Deleted)) => {
-                let mut stmt = transaction.prepare_cached(
-                    "SELECT key, version_id, size, last_modified, md5, is_latest, is_delete_marker FROM object_version WHERE key >= ?1 ORDER BY key, sequence DESC LIMIT ?2;",
-                )?;
-                stmt.query_map((after_key, limit), map_summary)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            }
-            (None, Some(after_key), None) => {
-                let mut stmt = transaction.prepare_cached(
-                    "SELECT key, version_id, size, last_modified, md5, is_latest, is_delete_marker FROM object_version WHERE key > ?1 ORDER BY key, sequence DESC LIMIT ?2;",
-                )?;
-                stmt.query_map((after_key, limit), map_summary)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            }
-            (None, None, _) => {
-                let mut stmt = transaction.prepare_cached(
-                    "SELECT key, version_id, size, last_modified, md5, is_latest, is_delete_marker FROM object_version ORDER BY key, sequence DESC LIMIT ?1;",
-                )?;
-                stmt.query_map([limit], map_summary)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            }
-        };
+        let (marker_kind, after_sequence) =
+            object_version_marker_state(transaction, after_key, after_version_id)?;
+        let delimiter = delimiter
+            .filter(|delimiter| delimiter.is_empty().not())
+            .unwrap_or("");
+        let entries = query_object_version_entries(
+            transaction,
+            prefix,
+            delimiter,
+            marker_kind,
+            after_key,
+            after_sequence,
+            limit.saturating_add(1),
+        )?;
 
-        Ok(versions)
+        Ok(object_version_list_page(entries, limit))
     }
 }
 
@@ -244,6 +413,34 @@ mod tests {
         assert!(matches!(result, Err(SqliteError::Rusqlite(_))));
     }
 
+    fn object_entry(entry: &ObjectVersionListEntry) -> (&str, &str, bool) {
+        match entry {
+            ObjectVersionListEntry::Object(summary) => (
+                summary.key.as_str(),
+                summary.version_id.as_str(),
+                summary.is_delete_marker,
+            ),
+            ObjectVersionListEntry::CommonPrefix { .. } => {
+                panic!("expected object version entry")
+            }
+        }
+    }
+
+    fn common_prefix_entry(entry: &ObjectVersionListEntry) -> (&str, &str, &str) {
+        match entry {
+            ObjectVersionListEntry::CommonPrefix {
+                prefix,
+                marker_key,
+                marker_version_id,
+            } => (
+                prefix.as_str(),
+                marker_key.as_str(),
+                marker_version_id.as_str(),
+            ),
+            ObjectVersionListEntry::Object(_) => panic!("expected common prefix entry"),
+        }
+    }
+
     #[test]
     fn lists_current_live_objects_with_keyset_bounds() {
         let mut connection = open_schema();
@@ -314,7 +511,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_versions_in_key_and_newest_first_order() {
+    fn lists_version_entries_with_page_markers() {
         let mut connection = open_schema();
         let transaction = must(connection.transaction());
         must(Sqlite::put_bucket_versioning_state(
@@ -331,60 +528,100 @@ mod tests {
         ));
         let beta_v1 = put_object(&transaction, "beta", b"one");
 
-        let all = must(Sqlite::list_object_versions(
+        let page = must(Sqlite::list_object_version_entries(
             &transaction,
+            "",
             None,
             None,
             None,
-            10,
+            2,
         ));
+        assert!(page.is_truncated);
+        assert_eq!(page.next_key_marker.as_deref(), Some("alpha"));
         assert_eq!(
-            all.iter()
-                .map(|summary| (
-                    summary.key.as_str(),
-                    summary.version_id.as_str(),
-                    summary.is_latest,
-                    summary.is_delete_marker,
-                ))
-                .collect::<Vec<_>>(),
+            page.next_version_id_marker.as_deref(),
+            Some(alpha_v2.as_str())
+        );
+        assert_eq!(
+            page.entries.iter().map(object_entry).collect::<Vec<_>>(),
             vec![
-                ("alpha", "alpha-delete", true, true),
-                ("alpha", alpha_v2.as_str(), false, false),
-                ("alpha", alpha_v1.as_str(), false, false),
-                ("beta", beta_v1.as_str(), true, false),
+                ("alpha", "alpha-delete", true),
+                ("alpha", alpha_v2.as_str(), false),
             ]
         );
 
-        let after_delete = Sqlite::list_object_versions(
+        let page = must(Sqlite::list_object_version_entries(
             &transaction,
+            "",
             None,
-            Some("alpha"),
-            Some("alpha-delete"),
+            page.next_key_marker.as_deref(),
+            page.next_version_id_marker.as_deref(),
             10,
-        )
-        .ok();
+        ));
+        assert!(page.is_truncated.not());
         assert_eq!(
-            after_delete.as_ref().map(|versions| versions
-                .iter()
-                .map(|summary| summary.version_id.as_str())
-                .collect::<Vec<_>>()),
-            Some(vec![alpha_v2.as_str(), alpha_v1.as_str(), beta_v1.as_str()])
-        );
-
-        let after_middle =
-            Sqlite::list_object_versions(&transaction, None, Some("alpha"), Some(&alpha_v2), 10)
-                .ok();
-        assert_eq!(
-            after_middle.as_ref().map(|versions| versions
-                .iter()
-                .map(|summary| summary.version_id.as_str())
-                .collect::<Vec<_>>()),
-            Some(vec![alpha_v1.as_str(), beta_v1.as_str()])
+            page.entries.iter().map(object_entry).collect::<Vec<_>>(),
+            vec![
+                ("alpha", alpha_v1.as_str(), false),
+                ("beta", beta_v1.as_str(), false),
+            ]
         );
     }
 
     #[test]
-    fn treats_missing_version_marker_as_deleted_marker_position() {
+    fn list_version_entries_collapse_common_prefixes() {
+        let mut connection = open_schema();
+        let transaction = must(connection.transaction());
+        must(Sqlite::put_bucket_versioning_state(
+            &transaction,
+            BucketVersioningState::Enabled,
+        ));
+
+        put_object(&transaction, "version/dir/a", b"one");
+        put_object(&transaction, "version/dir/a", b"two");
+        let dir_latest = put_object(&transaction, "version/dir/a", b"three");
+        put_object(&transaction, "version/dir/b", b"one");
+        let file = put_object(&transaction, "version/file", b"one");
+
+        let page = must(Sqlite::list_object_version_entries(
+            &transaction,
+            "version/",
+            Some("/"),
+            None,
+            None,
+            1,
+        ));
+        assert!(page.is_truncated);
+        assert_eq!(
+            page.entries
+                .iter()
+                .map(common_prefix_entry)
+                .collect::<Vec<_>>(),
+            vec![("version/dir/", "version/dir/a", dir_latest.as_str())]
+        );
+        assert_eq!(page.next_key_marker.as_deref(), Some("version/dir/a"));
+        assert_eq!(
+            page.next_version_id_marker.as_deref(),
+            Some(dir_latest.as_str())
+        );
+
+        let page = must(Sqlite::list_object_version_entries(
+            &transaction,
+            "version/",
+            Some("/"),
+            page.next_key_marker.as_deref(),
+            page.next_version_id_marker.as_deref(),
+            10,
+        ));
+        assert!(page.is_truncated.not());
+        assert_eq!(
+            page.entries.iter().map(object_entry).collect::<Vec<_>>(),
+            vec![("version/file", file.as_str(), false)]
+        );
+    }
+
+    #[test]
+    fn list_version_entries_treat_missing_marker_as_deleted_position() {
         let mut connection = open_schema();
         let transaction = must(connection.transaction());
         must(Sqlite::put_bucket_versioning_state(
@@ -396,51 +633,65 @@ mod tests {
         let alpha_v2 = put_object(&transaction, "alpha", b"two");
         let beta_v1 = put_object(&transaction, "beta", b"one");
 
-        let after_deleted_marker = Sqlite::list_object_versions(
+        let page = must(Sqlite::list_object_version_entries(
             &transaction,
+            "",
             None,
             Some("alpha"),
             Some("deleted-marker-no-longer-present"),
             10,
-        )
-        .ok();
+        ));
         assert_eq!(
-            after_deleted_marker.as_ref().map(|versions| versions
-                .iter()
-                .map(|summary| summary.version_id.as_str())
-                .collect::<Vec<_>>()),
-            Some(vec![alpha_v2.as_str(), alpha_v1.as_str(), beta_v1.as_str()])
+            page.entries.iter().map(object_entry).collect::<Vec<_>>(),
+            vec![
+                ("alpha", alpha_v2.as_str(), false),
+                ("alpha", alpha_v1.as_str(), false),
+                ("beta", beta_v1.as_str(), false),
+            ]
         );
 
-        let after_key_only = must(Sqlite::list_object_versions(
+        let page = must(Sqlite::list_object_version_entries(
             &transaction,
+            "",
             None,
             Some("alpha"),
             None,
             10,
         ));
         assert_eq!(
-            after_key_only
-                .iter()
-                .map(|summary| summary.version_id.as_str())
-                .collect::<Vec<_>>(),
-            vec![beta_v1.as_str()]
+            page.entries.iter().map(object_entry).collect::<Vec<_>>(),
+            vec![("beta", beta_v1.as_str(), false)]
         );
 
-        let prefix_after_key_only = must(Sqlite::list_object_versions(
+        let page = must(Sqlite::list_object_version_entries(
             &transaction,
-            Some("alpha"),
+            "alpha",
+            None,
             Some("alpha"),
             None,
             10,
         ));
-        assert_eq!(
-            prefix_after_key_only
-                .iter()
-                .map(|summary| summary.version_id.as_str())
-                .collect::<Vec<_>>(),
-            vec![beta_v1.as_str()]
-        );
+        assert!(page.entries.is_empty());
+    }
+
+    #[test]
+    fn list_version_entries_accept_zero_limit() {
+        let mut connection = open_schema();
+        let transaction = must(connection.transaction());
+        put_object(&transaction, "key", b"value");
+
+        let page = must(Sqlite::list_object_version_entries(
+            &transaction,
+            "",
+            Some("/"),
+            None,
+            None,
+            0,
+        ));
+        assert!(page.entries.is_empty());
+        assert!(page.next_key_marker.is_none());
+        assert!(page.next_version_id_marker.is_none());
+        assert!(page.is_truncated.not());
     }
 
     #[test]
@@ -458,11 +709,19 @@ mod tests {
         }
 
         for result in [
-            Sqlite::list_object_versions(&transaction, Some("a"), Some("b"), None, 1),
-            Sqlite::list_object_versions(&transaction, Some("a"), None, None, 1),
-            Sqlite::list_object_versions(&transaction, None, Some("b"), None, 1),
-            Sqlite::list_object_versions(&transaction, None, None, None, 1),
-            Sqlite::list_object_versions(&transaction, None, Some("b"), Some("v"), 1),
+            Sqlite::list_object_version_entries(&transaction, "a", None, Some("b"), None, 1),
+            Sqlite::list_object_version_entries(&transaction, "a", None, None, None, 1),
+            Sqlite::list_object_version_entries(&transaction, "", None, Some("b"), None, 1),
+            Sqlite::list_object_version_entries(&transaction, "", None, None, None, 1),
+            Sqlite::list_object_version_entries(&transaction, "", None, Some("b"), Some("v"), 1),
+            Sqlite::list_object_version_entries(
+                &transaction,
+                "a",
+                Some("/"),
+                Some("b"),
+                Some("v"),
+                1,
+            ),
         ] {
             assert_rusqlite_error(&result);
         }
@@ -494,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn list_versions_rejects_malformed_rows_and_limits() {
+    fn list_version_entries_reject_malformed_rows_and_limits() {
         let mut connection = must(Connection::open_in_memory());
         create_loose_object_version_table(&connection);
         must(connection.execute(
@@ -515,15 +774,17 @@ mod tests {
         ));
 
         let transaction = must(connection.transaction());
-        assert_rusqlite_error(&Sqlite::list_object_versions(
+        assert_rusqlite_error(&Sqlite::list_object_version_entries(
             &transaction,
+            "",
             None,
             None,
             None,
             1,
         ));
-        assert_rusqlite_error(&Sqlite::list_object_versions(
+        assert_rusqlite_error(&Sqlite::list_object_version_entries(
             &transaction,
+            "",
             None,
             None,
             None,

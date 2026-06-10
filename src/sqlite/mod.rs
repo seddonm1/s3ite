@@ -776,6 +776,26 @@ pub(crate) struct ObjectSummary {
     pub(crate) is_delete_marker: bool,
 }
 
+/// Storage-level entry emitted by object-version listing.
+#[derive(Debug)]
+pub(crate) enum ObjectVersionListEntry {
+    Object(ObjectSummary),
+    CommonPrefix {
+        prefix: String,
+        marker_key: String,
+        marker_version_id: String,
+    },
+}
+
+/// Page of storage-level object-version listing entries.
+#[derive(Debug)]
+pub(crate) struct ObjectVersionListPage {
+    pub(crate) entries: Vec<ObjectVersionListEntry>,
+    pub(crate) next_key_marker: Option<String>,
+    pub(crate) next_version_id_marker: Option<String>,
+    pub(crate) is_truncated: bool,
+}
+
 /// ETag-like object identity condition evaluated by the storage layer.
 #[derive(Clone, Debug)]
 pub(crate) enum ObjectTagCondition {

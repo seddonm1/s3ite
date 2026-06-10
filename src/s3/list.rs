@@ -9,7 +9,7 @@ use s3s::{
     },
 };
 
-use crate::sqlite::{ObjectSummary, Sqlite};
+use crate::sqlite::{ObjectSummary, ObjectVersionListEntry, Sqlite};
 
 use super::{
     CONTINUATION_TOKEN_PREFIX, LIST_BATCH_SIZE, hex, owner, s3_error, s3_error_from_sqlite,
@@ -196,15 +196,6 @@ pub(super) struct KeyListing {
     is_truncated: bool,
 }
 
-pub(super) struct ObjectVersionListing {
-    versions: Vec<ObjectSummary>,
-    delete_markers: Vec<ObjectSummary>,
-    common_prefixes: Vec<CommonPrefix>,
-    next_key_marker: Option<String>,
-    next_version_id_marker: Option<String>,
-    is_truncated: bool,
-}
-
 impl Sqlite {
     /// Lists keys and common prefixes using S3 prefix, delimiter, and marker semantics.
     async fn list_keys(
@@ -318,153 +309,6 @@ impl Sqlite {
             is_truncated,
         })
     }
-
-    /// Lists object versions and common prefixes using S3 version marker semantics.
-    #[allow(clippy::too_many_lines)]
-    async fn list_versions(
-        &self,
-        bucket: &str,
-        prefix_filter: &str,
-        delimiter_filter: Option<&str>,
-        mut after_key: Option<String>,
-        mut after_version_id: Option<String>,
-        max_keys: usize,
-    ) -> S3Result<ObjectVersionListing> {
-        let mut versions = Vec::new();
-        let mut delete_markers = Vec::new();
-        let mut common_prefixes = Vec::new();
-        let mut seen_common_prefixes = HashSet::new();
-        let marker_filter = after_key.clone();
-        let mut next_key_marker = None;
-        let mut next_version_id_marker = None;
-        let mut count = 0usize;
-        let mut is_truncated = false;
-        let list_batch_len = usize::try_from(LIST_BATCH_SIZE).map_err(S3Error::internal_error)?;
-
-        if max_keys == 0 {
-            self.get_connection(bucket)
-                .await
-                .map_err(s3_error_from_sqlite)?;
-        } else {
-            'pages: loop {
-                let prefix = prefix_filter.to_string();
-                let after_key_query = after_key.clone();
-                let after_version_id_query = after_version_id.clone();
-                let summaries = {
-                    let connection = self
-                        .get_connection(bucket)
-                        .await
-                        .map_err(s3_error_from_sqlite)?;
-                    connection
-                        .read(move |transaction| {
-                            Self::list_version_page(
-                                transaction,
-                                &prefix,
-                                after_key_query.as_deref(),
-                                after_version_id_query.as_deref(),
-                            )
-                        })
-                        .await
-                        .map_err(s3_error_from_sqlite)?
-                };
-
-                if summaries.is_empty() {
-                    break;
-                }
-
-                let summary_count = summaries.len();
-                for summary in summaries {
-                    if prefix_filter.is_empty().not()
-                        && summary.key.starts_with(prefix_filter).not()
-                    {
-                        break 'pages;
-                    }
-
-                    let scanned_key = summary.key.clone();
-                    let scanned_version_id = summary.version_id.clone();
-                    if let Some(common_prefix) =
-                        common_prefix_for_key(&summary.key, prefix_filter, delimiter_filter)
-                    {
-                        if marker_filter
-                            .as_ref()
-                            .is_some_and(|marker| common_prefix.as_str() <= marker.as_str())
-                        {
-                            after_key = Some(scanned_key);
-                            after_version_id = Some(scanned_version_id);
-                            continue;
-                        }
-
-                        if seen_common_prefixes.contains(&common_prefix) {
-                            after_key = Some(scanned_key);
-                            after_version_id = Some(scanned_version_id);
-                            continue;
-                        }
-
-                        if count == max_keys {
-                            is_truncated = true;
-                            break 'pages;
-                        }
-
-                        seen_common_prefixes.insert(common_prefix.clone());
-                        common_prefixes.push(CommonPrefix {
-                            prefix: Some(common_prefix),
-                        });
-                        next_key_marker = Some(scanned_key.clone());
-                        next_version_id_marker = Some(scanned_version_id.clone());
-                        count += 1;
-                        after_key = Some(scanned_key);
-                        after_version_id = Some(scanned_version_id);
-                        continue;
-                    }
-
-                    if count == max_keys {
-                        is_truncated = true;
-                        break 'pages;
-                    }
-
-                    next_key_marker = Some(scanned_key.clone());
-                    next_version_id_marker = Some(scanned_version_id.clone());
-                    after_key = Some(scanned_key);
-                    after_version_id = Some(scanned_version_id);
-                    if summary.is_delete_marker {
-                        delete_markers.push(summary);
-                    } else {
-                        versions.push(summary);
-                    }
-                    count += 1;
-                }
-
-                if summary_count < list_batch_len {
-                    break;
-                }
-            }
-        }
-
-        Ok(ObjectVersionListing {
-            versions,
-            delete_markers,
-            common_prefixes,
-            next_key_marker,
-            next_version_id_marker,
-            is_truncated,
-        })
-    }
-
-    /// Reads one storage page for `ListObjectVersions`.
-    fn list_version_page(
-        transaction: &rusqlite::Transaction<'_>,
-        prefix: &str,
-        after_key: Option<&str>,
-        after_version_id: Option<&str>,
-    ) -> rusqlite::Result<Vec<ObjectSummary>, crate::sqlite::SqliteError> {
-        Self::list_object_versions(
-            transaction,
-            Some(prefix),
-            after_key,
-            after_version_id,
-            LIST_BATCH_SIZE,
-        )
-    }
 }
 
 /// Lists objects using the original `ListObjects` marker protocol.
@@ -574,7 +418,6 @@ pub(super) async fn list_object_versions(
     delimiter = delimiter.map(decode_list_input_value);
 
     let max_keys = max_keys.unwrap_or(1000).clamp(0, 1000);
-    let max_keys_usize = usize::try_from(max_keys).map_err(S3Error::internal_error)?;
     let key_marker_clone = key_marker.clone();
     let version_id_marker_clone = version_id_marker.clone();
     let prefix_filter = prefix.clone().unwrap_or_default();
@@ -586,51 +429,66 @@ pub(super) async fn list_object_versions(
     let delimiter = output_delimiter(delimiter);
     let owner = owner();
 
-    let listing = sqlite
-        .list_versions(
-            &bucket,
-            &prefix_filter,
-            delimiter_filter.as_deref(),
-            key_marker.clone(),
-            version_id_marker.clone(),
-            max_keys_usize,
-        )
-        .await?;
-    let versions = listing
-        .versions
-        .into_iter()
-        .map(|summary| object_version_from_summary(summary, encode_keys, Some(&owner)))
-        .collect::<Vec<_>>();
-    let delete_markers = listing
-        .delete_markers
-        .into_iter()
-        .map(|summary| delete_marker_from_summary(summary, encode_keys, Some(&owner)))
-        .collect::<Vec<_>>();
+    let prefix_query = prefix_filter.clone();
+    let delimiter_query = delimiter_filter.clone();
+    let key_marker_query = key_marker.clone();
+    let version_id_marker_query = version_id_marker.clone();
+    let connection = sqlite
+        .get_connection(&bucket)
+        .await
+        .map_err(s3_error_from_sqlite)?;
+    let listing = connection
+        .read(move |transaction| {
+            Sqlite::list_object_version_entries(
+                transaction,
+                &prefix_query,
+                delimiter_query.as_deref(),
+                key_marker_query.as_deref(),
+                version_id_marker_query.as_deref(),
+                i64::from(max_keys),
+            )
+        })
+        .await
+        .map_err(s3_error_from_sqlite)?;
+
+    let mut versions = Vec::new();
+    let mut delete_markers = Vec::new();
+    let mut common_prefixes = Vec::new();
+    for entry in listing.entries {
+        match entry {
+            ObjectVersionListEntry::Object(summary) if summary.is_delete_marker => {
+                delete_markers.push(delete_marker_from_summary(
+                    summary,
+                    encode_keys,
+                    Some(&owner),
+                ));
+            }
+            ObjectVersionListEntry::Object(summary) => {
+                versions.push(object_version_from_summary(
+                    summary,
+                    encode_keys,
+                    Some(&owner),
+                ));
+            }
+            ObjectVersionListEntry::CommonPrefix { prefix, .. } => {
+                common_prefixes.push(CommonPrefix {
+                    prefix: Some(encode_list_value(prefix, encode_keys)),
+                });
+            }
+        }
+    }
 
     let next_key_marker = listing
         .next_key_marker
-        .filter(|_| listing.is_truncated)
         .map(|marker| encode_list_value(marker, encode_keys));
-    let next_version_id_marker = listing
-        .next_version_id_marker
-        .filter(|_| listing.is_truncated);
+    let next_version_id_marker = listing.next_version_id_marker;
 
     let output = ListObjectVersionsOutput {
-        common_prefixes: delimiter.as_ref().map(|_| {
-            listing
-                .common_prefixes
-                .into_iter()
-                .map(|common_prefix| CommonPrefix {
-                    prefix: common_prefix
-                        .prefix
-                        .map(|prefix| encode_list_value(prefix, encode_keys)),
-                })
-                .collect::<Vec<_>>()
-        }),
+        common_prefixes: delimiter.as_ref().map(|_| common_prefixes),
         delete_markers: Some(delete_markers),
         delimiter,
         encoding_type,
-        is_truncated: Some(next_key_marker.is_some()),
+        is_truncated: Some(listing.is_truncated),
         key_marker: key_marker_clone,
         max_keys: Some(max_keys),
         name: Some(bucket),
