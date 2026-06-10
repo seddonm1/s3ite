@@ -1,17 +1,21 @@
 //! S3 `PutObject` request handling.
 
+use std::collections::HashMap;
+
+use super::sse::ActiveSse;
 use super::{
     CONTENT_MD5, ChecksumInput, ChecksumPolicy, ChecksumTypeKind, Digest, ETag, KeyMetadata,
-    KeyValue, Md5, Not, ObjectAclRequest, OffsetDateTime, PutObjectInput, PutObjectOutput, S3Error,
-    S3ErrorCode, S3Request, S3Response, S3Result, Sqlite, StorageClass, StoredChecksum,
-    StreamingBlob, TryStreamExt, checksum_crc32, checksum_crc32c, checksum_crc64nvme,
-    checksum_sha1, checksum_sha256, checksum_type_output, copy_bytes, finish_payload_checksum, hex,
-    load_bucket_object_lock_config, normalize_content_encoding, normalize_metadata,
-    object_lock_for_new_version, object_lock_write_headers, object_write_conditions,
-    payload_checksum_accumulator, read_object_body_encrypted, requested_sse_s3,
-    resolve_write_encryption, s3_error, s3_error_from_sqlite, sse_s3_output,
-    stored_tags_from_header, validate_content_md5, validate_declared_object_write_length,
-    validate_expected_bucket_owner, validate_no_unsupported_sse_headers, validate_object_acl,
+    KeyValue, Md5, Not, ObjectAclRequest, ObjectWriteConditions, OffsetDateTime, PutObjectInput,
+    PutObjectOutput, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, Sqlite, StorageClass,
+    StoredChecksum, StoredObjectLock, StoredTag, StreamingBlob, TryStreamExt, checksum_crc32,
+    checksum_crc32c, checksum_crc64nvme, checksum_sha1, checksum_sha256, checksum_type_output,
+    copy_bytes, finish_payload_checksum, hex, load_bucket_object_lock_config,
+    normalize_content_encoding, normalize_metadata, object_lock_for_new_version,
+    object_lock_write_headers, object_write_conditions, payload_checksum_accumulator,
+    read_object_body_encrypted, requested_sse_s3, resolve_write_encryption, s3_error,
+    s3_error_from_sqlite, sse_s3_output, stored_tags_from_header, validate_content_md5,
+    validate_declared_object_write_length, validate_expected_bucket_owner,
+    validate_no_unsupported_sse_headers, validate_object_acl,
 };
 
 /// Fully buffered object body plus hashes needed by the storage write.
@@ -22,11 +26,30 @@ struct BufferedObjectBody {
     checksum: StoredChecksum,
 }
 
+#[derive(Clone, Copy)]
+struct ContentMd5Input<'a> {
+    header_present: bool,
+    value: Option<&'a str>,
+}
+
+/// Normalized object write state shared by plain and encrypted `PutObject`.
+struct PutObjectWriteContext {
+    bucket: String,
+    key: String,
+    metadata: Option<HashMap<String, String>>,
+    content_type: Option<String>,
+    content_encoding: Option<String>,
+    cache_control: Option<String>,
+    expires: Option<OffsetDateTime>,
+    write_conditions: ObjectWriteConditions,
+    tags: Vec<StoredTag>,
+    object_lock: StoredObjectLock,
+}
+
 /// Reads the request body while accumulating MD5 and the selected S3 checksum.
 async fn read_put_object_body(
     body: StreamingBlob,
-    content_md5_header_present: bool,
-    content_md5: Option<&str>,
+    content_md5: ContentMd5Input<'_>,
     checksum_input: ChecksumInput,
 ) -> S3Result<BufferedObjectBody> {
     let mut md5_hash = Md5::new();
@@ -43,7 +66,11 @@ async fn read_put_object_body(
     let md5_bytes = md5_hash.finalize();
     let md5 = hex(md5_bytes);
 
-    validate_content_md5(content_md5_header_present, content_md5, md5_bytes.as_ref())?;
+    validate_content_md5(
+        content_md5.header_present,
+        content_md5.value,
+        md5_bytes.as_ref(),
+    )?;
 
     let checksum = finish_payload_checksum(
         &checksum_input,
@@ -120,8 +147,161 @@ fn put_object_output(
     }
 }
 
+async fn put_encrypted_object(
+    sqlite: &Sqlite,
+    body: StreamingBlob,
+    content_md5: ContentMd5Input<'_>,
+    checksum_input: ChecksumInput,
+    chunk_size: usize,
+    encryption: ActiveSse,
+    context: PutObjectWriteContext,
+) -> S3Result<PutObjectOutput> {
+    let encrypted_body = read_object_body_encrypted(
+        body,
+        content_md5.header_present,
+        content_md5.value,
+        checksum_input,
+        chunk_size,
+        &encryption,
+    )
+    .await?;
+
+    let size = encrypted_body.size;
+    let md5 = encrypted_body.md5;
+    let checksum = encrypted_body.checksum;
+    let md5_clone = md5.clone();
+    let checksum_clone = checksum.clone();
+    let stored_encryption = Some(encryption.stored.clone());
+    let chunks = encrypted_body.chunks;
+    let PutObjectWriteContext {
+        bucket,
+        key,
+        metadata,
+        content_type,
+        content_encoding,
+        cache_control,
+        expires,
+        write_conditions,
+        tags,
+        object_lock,
+    } = context;
+    let connection = sqlite
+        .get_connection(&bucket)
+        .await
+        .map_err(s3_error_from_sqlite)?;
+    let write_outcome = connection
+        .write(move |transaction| {
+            Sqlite::check_object_write_conditions(transaction, &key, &write_conditions)?;
+            let outcome = Sqlite::put_object_with_encoded_chunks(
+                transaction,
+                &key,
+                KeyMetadata {
+                    version_id: String::new(),
+                    size,
+                    metadata,
+                    content_type,
+                    content_encoding,
+                    cache_control,
+                    expires,
+                    last_modified: OffsetDateTime::now_utc(),
+                    md5: Some(md5_clone),
+                    checksum: Some(checksum_clone),
+                    stored_sse: stored_encryption,
+                    object_lock,
+                    is_latest: true,
+                    is_delete_marker: false,
+                },
+                chunks,
+            )?;
+            Sqlite::replace_object_tags(transaction, outcome.sequence, &tags)?;
+            Ok(outcome)
+        })
+        .await
+        .map_err(s3_error_from_sqlite)?;
+
+    Ok(put_object_output(
+        md5,
+        &checksum,
+        write_outcome.returned_version_id,
+        true,
+    ))
+}
+
+async fn put_plain_object(
+    sqlite: &Sqlite,
+    body: StreamingBlob,
+    content_md5: ContentMd5Input<'_>,
+    checksum_input: ChecksumInput,
+    chunk_size: usize,
+    context: PutObjectWriteContext,
+) -> S3Result<PutObjectOutput> {
+    let BufferedObjectBody {
+        value,
+        size,
+        md5,
+        checksum,
+    } = read_put_object_body(body, content_md5, checksum_input).await?;
+
+    let md5_clone = md5.clone();
+    let checksum_clone = checksum.clone();
+    let PutObjectWriteContext {
+        bucket,
+        key,
+        metadata,
+        content_type,
+        content_encoding,
+        cache_control,
+        expires,
+        write_conditions,
+        tags,
+        object_lock,
+    } = context;
+    let connection = sqlite
+        .get_connection(&bucket)
+        .await
+        .map_err(s3_error_from_sqlite)?;
+    let write_outcome = connection
+        .write(move |transaction| {
+            Sqlite::check_object_write_conditions(transaction, &key, &write_conditions)?;
+            let outcome = Sqlite::put_object_with_chunk_size(
+                transaction,
+                KeyValue {
+                    key,
+                    value: Some(value),
+                    key_metadata: KeyMetadata {
+                        version_id: String::new(),
+                        size,
+                        metadata,
+                        content_type,
+                        content_encoding,
+                        cache_control,
+                        expires,
+                        last_modified: OffsetDateTime::now_utc(),
+                        md5: Some(md5_clone),
+                        checksum: Some(checksum_clone),
+                        stored_sse: None,
+                        object_lock,
+                        is_latest: true,
+                        is_delete_marker: false,
+                    },
+                },
+                chunk_size,
+            )?;
+            Sqlite::replace_object_tags(transaction, outcome.sequence, &tags)?;
+            Ok(outcome)
+        })
+        .await
+        .map_err(s3_error_from_sqlite)?;
+
+    Ok(put_object_output(
+        md5,
+        &checksum,
+        write_outcome.returned_version_id,
+        false,
+    ))
+}
+
 /// Stores an object body and metadata.
-#[allow(clippy::too_many_lines)]
 pub(super) async fn put_object(
     sqlite: &Sqlite,
     req: S3Request<PutObjectInput>,
@@ -195,132 +375,53 @@ pub(super) async fn put_object(
         return Err(s3_error(S3ErrorCode::IncompleteBody));
     };
 
+    let content_md5 = ContentMd5Input {
+        header_present: headers.contains_key(CONTENT_MD5),
+        value: content_md5.as_deref(),
+    };
+    let checksum_input = ChecksumInput::write_request(
+        checksum_algorithm,
+        checksum_crc32,
+        checksum_crc32c,
+        checksum_crc64nvme,
+        checksum_sha1,
+        checksum_sha256,
+    );
+    let context = PutObjectWriteContext {
+        bucket,
+        key,
+        metadata,
+        content_type,
+        content_encoding,
+        cache_control,
+        expires: expires.map(Into::into),
+        write_conditions,
+        tags,
+        object_lock,
+    };
     let chunk_size = sqlite.blob_chunk_size();
-    let encryption = resolve_write_encryption(sqlite, &bucket, explicit_sse_s3).await?;
-    if let Some(encryption) = encryption {
-        let encrypted_body = read_object_body_encrypted(
+    let encryption = resolve_write_encryption(sqlite, &context.bucket, explicit_sse_s3).await?;
+    let output = if let Some(encryption) = encryption {
+        put_encrypted_object(
+            sqlite,
             body,
-            headers.contains_key(CONTENT_MD5),
-            content_md5.as_deref(),
-            ChecksumInput::write_request(
-                checksum_algorithm,
-                checksum_crc32,
-                checksum_crc32c,
-                checksum_crc64nvme,
-                checksum_sha1,
-                checksum_sha256,
-            ),
+            content_md5,
+            checksum_input,
             chunk_size,
-            &encryption,
+            encryption,
+            context,
         )
-        .await?;
-
-        let size = encrypted_body.size;
-        let md5 = encrypted_body.md5;
-        let checksum = encrypted_body.checksum;
-        let md5_clone = md5.clone();
-        let checksum_clone = checksum.clone();
-        let stored_encryption = Some(encryption.stored.clone());
-        let chunks = encrypted_body.chunks;
-        let tags = tags.clone();
-        let object_lock = object_lock.clone();
-        let connection = sqlite
-            .get_connection(&bucket)
-            .await
-            .map_err(s3_error_from_sqlite)?;
-        let write_outcome = connection
-            .write(move |transaction| {
-                Sqlite::check_object_write_conditions(transaction, &key, &write_conditions)?;
-                let outcome = Sqlite::put_object_with_encoded_chunks(
-                    transaction,
-                    &key,
-                    KeyMetadata {
-                        version_id: String::new(),
-                        size,
-                        metadata,
-                        content_type,
-                        content_encoding,
-                        cache_control,
-                        expires: expires.map(Into::into),
-                        last_modified: OffsetDateTime::now_utc(),
-                        md5: Some(md5_clone),
-                        checksum: Some(checksum_clone),
-                        stored_sse: stored_encryption,
-                        object_lock,
-                        is_latest: true,
-                        is_delete_marker: false,
-                    },
-                    chunks,
-                )?;
-                Sqlite::replace_object_tags(transaction, outcome.sequence, &tags)?;
-                Ok(outcome)
-            })
-            .await
-            .map_err(s3_error_from_sqlite)?;
-
-        let output = put_object_output(md5, &checksum, write_outcome.returned_version_id, true);
-        return Ok(S3Response::new(output));
-    }
-
-    let BufferedObjectBody {
-        value,
-        size,
-        md5,
-        checksum,
-    } = read_put_object_body(
-        body,
-        headers.contains_key(CONTENT_MD5),
-        content_md5.as_deref(),
-        ChecksumInput::write_request(
-            checksum_algorithm,
-            checksum_crc32,
-            checksum_crc32c,
-            checksum_crc64nvme,
-            checksum_sha1,
-            checksum_sha256,
-        ),
-    )
-    .await?;
-
-    let md5_clone = md5.clone();
-    let checksum_clone = checksum.clone();
-    let connection = sqlite
-        .get_connection(&bucket)
-        .await
-        .map_err(s3_error_from_sqlite)?;
-    let write_outcome = connection
-        .write(move |transaction| {
-            Sqlite::check_object_write_conditions(transaction, &key, &write_conditions)?;
-            let outcome = Sqlite::put_object_with_chunk_size(
-                transaction,
-                KeyValue {
-                    key,
-                    value: Some(value),
-                    key_metadata: KeyMetadata {
-                        version_id: String::new(),
-                        size,
-                        metadata,
-                        content_type,
-                        content_encoding,
-                        cache_control,
-                        expires: expires.map(Into::into),
-                        last_modified: OffsetDateTime::now_utc(),
-                        md5: Some(md5_clone),
-                        checksum: Some(checksum_clone),
-                        stored_sse: None,
-                        object_lock,
-                        is_latest: true,
-                        is_delete_marker: false,
-                    },
-                },
-                chunk_size,
-            )?;
-            Sqlite::replace_object_tags(transaction, outcome.sequence, &tags)?;
-            Ok(outcome)
-        })
-        .await
-        .map_err(s3_error_from_sqlite)?;
-
-    let output = put_object_output(md5, &checksum, write_outcome.returned_version_id, false);
+        .await?
+    } else {
+        put_plain_object(
+            sqlite,
+            body,
+            content_md5,
+            checksum_input,
+            chunk_size,
+            context,
+        )
+        .await?
+    };
     Ok(S3Response::new(output))
 }
