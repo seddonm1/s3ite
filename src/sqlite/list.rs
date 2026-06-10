@@ -162,7 +162,10 @@ mod tests {
 
     use crate::{
         s3::{FullObjectChecksum, StoredChecksum, StoredObjectLock},
-        sqlite::{BucketVersioningState, KeyMetadata, KeyValue, SqliteError},
+        sqlite::{
+            BucketVersioningState, KeyMetadata, KeyValue, SqliteError,
+            put::test_support as put_test_support,
+        },
     };
 
     use super::*;
@@ -213,7 +216,11 @@ mod tests {
     }
 
     fn put_object(transaction: &Transaction, key: &str, value: &[u8]) -> String {
-        must(Sqlite::put_object(transaction, key_value(key, value))).version_id
+        must(put_test_support::put_object(
+            transaction,
+            key_value(key, value),
+        ))
+        .version_id
     }
 
     fn create_loose_object_version_table(connection: &Connection) {

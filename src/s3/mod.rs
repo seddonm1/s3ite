@@ -155,6 +155,9 @@ pub(crate) use self::{
 #[cfg(test)]
 pub(crate) use self::checksum::FullObjectChecksum;
 
+#[cfg(test)]
+pub(crate) use self::checksum::test_support as checksum_test_support;
+
 use self::{
     checksum::{
         ChecksumInput, ChecksumPolicy, checksum_algorithm_from_request, checksum_algorithm_output,

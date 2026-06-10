@@ -775,19 +775,6 @@ impl Sqlite {
             .optional()?)
     }
 
-    /// Inserts or replaces a multipart upload part.
-    #[cfg(test)]
-    pub(crate) fn put_multipart(
-        transaction: &Transaction,
-        multipart: &Multipart,
-    ) -> SqliteResult<usize> {
-        Self::put_multipart_with_chunk_size(
-            transaction,
-            multipart,
-            super::DEFAULT_OBJECT_BLOB_CHUNK_SIZE,
-        )
-    }
-
     /// Inserts or replaces a multipart upload part using the requested chunk size.
     pub(crate) fn put_multipart_with_chunk_size(
         transaction: &Transaction,
@@ -1137,146 +1124,6 @@ impl Sqlite {
         i32::try_from(count).map_err(|_| SqliteError::MultipartObjectTooLarge)
     }
 
-    /// Inserts completed multipart object part boundaries.
-    #[cfg(test)]
-    fn put_completed_object_parts(
-        transaction: &Transaction,
-        key: &str,
-        version_id: &str,
-        parts: &[CompletedObjectPart],
-    ) -> SqliteResult<()> {
-        let mut stmt = transaction.prepare_cached(
-            "
-            INSERT INTO object_part (
-                object_sequence,
-                upload_id,
-                is_multipart_part,
-                last_modified,
-                part_number,
-                start,
-                size,
-                md5,
-                checksum_algorithm,
-                checksum_type,
-                checksum_value
-            )
-            VALUES (
-                (
-                    SELECT sequence
-                    FROM object_version
-                    WHERE key = ?1 AND version_id = ?2
-                ),
-                NULL,
-                1,
-                ?3,
-                ?4,
-                ?5,
-                ?6,
-                ?7,
-                ?8,
-                ?9,
-                ?10
-            );",
-        )?;
-
-        for part in parts {
-            stmt.execute((
-                key,
-                version_id,
-                OffsetDateTime::now_utc(),
-                part.part_number,
-                sql_size(part.start)?,
-                sql_size(part.size)?,
-                Option::<String>::None,
-                part.checksum.as_ref().map(PartChecksum::algorithm),
-                Option::<ChecksumTypeKind>::None,
-                part.checksum.as_ref().map(PartChecksum::as_str),
-            ))?;
-        }
-
-        Ok(())
-    }
-
-    /// Fetches multipart upload parts with bodies ordered by part number.
-    #[cfg(test)]
-    pub(crate) fn get_multiparts(
-        transaction: &Transaction,
-        upload_id: Uuid,
-    ) -> SqliteResult<Vec<Multipart>> {
-        let mut stmt = transaction.prepare_cached(
-            "
-            SELECT
-                last_modified,
-                part_number,
-                size,
-                md5,
-                checksum_algorithm,
-                checksum_type,
-                checksum_value
-            FROM object_part
-            WHERE upload_id = ?1
-            ORDER BY part_number;",
-        )?;
-
-        let mut rows = stmt.query([upload_id])?;
-        let mut parts = Vec::new();
-        while let Some(row) = rows.next()? {
-            let part_number = row.get(1)?;
-            let size = row_size(row, 2)?;
-            parts.push(Multipart {
-                upload_id,
-                last_modified: row.get(0)?,
-                part_number,
-                value: Self::get_upload_part_bytes(transaction, upload_id, part_number, size)?,
-                size,
-                md5: row.get(3)?,
-                checksum: optional_part_checksum(row.get(4)?, row.get(5)?, row.get(6)?)?,
-            });
-        }
-
-        Ok(parts)
-    }
-
-    /// Reassembles one active upload part from its storage chunks.
-    #[cfg(test)]
-    fn get_upload_part_bytes(
-        transaction: &Transaction,
-        upload_id: Uuid,
-        part_number: i32,
-        expected_size: i64,
-    ) -> SqliteResult<Vec<u8>> {
-        let expected_size =
-            usize::try_from(expected_size).map_err(|_| SqliteError::ObjectBodyInconsistent)?;
-        let mut stmt = transaction.prepare_cached(
-            "
-            SELECT offset, size, body
-            FROM object_blob_chunk
-            WHERE upload_id = ?1 AND part_number = ?2
-            ORDER BY chunk_number;",
-        )?;
-        let mut rows = stmt.query((upload_id, part_number))?;
-        let mut value = Vec::with_capacity(expected_size);
-        let mut expected_offset = 0usize;
-        while let Some(row) = rows.next()? {
-            let offset = usize::try_from(row_size(row, 0)?)
-                .map_err(|_| SqliteError::ObjectBodyInconsistent)?;
-            let size = usize::try_from(row_size(row, 1)?)
-                .map_err(|_| SqliteError::ObjectBodyInconsistent)?;
-            let body = row.get::<_, Vec<u8>>(2)?;
-            if offset != expected_offset || body.len() != size {
-                return Err(SqliteError::ObjectBodyInconsistent);
-            }
-            expected_offset = expected_offset
-                .checked_add(size)
-                .ok_or(SqliteError::ObjectBodyInconsistent)?;
-            value.extend_from_slice(&body);
-        }
-        if expected_offset != expected_size || value.len() != expected_size {
-            return Err(SqliteError::ObjectBodyInconsistent);
-        }
-        Ok(value)
-    }
-
     /// Converts active upload part rows and chunks into completed object-owned rows.
     fn reown_completed_multipart_rows(
         transaction: &Transaction,
@@ -1349,6 +1196,167 @@ impl Sqlite {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use rusqlite::Transaction;
+    use time::OffsetDateTime;
+    use uuid::Uuid;
+
+    use super::super::{
+        ChecksumTypeKind, CompletedObjectPart, Multipart, PartChecksum, Sqlite, SqliteError,
+        SqliteResult, optional_part_checksum, row_size, sql_size,
+    };
+
+    /// Inserts or replaces a multipart upload part.
+    pub(crate) fn put_multipart(
+        transaction: &Transaction,
+        multipart: &Multipart,
+    ) -> SqliteResult<usize> {
+        Sqlite::put_multipart_with_chunk_size(
+            transaction,
+            multipart,
+            super::super::DEFAULT_OBJECT_BLOB_CHUNK_SIZE,
+        )
+    }
+
+    /// Inserts completed multipart object part boundaries.
+    pub(crate) fn put_completed_object_parts(
+        transaction: &Transaction,
+        key: &str,
+        version_id: &str,
+        parts: &[CompletedObjectPart],
+    ) -> SqliteResult<()> {
+        let mut stmt = transaction.prepare_cached(
+            "
+            INSERT INTO object_part (
+                object_sequence,
+                upload_id,
+                is_multipart_part,
+                last_modified,
+                part_number,
+                start,
+                size,
+                md5,
+                checksum_algorithm,
+                checksum_type,
+                checksum_value
+            )
+            VALUES (
+                (
+                    SELECT sequence
+                    FROM object_version
+                    WHERE key = ?1 AND version_id = ?2
+                ),
+                NULL,
+                1,
+                ?3,
+                ?4,
+                ?5,
+                ?6,
+                ?7,
+                ?8,
+                ?9,
+                ?10
+            );",
+        )?;
+
+        for part in parts {
+            stmt.execute((
+                key,
+                version_id,
+                OffsetDateTime::now_utc(),
+                part.part_number,
+                sql_size(part.start)?,
+                sql_size(part.size)?,
+                Option::<String>::None,
+                part.checksum.as_ref().map(PartChecksum::algorithm),
+                Option::<ChecksumTypeKind>::None,
+                part.checksum.as_ref().map(PartChecksum::as_str),
+            ))?;
+        }
+
+        Ok(())
+    }
+
+    /// Fetches multipart upload parts with bodies ordered by part number.
+    pub(crate) fn get_multiparts(
+        transaction: &Transaction,
+        upload_id: Uuid,
+    ) -> SqliteResult<Vec<Multipart>> {
+        let mut stmt = transaction.prepare_cached(
+            "
+            SELECT
+                last_modified,
+                part_number,
+                size,
+                md5,
+                checksum_algorithm,
+                checksum_type,
+                checksum_value
+            FROM object_part
+            WHERE upload_id = ?1
+            ORDER BY part_number;",
+        )?;
+
+        let mut rows = stmt.query([upload_id])?;
+        let mut parts = Vec::new();
+        while let Some(row) = rows.next()? {
+            let part_number = row.get(1)?;
+            let size = row_size(row, 2)?;
+            parts.push(Multipart {
+                upload_id,
+                last_modified: row.get(0)?,
+                part_number,
+                value: get_upload_part_bytes(transaction, upload_id, part_number, size)?,
+                size,
+                md5: row.get(3)?,
+                checksum: optional_part_checksum(row.get(4)?, row.get(5)?, row.get(6)?)?,
+            });
+        }
+
+        Ok(parts)
+    }
+
+    /// Reassembles one active upload part from its storage chunks.
+    fn get_upload_part_bytes(
+        transaction: &Transaction,
+        upload_id: Uuid,
+        part_number: i32,
+        expected_size: i64,
+    ) -> SqliteResult<Vec<u8>> {
+        let expected_size =
+            usize::try_from(expected_size).map_err(|_| SqliteError::ObjectBodyInconsistent)?;
+        let mut stmt = transaction.prepare_cached(
+            "
+            SELECT offset, size, body
+            FROM object_blob_chunk
+            WHERE upload_id = ?1 AND part_number = ?2
+            ORDER BY chunk_number;",
+        )?;
+        let mut rows = stmt.query((upload_id, part_number))?;
+        let mut value = Vec::with_capacity(expected_size);
+        let mut expected_offset = 0usize;
+        while let Some(row) = rows.next()? {
+            let offset = usize::try_from(row_size(row, 0)?)
+                .map_err(|_| SqliteError::ObjectBodyInconsistent)?;
+            let size = usize::try_from(row_size(row, 1)?)
+                .map_err(|_| SqliteError::ObjectBodyInconsistent)?;
+            let body = row.get::<_, Vec<u8>>(2)?;
+            if offset != expected_offset || body.len() != size {
+                return Err(SqliteError::ObjectBodyInconsistent);
+            }
+            expected_offset = expected_offset
+                .checked_add(size)
+                .ok_or(SqliteError::ObjectBodyInconsistent)?;
+            value.extend_from_slice(&body);
+        }
+        if expected_offset != expected_size || value.len() != expected_size {
+            return Err(SqliteError::ObjectBodyInconsistent);
+        }
+        Ok(value)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
@@ -1363,7 +1371,7 @@ mod tests {
             CompletedMultipartUploadRecord, CompletedObjectPart, EncodedBlobChunk,
             MultipartCompletion, MultipartCompletionPart, MultipartCompletionRequest,
             MultipartPartWrite, MultipartUploadState, NULL_VERSION_ID, ObjectWriteConditions,
-            Sqlite, SqliteError, SqliteResult,
+            Sqlite, SqliteError, SqliteResult, get::test_support as get_test_support,
         },
     };
 
@@ -1635,8 +1643,9 @@ mod tests {
         assert!(
             Sqlite::get_multipart_upload_state(&transaction, upload_id, "bucket", "key")?.is_none()
         );
-        assert!(Sqlite::get_multiparts(&transaction, upload_id)?.is_empty());
-        let object = Sqlite::get_object(&transaction, "key")?.ok_or(SqliteError::ObjectNotFound)?;
+        assert!(test_support::get_multiparts(&transaction, upload_id)?.is_empty());
+        let object = get_test_support::get_object(&transaction, "key")?
+            .ok_or(SqliteError::ObjectNotFound)?;
         assert_eq!(object.value.as_deref(), Some(b"abc".as_slice()));
         let version_id = object.key_metadata.version_id;
         let completed_part =
@@ -1740,7 +1749,7 @@ mod tests {
         let mut connection = open_schema()?;
         let transaction = connection.transaction()?;
         assert!(matches!(
-            Sqlite::put_completed_object_parts(
+            test_support::put_completed_object_parts(
                 &transaction,
                 "key",
                 "version",
@@ -1756,7 +1765,7 @@ mod tests {
             ))
         ));
         assert!(matches!(
-            Sqlite::put_completed_object_parts(
+            test_support::put_completed_object_parts(
                 &transaction,
                 "key",
                 "version",

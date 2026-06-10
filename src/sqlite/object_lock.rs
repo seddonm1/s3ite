@@ -143,7 +143,7 @@ mod tests {
 
     use crate::{
         s3::{FullObjectChecksum, StoredChecksum, StoredObjectLock},
-        sqlite::{KeyMetadata, KeyValue, Sqlite, SqliteResult},
+        sqlite::{KeyMetadata, KeyValue, Sqlite, SqliteResult, put::test_support},
     };
 
     use super::*;
@@ -205,7 +205,7 @@ mod tests {
     fn per_version_lock_metadata_round_trips() -> SqliteResult<()> {
         let mut connection = open_schema()?;
         let transaction = connection.transaction()?;
-        let outcome = Sqlite::put_object(&transaction, key_value("key", b"value"))?;
+        let outcome = test_support::put_object(&transaction, key_value("key", b"value"))?;
         Sqlite::put_object_legal_hold(&transaction, outcome.sequence, true)?;
         let retention = StoredObjectRetention {
             mode: StoredObjectLockMode::Compliance,

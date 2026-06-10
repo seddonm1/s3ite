@@ -161,7 +161,7 @@ mod tests {
     use crate::{
         s3::{
             ChecksumAlgorithmKind, ChecksumTypeKind, FullObjectChecksum, MultipartChecksumConfig,
-            PartChecksum, StoredChecksum, decode_base64, encode_hex,
+            PartChecksum, StoredChecksum, checksum_test_support, decode_base64, encode_hex,
         },
         sqlite::{
             SqliteError, optional_multipart_checksum_config, optional_part_checksum,
@@ -371,7 +371,7 @@ mod tests {
     #[test]
     fn computes_checksum_by_storage_algorithm() {
         assert_eq!(
-            ChecksumAlgorithmKind::Crc64Nvme.checksum_value(b"test data"),
+            checksum_test_support::checksum_value(ChecksumAlgorithmKind::Crc64Nvme, b"test data"),
             "rsrzr5yYqFU="
         );
     }

@@ -1,15 +1,11 @@
 //! `SQLite` object read helpers.
 
-#[cfg(test)]
-use std::ops::Not;
 use std::ops::Range as ByteRange;
 
 use rusqlite::{OptionalExtension, Transaction};
 
 use crate::database::BlobReadRequest;
 
-#[cfg(test)]
-use super::KeyValue;
 use super::{
     KeyMetadata, ObjectBodyReference, Sqlite, SqliteError, SqliteResult, StoredBlobChunk,
     optional_stored_checksum, optional_stored_object_lock, optional_stored_sse, row_bool, row_size,
@@ -38,122 +34,6 @@ impl Sqlite {
         let mut stmt =
             transaction.prepare_cached("SELECT EXISTS(SELECT 1 FROM object_version);")?;
         Ok(stmt.query_row((), |row| row.get(0))?)
-    }
-
-    /// Fetches the current visible object body and metadata by key.
-    #[cfg(test)]
-    pub(crate) fn get_object(
-        transaction: &Transaction,
-        key: &str,
-    ) -> SqliteResult<Option<KeyValue>> {
-        Self::get_object_internal(transaction, key, None, false)
-    }
-
-    /// Fetches an object body and metadata by current or exact version selector.
-    #[cfg(test)]
-    fn get_object_internal(
-        transaction: &Transaction,
-        key: &str,
-        version_id: Option<&str>,
-        include_delete_markers: bool,
-    ) -> SqliteResult<Option<KeyValue>> {
-        let mut stmt = transaction.prepare_cached(
-            "
-            SELECT
-                ov.sequence,
-                ov.key,
-                ov.version_id,
-                ov.size,
-                ov.metadata,
-                ov.content_type,
-                ov.content_encoding,
-                ov.cache_control,
-                ov.expires,
-                ov.last_modified,
-                ov.md5,
-                ov.checksum_algorithm,
-                ov.checksum_type,
-                ov.checksum_value,
-                ov.sse_algorithm,
-                ov.sse_key_nonce,
-                ov.sse_key_ciphertext,
-                ov.sse_key_tag,
-                ov.object_lock_legal_hold,
-                ov.object_lock_retention_mode,
-                ov.object_lock_retain_until,
-                ov.is_latest,
-                ov.is_delete_marker
-            FROM object_version AS ov
-            WHERE ov.key = ?1
-                AND (?2 IS NULL OR ov.version_id = ?2)
-                AND (?2 IS NOT NULL OR ov.is_latest = 1)
-                AND (?3 OR ov.is_delete_marker = 0);",
-        )?;
-
-        let object = stmt
-            .query_row((key, version_id, include_delete_markers), |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    KeyValue {
-                        key: row.get(1)?,
-                        value: None,
-                        key_metadata: KeyMetadata {
-                            version_id: row.get(2)?,
-                            size: row_size(row, 3)?,
-                            metadata: row
-                                .get::<_, Option<String>>(4)?
-                                .map(|metadata| serde_json::from_str(&metadata))
-                                .transpose()
-                                .map_err(|err| {
-                                    rusqlite::Error::FromSqlConversionFailure(
-                                        4,
-                                        rusqlite::types::Type::Text,
-                                        Box::new(err),
-                                    )
-                                })?,
-                            content_type: row.get(5)?,
-                            content_encoding: row.get(6)?,
-                            cache_control: row.get(7)?,
-                            expires: row.get(8)?,
-                            last_modified: row.get(9)?,
-                            md5: row.get(10)?,
-                            checksum: optional_stored_checksum(
-                                row.get(11)?,
-                                row.get(12)?,
-                                row.get(13)?,
-                            )?,
-                            stored_sse: optional_stored_sse(
-                                row.get(14)?,
-                                row.get(15)?,
-                                row.get(16)?,
-                                row.get(17)?,
-                            )?,
-                            object_lock: optional_stored_object_lock(
-                                row.get(18)?,
-                                row.get(19)?,
-                                row.get(20)?,
-                            )?,
-                            is_latest: row_bool(row, 21)?,
-                            is_delete_marker: row_bool(row, 22)?,
-                        },
-                    },
-                ))
-            })
-            .optional()?;
-
-        let Some((sequence, mut object)) = object else {
-            return Ok(None);
-        };
-
-        if object.key_metadata.is_delete_marker.not() {
-            object.value = Some(Self::get_object_bytes(
-                transaction,
-                sequence,
-                object.key_metadata.size,
-            )?);
-        }
-
-        Ok(Some(object))
     }
 
     /// Reassembles object bytes from stored chunks for copy-style operations.
@@ -517,6 +397,132 @@ impl Sqlite {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use std::ops::Not;
+
+    use rusqlite::{OptionalExtension, Transaction};
+
+    use super::super::{
+        KeyMetadata, KeyValue, Sqlite, SqliteResult, optional_stored_checksum,
+        optional_stored_object_lock, optional_stored_sse, row_bool, row_size,
+    };
+
+    /// Fetches the current visible object body and metadata by key.
+    pub(crate) fn get_object(
+        transaction: &Transaction,
+        key: &str,
+    ) -> SqliteResult<Option<KeyValue>> {
+        get_object_internal(transaction, key, None, false)
+    }
+
+    /// Fetches an object body and metadata by current or exact version selector.
+    fn get_object_internal(
+        transaction: &Transaction,
+        key: &str,
+        version_id: Option<&str>,
+        include_delete_markers: bool,
+    ) -> SqliteResult<Option<KeyValue>> {
+        let mut stmt = transaction.prepare_cached(
+            "
+            SELECT
+                ov.sequence,
+                ov.key,
+                ov.version_id,
+                ov.size,
+                ov.metadata,
+                ov.content_type,
+                ov.content_encoding,
+                ov.cache_control,
+                ov.expires,
+                ov.last_modified,
+                ov.md5,
+                ov.checksum_algorithm,
+                ov.checksum_type,
+                ov.checksum_value,
+                ov.sse_algorithm,
+                ov.sse_key_nonce,
+                ov.sse_key_ciphertext,
+                ov.sse_key_tag,
+                ov.object_lock_legal_hold,
+                ov.object_lock_retention_mode,
+                ov.object_lock_retain_until,
+                ov.is_latest,
+                ov.is_delete_marker
+            FROM object_version AS ov
+            WHERE ov.key = ?1
+                AND (?2 IS NULL OR ov.version_id = ?2)
+                AND (?2 IS NOT NULL OR ov.is_latest = 1)
+                AND (?3 OR ov.is_delete_marker = 0);",
+        )?;
+
+        let object = stmt
+            .query_row((key, version_id, include_delete_markers), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    KeyValue {
+                        key: row.get(1)?,
+                        value: None,
+                        key_metadata: KeyMetadata {
+                            version_id: row.get(2)?,
+                            size: row_size(row, 3)?,
+                            metadata: row
+                                .get::<_, Option<String>>(4)?
+                                .map(|metadata| serde_json::from_str(&metadata))
+                                .transpose()
+                                .map_err(|err| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        4,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(err),
+                                    )
+                                })?,
+                            content_type: row.get(5)?,
+                            content_encoding: row.get(6)?,
+                            cache_control: row.get(7)?,
+                            expires: row.get(8)?,
+                            last_modified: row.get(9)?,
+                            md5: row.get(10)?,
+                            checksum: optional_stored_checksum(
+                                row.get(11)?,
+                                row.get(12)?,
+                                row.get(13)?,
+                            )?,
+                            stored_sse: optional_stored_sse(
+                                row.get(14)?,
+                                row.get(15)?,
+                                row.get(16)?,
+                                row.get(17)?,
+                            )?,
+                            object_lock: optional_stored_object_lock(
+                                row.get(18)?,
+                                row.get(19)?,
+                                row.get(20)?,
+                            )?,
+                            is_latest: row_bool(row, 21)?,
+                            is_delete_marker: row_bool(row, 22)?,
+                        },
+                    },
+                ))
+            })
+            .optional()?;
+
+        let Some((sequence, mut object)) = object else {
+            return Ok(None);
+        };
+
+        if object.key_metadata.is_delete_marker.not() {
+            object.value = Some(Sqlite::get_object_bytes(
+                transaction,
+                sequence,
+                object.key_metadata.size,
+            )?);
+        }
+
+        Ok(Some(object))
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
@@ -527,6 +533,8 @@ mod tests {
         s3::{FullObjectChecksum, StoredChecksum},
         sqlite::{Sqlite, SqliteError, SqliteResult},
     };
+
+    use super::test_support;
 
     fn open_schema() -> SqliteResult<Connection> {
         let mut connection = Connection::open_in_memory()?;
@@ -643,7 +651,7 @@ mod tests {
             metadata.insert("color".to_string(), "blue".to_string());
             metadata
         };
-        let object = Sqlite::get_object(&transaction, "key")?;
+        let object = test_support::get_object(&transaction, "key")?;
         assert_eq!(
             object.as_ref().map(|object| object.value.as_deref()),
             Some(Some(&b"body"[..]))
@@ -699,7 +707,7 @@ mod tests {
         let transaction = connection.transaction()?;
 
         assert!(matches!(
-            Sqlite::get_object(&transaction, "key"),
+            test_support::get_object(&transaction, "key"),
             Err(SqliteError::ObjectBodyInconsistent)
         ));
         Ok(())
@@ -718,7 +726,7 @@ mod tests {
         )?;
         let transaction = connection.transaction()?;
 
-        assert_conversion_error(&Sqlite::get_object(&transaction, "key"));
+        assert_conversion_error(&test_support::get_object(&transaction, "key"));
         assert_conversion_error(&Sqlite::get_current_object_body_reference(
             &transaction,
             "key",

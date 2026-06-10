@@ -2208,6 +2208,7 @@ mod maintenance_tests {
     use super::{
         CompletedMultipartUploadRecord, Duration, Multipart, MultipartUploadState, NULL_VERSION_ID,
         OffsetDateTime, Sqlite, SqliteResult, Uuid,
+        multipart::test_support as multipart_test_support,
     };
 
     fn open_test_connection() -> rusqlite::Result<Connection> {
@@ -2294,7 +2295,7 @@ mod maintenance_tests {
             md5: None,
             checksum: None,
         };
-        Sqlite::put_multipart(&transaction, &multipart)?;
+        multipart_test_support::put_multipart(&transaction, &multipart)?;
         transaction.execute(
             "UPDATE multipart_upload SET last_modified = ?2 WHERE upload_id = ?1;",
             (
@@ -2332,7 +2333,7 @@ mod maintenance_tests {
         let upload_state =
             Sqlite::get_multipart_upload_state(&transaction, upload_id, "bucket", "key")?;
         assert!(upload_state.is_none());
-        assert!(Sqlite::get_multiparts(&transaction, upload_id)?.is_empty());
+        assert!(multipart_test_support::get_multiparts(&transaction, upload_id)?.is_empty());
 
         let completed = Sqlite::get_completed_multipart_upload(
             &transaction,

@@ -395,15 +395,6 @@ impl Sqlite {
             .ok_or(SqliteError::ObjectBodyInconsistent)
     }
 
-    /// Inserts an object version or replaces the `null` version.
-    #[cfg(test)]
-    pub(crate) fn put_object(
-        transaction: &Transaction,
-        kv: KeyValue,
-    ) -> SqliteResult<ObjectWriteOutcome> {
-        Self::put_object_with_chunk_size(transaction, kv, super::DEFAULT_OBJECT_BLOB_CHUNK_SIZE)
-    }
-
     /// Inserts an object version using the requested body chunk size.
     pub(crate) fn put_object_with_chunk_size(
         transaction: &Transaction,
@@ -476,13 +467,35 @@ impl Sqlite {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use rusqlite::Transaction;
+
+    use super::super::{KeyValue, ObjectWriteOutcome, Sqlite, SqliteResult};
+
+    /// Inserts an object version or replaces the `null` version.
+    pub(crate) fn put_object(
+        transaction: &Transaction,
+        kv: KeyValue,
+    ) -> SqliteResult<ObjectWriteOutcome> {
+        Sqlite::put_object_with_chunk_size(
+            transaction,
+            kv,
+            super::super::DEFAULT_OBJECT_BLOB_CHUNK_SIZE,
+        )
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use rusqlite::Connection;
     use time::OffsetDateTime;
 
     use crate::{
         s3::{FullObjectChecksum, StoredChecksum, StoredObjectLock},
-        sqlite::{EncodedBlobChunk, KeyMetadata, KeyValue, Sqlite, SqliteError, SqliteResult},
+        sqlite::{
+            EncodedBlobChunk, KeyMetadata, KeyValue, Sqlite, SqliteError, SqliteResult,
+            get::test_support,
+        },
     };
 
     fn open_schema() -> SqliteResult<Connection> {
@@ -553,7 +566,8 @@ mod tests {
                 (4, 1, b"e".to_vec()),
             ]
         );
-        let object = Sqlite::get_object(&transaction, "key")?.ok_or(SqliteError::ObjectNotFound)?;
+        let object =
+            test_support::get_object(&transaction, "key")?.ok_or(SqliteError::ObjectNotFound)?;
         assert_eq!(object.value.as_deref(), Some(b"abcde".as_slice()));
         Ok(())
     }
@@ -585,7 +599,8 @@ mod tests {
 
         let outcome =
             Sqlite::put_object_with_encoded_chunks(&transaction, "key", metadata, chunks)?;
-        let object = Sqlite::get_object(&transaction, "key")?.ok_or(SqliteError::ObjectNotFound)?;
+        let object =
+            test_support::get_object(&transaction, "key")?.ok_or(SqliteError::ObjectNotFound)?;
 
         assert_eq!(object.value.as_deref(), Some(b"abcde".as_slice()));
         assert_eq!(

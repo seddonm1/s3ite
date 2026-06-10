@@ -201,6 +201,7 @@ mod tests {
         s3::{FullObjectChecksum, StoredChecksum, StoredObjectLock, StoredTag},
         sqlite::{
             KeyMetadata, KeyValue, MultipartUploadState, NULL_VERSION_ID, Sqlite, SqliteResult,
+            put::test_support as put_test_support,
         },
     };
 
@@ -283,7 +284,7 @@ mod tests {
     fn object_tags_replace_and_read_in_key_order() -> SqliteResult<()> {
         let mut connection = open_schema()?;
         let transaction = connection.transaction()?;
-        let outcome = Sqlite::put_object(&transaction, key_value("key", b"value"))?;
+        let outcome = put_test_support::put_object(&transaction, key_value("key", b"value"))?;
 
         Sqlite::replace_object_tags(&transaction, outcome.sequence, &tags())?;
         assert_eq!(
@@ -309,7 +310,7 @@ mod tests {
     fn object_tags_cascade_with_object_version() -> SqliteResult<()> {
         let mut connection = open_schema()?;
         let transaction = connection.transaction()?;
-        let outcome = Sqlite::put_object(&transaction, key_value("key", b"value"))?;
+        let outcome = put_test_support::put_object(&transaction, key_value("key", b"value"))?;
         Sqlite::replace_object_tags(&transaction, outcome.sequence, &tags())?;
 
         transaction.execute(
@@ -344,7 +345,7 @@ mod tests {
             },
         )?;
         Sqlite::put_multipart_upload_tags(&transaction, upload_id, &tags())?;
-        let outcome = Sqlite::put_object(&transaction, key_value("key", b"value"))?;
+        let outcome = put_test_support::put_object(&transaction, key_value("key", b"value"))?;
 
         Sqlite::copy_multipart_upload_tags_to_object(&transaction, upload_id, outcome.sequence)?;
         Sqlite::delete_multipart(&transaction, upload_id)?;

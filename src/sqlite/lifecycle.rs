@@ -648,6 +648,7 @@ mod tests {
         },
         sqlite::{
             KeyMetadata, KeyValue, MultipartUploadState, NULL_VERSION_ID, Sqlite, SqliteResult,
+            put::test_support as put_test_support,
         },
     };
 
@@ -738,11 +739,11 @@ mod tests {
         let transaction = connection.transaction()?;
         let now = OffsetDateTime::UNIX_EPOCH + time::Duration::days(10);
         Sqlite::replace_bucket_lifecycle_rules(&transaction, &[expiration_rule(1)])?;
-        Sqlite::put_object(
+        put_test_support::put_object(
             &transaction,
             key_value("logs/old", b"value", OffsetDateTime::UNIX_EPOCH),
         )?;
-        Sqlite::put_object(
+        put_test_support::put_object(
             &transaction,
             key_value("other/old", b"value", OffsetDateTime::UNIX_EPOCH),
         )?;

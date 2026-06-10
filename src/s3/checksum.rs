@@ -34,21 +34,6 @@ pub(crate) enum ChecksumAlgorithmKind {
     Sha256,
 }
 
-impl ChecksumAlgorithmKind {
-    /// Computes this checksum over a byte slice and base64-encodes the digest.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn checksum_value(self, value: &[u8]) -> String {
-        match self {
-            Self::Crc32 => encode_base64(Crc32::checksum(value).as_ref()),
-            Self::Crc32c => encode_base64(Crc32c::checksum(value).as_ref()),
-            Self::Crc64Nvme => encode_base64(Crc64Nvme::checksum(value).as_ref()),
-            Self::Sha1 => encode_base64(Sha1::checksum(value).as_ref()),
-            Self::Sha256 => encode_base64(Sha256::checksum(value).as_ref()),
-        }
-    }
-}
-
 /// Checksum aggregation modes supported by S3 object checksums.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ChecksumTypeKind {
@@ -1134,12 +1119,31 @@ pub(super) fn object_checksum_for_part(
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use s3s::crypto::{Checksum as _, Crc32, Crc32c, Crc64Nvme, Sha1, Sha256};
+
+    use super::{ChecksumAlgorithmKind, encode_base64};
+
+    /// Computes this checksum over a byte slice and base64-encodes the digest.
+    #[must_use]
+    pub(crate) fn checksum_value(algorithm: ChecksumAlgorithmKind, value: &[u8]) -> String {
+        match algorithm {
+            ChecksumAlgorithmKind::Crc32 => encode_base64(Crc32::checksum(value).as_ref()),
+            ChecksumAlgorithmKind::Crc32c => encode_base64(Crc32c::checksum(value).as_ref()),
+            ChecksumAlgorithmKind::Crc64Nvme => encode_base64(Crc64Nvme::checksum(value).as_ref()),
+            ChecksumAlgorithmKind::Sha1 => encode_base64(Sha1::checksum(value).as_ref()),
+            ChecksumAlgorithmKind::Sha256 => encode_base64(Sha256::checksum(value).as_ref()),
+        }
+    }
+}
+
+#[cfg(test)]
 mod model_tests {
     use super::{
         ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKind, ChecksumView,
         CompositeChecksum, FullObjectChecksum, MultipartChecksumConfig,
         MultipartCompletionChecksum, PartChecksum, StoredChecksum, decode_base64, decode_md5_hex,
-        encode_base64, encode_hex,
+        encode_base64, encode_hex, test_support,
     };
 
     #[test]
@@ -1355,23 +1359,23 @@ mod model_tests {
     fn computes_base64_checksum_values() {
         let value = b"test data";
         assert_eq!(
-            ChecksumAlgorithmKind::Crc32.checksum_value(value),
+            test_support::checksum_value(ChecksumAlgorithmKind::Crc32, value),
             "0wiusg=="
         );
         assert_eq!(
-            ChecksumAlgorithmKind::Crc32c.checksum_value(value),
+            test_support::checksum_value(ChecksumAlgorithmKind::Crc32c, value),
             "M3m0yg=="
         );
         assert_eq!(
-            ChecksumAlgorithmKind::Crc64Nvme.checksum_value(value),
+            test_support::checksum_value(ChecksumAlgorithmKind::Crc64Nvme, value),
             "rsrzr5yYqFU="
         );
         assert_eq!(
-            ChecksumAlgorithmKind::Sha1.checksum_value(value),
+            test_support::checksum_value(ChecksumAlgorithmKind::Sha1, value),
             "9I3YU4IIYIFsddVND1hNyGMyenw="
         );
         assert_eq!(
-            ChecksumAlgorithmKind::Sha256.checksum_value(value),
+            test_support::checksum_value(ChecksumAlgorithmKind::Sha256, value),
             "kW8AJ6V1B0znKjMXd8NHjWUT94alkb2JLaGld78jNfk="
         );
     }
@@ -1390,7 +1394,7 @@ mod model_tests {
             accumulator.update(b"data");
             assert_eq!(
                 accumulator.finish_value(),
-                algorithm.checksum_value(b"test data")
+                test_support::checksum_value(algorithm, b"test data")
             );
         }
     }
@@ -1429,7 +1433,7 @@ mod model_tests {
             Some(StoredChecksum::Composite(CompositeChecksum::Sha256(
                 format!(
                     "{}-2",
-                    ChecksumAlgorithmKind::Sha256.checksum_value(b"partdigest")
+                    test_support::checksum_value(ChecksumAlgorithmKind::Sha256, b"partdigest")
                 )
             )))
         );
