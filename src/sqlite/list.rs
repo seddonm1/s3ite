@@ -10,115 +10,6 @@ const MARKER_DELETED_VERSION: i64 = 3;
 const OBJECT_ENTRY_KIND: i64 = 0;
 const COMMON_PREFIX_ENTRY_KIND: i64 = 1;
 
-const OBJECT_VERSION_ENTRY_LIST_SQL: &str = "
-WITH filtered AS (
-    SELECT
-        sequence,
-        key,
-        version_id,
-        size,
-        last_modified,
-        md5,
-        is_latest,
-        is_delete_marker,
-        CASE
-            WHEN :delimiter = '' THEN NULL
-            WHEN instr(substr(key, length(:prefix) + 1), :delimiter) = 0 THEN NULL
-            ELSE substr(
-                key,
-                1,
-                length(:prefix)
-                    + instr(substr(key, length(:prefix) + 1), :delimiter)
-                    + length(:delimiter)
-                    - 1
-            )
-        END AS common_prefix
-    FROM object_version
-    WHERE
-        (
-            :prefix = ''
-            OR (
-                key >= :prefix
-                AND substr(key, 1, length(:prefix)) = :prefix
-            )
-        )
-        AND (
-            :marker_kind = 0
-            OR (:marker_kind = 1 AND key > :after_key)
-            OR (
-                :marker_kind = 2
-                AND (
-                    key > :after_key
-                    OR (key = :after_key AND sequence < :after_sequence)
-                )
-            )
-            OR (:marker_kind = 3 AND key >= :after_key)
-        )
-),
-prefix_rows AS (
-    SELECT
-        *,
-        row_number() OVER (
-            PARTITION BY common_prefix
-            ORDER BY key, sequence DESC
-        ) AS prefix_rank
-    FROM filtered
-    WHERE common_prefix IS NOT NULL
-)
-SELECT
-    entry_kind,
-    key,
-    version_id,
-    size,
-    last_modified,
-    md5,
-    is_latest,
-    is_delete_marker,
-    common_prefix,
-    marker_key,
-    marker_version_id
-FROM (
-    SELECT
-        0 AS entry_kind,
-        key,
-        version_id,
-        size,
-        last_modified,
-        md5,
-        is_latest,
-        is_delete_marker,
-        NULL AS common_prefix,
-        key AS marker_key,
-        version_id AS marker_version_id,
-        key AS sort_key,
-        sequence AS sort_sequence
-    FROM filtered
-    WHERE common_prefix IS NULL
-
-    UNION ALL
-
-    SELECT
-        1 AS entry_kind,
-        NULL AS key,
-        NULL AS version_id,
-        NULL AS size,
-        NULL AS last_modified,
-        NULL AS md5,
-        NULL AS is_latest,
-        NULL AS is_delete_marker,
-        common_prefix,
-        key AS marker_key,
-        version_id AS marker_version_id,
-        common_prefix AS sort_key,
-        sequence AS sort_sequence
-    FROM prefix_rows
-    WHERE
-        prefix_rank = 1
-        AND (:after_key IS NULL OR common_prefix > :after_key)
-)
-ORDER BY sort_key, sort_sequence DESC
-LIMIT :limit;";
-
 impl ObjectVersionListEntry {
     fn marker(&self) -> (&str, &str) {
         match self {
@@ -132,6 +23,11 @@ impl ObjectVersionListEntry {
     }
 }
 
+/// Builds a page from one more emitted entry than the client limit.
+///
+/// The extra entry only determines truncation. When the page is truncated, the
+/// next markers come from the last retained emitted entry, whether that entry is
+/// an object version or a collapsed common prefix.
 fn object_version_list_page(
     mut entries: Vec<ObjectVersionListEntry>,
     limit: i64,
@@ -167,6 +63,11 @@ fn object_version_list_page(
     }
 }
 
+/// Classifies version-list markers before applying them in SQL.
+///
+/// Key-only markers resume after the key. Exact version markers resume after
+/// the matching `(key, sequence)`. If the version marker is no longer present,
+/// it is treated as a deleted-marker position and resumes at `key >= marker`.
 fn object_version_marker_state(
     transaction: &Transaction,
     after_key: Option<&str>,
@@ -211,6 +112,12 @@ fn object_version_entry_from_row(
     }
 }
 
+/// Queries object-version list entries in storage order.
+///
+/// The CTE first applies prefix and marker filters, then derives delimiter
+/// common prefixes. Object rows without a common prefix are emitted directly;
+/// grouped prefixes emit one entry, using the first raw `(key, sequence DESC)`
+/// row in that group as the source for pagination markers.
 fn query_object_version_entries(
     transaction: &Transaction,
     prefix: &str,
@@ -220,16 +127,81 @@ fn query_object_version_entries(
     after_sequence: Option<i64>,
     fetch_limit: i64,
 ) -> SqliteResult<Vec<ObjectVersionListEntry>> {
-    let mut stmt = transaction.prepare_cached(OBJECT_VERSION_ENTRY_LIST_SQL)?;
+    let mut stmt = transaction.prepare_cached(
+        "
+        WITH filtered AS (
+            SELECT
+                sequence, key, version_id, size, last_modified, md5,
+                is_latest, is_delete_marker,
+                CASE
+                    WHEN ?2 = '' THEN NULL
+                    WHEN instr(substr(key, length(?1) + 1), ?2) = 0 THEN NULL
+                    ELSE substr(
+                        key, 1,
+                        length(?1) + instr(substr(key, length(?1) + 1), ?2) + length(?2) - 1
+                    )
+                END AS common_prefix
+            FROM object_version
+            WHERE
+                (?1 = '' OR (key >= ?1 AND substr(key, 1, length(?1)) = ?1))
+                AND (
+                    ?3 = 0
+                    OR (?3 = 1 AND key > ?4)
+                    OR (?3 = 2 AND (key > ?4 OR (key = ?4 AND sequence < ?5)))
+                    OR (?3 = 3 AND key >= ?4)
+                )
+        ),
+        prefix_rows AS (
+            SELECT
+                *,
+                row_number() OVER (PARTITION BY common_prefix ORDER BY key, sequence DESC)
+                    AS prefix_rank
+            FROM filtered
+            WHERE common_prefix IS NOT NULL
+        )
+        SELECT
+            entry_kind, key, version_id, size, last_modified, md5,
+            is_latest, is_delete_marker, common_prefix, marker_key, marker_version_id
+        FROM (
+            SELECT
+                0 AS entry_kind, key, version_id, size, last_modified, md5,
+                is_latest, is_delete_marker,
+                NULL AS common_prefix,
+                key AS marker_key,
+                version_id AS marker_version_id,
+                key AS sort_key,
+                sequence AS sort_sequence
+            FROM filtered
+            WHERE common_prefix IS NULL
+
+            UNION ALL
+
+            SELECT
+                1 AS entry_kind,
+                NULL AS key, NULL AS version_id, NULL AS size, NULL AS last_modified,
+                NULL AS md5, NULL AS is_latest, NULL AS is_delete_marker,
+                common_prefix,
+                key AS marker_key,
+                version_id AS marker_version_id,
+                common_prefix AS sort_key,
+                sequence AS sort_sequence
+            FROM prefix_rows
+            WHERE
+                prefix_rank = 1
+                AND (?4 IS NULL OR common_prefix > ?4)
+        )
+        ORDER BY sort_key, sort_sequence DESC
+        LIMIT ?6;",
+    )?;
     let rows = stmt.query_map(
-        rusqlite::named_params! {
-            ":prefix": prefix,
-            ":delimiter": delimiter,
-            ":marker_kind": marker_kind,
-            ":after_key": after_key,
-            ":after_sequence": after_sequence,
-            ":limit": fetch_limit,
-        },
+        (
+            prefix,
+            delimiter,
+            marker_kind,
+            after_key,
+            after_sequence,
+            fetch_limit,
+        ),
         object_version_entry_from_row,
     )?;
 
@@ -292,7 +264,11 @@ impl Sqlite {
         Ok(objects)
     }
 
-    /// Lists object versions and collapsed common prefixes as emitted page entries.
+    /// Lists object versions and collapsed common prefixes as storage entries.
+    ///
+    /// This is the storage-level `ListObjectVersions` pager. It returns plain
+    /// object summaries and common-prefix entries; S3 DTO conversion, owner
+    /// fields, and URL encoding stay in the S3 layer.
     pub(crate) fn list_object_version_entries(
         transaction: &Transaction,
         prefix: &str,
