@@ -834,6 +834,22 @@ pub(crate) struct MultipartUploadSummary {
     pub(crate) checksum: Option<MultipartChecksumConfig>,
 }
 
+/// Storage-level multipart upload list entry.
+#[derive(Debug)]
+pub(crate) enum MultipartUploadListEntry {
+    Upload(MultipartUploadSummary),
+    CommonPrefix { prefix: String },
+}
+
+/// Page of multipart upload list entries returned by storage.
+#[derive(Debug)]
+pub(crate) struct MultipartUploadListPage {
+    pub(crate) entries: Vec<MultipartUploadListEntry>,
+    pub(crate) next_key_marker: Option<String>,
+    pub(crate) next_upload_id_marker: Option<String>,
+    pub(crate) is_truncated: bool,
+}
+
 /// Completion ledger entry used to make multipart completion idempotent.
 #[derive(Debug)]
 pub(crate) struct CompletedMultipartUploadState {

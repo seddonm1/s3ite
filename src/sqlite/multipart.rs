@@ -10,12 +10,16 @@ use super::{
     CompletedMultipartUploadRecord, CompletedMultipartUploadState, CompletedObjectPart,
     KeyMetadata, Multipart, MultipartChecksumConfig, MultipartCompletion,
     MultipartCompletionChecksum, MultipartCompletionPart, MultipartCompletionRequest,
-    MultipartMetadata, MultipartPartWrite, MultipartUploadState, MultipartUploadSummary,
-    PartChecksum, PreparedMultipartUpload, Sqlite, SqliteError, SqliteResult, StoredBlobChunk,
-    StoredChecksum, StoredSse, decode_base64, decode_md5_hex, encode_hex,
-    optional_multipart_checksum_config, optional_part_checksum, optional_stored_object_lock,
-    optional_stored_sse, required_stored_checksum, row_size, sql_limit, sql_size,
+    MultipartMetadata, MultipartPartWrite, MultipartUploadListEntry, MultipartUploadListPage,
+    MultipartUploadState, MultipartUploadSummary, PartChecksum, PreparedMultipartUpload, Sqlite,
+    SqliteError, SqliteResult, StoredBlobChunk, StoredChecksum, StoredSse, decode_base64,
+    decode_md5_hex, encode_hex, optional_multipart_checksum_config, optional_part_checksum,
+    optional_stored_object_lock, optional_stored_sse, required_stored_checksum, row_size,
+    sql_limit, sql_size,
 };
+
+const MULTIPART_UPLOAD_ENTRY_KIND: i64 = 0;
+const MULTIPART_COMMON_PREFIX_ENTRY_KIND: i64 = 1;
 
 #[derive(Clone, Copy)]
 struct CompletionPartMetadata<'a> {
@@ -47,6 +51,152 @@ impl<'a> From<&'a MultipartMetadata> for CompletionPartMetadata<'a> {
             checksum: part.checksum.as_ref(),
         }
     }
+}
+
+impl MultipartUploadListEntry {
+    fn marker(&self) -> (&str, Option<Uuid>) {
+        match self {
+            Self::Upload(summary) => (&summary.key, Some(summary.upload_id)),
+            Self::CommonPrefix { prefix } => (prefix, None),
+        }
+    }
+}
+
+/// Builds a multipart upload list page from one more entry than the client limit.
+fn multipart_upload_list_page(
+    mut entries: Vec<MultipartUploadListEntry>,
+    limit: i64,
+) -> MultipartUploadListPage {
+    if limit == 0 {
+        return MultipartUploadListPage {
+            entries: Vec::new(),
+            next_key_marker: None,
+            next_upload_id_marker: None,
+            is_truncated: false,
+        };
+    }
+
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let is_truncated = entries.len() > limit;
+    if is_truncated {
+        entries.truncate(limit);
+    }
+    let (next_key_marker, next_upload_id_marker) = if is_truncated {
+        entries.last().map_or((None, None), |entry| {
+            let (key, upload_id) = entry.marker();
+            (
+                Some(key.to_string()),
+                upload_id.map(|upload_id| upload_id.to_string()),
+            )
+        })
+    } else {
+        (None, None)
+    };
+
+    MultipartUploadListPage {
+        entries,
+        next_key_marker,
+        next_upload_id_marker,
+        is_truncated,
+    }
+}
+
+fn multipart_upload_entry_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<MultipartUploadListEntry> {
+    match row.get::<_, i64>(0)? {
+        MULTIPART_UPLOAD_ENTRY_KIND => {
+            Ok(MultipartUploadListEntry::Upload(MultipartUploadSummary {
+                key: row.get(1)?,
+                upload_id: row.get(2)?,
+                initiated: row.get(3)?,
+                checksum: optional_multipart_checksum_config(
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                )?,
+            }))
+        }
+        MULTIPART_COMMON_PREFIX_ENTRY_KIND => Ok(MultipartUploadListEntry::CommonPrefix {
+            prefix: row.get(7)?,
+        }),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+/// Queries active multipart uploads and delimiter groups in emitted-entry order.
+///
+/// The CTE applies prefix and marker filters, derives common prefixes, emits
+/// uploads outside delimiter groups, and emits one row for each grouped prefix.
+fn query_multipart_upload_entries(
+    transaction: &Transaction,
+    prefix: &str,
+    delimiter: &str,
+    after_key: Option<&str>,
+    after_upload_id: Option<Uuid>,
+    fetch_limit: i64,
+) -> SqliteResult<Vec<MultipartUploadListEntry>> {
+    let mut stmt = transaction.prepare_cached(
+        "
+        WITH filtered AS (
+            SELECT
+                key, upload_id, initiated,
+                checksum_algorithm, checksum_type, checksum_value,
+                CASE
+                    WHEN ?2 = '' THEN NULL
+                    WHEN instr(substr(key, length(?1) + 1), ?2) = 0 THEN NULL
+                    ELSE substr(
+                        key, 1,
+                        length(?1) + instr(substr(key, length(?1) + 1), ?2) + length(?2) - 1
+                    )
+                END AS common_prefix
+            FROM multipart_upload
+            WHERE
+                (?1 = '' OR (key >= ?1 AND substr(key, 1, length(?1)) = ?1))
+                AND (
+                    ?3 IS NULL
+                    OR (?4 IS NULL AND key > ?3)
+                    OR (?4 IS NOT NULL AND (key > ?3 OR (key = ?3 AND upload_id > ?4)))
+                )
+        ),
+        prefix_rows AS (
+            SELECT
+                *,
+                row_number() OVER (PARTITION BY common_prefix ORDER BY key, upload_id)
+                    AS prefix_rank
+            FROM filtered
+            WHERE common_prefix IS NOT NULL
+        )
+        SELECT
+            entry_kind, key, upload_id, initiated, checksum_algorithm,
+            checksum_type, checksum_value, common_prefix
+        FROM (
+            SELECT
+                0 AS entry_kind, key, upload_id, initiated, checksum_algorithm,
+                checksum_type, checksum_value, NULL AS common_prefix,
+                key AS sort_key, upload_id AS sort_upload_id
+            FROM filtered
+            WHERE common_prefix IS NULL
+
+            UNION ALL
+
+            SELECT
+                1 AS entry_kind, NULL AS key, NULL AS upload_id,
+                NULL AS initiated, NULL AS checksum_algorithm, NULL AS checksum_type,
+                NULL AS checksum_value, common_prefix,
+                common_prefix AS sort_key, upload_id AS sort_upload_id
+            FROM prefix_rows
+            WHERE prefix_rank = 1 AND (?3 IS NULL OR common_prefix > ?3)
+        )
+        ORDER BY sort_key, sort_upload_id
+        LIMIT ?5;",
+    )?;
+    let rows = stmt.query_map(
+        (prefix, delimiter, after_key, after_upload_id, fetch_limit),
+        multipart_upload_entry_from_row,
+    )?;
+
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 struct MultipartObjectPreparation<'a> {
@@ -954,81 +1104,37 @@ impl Sqlite {
         Ok(objects.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Lists active multipart uploads ordered by key and upload ID.
-    pub(crate) fn list_multipart_uploads(
+    /// Lists active multipart uploads and collapsed common prefixes.
+    ///
+    /// This is the storage-level `ListMultipartUploads` pager. It returns plain
+    /// upload summaries and common-prefix entries; S3 DTO conversion, owner
+    /// fields, and URL encoding stay in the S3 layer.
+    pub(crate) fn list_multipart_upload_entries(
         transaction: &Transaction,
-        prefix: Option<&str>,
+        prefix: &str,
+        delimiter: Option<&str>,
         after_key: Option<&str>,
         after_upload_id: Option<Uuid>,
         limit: i64,
-    ) -> SqliteResult<Vec<MultipartUploadSummary>> {
+    ) -> SqliteResult<MultipartUploadListPage> {
         let limit = sql_limit(limit)?;
-        let prefix = prefix.and_then(|prefix| prefix.is_empty().not().then_some(prefix));
-        let map_upload = |row: &rusqlite::Row<'_>| {
-            Ok(MultipartUploadSummary {
-                key: row.get(0)?,
-                upload_id: row.get(1)?,
-                initiated: row.get(2)?,
-                checksum: optional_multipart_checksum_config(
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                )?,
-            })
-        };
+        if limit == 0 {
+            return Ok(multipart_upload_list_page(Vec::new(), limit));
+        }
 
-        let uploads = match (prefix, after_key, after_upload_id) {
-            (Some(prefix), Some(after_key), Some(after_upload_id)) => {
-                let mut stmt = transaction.prepare_cached(
-                    "SELECT key, upload_id, initiated, checksum_algorithm, checksum_type, checksum_value FROM multipart_upload WHERE key >= ?1 AND (key > ?2 OR (key = ?2 AND upload_id > ?3)) ORDER BY key, upload_id LIMIT ?4;",
-                )?;
-                stmt.query_map(
-                    rusqlite::params![prefix, after_key, after_upload_id, limit],
-                    map_upload,
-                )?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-            }
-            (Some(prefix), Some(after_key), None) => {
-                let mut stmt = transaction.prepare_cached(
-                    "SELECT key, upload_id, initiated, checksum_algorithm, checksum_type, checksum_value FROM multipart_upload WHERE key >= ?1 AND key > ?2 ORDER BY key, upload_id LIMIT ?3;",
-                )?;
-                stmt.query_map(rusqlite::params![prefix, after_key, limit], map_upload)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            }
-            (Some(prefix), None, _) => {
-                let mut stmt = transaction.prepare_cached(
-                    "SELECT key, upload_id, initiated, checksum_algorithm, checksum_type, checksum_value FROM multipart_upload WHERE key >= ?1 ORDER BY key, upload_id LIMIT ?2;",
-                )?;
-                stmt.query_map(rusqlite::params![prefix, limit], map_upload)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            }
-            (None, Some(after_key), Some(after_upload_id)) => {
-                let mut stmt = transaction.prepare_cached(
-                    "SELECT key, upload_id, initiated, checksum_algorithm, checksum_type, checksum_value FROM multipart_upload WHERE key > ?1 OR (key = ?1 AND upload_id > ?2) ORDER BY key, upload_id LIMIT ?3;",
-                )?;
-                stmt.query_map(
-                    rusqlite::params![after_key, after_upload_id, limit],
-                    map_upload,
-                )?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-            }
-            (None, Some(after_key), None) => {
-                let mut stmt = transaction.prepare_cached(
-                    "SELECT key, upload_id, initiated, checksum_algorithm, checksum_type, checksum_value FROM multipart_upload WHERE key > ?1 ORDER BY key, upload_id LIMIT ?2;",
-                )?;
-                stmt.query_map(rusqlite::params![after_key, limit], map_upload)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            }
-            (None, None, _) => {
-                let mut stmt = transaction.prepare_cached(
-                    "SELECT key, upload_id, initiated, checksum_algorithm, checksum_type, checksum_value FROM multipart_upload ORDER BY key, upload_id LIMIT ?1;",
-                )?;
-                stmt.query_map([limit], map_upload)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            }
-        };
+        let delimiter = delimiter
+            .filter(|delimiter| delimiter.is_empty().not())
+            .unwrap_or("");
+        let entries = query_multipart_upload_entries(
+            transaction,
+            prefix,
+            delimiter,
+            after_key,
+            after_upload_id,
+            limit.saturating_add(1),
+        )?;
 
-        Ok(uploads)
+        Ok(multipart_upload_list_page(entries, limit))
     }
 
     /// Fetches one completed multipart object part boundary.
@@ -1420,6 +1526,26 @@ mod tests {
         }
     }
 
+    fn listed_uploads(page: MultipartUploadListPage) -> Vec<(String, Uuid)> {
+        page.entries
+            .into_iter()
+            .filter_map(|entry| match entry {
+                MultipartUploadListEntry::Upload(summary) => Some((summary.key, summary.upload_id)),
+                MultipartUploadListEntry::CommonPrefix { .. } => None,
+            })
+            .collect()
+    }
+
+    fn listed_prefixes(page: MultipartUploadListPage) -> Vec<String> {
+        page.entries
+            .into_iter()
+            .filter_map(|entry| match entry {
+                MultipartUploadListEntry::Upload(_) => None,
+                MultipartUploadListEntry::CommonPrefix { prefix } => Some(prefix),
+            })
+            .collect()
+    }
+
     fn require_prepared(completion: MultipartCompletion) -> SqliteResult<PreparedMultipartUpload> {
         match completion {
             MultipartCompletion::Prepared(prepared) => Ok(prepared),
@@ -1707,39 +1833,107 @@ mod tests {
             )?;
         }
 
-        let prefix_after_key =
-            Sqlite::list_multipart_uploads(&transaction, Some("alpha"), Some("alpha"), None, 10)?;
+        let prefix_after_key = Sqlite::list_multipart_upload_entries(
+            &transaction,
+            "alpha",
+            None,
+            Some("alpha"),
+            None,
+            10,
+        )?;
         assert_eq!(
-            prefix_after_key
-                .iter()
-                .map(|summary| summary.key.as_str())
-                .collect::<Vec<_>>(),
-            vec!["beta"]
+            listed_uploads(prefix_after_key),
+            Vec::<(String, Uuid)>::new()
         );
 
-        let after_key_and_upload = Sqlite::list_multipart_uploads(
+        let after_key_and_upload = Sqlite::list_multipart_upload_entries(
             &transaction,
+            "",
             None,
             Some("alpha"),
             Some(alpha_first),
             10,
         )?;
         assert_eq!(
-            after_key_and_upload
-                .iter()
-                .map(|summary| (summary.key.as_str(), summary.upload_id))
-                .collect::<Vec<_>>(),
-            vec![("alpha", alpha_second), ("beta", beta)]
+            listed_uploads(after_key_and_upload),
+            vec![
+                ("alpha".to_string(), alpha_second),
+                ("beta".to_string(), beta)
+            ]
         );
 
         let after_key_only =
-            Sqlite::list_multipart_uploads(&transaction, None, Some("alpha"), None, 10)?;
+            Sqlite::list_multipart_upload_entries(&transaction, "", None, Some("alpha"), None, 10)?;
         assert_eq!(
-            after_key_only
-                .iter()
-                .map(|summary| summary.key.as_str())
+            listed_uploads(after_key_only),
+            vec![("beta".to_string(), beta)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn list_multipart_upload_entries_groups_delimiter_prefixes() -> SqliteResult<()> {
+        let mut connection = open_schema()?;
+        let transaction = connection.transaction()?;
+
+        for (upload_id, key) in [
+            (Uuid::from_u128(4), "group/a/one"),
+            (Uuid::from_u128(5), "group/a/two"),
+            (Uuid::from_u128(6), "group/b/one"),
+            (Uuid::from_u128(7), "group/root"),
+        ] {
+            Sqlite::create_multipart_upload(
+                &transaction,
+                upload_id,
+                "bucket",
+                key,
+                upload_state(),
+            )?;
+        }
+
+        let grouped = Sqlite::list_multipart_upload_entries(
+            &transaction,
+            "group/",
+            Some("/"),
+            None,
+            None,
+            10,
+        )?;
+        assert_eq!(
+            listed_prefixes(grouped),
+            vec!["group/a/".to_string(), "group/b/".to_string()]
+        );
+
+        let truncated = Sqlite::list_multipart_upload_entries(
+            &transaction,
+            "group/",
+            Some("/"),
+            None,
+            None,
+            1,
+        )?;
+        assert!(truncated.is_truncated);
+        assert_eq!(truncated.next_key_marker.as_deref(), Some("group/a/"));
+        assert_eq!(truncated.next_upload_id_marker, None);
+
+        let resumed = Sqlite::list_multipart_upload_entries(
+            &transaction,
+            "group/",
+            Some("/"),
+            truncated.next_key_marker.as_deref(),
+            None,
+            10,
+        )?;
+        assert_eq!(
+            resumed
+                .entries
+                .into_iter()
+                .map(|entry| match entry {
+                    MultipartUploadListEntry::Upload(summary) => summary.key,
+                    MultipartUploadListEntry::CommonPrefix { prefix } => prefix,
+                })
                 .collect::<Vec<_>>(),
-            vec!["beta"]
+            vec!["group/b/".to_string(), "group/root".to_string()]
         );
         Ok(())
     }

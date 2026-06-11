@@ -69,10 +69,11 @@ use uuid::Uuid;
 
 use crate::ClientAddress;
 use crate::sqlite::{
-    BucketVersioningState, CompletedObjectPart, KeyMetadata, KeyValue, Multipart,
-    MultipartCompletion, MultipartCompletionPart, MultipartCompletionRequest, MultipartPartWrite,
-    MultipartUploadState, MultipartUploadSummary, ObjectBodyReference, ObjectDeleteOutcome,
-    ObjectTagCondition, ObjectWriteConditions, Sqlite, SqliteError, SqliteResult,
+    BucketVersioningState, CompletedMultipartUploadOutcome, CompletedObjectPart, KeyMetadata,
+    KeyValue, Multipart, MultipartCompletion, MultipartCompletionPart, MultipartCompletionRequest,
+    MultipartPartWrite, MultipartUploadListEntry, MultipartUploadState, ObjectBodyReference,
+    ObjectDeleteOutcome, ObjectTagCondition, ObjectWriteConditions, Sqlite, SqliteError,
+    SqliteResult,
 };
 
 const LIST_BATCH_SIZE: i64 = 1024;
@@ -172,9 +173,8 @@ use self::{
         s3_error_with_message,
     },
     list::{
-        common_prefix_for_key, decode_continuation_token, decode_list_input_value,
-        encode_continuation_token, encode_list_value, is_url_encoding, list_limit,
-        output_delimiter,
+        decode_continuation_token, decode_list_input_value, encode_continuation_token,
+        encode_list_value, is_url_encoding, list_limit, output_delimiter,
     },
     metadata::{normalize_content_encoding, normalize_metadata},
     multipart::{requested_part_range, validate_part_number},

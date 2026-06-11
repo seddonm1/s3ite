@@ -1,34 +1,31 @@
-use std::collections::HashSet;
-
 use crate::sqlite::EncodedBlobChunk;
 
 use super::copy::{load_copy_source_object, validate_copy_source_conditions};
 use super::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, ActiveSse, ByteRange, CONTENT_MD5,
     ChecksumAccumulator, ChecksumInput, ChecksumTypeKind, CommonPrefix,
-    CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CompletedObjectPart,
-    CompletedPart, CopyPartResult, CopySource, CreateMultipartUploadInput,
-    CreateMultipartUploadOutput, Digest, ETag, Initiator, InternalError, KeyValue, LIST_BATCH_SIZE,
+    CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CompletedMultipartUploadOutcome,
+    CompletedObjectPart, CompletedPart, CopyPartResult, CopySource, CreateMultipartUploadInput,
+    CreateMultipartUploadOutput, Digest, ETag, Initiator, InternalError, KeyValue,
     ListMultipartUploadsInput, ListMultipartUploadsOutput, ListPartsInput, ListPartsOutput, Md5,
     Multipart, MultipartChecksumConfig, MultipartCompletion, MultipartCompletionChecksum,
     MultipartCompletionPart, MultipartCompletionRequest, MultipartPartWrite, MultipartUpload,
-    MultipartUploadState, MultipartUploadSummary, Not, ObjectAclRequest, ObjectReadConditions,
-    OffsetDateTime, Part, PartChecksum, S3_SINGLE_REQUEST_BODY_MAX, S3Error, S3ErrorCode, S3Range,
-    S3Request, S3Response, S3Result, Sqlite, SqliteError, SqliteResult, StorageClass,
+    MultipartUploadListEntry, MultipartUploadState, Not, ObjectAclRequest, ObjectReadConditions,
+    OffsetDateTime, Owner, Part, PartChecksum, S3_SINGLE_REQUEST_BODY_MAX, S3Error, S3ErrorCode,
+    S3Range, S3Request, S3Response, S3Result, Sqlite, SqliteError, SqliteResult, StorageClass,
     StoredChecksum, StoredSse, StreamingBlob, TryStreamExt, UploadPartCopyInput,
     UploadPartCopyOutput, UploadPartInput, UploadPartOutput, Uuid, active_sse_from_stored,
     checksum_algorithm_output, checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_sha1,
-    checksum_sha256, checksum_type_output, common_prefix_for_key, configured_part_checksum,
-    copy_bytes, decode_list_input_value, decrypt_stored_chunks,
-    default_crc64nvme_full_object_checksum, encode_list_value, encrypt_value_chunks,
-    finish_part_checksum, hex, is_url_encoding, load_bucket_object_lock_config,
-    multipart_checksum_config, normalize_content_encoding, normalize_metadata,
-    object_lock_for_new_version, object_lock_write_headers, object_write_conditions,
-    output_delimiter, owner, part_checksum_accumulator, read_part_body_encrypted, requested_sse_s3,
-    resolve_write_encryption, s3_error, s3_error_from_sqlite, s3_error_with_message, sse_s3_output,
-    stored_tags_from_header, validate_content_md5, validate_declared_object_write_length,
-    validate_expected_bucket_owner, validate_no_sse_headers, validate_no_unsupported_sse_headers,
-    validate_object_acl,
+    checksum_sha256, checksum_type_output, configured_part_checksum, copy_bytes,
+    decode_list_input_value, decrypt_stored_chunks, default_crc64nvme_full_object_checksum,
+    encode_list_value, encrypt_value_chunks, finish_part_checksum, hex, is_url_encoding,
+    load_bucket_object_lock_config, multipart_checksum_config, normalize_content_encoding,
+    normalize_metadata, object_lock_for_new_version, object_lock_write_headers,
+    object_write_conditions, output_delimiter, owner, part_checksum_accumulator,
+    read_part_body_encrypted, requested_sse_s3, resolve_write_encryption, s3_error,
+    s3_error_from_sqlite, s3_error_with_message, sse_s3_output, stored_tags_from_header,
+    validate_content_md5, validate_declared_object_write_length, validate_expected_bucket_owner,
+    validate_no_sse_headers, validate_no_unsupported_sse_headers, validate_object_acl,
 };
 
 /// Normalizes a completed multipart part list while preserving S3 ordering rules.
@@ -273,6 +270,17 @@ fn active_upload_encryption(
     active_sse_from_stored(&master_key, stored)
         .map(Some)
         .map_err(|_| s3_error_with_message(InternalError, "SSE-S3 decryption failed"))
+}
+
+struct UploadPartWriteContext {
+    bucket: String,
+    key: String,
+    upload_id: Uuid,
+    part_number: i32,
+    access_key: Option<String>,
+    checksum_config: Option<MultipartChecksumConfig>,
+    expected_encryption: Option<StoredSse>,
+    chunk_size: usize,
 }
 
 /// Converts a stored completed part boundary into an object byte range.
@@ -693,138 +701,50 @@ async fn upload_part_copy_cross_bucket(
         .map_err(s3_error_from_sqlite)
 }
 
-pub(super) struct MultipartUploadListing {
-    uploads: Vec<MultipartUploadSummary>,
-    common_prefixes: Vec<CommonPrefix>,
-    next_key_marker: Option<String>,
-    next_upload_id_marker: Option<String>,
-    is_truncated: bool,
+fn multipart_upload_from_summary(
+    summary: crate::sqlite::MultipartUploadSummary,
+    encode_keys: bool,
+    owner: &Owner,
+    initiator: &Initiator,
+) -> MultipartUpload {
+    MultipartUpload {
+        checksum_algorithm: checksum_algorithm_output(summary.checksum),
+        checksum_type: checksum_type_output(summary.checksum),
+        initiated: Some(summary.initiated.into()),
+        initiator: Some(initiator.clone()),
+        key: Some(encode_list_value(summary.key, encode_keys)),
+        owner: Some(owner.clone()),
+        storage_class: Some(StorageClass::from_static(StorageClass::STANDARD)),
+        upload_id: Some(summary.upload_id.to_string()),
+    }
 }
 
-impl Sqlite {
-    /// Lists active multipart uploads with S3 prefix, delimiter, and marker semantics.
-    #[allow(clippy::too_many_lines)]
-    async fn list_active_multipart_uploads(
-        &self,
-        bucket: &str,
-        prefix_filter: &str,
-        delimiter_filter: Option<&str>,
-        mut after_key: Option<String>,
-        mut after_upload_id: Option<Uuid>,
-        max_uploads: usize,
-    ) -> S3Result<MultipartUploadListing> {
-        let mut uploads = Vec::new();
-        let mut common_prefixes = Vec::new();
-        let mut seen_common_prefixes = HashSet::new();
-        let marker_filter = after_key.clone();
-        let mut next_key_marker = None;
-        let mut next_upload_id_marker = None;
-        let mut count = 0usize;
-        let mut is_truncated = false;
-        let list_batch_len = usize::try_from(LIST_BATCH_SIZE).map_err(S3Error::internal_error)?;
-
-        if max_uploads == 0 {
-            self.get_connection(bucket)
-                .await
-                .map_err(s3_error_from_sqlite)?;
-        } else {
-            'pages: loop {
-                let prefix = prefix_filter.to_string();
-                let after_key_query = after_key.clone();
-                let after_upload_id_query = after_upload_id;
-                let summaries = {
-                    let connection = self
-                        .get_connection(bucket)
-                        .await
-                        .map_err(s3_error_from_sqlite)?;
-                    connection
-                        .read(move |transaction| {
-                            Self::list_multipart_uploads(
-                                transaction,
-                                Some(&prefix),
-                                after_key_query.as_deref(),
-                                after_upload_id_query,
-                                LIST_BATCH_SIZE,
-                            )
-                        })
-                        .await
-                        .map_err(s3_error_from_sqlite)?
-                };
-
-                if summaries.is_empty() {
-                    break;
-                }
-
-                let summary_count = summaries.len();
-                for summary in summaries {
-                    if prefix_filter.is_empty().not()
-                        && summary.key.starts_with(prefix_filter).not()
-                    {
-                        break 'pages;
-                    }
-
-                    if let Some(common_prefix) =
-                        common_prefix_for_key(&summary.key, prefix_filter, delimiter_filter)
-                    {
-                        if marker_filter
-                            .as_ref()
-                            .is_some_and(|marker| common_prefix.as_str() <= marker.as_str())
-                        {
-                            after_key = Some(summary.key);
-                            after_upload_id = Some(summary.upload_id);
-                            continue;
-                        }
-
-                        if seen_common_prefixes.contains(&common_prefix) {
-                            after_key = Some(summary.key);
-                            after_upload_id = Some(summary.upload_id);
-                            continue;
-                        }
-
-                        if count == max_uploads {
-                            is_truncated = true;
-                            break 'pages;
-                        }
-
-                        seen_common_prefixes.insert(common_prefix.clone());
-                        next_key_marker = Some(common_prefix.clone());
-                        next_upload_id_marker = None;
-                        common_prefixes.push(CommonPrefix {
-                            prefix: Some(common_prefix),
-                        });
-                        count += 1;
-                        after_key = Some(summary.key);
-                        after_upload_id = Some(summary.upload_id);
-                        continue;
-                    }
-
-                    if count == max_uploads {
-                        is_truncated = true;
-                        break 'pages;
-                    }
-
-                    next_key_marker = Some(summary.key.clone());
-                    next_upload_id_marker = Some(summary.upload_id.to_string());
-                    after_key = Some(summary.key.clone());
-                    after_upload_id = Some(summary.upload_id);
-                    uploads.push(summary);
-                    count += 1;
-                }
-
-                if summary_count < list_batch_len {
-                    break;
-                }
+fn multipart_upload_listing_entries(
+    entries: Vec<MultipartUploadListEntry>,
+    encode_keys: bool,
+    owner: &Owner,
+    initiator: &Initiator,
+) -> (Vec<MultipartUpload>, Vec<CommonPrefix>) {
+    let mut uploads = Vec::new();
+    let mut common_prefixes = Vec::new();
+    for entry in entries {
+        match entry {
+            MultipartUploadListEntry::Upload(summary) => {
+                uploads.push(multipart_upload_from_summary(
+                    summary,
+                    encode_keys,
+                    owner,
+                    initiator,
+                ));
+            }
+            MultipartUploadListEntry::CommonPrefix { prefix } => {
+                common_prefixes.push(CommonPrefix {
+                    prefix: Some(encode_list_value(prefix, encode_keys)),
+                });
             }
         }
-
-        Ok(MultipartUploadListing {
-            uploads,
-            common_prefixes,
-            next_key_marker,
-            next_upload_id_marker,
-            is_truncated,
-        })
     }
+    (uploads, common_prefixes)
 }
 
 /// Lists active multipart uploads in a bucket.
@@ -850,7 +770,6 @@ pub(super) async fn list_multipart_uploads(
     key_marker = key_marker.map(decode_list_input_value);
 
     let max_uploads = list_limit(max_uploads, 1000, 1000)?;
-    let max_uploads_usize = usize::try_from(max_uploads).map_err(S3Error::internal_error)?;
     let prefix_filter = prefix.clone().unwrap_or_default();
     let encode_keys = is_url_encoding(encoding_type.as_ref());
     let delimiter_filter = delimiter
@@ -867,49 +786,39 @@ pub(super) async fn list_multipart_uploads(
         None
     };
 
-    let listing = sqlite
-        .list_active_multipart_uploads(
-            &bucket,
-            &prefix_filter,
-            delimiter_filter.as_deref(),
-            key_marker.clone(),
-            after_upload_id,
-            max_uploads_usize,
-        )
-        .await?;
+    let listing = {
+        let prefix_filter = prefix_filter.clone();
+        let delimiter_filter = delimiter_filter.clone();
+        let key_marker = key_marker.clone();
+        let connection = sqlite
+            .get_connection(&bucket)
+            .await
+            .map_err(s3_error_from_sqlite)?;
+        connection
+            .read(move |transaction| {
+                Sqlite::list_multipart_upload_entries(
+                    transaction,
+                    &prefix_filter,
+                    delimiter_filter.as_deref(),
+                    key_marker.as_deref(),
+                    after_upload_id,
+                    i64::from(max_uploads),
+                )
+            })
+            .await
+            .map_err(s3_error_from_sqlite)?
+    };
     let owner = owner();
     let initiator = Initiator {
         display_name: owner.display_name.clone(),
         id: owner.id.clone(),
     };
-    let uploads = listing
-        .uploads
-        .into_iter()
-        .map(|summary| MultipartUpload {
-            checksum_algorithm: checksum_algorithm_output(summary.checksum),
-            checksum_type: checksum_type_output(summary.checksum),
-            initiated: Some(summary.initiated.into()),
-            initiator: Some(initiator.clone()),
-            key: Some(encode_list_value(summary.key, encode_keys)),
-            owner: Some(owner.clone()),
-            storage_class: Some(StorageClass::from_static(StorageClass::STANDARD)),
-            upload_id: Some(summary.upload_id.to_string()),
-        })
-        .collect::<Vec<_>>();
+    let (uploads, common_prefixes) =
+        multipart_upload_listing_entries(listing.entries, encode_keys, &owner, &initiator);
 
     let output = ListMultipartUploadsOutput {
         bucket: Some(bucket),
-        common_prefixes: delimiter.as_ref().map(|_| {
-            listing
-                .common_prefixes
-                .into_iter()
-                .map(|common_prefix| CommonPrefix {
-                    prefix: common_prefix
-                        .prefix
-                        .map(|prefix| encode_list_value(prefix, encode_keys)),
-                })
-                .collect::<Vec<_>>()
-        }),
+        common_prefixes: delimiter.as_ref().map(|_| common_prefixes),
         delimiter,
         encoding_type,
         is_truncated: Some(listing.is_truncated),
@@ -1051,8 +960,174 @@ pub(super) async fn create_multipart_upload(
     Ok(S3Response::new(output))
 }
 
+async fn upload_encrypted_part(
+    sqlite: &Sqlite,
+    context: UploadPartWriteContext,
+    body: StreamingBlob,
+    checksum_input: &ChecksumInput,
+    content_md5_present: bool,
+    content_md5: Option<String>,
+    encryption: ActiveSse,
+) -> S3Result<S3Response<UploadPartOutput>> {
+    let encrypted_body = read_part_body_encrypted(
+        body,
+        checksum_input,
+        context.checksum_config,
+        content_md5_present,
+        content_md5.as_deref(),
+        context.chunk_size,
+        &encryption,
+    )
+    .await?;
+    let size = encrypted_body.size;
+    let md5 = encrypted_body.md5;
+    let checksum = encrypted_body.checksum;
+    let md5_clone = md5.clone();
+    let checksum_write = checksum.clone();
+    let chunks = encrypted_body.chunks;
+    let UploadPartWriteContext {
+        bucket,
+        key,
+        upload_id,
+        part_number,
+        access_key,
+        checksum_config,
+        expected_encryption,
+        ..
+    } = context;
+    let connection = sqlite
+        .get_connection(&bucket)
+        .await
+        .map_err(s3_error_from_sqlite)?;
+    connection
+        .write(move |transaction| {
+            validate_upload_part_write_state(
+                transaction,
+                upload_id,
+                &bucket,
+                &key,
+                access_key.as_deref(),
+                checksum_config,
+                expected_encryption.as_ref(),
+            )?;
+            let part = MultipartPartWrite {
+                upload_id,
+                part_number,
+                last_modified: OffsetDateTime::now_utc(),
+                size,
+                md5: Some(md5_clone),
+                checksum: checksum_write,
+            };
+            Sqlite::put_multipart_with_encoded_chunks(transaction, &part, chunks)?;
+
+            Ok(())
+        })
+        .await
+        .map_err(s3_error_from_sqlite)?;
+
+    Ok(S3Response::new(upload_part_output(
+        md5,
+        checksum.as_ref(),
+        true,
+    )))
+}
+
+async fn upload_plain_part(
+    sqlite: &Sqlite,
+    context: UploadPartWriteContext,
+    body: StreamingBlob,
+    checksum_input: &ChecksumInput,
+    content_md5_present: bool,
+    content_md5: Option<String>,
+) -> S3Result<S3Response<UploadPartOutput>> {
+    let (value, size, md5, explicit_checksum) = read_upload_part_body(
+        body,
+        checksum_input,
+        content_md5_present,
+        content_md5.as_deref(),
+    )
+    .await?;
+    let checksum =
+        explicit_checksum.or_else(|| configured_part_checksum(context.checksum_config, &value));
+    let md5_clone = md5.clone();
+    let checksum_write = checksum.clone();
+    let UploadPartWriteContext {
+        bucket,
+        key,
+        upload_id,
+        part_number,
+        access_key,
+        checksum_config,
+        expected_encryption,
+        chunk_size,
+    } = context;
+    let connection = sqlite
+        .get_connection(&bucket)
+        .await
+        .map_err(s3_error_from_sqlite)?;
+    connection
+        .write(move |transaction| {
+            validate_upload_part_write_state(
+                transaction,
+                upload_id,
+                &bucket,
+                &key,
+                access_key.as_deref(),
+                checksum_config,
+                expected_encryption.as_ref(),
+            )?;
+            let multipart = Multipart {
+                upload_id,
+                part_number,
+                last_modified: OffsetDateTime::now_utc(),
+                value,
+                size,
+                md5: Some(md5_clone),
+                checksum: checksum_write,
+            };
+            Sqlite::put_multipart_with_chunk_size(transaction, &multipart, chunk_size)?;
+
+            Ok(())
+        })
+        .await
+        .map_err(s3_error_from_sqlite)?;
+
+    Ok(S3Response::new(upload_part_output(
+        md5,
+        checksum.as_ref(),
+        false,
+    )))
+}
+
+async fn load_upload_part_state(
+    sqlite: &Sqlite,
+    bucket: &str,
+    key: &str,
+    upload_id: Uuid,
+    access_key: Option<&str>,
+) -> S3Result<MultipartUploadState> {
+    let bucket = bucket.to_string();
+    let key = key.to_string();
+    let access_key = access_key.map(str::to_string);
+    let connection = sqlite
+        .get_connection(&bucket)
+        .await
+        .map_err(s3_error_from_sqlite)?;
+    connection
+        .read(move |transaction| {
+            load_multipart_upload_state(
+                transaction,
+                upload_id,
+                &bucket,
+                &key,
+                access_key.as_deref(),
+            )
+        })
+        .await
+        .map_err(s3_error_from_sqlite)
+}
+
 /// Stores or replaces a multipart upload part.
-#[allow(clippy::too_many_lines)]
 pub(super) async fn upload_part(
     sqlite: &Sqlite,
     req: S3Request<UploadPartInput>,
@@ -1114,132 +1189,46 @@ pub(super) async fn upload_part(
         request_checksum_sha256,
     );
 
+    let content_md5_present = headers.contains_key(CONTENT_MD5);
     let chunk_size = sqlite.blob_chunk_size();
-    let upload_state = {
-        let upload_id_for_read = upload_id;
-        let bucket = bucket.clone();
-        let key = key.clone();
-        let access_key = access_key.clone();
-        let connection = sqlite
-            .get_connection(&bucket)
-            .await
-            .map_err(s3_error_from_sqlite)?;
-        connection
-            .read(move |transaction| {
-                load_multipart_upload_state(
-                    transaction,
-                    upload_id_for_read,
-                    &bucket,
-                    &key,
-                    access_key.as_deref(),
-                )
-            })
-            .await
-            .map_err(s3_error_from_sqlite)?
-    };
+    let upload_state =
+        load_upload_part_state(sqlite, &bucket, &key, upload_id, access_key.as_deref()).await?;
     let checksum_config = upload_state.checksum;
     let expected_encryption = upload_state.stored_sse.clone();
     let encryption = active_upload_encryption(sqlite, upload_state.stored_sse)?;
+    let context = UploadPartWriteContext {
+        bucket,
+        key,
+        upload_id,
+        part_number,
+        access_key,
+        checksum_config,
+        expected_encryption,
+        chunk_size,
+    };
+
     if let Some(encryption) = encryption {
-        let encrypted_body = read_part_body_encrypted(
+        upload_encrypted_part(
+            sqlite,
+            context,
             body,
             &checksum_input,
-            checksum_config,
-            headers.contains_key(CONTENT_MD5),
-            content_md5.as_deref(),
-            chunk_size,
-            &encryption,
+            content_md5_present,
+            content_md5,
+            encryption,
         )
-        .await?;
-        let size = encrypted_body.size;
-        let md5 = encrypted_body.md5;
-        let checksum = encrypted_body.checksum;
-        let md5_clone = md5.clone();
-        let checksum_write = checksum.clone();
-        let chunks = encrypted_body.chunks;
-        let connection = sqlite
-            .get_connection(&bucket)
-            .await
-            .map_err(s3_error_from_sqlite)?;
-        connection
-            .write(move |transaction| {
-                validate_upload_part_write_state(
-                    transaction,
-                    upload_id,
-                    &bucket,
-                    &key,
-                    access_key.as_deref(),
-                    checksum_config,
-                    expected_encryption.as_ref(),
-                )?;
-                let part = MultipartPartWrite {
-                    upload_id,
-                    part_number,
-                    last_modified: OffsetDateTime::now_utc(),
-                    size,
-                    md5: Some(md5_clone),
-                    checksum: checksum_write,
-                };
-                Sqlite::put_multipart_with_encoded_chunks(transaction, &part, chunks)?;
-
-                Ok(())
-            })
-            .await
-            .map_err(s3_error_from_sqlite)?;
-
-        return Ok(S3Response::new(upload_part_output(
-            md5,
-            checksum.as_ref(),
-            true,
-        )));
+        .await
+    } else {
+        upload_plain_part(
+            sqlite,
+            context,
+            body,
+            &checksum_input,
+            content_md5_present,
+            content_md5,
+        )
+        .await
     }
-
-    let (value, size, md5, explicit_checksum) = read_upload_part_body(
-        body,
-        &checksum_input,
-        headers.contains_key(CONTENT_MD5),
-        content_md5.as_deref(),
-    )
-    .await?;
-    let md5_clone = md5.clone();
-    let checksum = explicit_checksum.or_else(|| configured_part_checksum(checksum_config, &value));
-    let checksum_write = checksum.clone();
-    let connection = sqlite
-        .get_connection(&bucket)
-        .await
-        .map_err(s3_error_from_sqlite)?;
-    connection
-        .write(move |transaction| {
-            validate_upload_part_write_state(
-                transaction,
-                upload_id,
-                &bucket,
-                &key,
-                access_key.as_deref(),
-                checksum_config,
-                expected_encryption.as_ref(),
-            )?;
-            let multipart = Multipart {
-                upload_id,
-                part_number,
-                last_modified: OffsetDateTime::now_utc(),
-                value,
-                size,
-                md5: Some(md5_clone),
-                checksum: checksum_write,
-            };
-            Sqlite::put_multipart_with_chunk_size(transaction, &multipart, chunk_size)?;
-
-            Ok(())
-        })
-        .await
-        .map_err(s3_error_from_sqlite)?;
-
-    Ok(S3Response::new(upload_part_output(
-        md5,
-        checksum.as_ref(),
-        false,
-    )))
 }
 
 /// Copies an existing object byte range into a multipart upload part.
@@ -1535,14 +1524,11 @@ async fn precompute_encrypted_full_object_checksum(
         .map_err(s3_error_from_sqlite)
 }
 
-/// Completes a multipart upload and records the result for idempotent retries.
-#[allow(clippy::too_many_lines)]
-pub(super) async fn complete_multipart_upload(
-    sqlite: &Sqlite,
-    req: S3Request<CompleteMultipartUploadInput>,
-) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-    validate_expected_bucket_owner(req.input.expected_bucket_owner.as_deref())?;
-    validate_no_sse_headers(&req.headers)?;
+fn normalize_multipart_completion_request(
+    input: CompleteMultipartUploadInput,
+    access_key: Option<String>,
+) -> S3Result<MultipartCompletionRequest> {
+    validate_expected_bucket_owner(input.expected_bucket_owner.as_deref())?;
     let CompleteMultipartUploadInput {
         multipart_upload,
         bucket,
@@ -1557,20 +1543,11 @@ pub(super) async fn complete_multipart_upload(
         checksum_sha256: request_checksum_sha256,
         checksum_type,
         ..
-    } = req.input;
-
-    let write_conditions = object_write_conditions(if_match, if_none_match);
-
-    sqlite
-        .validate_mutable_bucket(&bucket)
-        .map_err(s3_error_from_sqlite)?;
-
+    } = input;
     let upload_id = parse_upload_id(&upload_id)?;
-
     let Some(multipart_upload) = multipart_upload else {
         return Err(s3_error(S3ErrorCode::InvalidPart));
     };
-
     let requested_parts = multipart_upload.parts.unwrap_or_default();
     if requested_parts.is_empty() {
         return Err(s3_error_with_message(
@@ -1579,77 +1556,93 @@ pub(super) async fn complete_multipart_upload(
         ));
     }
 
-    let requested_parts = normalize_completion_parts(requested_parts)?;
-    let requested_checksum = ChecksumInput::completion_request(
-        checksum_type,
-        request_checksum_crc32,
-        request_checksum_crc32c,
-        request_checksum_crc64nvme,
-        request_checksum_sha1,
-        request_checksum_sha256,
-    )
-    .into_completion_checksum()?;
-    let default_checksum = default_crc64nvme_full_object_checksum();
-    let access_key = req.credentials.map(|credentials| credentials.access_key);
-    let precomputed_full_object_checksum = precompute_encrypted_full_object_checksum(
+    Ok(MultipartCompletionRequest {
+        bucket,
+        key,
+        upload_id,
+        requested_parts: normalize_completion_parts(requested_parts)?,
+        requested_checksum: ChecksumInput::completion_request(
+            checksum_type,
+            request_checksum_crc32,
+            request_checksum_crc32c,
+            request_checksum_crc64nvme,
+            request_checksum_sha1,
+            request_checksum_sha256,
+        )
+        .into_completion_checksum()?,
+        default_checksum: default_crc64nvme_full_object_checksum(),
+        access_key,
+        write_conditions: object_write_conditions(if_match, if_none_match),
+        precomputed_full_object_checksum: None,
+    })
+}
+
+async fn precompute_multipart_completion_checksum(
+    sqlite: &Sqlite,
+    request: &MultipartCompletionRequest,
+) -> S3Result<Option<StoredChecksum>> {
+    precompute_encrypted_full_object_checksum(
         sqlite,
         EncryptedFullObjectChecksumRequest {
-            bucket: &bucket,
-            key: &key,
-            upload_id,
-            requested_parts: &requested_parts,
-            requested_checksum: &requested_checksum,
-            default_checksum,
-            access_key: access_key.as_deref(),
+            bucket: &request.bucket,
+            key: &request.key,
+            upload_id: request.upload_id,
+            requested_parts: &request.requested_parts,
+            requested_checksum: &request.requested_checksum,
+            default_checksum: request.default_checksum,
+            access_key: request.access_key.as_deref(),
         },
     )
-    .await?;
+    .await
+}
 
-    let request = MultipartCompletionRequest {
-        bucket: bucket.clone(),
-        key: key.clone(),
-        upload_id,
-        requested_parts,
-        requested_checksum,
-        default_checksum,
-        access_key,
-        write_conditions,
-        precomputed_full_object_checksum,
-    };
+async fn prepare_multipart_completion(
+    sqlite: &Sqlite,
+    request: MultipartCompletionRequest,
+) -> S3Result<(MultipartCompletionRequest, MultipartCompletion)> {
+    let bucket = request.bucket.clone();
+    let connection = sqlite
+        .get_connection(&bucket)
+        .await
+        .map_err(s3_error_from_sqlite)?;
+    connection
+        .read(move |transaction| {
+            let completion = Sqlite::prepare_multipart_upload_completion(transaction, &request)?;
+            Ok((request, completion))
+        })
+        .await
+        .map_err(s3_error_from_sqlite)
+}
 
-    let (request, completion) = {
-        let connection = sqlite
-            .get_connection(&bucket)
-            .await
-            .map_err(s3_error_from_sqlite)?;
-        connection
-            .read(move |transaction| {
-                let completion =
-                    Sqlite::prepare_multipart_upload_completion(transaction, &request)?;
-                Ok((request, completion))
-            })
-            .await
-            .map_err(s3_error_from_sqlite)?
-    };
-    let completed = match completion {
-        MultipartCompletion::AlreadyCompleted(completed) => completed,
+async fn write_multipart_completion(
+    sqlite: &Sqlite,
+    bucket: &str,
+    request: MultipartCompletionRequest,
+    completion: MultipartCompletion,
+) -> S3Result<CompletedMultipartUploadOutcome> {
+    match completion {
+        MultipartCompletion::AlreadyCompleted(completed) => Ok(completed),
         MultipartCompletion::Prepared(prepared) => {
             let connection = sqlite
-                .get_connection(&bucket)
+                .get_connection(bucket)
                 .await
                 .map_err(s3_error_from_sqlite)?;
             connection
                 .write(move |transaction| {
-                    let completed =
-                        Sqlite::put_prepared_multipart_upload(transaction, &request, prepared)?;
-                    Ok(completed)
+                    Sqlite::put_prepared_multipart_upload(transaction, &request, prepared)
                 })
                 .await
-                .map_err(s3_error_from_sqlite)?
+                .map_err(s3_error_from_sqlite)
         }
-    };
-    let completed_checksum_type = checksum_type_output(&completed.checksum);
-    let output = CompleteMultipartUploadOutput {
+    }
+}
+
+fn complete_multipart_upload_output(
+    bucket: String,
+    key: String,
+    completed: CompletedMultipartUploadOutcome,
+) -> CompleteMultipartUploadOutput {
+    CompleteMultipartUploadOutput {
         bucket: Some(bucket),
         key: Some(key),
         e_tag: Some(ETag::Strong(completed.md5)),
@@ -1659,11 +1652,35 @@ pub(super) async fn complete_multipart_upload(
         checksum_crc64nvme: checksum_crc64nvme(&completed.checksum),
         checksum_sha1: checksum_sha1(&completed.checksum),
         checksum_sha256: checksum_sha256(&completed.checksum),
-        checksum_type: completed_checksum_type,
+        checksum_type: checksum_type_output(&completed.checksum),
         server_side_encryption: sse_s3_output(completed.stored_sse.is_some()),
         ..Default::default()
-    };
-    Ok(S3Response::new(output))
+    }
+}
+
+/// Completes a multipart upload and records the result for idempotent retries.
+pub(super) async fn complete_multipart_upload(
+    sqlite: &Sqlite,
+    req: S3Request<CompleteMultipartUploadInput>,
+) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+    validate_no_sse_headers(&req.headers)?;
+    let access_key = req.credentials.map(|credentials| credentials.access_key);
+    let mut request = normalize_multipart_completion_request(req.input, access_key)?;
+
+    sqlite
+        .validate_mutable_bucket(&request.bucket)
+        .map_err(s3_error_from_sqlite)?;
+
+    request.precomputed_full_object_checksum =
+        precompute_multipart_completion_checksum(sqlite, &request).await?;
+    let bucket = request.bucket.clone();
+    let key = request.key.clone();
+    let (request, completion) = prepare_multipart_completion(sqlite, request).await?;
+    let completed = write_multipart_completion(sqlite, &bucket, request, completion).await?;
+
+    Ok(S3Response::new(complete_multipart_upload_output(
+        bucket, key, completed,
+    )))
 }
 
 #[cfg(test)]

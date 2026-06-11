@@ -94,6 +94,12 @@ enum ObjectBodyReadStart {
     SseNotConfigured,
 }
 
+enum ObjectBodyDecryption {
+    Plain,
+    Bytes(Vec<u8>),
+    SseNotConfigured,
+}
+
 /// Object metadata selected for `HeadObject` and attribute responses.
 struct ObjectMetadataRead {
     metadata: KeyMetadata,
@@ -236,40 +242,27 @@ fn lifecycle_expiration_response_header(
         .transpose()
 }
 
-/// Resolves object metadata and body reads inside one storage transaction.
-#[allow(clippy::too_many_lines)]
-fn resolve_get_object_read(
+fn load_object_body_reference(
     transaction: &rusqlite::Transaction<'_>,
     key: &str,
     version_id: Option<&str>,
-    part_number: Option<i32>,
-    range: Option<&S3Range>,
-    conditions: &ObjectReadConditions,
-    sse_s3_master_key: Option<[u8; 32]>,
-) -> SqliteResult<(ObjectBodyReadStart, Vec<BlobReadRequest>)> {
-    let object = match version_id {
+) -> SqliteResult<Option<ObjectBodyReference>> {
+    Ok(match version_id {
         Some(version_id) => Some(
             Sqlite::get_object_version_body_reference(transaction, key, version_id)?
                 .ok_or(SqliteError::ObjectVersionNotFound)?,
         ),
         None => Sqlite::get_current_object_body_reference(transaction, key)?,
-    };
-    let Some(object) = object else {
-        return Ok((ObjectBodyReadStart::Missing, Vec::new()));
-    };
-    if object.key_metadata.is_delete_marker {
-        return Ok((ObjectBodyReadStart::DeleteMarker, Vec::new()));
-    }
-    if let Err(failure) = validate_read_conditions(&object.key_metadata, conditions) {
-        return Ok((
-            ObjectBodyReadStart::ConditionFailed {
-                failure,
-                md5: object.key_metadata.md5.clone(),
-            },
-            Vec::new(),
-        ));
-    }
+    })
+}
 
+fn load_object_body_read_found(
+    transaction: &rusqlite::Transaction<'_>,
+    key: &str,
+    object: ObjectBodyReference,
+    part_number: Option<i32>,
+    range: Option<&S3Range>,
+) -> SqliteResult<ObjectBodyReadFound> {
     let object_size =
         u64::try_from(object.key_metadata.size).map_err(|_| SqliteError::ObjectBodyInconsistent)?;
     let (completed_part, completed_part_count) =
@@ -289,43 +282,96 @@ fn resolve_get_object_read(
         object.key_metadata.last_modified,
     )?;
 
-    let decrypted_body = if let Some(stored) = object.key_metadata.stored_sse.clone() {
-        let Some(master_key) = sse_s3_master_key else {
+    Ok(ObjectBodyReadFound {
+        object,
+        completed_part,
+        completed_part_count,
+        object_range,
+        expiration,
+    })
+}
+
+fn decrypt_object_body_if_needed(
+    transaction: &rusqlite::Transaction<'_>,
+    object: &ObjectBodyReference,
+    object_range: &ByteRange<u64>,
+    sse_s3_master_key: Option<[u8; 32]>,
+) -> SqliteResult<ObjectBodyDecryption> {
+    let Some(stored) = object.key_metadata.stored_sse.clone() else {
+        return Ok(ObjectBodyDecryption::Plain);
+    };
+    let Some(master_key) = sse_s3_master_key else {
+        return Ok(ObjectBodyDecryption::SseNotConfigured);
+    };
+
+    let active = active_sse_from_stored(&master_key, stored).map_err(SqliteError::Configuration)?;
+    let chunks =
+        Sqlite::get_object_blob_chunks(transaction, object.sequence, object.key_metadata.size)?;
+    let value = decrypt_stored_chunks(&active, chunks)?;
+    let start = usize::try_from(object_range.start).map_err(|_| SqliteError::InvalidObjectRange)?;
+    let end = usize::try_from(object_range.end).map_err(|_| SqliteError::InvalidObjectRange)?;
+    let bytes = value
+        .get(start..end)
+        .map(<[u8]>::to_vec)
+        .ok_or(SqliteError::InvalidObjectRange)?;
+
+    Ok(ObjectBodyDecryption::Bytes(bytes))
+}
+
+/// Resolves object metadata and body reads inside one storage transaction.
+fn resolve_get_object_read(
+    transaction: &rusqlite::Transaction<'_>,
+    key: &str,
+    version_id: Option<&str>,
+    part_number: Option<i32>,
+    range: Option<&S3Range>,
+    conditions: &ObjectReadConditions,
+    sse_s3_master_key: Option<[u8; 32]>,
+) -> SqliteResult<(ObjectBodyReadStart, Vec<BlobReadRequest>)> {
+    let object = load_object_body_reference(transaction, key, version_id)?;
+    let Some(object) = object else {
+        return Ok((ObjectBodyReadStart::Missing, Vec::new()));
+    };
+    if object.key_metadata.is_delete_marker {
+        return Ok((ObjectBodyReadStart::DeleteMarker, Vec::new()));
+    }
+    if let Err(failure) = validate_read_conditions(&object.key_metadata, conditions) {
+        return Ok((
+            ObjectBodyReadStart::ConditionFailed {
+                failure,
+                md5: object.key_metadata.md5.clone(),
+            },
+            Vec::new(),
+        ));
+    }
+
+    let read = load_object_body_read_found(transaction, key, object, part_number, range)?;
+    let decrypted_body = match decrypt_object_body_if_needed(
+        transaction,
+        &read.object,
+        &read.object_range,
+        sse_s3_master_key,
+    )? {
+        ObjectBodyDecryption::Plain => None,
+        ObjectBodyDecryption::Bytes(bytes) => Some(bytes),
+        ObjectBodyDecryption::SseNotConfigured => {
             return Ok((ObjectBodyReadStart::SseNotConfigured, Vec::new()));
-        };
-        let active =
-            active_sse_from_stored(&master_key, stored).map_err(SqliteError::Configuration)?;
-        let chunks =
-            Sqlite::get_object_blob_chunks(transaction, object.sequence, object.key_metadata.size)?;
-        let value = decrypt_stored_chunks(&active, chunks)?;
-        let start =
-            usize::try_from(object_range.start).map_err(|_| SqliteError::InvalidObjectRange)?;
-        let end = usize::try_from(object_range.end).map_err(|_| SqliteError::InvalidObjectRange)?;
-        Some(
-            value
-                .get(start..end)
-                .map(<[u8]>::to_vec)
-                .ok_or(SqliteError::InvalidObjectRange)?,
-        )
-    } else {
-        None
+        }
     };
 
     let requests = if decrypted_body.is_some() {
         Vec::new()
     } else {
-        Sqlite::object_blob_read_requests(transaction, object.sequence, object_range.clone())?
+        Sqlite::object_blob_read_requests(
+            transaction,
+            read.object.sequence,
+            read.object_range.clone(),
+        )?
     };
 
     Ok((
         ObjectBodyReadStart::Found {
-            read: Box::new(ObjectBodyReadFound {
-                object,
-                completed_part,
-                completed_part_count,
-                object_range,
-                expiration,
-            }),
+            read: Box::new(read),
             decrypted_body,
         },
         requests,
