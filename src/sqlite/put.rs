@@ -7,8 +7,8 @@ use time::OffsetDateTime;
 
 use super::{
     BucketVersioningState, EncodedBlobChunk, KeyMetadata, KeyValue, NULL_VERSION_ID,
-    ObjectTagCondition, ObjectWriteConditions, ObjectWriteOutcome, Sqlite, SqliteError,
-    SqliteResult, sql_size,
+    ObjectTagCondition, ObjectWriteConditions, ObjectWriteOutcome, SSE_S3_ALGORITHM_CODE, Sqlite,
+    SqliteError, SqliteResult, sql_size,
 };
 
 const VERSION_ID_LEN: usize = 31;
@@ -198,7 +198,7 @@ impl Sqlite {
             key_metadata
                 .stored_sse
                 .as_ref()
-                .map(|_| crate::s3::SSE_S3_ALGORITHM_CODE),
+                .map(|_| SSE_S3_ALGORITHM_CODE),
             key_metadata
                 .stored_sse
                 .as_ref()
@@ -490,12 +490,9 @@ mod tests {
     use rusqlite::Connection;
     use time::OffsetDateTime;
 
-    use crate::{
-        s3::{FullObjectChecksum, StoredChecksum, StoredObjectLock},
-        sqlite::{
-            EncodedBlobChunk, KeyMetadata, KeyValue, Sqlite, SqliteError, SqliteResult,
-            get::test_support,
-        },
+    use crate::sqlite::{
+        EncodedBlobChunk, FullObjectChecksum, KeyMetadata, KeyValue, Sqlite, SqliteError,
+        SqliteResult, StoredChecksum, StoredObjectLock, get::test_support,
     };
 
     fn open_schema() -> SqliteResult<Connection> {

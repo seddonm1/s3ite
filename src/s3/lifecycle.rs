@@ -8,9 +8,11 @@ use super::{
     DeleteBucketLifecycleInput, DeleteBucketLifecycleOutput, ExpirationStatus,
     GetBucketLifecycleConfigurationInput, GetBucketLifecycleConfigurationOutput,
     LifecycleExpiration, LifecycleRule, LifecycleRuleAndOperator, LifecycleRuleFilter,
-    LifecycleRules, NoncurrentVersionExpiration, PutBucketLifecycleConfigurationInput,
-    PutBucketLifecycleConfigurationOutput, S3ErrorCode, S3Request, S3Response, S3Result, Sqlite,
-    StoredTag, Tag, TagSet, Timestamp, s3_error, s3_error_from_sqlite, s3_error_with_message,
+    LifecycleRules, NoncurrentVersionExpiration, ObjectLifecycleExpiration,
+    PutBucketLifecycleConfigurationInput, PutBucketLifecycleConfigurationOutput, S3ErrorCode,
+    S3Request, S3Response, S3Result, Sqlite, StoredLifecycleAndFilter, StoredLifecycleExpiration,
+    StoredLifecycleFilter, StoredLifecycleRule, StoredNoncurrentVersionExpiration, StoredTag, Tag,
+    TagSet, Timestamp, s3_error, s3_error_from_sqlite, s3_error_with_message,
     validate_expected_bucket_owner,
 };
 
@@ -20,58 +22,21 @@ const MAX_LIFECYCLE_RULES: usize = 1000;
 const MAX_LIFECYCLE_RULE_ID_CHARS: usize = 255;
 const MAX_NEWER_NONCURRENT_VERSIONS: i32 = 100;
 
-/// Normalized S3 bucket lifecycle rule persisted by storage.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StoredLifecycleRule {
-    pub(crate) id: Option<String>,
-    pub(crate) enabled: bool,
-    pub(crate) filter: StoredLifecycleFilter,
-    pub(crate) expiration: Option<StoredLifecycleExpiration>,
-    pub(crate) noncurrent_expiration: Option<StoredNoncurrentVersionExpiration>,
-    pub(crate) abort_incomplete_multipart_days: Option<i32>,
-}
-
-/// Normalized lifecycle filter persisted by storage.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum StoredLifecycleFilter {
-    Empty,
-    LegacyPrefix(String),
-    Prefix(String),
-    Tag(StoredTag),
-    SizeGreaterThan(i64),
-    SizeLessThan(i64),
-    And(StoredLifecycleAndFilter),
-}
-
-/// Normalized lifecycle `And` filter.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StoredLifecycleAndFilter {
-    pub(crate) prefix: Option<String>,
-    pub(crate) tags: Vec<StoredTag>,
-    pub(crate) object_size_greater_than: Option<i64>,
-    pub(crate) object_size_less_than: Option<i64>,
-}
-
-/// Normalized current-version expiration action.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StoredLifecycleExpiration {
-    pub(crate) days: Option<i32>,
-    pub(crate) date: Option<OffsetDateTime>,
-    pub(crate) expired_object_delete_marker: bool,
-}
-
-/// Normalized noncurrent-version expiration action.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StoredNoncurrentVersionExpiration {
-    pub(crate) noncurrent_days: i32,
-    pub(crate) newer_noncurrent_versions: Option<i32>,
-}
-
 /// Header value for lifecycle expiration on object reads.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LifecycleExpirationHeader {
     pub(crate) expires_at: OffsetDateTime,
     pub(crate) rule_id: String,
+}
+
+impl From<ObjectLifecycleExpiration> for LifecycleExpirationHeader {
+    /// Converts storage-selected expiration metadata into the S3 response shape.
+    fn from(expiration: ObjectLifecycleExpiration) -> Self {
+        Self {
+            expires_at: expiration.expires_at,
+            rule_id: expiration.rule_id,
+        }
+    }
 }
 
 impl LifecycleExpirationHeader {
@@ -527,92 +492,6 @@ fn noncurrent_expiration_to_dto(
     }
 }
 
-/// Returns whether a lifecycle rule matches the supplied object attributes.
-#[must_use]
-pub(crate) fn lifecycle_rule_matches_object(
-    rule: &StoredLifecycleRule,
-    key: &str,
-    size: i64,
-    tags: &[StoredTag],
-) -> bool {
-    lifecycle_filter_matches_object(&rule.filter, key, size, tags)
-}
-
-fn lifecycle_filter_matches_object(
-    filter: &StoredLifecycleFilter,
-    key: &str,
-    size: i64,
-    tags: &[StoredTag],
-) -> bool {
-    match filter {
-        StoredLifecycleFilter::Empty => true,
-        StoredLifecycleFilter::LegacyPrefix(prefix) | StoredLifecycleFilter::Prefix(prefix) => {
-            key.starts_with(prefix)
-        }
-        StoredLifecycleFilter::Tag(tag) => tags.iter().any(|stored| stored == tag),
-        StoredLifecycleFilter::SizeGreaterThan(min) => size > *min,
-        StoredLifecycleFilter::SizeLessThan(max) => size < *max,
-        StoredLifecycleFilter::And(and) => {
-            and.prefix
-                .as_ref()
-                .is_none_or(|prefix| key.starts_with(prefix))
-                && and.object_size_greater_than.is_none_or(|min| size > min)
-                && and.object_size_less_than.is_none_or(|max| size < max)
-                && and
-                    .tags
-                    .iter()
-                    .all(|tag| tags.iter().any(|stored| stored == tag))
-        }
-    }
-}
-
-/// Returns the eligibility time for a current-version expiration action.
-pub(crate) fn current_expiration_time(
-    expiration: &StoredLifecycleExpiration,
-    last_modified: OffsetDateTime,
-) -> Option<OffsetDateTime> {
-    if expiration.expired_object_delete_marker {
-        return None;
-    }
-    expiration.date.or_else(|| {
-        expiration
-            .days
-            .map(|days| last_modified + time::Duration::days(i64::from(days)))
-    })
-}
-
-/// Returns the eligibility time for a noncurrent-version expiration action.
-#[must_use]
-pub(crate) fn noncurrent_expiration_time(
-    expiration: &StoredNoncurrentVersionExpiration,
-    last_modified: OffsetDateTime,
-) -> OffsetDateTime {
-    last_modified + time::Duration::days(i64::from(expiration.noncurrent_days))
-}
-
-/// Selects the lifecycle expiration header for an object when one applies.
-#[must_use]
-pub(crate) fn lifecycle_expiration_header(
-    rules: &[StoredLifecycleRule],
-    key: &str,
-    size: i64,
-    last_modified: OffsetDateTime,
-    tags: &[StoredTag],
-) -> Option<LifecycleExpirationHeader> {
-    rules
-        .iter()
-        .filter(|rule| rule.enabled && lifecycle_rule_matches_object(rule, key, size, tags))
-        .filter_map(|rule| {
-            let expiration = rule.expiration.as_ref()?;
-            let expires_at = current_expiration_time(expiration, last_modified)?;
-            Some(LifecycleExpirationHeader {
-                expires_at,
-                rule_id: rule.id.clone().unwrap_or_default(),
-            })
-        })
-        .min_by_key(|header| header.expires_at)
-}
-
 fn percent_encode_rule_id(value: &str) -> String {
     value
         .bytes()
@@ -636,6 +515,7 @@ fn percent_encode_rule_id(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sqlite::{lifecycle_rule_matches_object, object_lifecycle_expiration};
     use s3s::dto::Transition;
 
     fn enabled_rule(expiration: Option<StoredLifecycleExpiration>) -> StoredLifecycleRule {
@@ -655,29 +535,17 @@ mod tests {
             key: "class".to_string(),
             value: "tmp".to_string(),
         }];
-        assert!(lifecycle_filter_matches_object(
-            &StoredLifecycleFilter::Prefix("logs/".to_string()),
-            "logs/one",
-            10,
-            &tags,
-        ));
-        assert!(lifecycle_filter_matches_object(
-            &StoredLifecycleFilter::Tag(tags[0].clone()),
-            "any",
-            10,
-            &tags,
-        ));
-        assert!(lifecycle_filter_matches_object(
-            &StoredLifecycleFilter::And(StoredLifecycleAndFilter {
-                prefix: Some("logs/".to_string()),
-                tags: tags.clone(),
-                object_size_greater_than: Some(1),
-                object_size_less_than: Some(20),
-            }),
-            "logs/one",
-            10,
-            &tags,
-        ));
+        let mut rule = enabled_rule(None);
+        assert!(lifecycle_rule_matches_object(&rule, "logs/one", 10, &tags,));
+        rule.filter = StoredLifecycleFilter::Tag(tags[0].clone());
+        assert!(lifecycle_rule_matches_object(&rule, "any", 10, &tags));
+        rule.filter = StoredLifecycleFilter::And(StoredLifecycleAndFilter {
+            prefix: Some("logs/".to_string()),
+            tags: tags.clone(),
+            object_size_greater_than: Some(1),
+            object_size_less_than: Some(20),
+        });
+        assert!(lifecycle_rule_matches_object(&rule, "logs/one", 10, &tags,));
     }
 
     #[test]
@@ -689,9 +557,10 @@ mod tests {
             expired_object_delete_marker: false,
         }))];
 
-        let Some(header) = lifecycle_expiration_header(&rules, "logs/one", 10, now, &[]) else {
+        let Some(expiration) = object_lifecycle_expiration(&rules, "logs/one", 10, now, &[]) else {
             panic!("expiration header");
         };
+        let header = LifecycleExpirationHeader::from(expiration);
         assert_eq!(header.expires_at, now + time::Duration::days(2));
         let Ok(header_value) = header.to_header_value() else {
             panic!("expiration header should format");

@@ -12,7 +12,9 @@ use hyper::http::HeaderMap;
 use md5::{Digest, Md5};
 use s3s::{S3Error, S3ErrorCode, S3Result, dto::ServerSideEncryption};
 
-use crate::sqlite::{EncodedBlobChunk, Sqlite, SqliteError, SqliteResult, StoredBlobChunk};
+use crate::sqlite::{
+    EncodedBlobChunk, Sqlite, SqliteError, SqliteResult, StoredBlobChunk, StoredSse,
+};
 
 use super::{
     ChecksumAccumulator, ChecksumInput, ChecksumPolicy, ChecksumTypeKind, InternalError,
@@ -21,20 +23,10 @@ use super::{
     s3_error_from_sqlite, s3_error_with_message, validate_content_md5,
 };
 
-pub(crate) const SSE_S3_ALGORITHM_CODE: i64 = 1;
-
 const MASTER_KEY_LEN: usize = 32;
 const DATA_KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
-
-/// Stored object/upload envelope encryption metadata.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StoredSse {
-    pub(crate) nonce: Vec<u8>,
-    pub(crate) ciphertext: Vec<u8>,
-    pub(crate) tag: Vec<u8>,
-}
 
 /// Encryption state for a new write or existing multipart upload.
 #[derive(Clone, Debug)]

@@ -11,11 +11,11 @@ use super::{
     KeyMetadata, Multipart, MultipartChecksumConfig, MultipartCompletion,
     MultipartCompletionChecksum, MultipartCompletionPart, MultipartCompletionRequest,
     MultipartMetadata, MultipartPartWrite, MultipartUploadListEntry, MultipartUploadListPage,
-    MultipartUploadState, MultipartUploadSummary, PartChecksum, PreparedMultipartUpload, Sqlite,
-    SqliteError, SqliteResult, StoredBlobChunk, StoredChecksum, StoredSse, decode_base64,
-    decode_md5_hex, encode_hex, optional_multipart_checksum_config, optional_part_checksum,
-    optional_stored_object_lock, optional_stored_sse, required_stored_checksum, row_size,
-    sql_limit, sql_size,
+    MultipartUploadState, MultipartUploadSummary, PartChecksum, PreparedMultipartUpload,
+    SSE_S3_ALGORITHM_CODE, Sqlite, SqliteError, SqliteResult, StoredBlobChunk, StoredChecksum,
+    StoredSse, decode_base64, decode_multipart_md5_hex, encode_hex,
+    optional_multipart_checksum_config, optional_part_checksum, optional_stored_object_lock,
+    optional_stored_sse, required_stored_checksum, row_size, sql_limit, sql_size,
 };
 
 const MULTIPART_UPLOAD_ENTRY_KIND: i64 = 0;
@@ -407,7 +407,7 @@ impl Sqlite {
                 .md5
                 .as_deref()
                 .ok_or(SqliteError::InvalidMultipartPart)?;
-            md5_hash.update(decode_md5_hex(stored_md5)?);
+            md5_hash.update(decode_multipart_md5_hex(stored_md5)?);
             completed_parts.push(CompletedObjectPart {
                 part_number: part.part_number,
                 start: offset,
@@ -739,10 +739,7 @@ impl Sqlite {
             state.checksum.map(|checksum| checksum.algorithm),
             state.checksum.map(|checksum| checksum.checksum_type),
             Option::<String>::None,
-            state
-                .stored_sse
-                .as_ref()
-                .map(|_| crate::s3::SSE_S3_ALGORITHM_CODE),
+            state.stored_sse.as_ref().map(|_| SSE_S3_ALGORITHM_CODE),
             state
                 .stored_sse
                 .as_ref()
@@ -1468,17 +1465,13 @@ mod tests {
 
     use rusqlite::Connection;
 
-    use crate::{
-        s3::{
-            ChecksumAlgorithmKind, ChecksumTypeKind, FullObjectChecksum, MultipartChecksumConfig,
-            MultipartCompletionChecksum, StoredChecksum, StoredObjectLock,
-        },
-        sqlite::{
-            CompletedMultipartUploadRecord, CompletedObjectPart, EncodedBlobChunk,
-            MultipartCompletion, MultipartCompletionPart, MultipartCompletionRequest,
-            MultipartPartWrite, MultipartUploadState, NULL_VERSION_ID, ObjectWriteConditions,
-            Sqlite, SqliteError, SqliteResult, get::test_support as get_test_support,
-        },
+    use crate::sqlite::{
+        ChecksumAlgorithmKind, ChecksumTypeKind, CompletedMultipartUploadRecord,
+        CompletedObjectPart, EncodedBlobChunk, FullObjectChecksum, MultipartChecksumConfig,
+        MultipartCompletion, MultipartCompletionChecksum, MultipartCompletionPart,
+        MultipartCompletionRequest, MultipartPartWrite, MultipartUploadState, NULL_VERSION_ID,
+        ObjectWriteConditions, Sqlite, SqliteError, SqliteResult, StoredChecksum, StoredObjectLock,
+        get::test_support as get_test_support,
     };
 
     use super::*;

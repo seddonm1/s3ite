@@ -31,7 +31,7 @@ use crate::{
 };
 
 use super::{
-    S3ErrorCode, S3Request, S3Response, S3Result, s3_error, s3_error_from_sqlite,
+    S3ErrorCode, S3Request, S3Response, S3Result, StoredCorsRule, s3_error, s3_error_from_sqlite,
     s3_error_with_message, validate_expected_bucket_owner,
 };
 
@@ -41,17 +41,6 @@ const ACCESS_CONTROL_ALLOW_PRIVATE_NETWORK: &str = "access-control-allow-private
 const ACCESS_CONTROL_REQUEST_PRIVATE_NETWORK: &str = "access-control-request-private-network";
 const TRUE: &str = "true";
 const VARY_VALUE: &str = "origin, access-control-request-method, access-control-request-headers";
-
-/// Normalized S3 bucket CORS rule persisted by storage.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StoredCorsRule {
-    pub(crate) id: Option<String>,
-    pub(crate) allowed_origins: Vec<String>,
-    pub(crate) allowed_methods: Vec<String>,
-    pub(crate) allowed_headers: Vec<String>,
-    pub(crate) expose_headers: Vec<String>,
-    pub(crate) max_age_seconds: Option<i32>,
-}
 
 /// Bucket-aware CORS layer used outside the S3 service.
 #[derive(Clone, Debug)]

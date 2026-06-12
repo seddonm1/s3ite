@@ -7,10 +7,10 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{
-    LifecycleExpirationHeader, Sqlite, SqliteResult, StoredLifecycleAndFilter,
+    ObjectLifecycleExpiration, Sqlite, SqliteResult, StoredLifecycleAndFilter,
     StoredLifecycleExpiration, StoredLifecycleFilter, StoredLifecycleRule,
     StoredNoncurrentVersionExpiration, StoredObjectLock, StoredTag, current_expiration_time,
-    lifecycle_expiration_header, lifecycle_rule_matches_object, noncurrent_expiration_time,
+    lifecycle_rule_matches_object, noncurrent_expiration_time, object_lifecycle_expiration,
     object_lock_allows_lifecycle_delete, optional_stored_object_lock, row_size,
 };
 
@@ -183,14 +183,14 @@ impl Sqlite {
         Ok(())
     }
 
-    /// Computes an object's lifecycle expiration header, when a current expiration rule applies.
-    pub(crate) fn lifecycle_expiration_header_for_object(
+    /// Computes an object's lifecycle expiration, when a current expiration rule applies.
+    pub(crate) fn lifecycle_expiration_for_object(
         transaction: &Transaction,
         key: &str,
         version_id: &str,
         size: i64,
         last_modified: OffsetDateTime,
-    ) -> SqliteResult<Option<LifecycleExpirationHeader>> {
+    ) -> SqliteResult<Option<ObjectLifecycleExpiration>> {
         let rules = Self::get_bucket_lifecycle_rules(transaction)?;
         if rules.is_empty() {
             return Ok(None);
@@ -199,7 +199,7 @@ impl Sqlite {
             return Ok(None);
         };
         let tags = Self::get_object_tags(transaction, sequence)?;
-        Ok(lifecycle_expiration_header(
+        Ok(object_lifecycle_expiration(
             &rules,
             key,
             size,
@@ -641,15 +641,11 @@ mod tests {
     use time::OffsetDateTime;
     use uuid::Uuid;
 
-    use crate::{
-        s3::{
-            FullObjectChecksum, StoredChecksum, StoredLifecycleExpiration, StoredLifecycleFilter,
-            StoredLifecycleRule, StoredNoncurrentVersionExpiration, StoredObjectLock, StoredTag,
-        },
-        sqlite::{
-            KeyMetadata, KeyValue, MultipartUploadState, NULL_VERSION_ID, Sqlite, SqliteResult,
-            put::test_support as put_test_support,
-        },
+    use crate::sqlite::{
+        FullObjectChecksum, KeyMetadata, KeyValue, MultipartUploadState, NULL_VERSION_ID, Sqlite,
+        SqliteResult, StoredChecksum, StoredLifecycleExpiration, StoredLifecycleFilter,
+        StoredLifecycleRule, StoredNoncurrentVersionExpiration, StoredObjectLock, StoredTag,
+        put::test_support as put_test_support,
     };
 
     fn open_schema() -> SqliteResult<Connection> {

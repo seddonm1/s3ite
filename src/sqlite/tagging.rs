@@ -197,12 +197,10 @@ mod tests {
     use time::OffsetDateTime;
     use uuid::Uuid;
 
-    use crate::{
-        s3::{FullObjectChecksum, StoredChecksum, StoredObjectLock, StoredTag},
-        sqlite::{
-            KeyMetadata, KeyValue, MultipartUploadState, NULL_VERSION_ID, Sqlite, SqliteResult,
-            put::test_support as put_test_support,
-        },
+    use crate::sqlite::{
+        FullObjectChecksum, KeyMetadata, KeyValue, MultipartUploadState, NULL_VERSION_ID, Sqlite,
+        SqliteResult, StoredChecksum, StoredObjectLock, StoredTag,
+        put::test_support as put_test_support,
     };
 
     fn open_schema() -> SqliteResult<Connection> {

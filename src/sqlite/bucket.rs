@@ -9,8 +9,10 @@ use path_absolutize::Absolutize;
 use rusqlite::Transaction;
 use tokio::fs;
 
-use super::{BucketConnection, BucketVersioningState, Sqlite, SqliteError, SqliteResult};
-use crate::s3::SSE_S3_ALGORITHM_CODE;
+use super::{
+    BucketConnection, BucketVersioningState, SSE_S3_ALGORITHM_CODE, Sqlite, SqliteError,
+    SqliteResult,
+};
 
 impl Sqlite {
     /// Opens all existing bucket databases under the configured root.

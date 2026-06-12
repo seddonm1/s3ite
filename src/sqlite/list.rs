@@ -305,12 +305,9 @@ impl Sqlite {
 mod tests {
     use rusqlite::Connection;
 
-    use crate::{
-        s3::{FullObjectChecksum, StoredChecksum, StoredObjectLock},
-        sqlite::{
-            BucketVersioningState, KeyMetadata, KeyValue, SqliteError,
-            put::test_support as put_test_support,
-        },
+    use crate::sqlite::{
+        BucketVersioningState, FullObjectChecksum, KeyMetadata, KeyValue, SqliteError,
+        StoredChecksum, StoredObjectLock, put::test_support as put_test_support,
     };
 
     use super::*;

@@ -10,66 +10,10 @@ use super::{
     ObjectLockRetentionMode, ObjectLockRule, PutObjectLegalHoldInput, PutObjectLegalHoldOutput,
     PutObjectLockConfigurationInput, PutObjectLockConfigurationOutput, PutObjectRetentionInput,
     PutObjectRetentionOutput, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, Sqlite,
-    SqliteError, Timestamp, validate_expected_bucket_owner,
+    SqliteError, StoredObjectLock, StoredObjectLockConfig, StoredObjectLockDefaultRetention,
+    StoredObjectLockMode, StoredObjectRetention, Timestamp, validate_expected_bucket_owner,
 };
 use super::{DefaultRetention, s3_error, s3_error_from_sqlite, s3_error_with_message};
-
-/// Stored Object Lock retention mode.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StoredObjectLockMode {
-    Governance,
-    Compliance,
-}
-
-impl StoredObjectLockMode {
-    /// Returns the stable database representation.
-    #[must_use]
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Governance => "GOVERNANCE",
-            Self::Compliance => "COMPLIANCE",
-        }
-    }
-
-    /// Parses a stable database representation.
-    #[must_use]
-    pub(crate) fn from_sql(value: &str) -> Option<Self> {
-        match value {
-            "GOVERNANCE" => Some(Self::Governance),
-            "COMPLIANCE" => Some(Self::Compliance),
-            _ => None,
-        }
-    }
-}
-
-/// Stored per-object-version retention metadata.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StoredObjectRetention {
-    pub(crate) mode: StoredObjectLockMode,
-    pub(crate) retain_until: OffsetDateTime,
-}
-
-/// Stored per-object-version Object Lock metadata.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct StoredObjectLock {
-    pub(crate) legal_hold: Option<bool>,
-    pub(crate) retention: Option<StoredObjectRetention>,
-}
-
-/// Stored bucket default retention rule.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StoredObjectLockDefaultRetention {
-    pub(crate) mode: StoredObjectLockMode,
-    pub(crate) days: Option<i32>,
-    pub(crate) years: Option<i32>,
-}
-
-/// Stored bucket Object Lock configuration.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct StoredObjectLockConfig {
-    pub(crate) enabled: bool,
-    pub(crate) default_retention: Option<StoredObjectLockDefaultRetention>,
-}
 
 /// Parsed Object Lock headers for object writes.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -204,22 +148,6 @@ pub(super) fn validate_object_lock_delete(
             "object is protected by governance retention",
         )),
     }
-}
-
-/// Returns whether background lifecycle cleanup may permanently delete stored object data.
-#[must_use]
-pub(crate) fn object_lock_allows_lifecycle_delete(
-    lock: &StoredObjectLock,
-    now: OffsetDateTime,
-) -> bool {
-    if lock.legal_hold.is_some_and(|legal_hold| legal_hold) {
-        return false;
-    }
-
-    let Some(retention) = lock.retention.as_ref() else {
-        return true;
-    };
-    retention.retain_until <= now
 }
 
 /// Returns whether a delete request will permanently remove data rather than create only a marker.

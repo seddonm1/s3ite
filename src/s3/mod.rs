@@ -132,32 +132,21 @@ mod put;
 mod sse;
 mod tagging;
 
-pub(crate) use self::{
-    checksum::{
-        ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKind, MultipartChecksumConfig,
-        MultipartCompletionChecksum, PartChecksum, StoredChecksum, decode_base64, decode_md5_hex,
-        encode_hex,
-    },
-    cors::{BucketCorsLayer, StoredCorsRule},
-    lifecycle::{
-        LifecycleExpirationHeader, StoredLifecycleAndFilter, StoredLifecycleExpiration,
-        StoredLifecycleFilter, StoredLifecycleRule, StoredNoncurrentVersionExpiration,
-        current_expiration_time, lifecycle_expiration_header, lifecycle_rule_matches_object,
-        noncurrent_expiration_time,
-    },
-    object_lock::{
-        StoredObjectLock, StoredObjectLockConfig, StoredObjectLockDefaultRetention,
-        StoredObjectLockMode, StoredObjectRetention, object_lock_allows_lifecycle_delete,
-    },
-    sse::{SSE_S3_ALGORITHM_CODE, StoredSse, parse_master_key},
-    tagging::StoredTag,
+pub(crate) use crate::sqlite::{
+    ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKind, MultipartChecksumConfig,
+    MultipartCompletionChecksum, ObjectLifecycleExpiration, PartChecksum, StoredChecksum,
+    StoredCorsRule, StoredLifecycleAndFilter, StoredLifecycleExpiration, StoredLifecycleFilter,
+    StoredLifecycleRule, StoredNoncurrentVersionExpiration, StoredObjectLock,
+    StoredObjectLockConfig, StoredObjectLockDefaultRetention, StoredObjectLockMode,
+    StoredObjectRetention, StoredSse, StoredTag,
 };
 
 #[cfg(test)]
-pub(crate) use self::checksum::FullObjectChecksum;
+pub(crate) use crate::sqlite::FullObjectChecksum;
 
-#[cfg(test)]
-pub(crate) use self::checksum::test_support as checksum_test_support;
+pub(crate) use self::{
+    cors::BucketCorsLayer, lifecycle::LifecycleExpirationHeader, sse::parse_master_key,
+};
 
 use self::{
     checksum::{

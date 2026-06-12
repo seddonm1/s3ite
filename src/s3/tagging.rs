@@ -7,8 +7,8 @@ use super::{
     DeleteObjectTaggingOutput, GetBucketTaggingInput, GetBucketTaggingOutput,
     GetObjectTaggingInput, GetObjectTaggingOutput, PutBucketTaggingInput, PutBucketTaggingOutput,
     PutObjectTaggingInput, PutObjectTaggingOutput, S3ErrorCode, S3Request, S3Response, S3Result,
-    Sqlite, Tag, TagSet, Tagging, TaggingDirective, TaggingHeader, s3_error, s3_error_from_sqlite,
-    s3_error_with_message, validate_expected_bucket_owner,
+    Sqlite, StoredTag, Tag, TagSet, Tagging, TaggingDirective, TaggingHeader, s3_error,
+    s3_error_from_sqlite, s3_error_with_message, validate_expected_bucket_owner,
 };
 
 /// Maximum number of S3 tags allowed on one resource.
@@ -17,13 +17,6 @@ const MAX_TAGS: usize = 10;
 const MAX_TAG_KEY_CHARS: usize = 128;
 /// Maximum S3 tag value length, counted in Unicode scalar values.
 const MAX_TAG_VALUE_CHARS: usize = 256;
-
-/// Normalized S3 tag persisted by storage.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StoredTag {
-    pub(crate) key: String,
-    pub(crate) value: String,
-}
 
 /// Parsed copy tagging behavior.
 #[derive(Clone, Debug, Eq, PartialEq)]

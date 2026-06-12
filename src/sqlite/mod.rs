@@ -18,16 +18,6 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::database::BucketConnection;
-use crate::s3::{
-    ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKind, LifecycleExpirationHeader,
-    MultipartChecksumConfig, MultipartCompletionChecksum, PartChecksum, SSE_S3_ALGORITHM_CODE,
-    StoredChecksum, StoredCorsRule, StoredLifecycleAndFilter, StoredLifecycleExpiration,
-    StoredLifecycleFilter, StoredLifecycleRule, StoredNoncurrentVersionExpiration,
-    StoredObjectLock, StoredObjectLockConfig, StoredObjectLockDefaultRetention,
-    StoredObjectLockMode, StoredObjectRetention, StoredSse, StoredTag, current_expiration_time,
-    decode_base64, encode_hex, lifecycle_expiration_header, lifecycle_rule_matches_object,
-    noncurrent_expiration_time, object_lock_allows_lifecycle_delete,
-};
 
 mod bucket;
 mod checksum;
@@ -37,17 +27,33 @@ mod error;
 mod get;
 mod lifecycle;
 mod list;
+mod model;
 mod multipart;
 mod object_lock;
 mod put;
 mod tagging;
 
 use self::checksum::{
-    decode_md5_hex, optional_multipart_checksum_config, optional_part_checksum,
+    decode_multipart_md5_hex, optional_multipart_checksum_config, optional_part_checksum,
     optional_stored_checksum, required_stored_checksum,
 };
 use self::error::{NegativeObjectSize, NegativeSqlLimit};
 pub use self::error::{SqliteError, SqliteResult};
+pub(crate) use self::model::{
+    ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKind, MultipartChecksumConfig,
+    MultipartCompletionChecksum, ObjectLifecycleExpiration, PartChecksum, SSE_S3_ALGORITHM_CODE,
+    StoredChecksum, StoredCorsRule, StoredLifecycleAndFilter, StoredLifecycleExpiration,
+    StoredLifecycleFilter, StoredLifecycleRule, StoredNoncurrentVersionExpiration,
+    StoredObjectLock, StoredObjectLockConfig, StoredObjectLockDefaultRetention,
+    StoredObjectLockMode, StoredObjectRetention, StoredSse, StoredTag, current_expiration_time,
+    decode_base64, decode_md5_hex, encode_hex, lifecycle_rule_matches_object,
+    noncurrent_expiration_time, object_lifecycle_expiration, object_lock_allows_lifecycle_delete,
+};
+
+#[cfg(test)]
+pub(crate) use self::model::{
+    CompositeChecksum, FullObjectChecksum, encode_base64, test_support as checksum_test_support,
+};
 
 pub(crate) const NULL_VERSION_ID: &str = "null";
 
@@ -2239,12 +2245,10 @@ mod tests {
 mod maintenance_tests {
     use rusqlite::Connection;
 
-    use crate::s3::{FullObjectChecksum, StoredChecksum, StoredObjectLock};
-
     use super::{
-        CompletedMultipartUploadRecord, Duration, Multipart, MultipartUploadState, NULL_VERSION_ID,
-        OffsetDateTime, Sqlite, SqliteResult, Uuid,
-        multipart::test_support as multipart_test_support,
+        CompletedMultipartUploadRecord, Duration, FullObjectChecksum, Multipart,
+        MultipartUploadState, NULL_VERSION_ID, OffsetDateTime, Sqlite, SqliteResult,
+        StoredChecksum, StoredObjectLock, Uuid, multipart::test_support as multipart_test_support,
     };
 
     fn open_test_connection() -> rusqlite::Result<Connection> {

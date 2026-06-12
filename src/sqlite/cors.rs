@@ -200,10 +200,7 @@ impl Sqlite {
 mod tests {
     use rusqlite::Connection;
 
-    use crate::{
-        s3::StoredCorsRule,
-        sqlite::{Sqlite, SqliteResult},
-    };
+    use crate::sqlite::{Sqlite, SqliteResult, StoredCorsRule};
 
     fn open_schema() -> SqliteResult<Connection> {
         let mut connection = Connection::open_in_memory()?;

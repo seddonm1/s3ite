@@ -10,12 +10,10 @@ use rusqlite::{
     types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef},
 };
 
-use crate::s3::{
-    ChecksumAlgorithmKind, ChecksumTypeKind, MultipartChecksumConfig, PartChecksum, StoredChecksum,
-    decode_md5_hex as decode_storage_md5_hex,
+use super::{
+    ChecksumAlgorithmKind, ChecksumTypeKind, MultipartChecksumConfig, PartChecksum, SqliteError,
+    SqliteResult, StoredChecksum, decode_md5_hex,
 };
-
-use super::{SqliteError, SqliteResult};
 
 const CHECKSUM_ALGORITHM_CRC32: i64 = 1;
 const CHECKSUM_ALGORITHM_CRC32C: i64 = 2;
@@ -82,8 +80,8 @@ impl FromSql for ChecksumTypeKind {
 }
 
 /// Decodes a multipart MD5 `ETag` fragment from hexadecimal storage text.
-pub(super) fn decode_md5_hex(value: &str) -> SqliteResult<[u8; 16]> {
-    decode_storage_md5_hex(value).ok_or(SqliteError::InvalidMultipartPart)
+pub(super) fn decode_multipart_md5_hex(value: &str) -> SqliteResult<[u8; 16]> {
+    decode_md5_hex(value).ok_or(SqliteError::InvalidMultipartPart)
 }
 
 /// Builds a stored object checksum from non-null `SQLite` columns.
@@ -158,18 +156,14 @@ pub(super) fn checksum_conversion_error(error: SqliteError) -> rusqlite::Error {
 mod tests {
     use rusqlite::Connection;
 
-    use crate::{
-        s3::{
-            ChecksumAlgorithmKind, ChecksumTypeKind, FullObjectChecksum, MultipartChecksumConfig,
-            PartChecksum, StoredChecksum, checksum_test_support, decode_base64, encode_hex,
-        },
-        sqlite::{
-            SqliteError, optional_multipart_checksum_config, optional_part_checksum,
-            optional_stored_checksum, required_stored_checksum,
-        },
+    use crate::sqlite::{
+        ChecksumAlgorithmKind, ChecksumTypeKind, FullObjectChecksum, MultipartChecksumConfig,
+        PartChecksum, SqliteError, StoredChecksum, checksum_test_support, decode_base64,
+        encode_hex, optional_multipart_checksum_config, optional_part_checksum,
+        optional_stored_checksum, required_stored_checksum,
     };
 
-    use super::{decode_md5_hex, stored_checksum};
+    use super::{decode_multipart_md5_hex, stored_checksum};
 
     fn assert_sqlite_error<T>(result: crate::sqlite::SqliteResult<T>, expected: &SqliteError) {
         let err = result.err();
@@ -359,13 +353,16 @@ mod tests {
     #[test]
     fn maps_invalid_md5_hex_to_invalid_multipart_part() {
         assert_eq!(
-            decode_md5_hex("EB733A00C0C9D336E65691A37AB54293").ok(),
+            decode_multipart_md5_hex("EB733A00C0C9D336E65691A37AB54293").ok(),
             Some([
                 0xeb, 0x73, 0x3a, 0x00, 0xc0, 0xc9, 0xd3, 0x36, 0xe6, 0x56, 0x91, 0xa3, 0x7a, 0xb5,
                 0x42, 0x93
             ])
         );
-        assert_sqlite_error(decode_md5_hex("bad"), &SqliteError::InvalidMultipartPart);
+        assert_sqlite_error(
+            decode_multipart_md5_hex("bad"),
+            &SqliteError::InvalidMultipartPart,
+        );
     }
 
     #[test]

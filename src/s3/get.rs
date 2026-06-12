@@ -274,13 +274,14 @@ fn load_object_body_read_found(
         completed_part_count,
         object_size,
     )?;
-    let expiration = Sqlite::lifecycle_expiration_header_for_object(
+    let expiration = Sqlite::lifecycle_expiration_for_object(
         transaction,
         key,
         &object.version_id,
         object.key_metadata.size,
         object.key_metadata.last_modified,
-    )?;
+    )?
+    .map(LifecycleExpirationHeader::from);
 
     Ok(ObjectBodyReadFound {
         object,
@@ -447,13 +448,14 @@ fn load_head_object(
     let target = Sqlite::get_object_version_tagging_target(transaction, key, &metadata.version_id)?
         .ok_or(SqliteError::ObjectVersionNotFound)?;
     let tag_count = Sqlite::get_object_tag_count(transaction, target.sequence)?;
-    let expiration = Sqlite::lifecycle_expiration_header_for_object(
+    let expiration = Sqlite::lifecycle_expiration_for_object(
         transaction,
         key,
         &metadata.version_id,
         metadata.size,
         metadata.last_modified,
-    )?;
+    )?
+    .map(LifecycleExpirationHeader::from);
     let (completed_part, completed_part_count) =
         load_completed_part_info(transaction, key, &metadata.version_id, part_number)?;
     Ok(Some(ObjectMetadataRead {

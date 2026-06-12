@@ -141,9 +141,9 @@ mod tests {
     use rusqlite::Connection;
     use time::{Duration, OffsetDateTime};
 
-    use crate::{
-        s3::{FullObjectChecksum, StoredChecksum, StoredObjectLock},
-        sqlite::{KeyMetadata, KeyValue, Sqlite, SqliteResult, put::test_support},
+    use crate::sqlite::{
+        FullObjectChecksum, KeyMetadata, KeyValue, Sqlite, SqliteResult, StoredChecksum,
+        StoredObjectLock, put::test_support,
     };
 
     use super::*;

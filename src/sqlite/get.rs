@@ -529,10 +529,7 @@ mod tests {
     use rusqlite::Connection;
     use time::OffsetDateTime;
 
-    use crate::{
-        s3::{FullObjectChecksum, StoredChecksum},
-        sqlite::{Sqlite, SqliteError, SqliteResult},
-    };
+    use crate::sqlite::{FullObjectChecksum, Sqlite, SqliteError, SqliteResult, StoredChecksum};
 
     use super::test_support;
 
