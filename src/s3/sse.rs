@@ -521,13 +521,29 @@ fn add_body_len(total_size: i64, len: usize) -> S3Result<i64> {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, path::PathBuf, sync::Arc};
+
     use bytes::Bytes;
     use futures::{StreamExt as _, stream};
     use hyper::http::HeaderValue;
     use s3s::S3Error;
+    use tokio::sync::RwLock;
 
     use super::*;
-    use crate::s3::{ChecksumAlgorithmKind, ChecksumTypeKind};
+    use crate::{
+        Config,
+        s3::{ChecksumAlgorithmKind, ChecksumTypeKind},
+        sqlite::{DEFAULT_OBJECT_BLOB_CHUNK_SIZE, checksum_test_support},
+    };
+
+    fn sqlite_with_config(config: Config) -> Sqlite {
+        Sqlite {
+            root: PathBuf::new(),
+            config,
+            buckets: Arc::new(RwLock::new(HashMap::new())),
+            blob_chunk_size: DEFAULT_OBJECT_BLOB_CHUNK_SIZE,
+        }
+    }
 
     #[test]
     fn rejects_server_side_encryption_headers() {
@@ -558,6 +574,137 @@ mod tests {
                 "error should explain unsupported SSE header {header}"
             );
         }
+    }
+
+    #[test]
+    fn parses_master_key_and_rejects_bad_lengths() {
+        assert!(parse_master_key("not base64").is_err());
+        assert!(parse_master_key("AQID").is_err());
+    }
+
+    #[test]
+    fn sse_master_key_helpers_reject_missing_config_and_map_output_header() {
+        let sqlite = sqlite_with_config(Config::default());
+        assert!(matches!(
+            require_sse_s3_master_key(&sqlite)
+                .err()
+                .as_ref()
+                .map(S3Error::code),
+            Some(&S3ErrorCode::InvalidRequest)
+        ));
+        assert_eq!(
+            sse_s3_output(true)
+                .as_ref()
+                .map(ServerSideEncryption::as_str),
+            Some(ServerSideEncryption::AES256)
+        );
+        assert!(sse_s3_output(false).is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_write_encryption_rejects_sse_without_master_key() {
+        let sqlite = sqlite_with_config(Config::default());
+        assert!(matches!(
+            resolve_write_encryption(&sqlite, "bucket", true)
+                .await
+                .err()
+                .as_ref()
+                .map(S3Error::code),
+            Some(&S3ErrorCode::InvalidRequest)
+        ));
+    }
+
+    #[test]
+    fn rejects_unsupported_write_encryption_inputs() -> S3Result<()> {
+        assert!(matches!(
+            requested_sse_s3(None, true, false, false)
+                .err()
+                .as_ref()
+                .map(S3Error::code),
+            Some(&S3ErrorCode::InvalidArgument)
+        ));
+        assert!(matches!(
+            requested_sse_s3(None, false, true, false)
+                .err()
+                .as_ref()
+                .map(S3Error::code),
+            Some(&S3ErrorCode::InvalidArgument)
+        ));
+        assert!(matches!(
+            requested_sse_s3(None, false, false, true)
+                .err()
+                .as_ref()
+                .map(S3Error::code),
+            Some(&S3ErrorCode::InvalidArgument)
+        ));
+        assert!(requested_sse_s3(
+            Some(&ServerSideEncryption::from_static(
+                ServerSideEncryption::AES256
+            )),
+            false,
+            false,
+            false,
+        )?);
+        assert!(!requested_sse_s3(None, false, false, false)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn encrypt_and_decrypt_chunk_helpers_reject_inconsistent_input() -> S3Result<()> {
+        let encryption =
+            new_active_sse(&[6; 32]).map_err(|err| S3Error::with_message(InternalError, err))?;
+
+        assert!(split_ciphertext_tag(vec![1, 2, 3]).is_err());
+        assert!(encrypt_value_chunks(b"value", 0, &encryption).is_err());
+        assert!(
+            active_sse_from_stored(
+                &[0; 32],
+                StoredSse {
+                    nonce: vec![0],
+                    ciphertext: vec![0; 32],
+                    tag: vec![0; 16],
+                },
+            )
+            .is_err()
+        );
+        assert!(add_body_len(i64::MAX, 1).is_err());
+        let mut chunks = Vec::new();
+        let mut next_offset = i64::MAX;
+        assert!(push_encrypted_chunk(&mut chunks, &mut next_offset, b"x", &encryption).is_err());
+
+        let chunks = encrypt_value_chunks(b"abcdef", 3, &encryption)?;
+        let mut stored = chunks
+            .into_iter()
+            .map(StoredBlobChunk::from)
+            .collect::<Vec<_>>();
+        stored[0].offset = 1;
+        assert!(matches!(
+            decrypt_stored_chunks(&encryption, stored),
+            Err(SqliteError::ObjectBodyInconsistent)
+        ));
+
+        let mut stored = encrypt_value_chunks(b"abcdef", 3, &encryption)?
+            .into_iter()
+            .map(StoredBlobChunk::from)
+            .collect::<Vec<_>>();
+        stored[0].sse_nonce = None;
+        assert!(matches!(
+            decrypt_stored_chunks(&encryption, stored),
+            Err(SqliteError::ObjectBodyInconsistent)
+        ));
+
+        let mut stored = encrypt_value_chunks(b"abcdef", 3, &encryption)?
+            .into_iter()
+            .map(StoredBlobChunk::from)
+            .collect::<Vec<_>>();
+        stored[0].size += 1;
+        assert!(matches!(
+            decrypt_stored_chunks(&encryption, stored),
+            Err(SqliteError::ObjectBodyInconsistent)
+        ));
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -591,6 +738,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn object_body_encrypts_with_explicit_checksum() -> S3Result<()> {
+        let encryption =
+            new_active_sse(&[11; 32]).map_err(|err| S3Error::with_message(InternalError, err))?;
+        let sha256 = checksum_test_support::checksum_value(ChecksumAlgorithmKind::Sha256, b"abc");
+        let object = read_object_body_encrypted(
+            streaming_blob(&[b"abc"]),
+            false,
+            None,
+            ChecksumInput::value_fields(None, None, None, None, Some(sha256)),
+            3,
+            &encryption,
+        )
+        .await?;
+        assert_eq!(object.checksum.algorithm(), ChecksumAlgorithmKind::Sha256);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn part_body_encrypts_and_computes_configured_checksum() -> S3Result<()> {
         let encryption =
             new_active_sse(&[8; 32]).map_err(|err| S3Error::with_message(InternalError, err))?;
@@ -608,15 +773,51 @@ mod tests {
         )
         .await?;
 
-        let Some(checksum) = part.checksum else {
-            return Err(S3Error::with_message(
-                InternalError,
-                "configured part checksum is missing",
-            ));
-        };
+        let checksum = part.checksum.ok_or(S3Error::with_message(
+            InternalError,
+            "configured part checksum is missing",
+        ))?;
         assert_eq!(checksum.algorithm(), ChecksumAlgorithmKind::Sha256);
         assert_eq!(part.size, 11);
         assert_eq!(part.chunks.len(), 3);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn encrypted_body_helpers_reject_zero_chunk_size_and_accept_explicit_part_checksum()
+    -> S3Result<()> {
+        let encryption =
+            new_active_sse(&[10; 32]).map_err(|err| S3Error::with_message(InternalError, err))?;
+
+        assert!(
+            read_object_body_encrypted(
+                streaming_blob(&[b"abc"]),
+                false,
+                None,
+                ChecksumInput::default(),
+                0,
+                &encryption,
+            )
+            .await
+            .is_err()
+        );
+
+        let sha256 = checksum_test_support::checksum_value(ChecksumAlgorithmKind::Sha256, b"abc");
+        let part = read_part_body_encrypted(
+            streaming_blob(&[b"abc"]),
+            &ChecksumInput::value_fields(None, None, None, None, Some(sha256)),
+            None,
+            false,
+            None,
+            3,
+            &encryption,
+        )
+        .await?;
+        assert_eq!(
+            part.checksum.as_ref().map(PartChecksum::algorithm),
+            Some(ChecksumAlgorithmKind::Sha256)
+        );
 
         Ok(())
     }

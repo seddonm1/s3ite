@@ -946,6 +946,22 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn reader_open_failure_is_reported() {
+        let result = BucketConnectionInner::connect(
+            rusqlite::Connection::open_in_memory,
+            Arc::new(|| Err(rusqlite::Error::InvalidQuery)),
+            1,
+            1,
+            None,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(SqliteError::Rusqlite(rusqlite::Error::InvalidQuery))
+        ));
+    }
+
     fn sender_without_receiver() -> SyncSender<WorkerCommand> {
         let (sender, receiver) = sync_channel(1);
         drop(receiver);
@@ -974,6 +990,10 @@ mod tests {
         let execute = WorkerCommand::Execute(Box::new(|_| {}));
         assert_eq!(format!("{execute:?}"), "Execute");
         assert_eq!(format!("{:?}", WorkerCommand::Close), "Close");
+        let connection = BucketConnection {
+            inner: Arc::new(inner_with_handles(None, Vec::new(), Vec::new())),
+        };
+        assert!(format!("{connection:?}").contains("BucketConnection"));
         assert_eq!(WorkerRole::Writer.name(), "writer");
         assert_eq!(WorkerRole::Reader.name(), "reader");
         assert_eq!(WorkerRole::BlobReader.name(), "blob reader");
@@ -1072,6 +1092,42 @@ mod tests {
             .err();
         assert!(matches!(err, Some(SqliteError::Rusqlite(_))));
         connection.execute_batch("ROLLBACK;")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blob_read_stops_when_result_receiver_is_dropped() -> SqliteResult<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        connection.execute_batch(
+            "
+            CREATE TABLE blob_source (
+                sequence INTEGER PRIMARY KEY,
+                body BLOB NOT NULL
+            ) STRICT;
+            INSERT INTO blob_source (sequence, body) VALUES (1, X'010203');
+            ",
+        )?;
+        let (result_sender, result_receiver) = oneshot::channel();
+        drop(result_receiver);
+        let (chunk_sender, mut chunk_receiver) = tokio_mpsc::channel(1);
+        let timed_out = AtomicBool::new(false);
+
+        BucketConnectionInner::execute_blob_read(
+            &mut connection,
+            |_| {
+                Ok((
+                    (),
+                    vec![BlobReadRequest::new("blob_source", "body", 1, 0, 3, 3)],
+                ))
+            },
+            result_sender,
+            &chunk_sender,
+            None,
+            &timed_out,
+            &Handle::current(),
+        );
+        drop(chunk_sender);
+        assert!(chunk_receiver.recv().await.is_none());
         Ok(())
     }
 

@@ -529,6 +529,43 @@ mod tests {
         }
     }
 
+    fn stored_rule(id: &str, filter: StoredLifecycleFilter) -> StoredLifecycleRule {
+        StoredLifecycleRule {
+            id: Some(id.to_string()),
+            enabled: true,
+            filter,
+            expiration: Some(StoredLifecycleExpiration {
+                days: Some(1),
+                date: None,
+                expired_object_delete_marker: false,
+            }),
+            noncurrent_expiration: None,
+            abort_incomplete_multipart_days: None,
+        }
+    }
+
+    fn dto_rule() -> LifecycleRule {
+        LifecycleRule {
+            abort_incomplete_multipart_upload: None,
+            expiration: Some(LifecycleExpiration {
+                date: None,
+                days: Some(1),
+                expired_object_delete_marker: None,
+            }),
+            filter: Some(LifecycleRuleFilter::default()),
+            id: Some("rule".to_string()),
+            noncurrent_version_expiration: None,
+            noncurrent_version_transitions: None,
+            prefix: None,
+            status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            transitions: None,
+        }
+    }
+
+    fn lifecycle_config(rules: Vec<LifecycleRule>) -> BucketLifecycleConfiguration {
+        BucketLifecycleConfiguration { rules }
+    }
+
     #[test]
     fn lifecycle_filter_matching_supports_prefix_tag_size_and_and() {
         let tags = vec![StoredTag {
@@ -549,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_expiration_header_selects_earliest_matching_rule() {
+    fn lifecycle_expiration_header_selects_earliest_matching_rule() -> S3Result<()> {
         let now = OffsetDateTime::UNIX_EPOCH;
         let rules = vec![enabled_rule(Some(StoredLifecycleExpiration {
             days: Some(2),
@@ -557,29 +594,27 @@ mod tests {
             expired_object_delete_marker: false,
         }))];
 
-        let Some(expiration) = object_lifecycle_expiration(&rules, "logs/one", 10, now, &[]) else {
-            panic!("expiration header");
-        };
+        let expiration = object_lifecycle_expiration(&rules, "logs/one", 10, now, &[])
+            .ok_or(s3_error(S3ErrorCode::InternalError))?;
         let header = LifecycleExpirationHeader::from(expiration);
         assert_eq!(header.expires_at, now + time::Duration::days(2));
-        let Ok(header_value) = header.to_header_value() else {
-            panic!("expiration header should format");
-        };
+        let header_value = header.to_header_value()?;
         assert!(header_value.contains("rule-id=\"rule%20id\""));
+        Ok(())
     }
 
     #[test]
-    fn lifecycle_validation_rejects_days_zero_and_transitions() {
-        let Err(err) = stored_expiration_from_dto(LifecycleExpiration {
+    fn lifecycle_validation_rejects_days_zero_and_transitions() -> S3Result<()> {
+        let err = stored_expiration_from_dto(LifecycleExpiration {
             days: Some(0),
             date: None,
             expired_object_delete_marker: None,
-        }) else {
-            panic!("days=0 is invalid");
-        };
+        })
+        .err()
+        .ok_or(s3_error(S3ErrorCode::InternalError))?;
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
 
-        let Err(err) = stored_lifecycle_rule_from_dto(LifecycleRule {
+        let err = stored_lifecycle_rule_from_dto(LifecycleRule {
             abort_incomplete_multipart_upload: None,
             expiration: None,
             filter: Some(LifecycleRuleFilter::default()),
@@ -589,9 +624,208 @@ mod tests {
             prefix: None,
             status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
             transitions: Some(vec![Transition::default()]),
-        }) else {
-            panic!("transitions are unsupported");
-        };
+        })
+        .err()
+        .ok_or(s3_error(S3ErrorCode::InternalError))?;
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_validation_rejects_rule_counts_and_malformed_shapes() {
+        assert!(
+            stored_lifecycle_rules_from_configuration(Some(lifecycle_config(Vec::new()))).is_err()
+        );
+
+        let too_many_rules = std::iter::repeat_with(dto_rule)
+            .take(MAX_LIFECYCLE_RULES + 1)
+            .collect();
+        assert!(
+            stored_lifecycle_rules_from_configuration(Some(lifecycle_config(too_many_rules)))
+                .is_err()
+        );
+        assert!(stored_lifecycle_rules_from_configuration(None).is_err());
+        assert!(
+            stored_lifecycle_rule_from_dto(LifecycleRule {
+                expiration: None,
+                ..dto_rule()
+            })
+            .is_err()
+        );
+        assert!(
+            stored_lifecycle_rule_from_dto(LifecycleRule {
+                id: Some("x".repeat(MAX_LIFECYCLE_RULE_ID_CHARS + 1)),
+                ..dto_rule()
+            })
+            .is_err()
+        );
+        assert!(
+            stored_lifecycle_rule_from_dto(LifecycleRule {
+                status: ExpirationStatus::from_static("Unknown"),
+                ..dto_rule()
+            })
+            .is_err()
+        );
+        assert!(
+            stored_filter_from_dto(
+                Some("legacy/".to_string()),
+                Some(LifecycleRuleFilter::default())
+            )
+            .is_err()
+        );
+        assert!(
+            stored_filter_element_from_dto(LifecycleRuleFilter {
+                prefix: Some("logs/".to_string()),
+                tag: Some(Tag {
+                    key: Some("class".to_string()),
+                    value: Some("tmp".to_string()),
+                }),
+                ..Default::default()
+            })
+            .is_err()
+        );
+        assert!(
+            stored_tag_from_dto(Tag {
+                key: None,
+                value: Some("tmp".to_string()),
+            })
+            .is_err()
+        );
+        assert!(
+            stored_expiration_from_dto(LifecycleExpiration {
+                days: Some(1),
+                date: Some(OffsetDateTime::UNIX_EPOCH.into()),
+                expired_object_delete_marker: None,
+            })
+            .is_err()
+        );
+        assert!(
+            stored_noncurrent_expiration_from_dto(&NoncurrentVersionExpiration {
+                newer_noncurrent_versions: None,
+                noncurrent_days: None,
+            })
+            .is_err()
+        );
+        assert!(validate_newer_noncurrent_versions(0).is_err());
+        assert!(validate_newer_noncurrent_versions(MAX_NEWER_NONCURRENT_VERSIONS + 1).is_err());
+        assert!(validate_size(-1).is_err());
+    }
+
+    #[test]
+    fn lifecycle_rules_from_stored_covers_status_and_actions() {
+        let rules = lifecycle_rules_from_stored(vec![
+            StoredLifecycleRule {
+                id: Some("legacy".to_string()),
+                enabled: false,
+                filter: StoredLifecycleFilter::LegacyPrefix("old/".to_string()),
+                expiration: None,
+                noncurrent_expiration: Some(StoredNoncurrentVersionExpiration {
+                    noncurrent_days: 5,
+                    newer_noncurrent_versions: Some(2),
+                }),
+                abort_incomplete_multipart_days: Some(7),
+            },
+            StoredLifecycleRule {
+                id: Some("empty".to_string()),
+                enabled: true,
+                filter: StoredLifecycleFilter::Empty,
+                expiration: Some(StoredLifecycleExpiration {
+                    days: None,
+                    date: Some(OffsetDateTime::UNIX_EPOCH),
+                    expired_object_delete_marker: false,
+                }),
+                noncurrent_expiration: None,
+                abort_incomplete_multipart_days: None,
+            },
+        ]);
+
+        assert_eq!(rules[0].status.as_str(), ExpirationStatus::DISABLED);
+        assert_eq!(rules[0].prefix.as_deref(), Some("old/"));
+        assert_eq!(
+            rules[0]
+                .abort_incomplete_multipart_upload
+                .as_ref()
+                .and_then(|abort| abort.days_after_initiation),
+            Some(7)
+        );
+        assert_eq!(
+            rules[0]
+                .noncurrent_version_expiration
+                .as_ref()
+                .and_then(|expiration| expiration.newer_noncurrent_versions),
+            Some(2)
+        );
+        assert!(
+            rules[1]
+                .filter
+                .as_ref()
+                .is_some_and(|filter| *filter == LifecycleRuleFilter::default())
+        );
+    }
+
+    #[test]
+    fn lifecycle_rules_from_stored_covers_filter_shapes() {
+        let rules = lifecycle_rules_from_stored(vec![
+            StoredLifecycleRule {
+                id: Some("tag".to_string()),
+                enabled: true,
+                filter: StoredLifecycleFilter::Tag(StoredTag {
+                    key: "class".to_string(),
+                    value: "tmp".to_string(),
+                }),
+                expiration: Some(StoredLifecycleExpiration {
+                    days: None,
+                    date: None,
+                    expired_object_delete_marker: true,
+                }),
+                noncurrent_expiration: None,
+                abort_incomplete_multipart_days: None,
+            },
+            stored_rule("min-size", StoredLifecycleFilter::SizeGreaterThan(10)),
+            stored_rule("max-size", StoredLifecycleFilter::SizeLessThan(100)),
+            stored_rule(
+                "and",
+                StoredLifecycleFilter::And(StoredLifecycleAndFilter {
+                    prefix: Some("logs/".to_string()),
+                    tags: vec![StoredTag {
+                        key: "class".to_string(),
+                        value: "tmp".to_string(),
+                    }],
+                    object_size_greater_than: Some(1),
+                    object_size_less_than: Some(20),
+                }),
+            ),
+        ]);
+
+        assert_eq!(
+            rules[0]
+                .filter
+                .as_ref()
+                .and_then(|filter| filter.tag.as_ref())
+                .and_then(|tag| tag.key.as_deref()),
+            Some("class")
+        );
+        assert_eq!(
+            rules[1]
+                .filter
+                .as_ref()
+                .and_then(|filter| filter.object_size_greater_than),
+            Some(10)
+        );
+        assert_eq!(
+            rules[2]
+                .filter
+                .as_ref()
+                .and_then(|filter| filter.object_size_less_than),
+            Some(100)
+        );
+        assert_eq!(
+            rules[3]
+                .filter
+                .as_ref()
+                .and_then(|filter| filter.and.as_ref())
+                .and_then(|and| and.prefix.as_deref()),
+            Some("logs/")
+        );
     }
 }

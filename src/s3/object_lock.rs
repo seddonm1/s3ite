@@ -704,8 +704,27 @@ type SqliteResult<T> = Result<T, SqliteError>;
 mod tests {
     use super::*;
 
+    fn metadata_with_lock(object_lock: StoredObjectLock) -> KeyMetadata {
+        KeyMetadata {
+            version_id: "version".to_string(),
+            size: 0,
+            metadata: None,
+            content_type: None,
+            content_encoding: None,
+            cache_control: None,
+            expires: None,
+            last_modified: OffsetDateTime::UNIX_EPOCH,
+            md5: None,
+            checksum: None,
+            stored_sse: None,
+            object_lock,
+            is_latest: true,
+            is_delete_marker: false,
+        }
+    }
+
     #[test]
-    fn default_retention_uses_days_or_years() {
+    fn default_retention_uses_days_or_years() -> S3Result<()> {
         let now = OffsetDateTime::UNIX_EPOCH;
         let config = StoredObjectLockConfig {
             enabled: true,
@@ -715,15 +734,26 @@ mod tests {
                 years: None,
             }),
         };
-        let lock =
-            match object_lock_for_new_version(&config, ObjectLockWriteHeaders::default(), now) {
-                Ok(lock) => lock,
-                Err(err) => panic!("default retention should apply: {err:?}"),
-            };
+        let lock = object_lock_for_new_version(&config, ObjectLockWriteHeaders::default(), now)?;
         assert_eq!(
             lock.retention.map(|retention| retention.retain_until),
             Some(now + Duration::days(2))
         );
+
+        let config = StoredObjectLockConfig {
+            enabled: true,
+            default_retention: Some(StoredObjectLockDefaultRetention {
+                mode: StoredObjectLockMode::Compliance,
+                days: None,
+                years: Some(1),
+            }),
+        };
+        let lock = object_lock_for_new_version(&config, ObjectLockWriteHeaders::default(), now)?;
+        assert_eq!(
+            lock.retention.map(|retention| retention.retain_until),
+            Some(now + Duration::days(365))
+        );
+        Ok(())
     }
 
     #[test]
@@ -744,25 +774,10 @@ mod tests {
 
     #[test]
     fn legal_hold_blocks_deletes() {
-        let metadata = KeyMetadata {
-            version_id: "version".to_string(),
-            size: 0,
-            metadata: None,
-            content_type: None,
-            content_encoding: None,
-            cache_control: None,
-            expires: None,
-            last_modified: OffsetDateTime::UNIX_EPOCH,
-            md5: None,
-            checksum: None,
-            stored_sse: None,
-            object_lock: StoredObjectLock {
-                legal_hold: Some(true),
-                retention: None,
-            },
-            is_latest: true,
-            is_delete_marker: false,
-        };
+        let metadata = metadata_with_lock(StoredObjectLock {
+            legal_hold: Some(true),
+            retention: None,
+        });
         let Err(err) = validate_object_lock_delete(&metadata, false, OffsetDateTime::UNIX_EPOCH)
         else {
             panic!("legal hold should block delete");
@@ -772,29 +787,226 @@ mod tests {
 
     #[test]
     fn governance_retention_honors_bypass() {
-        let metadata = KeyMetadata {
-            version_id: "version".to_string(),
-            size: 0,
-            metadata: None,
-            content_type: None,
-            content_encoding: None,
-            cache_control: None,
-            expires: None,
-            last_modified: OffsetDateTime::UNIX_EPOCH,
-            md5: None,
-            checksum: None,
-            stored_sse: None,
-            object_lock: StoredObjectLock {
-                legal_hold: None,
-                retention: Some(StoredObjectRetention {
-                    mode: StoredObjectLockMode::Governance,
-                    retain_until: OffsetDateTime::UNIX_EPOCH + Duration::days(1),
-                }),
-            },
-            is_latest: true,
-            is_delete_marker: false,
-        };
+        let metadata = metadata_with_lock(StoredObjectLock {
+            legal_hold: None,
+            retention: Some(StoredObjectRetention {
+                mode: StoredObjectLockMode::Governance,
+                retain_until: OffsetDateTime::UNIX_EPOCH + Duration::days(1),
+            }),
+        });
         assert!(validate_object_lock_delete(&metadata, false, OffsetDateTime::UNIX_EPOCH).is_err());
         assert!(validate_object_lock_delete(&metadata, true, OffsetDateTime::UNIX_EPOCH).is_ok());
+    }
+
+    #[test]
+    fn copied_versions_preserve_source_lock_or_apply_explicit_headers() -> S3Result<()> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let config = StoredObjectLockConfig {
+            enabled: true,
+            default_retention: None,
+        };
+        let source = StoredObjectLock {
+            legal_hold: Some(false),
+            retention: Some(StoredObjectRetention {
+                mode: StoredObjectLockMode::Compliance,
+                retain_until: now + Duration::days(3),
+            }),
+        };
+
+        assert_eq!(
+            object_lock_for_copied_version(
+                &source,
+                &config,
+                ObjectLockWriteHeaders::default(),
+                now
+            )?,
+            source
+        );
+
+        let copied = object_lock_for_copied_version(
+            &StoredObjectLock::default(),
+            &config,
+            ObjectLockWriteHeaders {
+                legal_hold: Some(true),
+                retention: None,
+            },
+            now,
+        )?;
+        assert_eq!(copied.legal_hold, Some(true));
+        Ok(())
+    }
+
+    #[test]
+    fn object_lock_response_helpers_cover_legal_hold_and_retention_modes() {
+        let lock = StoredObjectLock {
+            legal_hold: Some(false),
+            retention: Some(StoredObjectRetention {
+                mode: StoredObjectLockMode::Compliance,
+                retain_until: OffsetDateTime::UNIX_EPOCH + Duration::days(1),
+            }),
+        };
+
+        assert_eq!(
+            object_lock_legal_hold_status(&lock)
+                .as_ref()
+                .map(ObjectLockLegalHoldStatus::as_str),
+            Some(ObjectLockLegalHoldStatus::OFF)
+        );
+        assert_eq!(
+            object_lock_mode(&lock).as_ref().map(ObjectLockMode::as_str),
+            Some(ObjectLockMode::COMPLIANCE)
+        );
+        assert_eq!(
+            object_lock_retain_until_date(&lock).map(OffsetDateTime::from),
+            Some(OffsetDateTime::UNIX_EPOCH + Duration::days(1))
+        );
+        assert_eq!(
+            legal_hold_to_dto(&lock)
+                .status
+                .as_ref()
+                .map(ObjectLockLegalHoldStatus::as_str),
+            Some(ObjectLockLegalHoldStatus::OFF)
+        );
+        assert_eq!(
+            lock.retention
+                .as_ref()
+                .map(retention_to_dto)
+                .and_then(|retention| retention.mode)
+                .as_ref()
+                .map(ObjectLockRetentionMode::as_str),
+            Some(ObjectLockRetentionMode::COMPLIANCE)
+        );
+    }
+
+    #[test]
+    fn object_lock_write_and_config_validation_reject_invalid_shapes() -> S3Result<()> {
+        assert!(legal_hold_from_status("BAD").is_err());
+        assert!(mode_from_object_lock_mode(&ObjectLockMode::from_static("BAD")).is_err());
+        assert!(mode_from_retention_mode(&ObjectLockRetentionMode::from_static("BAD")).is_err());
+        assert!(
+            retention_from_write_headers(
+                Some(ObjectLockMode::from_static(ObjectLockMode::GOVERNANCE)),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            validate_new_retention(
+                StoredObjectRetention {
+                    mode: StoredObjectLockMode::Governance,
+                    retain_until: OffsetDateTime::UNIX_EPOCH,
+                },
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .is_err()
+        );
+
+        assert!(config_from_dto(None).is_err());
+        assert!(
+            config_from_dto(Some(ObjectLockConfiguration {
+                object_lock_enabled: Some(ObjectLockEnabled::from_static("Disabled")),
+                rule: None,
+            }))
+            .is_err()
+        );
+        assert!(
+            config_from_dto(Some(ObjectLockConfiguration {
+                object_lock_enabled: Some(ObjectLockEnabled::from_static(
+                    ObjectLockEnabled::ENABLED
+                )),
+                rule: Some(ObjectLockRule {
+                    default_retention: None,
+                }),
+            }))
+            .is_err()
+        );
+
+        assert!(default_retention_from_dto(DefaultRetention::default()).is_err());
+        assert!(
+            default_retention_from_dto(DefaultRetention {
+                mode: Some(ObjectLockRetentionMode::from_static(
+                    ObjectLockRetentionMode::GOVERNANCE
+                )),
+                days: Some(1),
+                years: Some(1),
+            })
+            .is_err()
+        );
+        assert!(
+            default_retention_from_dto(DefaultRetention {
+                mode: Some(ObjectLockRetentionMode::from_static(
+                    ObjectLockRetentionMode::GOVERNANCE
+                )),
+                days: Some(0),
+                years: None,
+            })
+            .is_err()
+        );
+
+        assert!(legal_hold_from_dto(None).is_err());
+        assert!(legal_hold_from_dto(Some(ObjectLockLegalHold::default())).is_err());
+        assert!(optional_retention_from_dto(None)?.is_none());
+        assert!(optional_retention_from_dto(Some(ObjectLockRetention::default())).is_err());
+        assert!(
+            optional_retention_from_dto(Some(ObjectLockRetention {
+                mode: Some(ObjectLockRetentionMode::from_static(
+                    ObjectLockRetentionMode::GOVERNANCE
+                )),
+                retain_until_date: Some(OffsetDateTime::UNIX_EPOCH.into()),
+            }))
+            .is_err()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn retention_delete_and_update_validation_covers_active_and_expired_modes() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let expired = metadata_with_lock(StoredObjectLock {
+            legal_hold: None,
+            retention: Some(StoredObjectRetention {
+                mode: StoredObjectLockMode::Compliance,
+                retain_until: now,
+            }),
+        });
+        assert!(validate_object_lock_delete(&expired, false, now).is_ok());
+        assert!(
+            validate_object_lock_delete(
+                &metadata_with_lock(StoredObjectLock {
+                    legal_hold: None,
+                    retention: Some(StoredObjectRetention {
+                        mode: StoredObjectLockMode::Compliance,
+                        retain_until: now + Duration::days(1),
+                    }),
+                }),
+                false,
+                now,
+            )
+            .is_err()
+        );
+
+        let current = StoredObjectRetention {
+            mode: StoredObjectLockMode::Governance,
+            retain_until: now + Duration::days(2),
+        };
+        let extended = StoredObjectRetention {
+            mode: StoredObjectLockMode::Governance,
+            retain_until: now + Duration::days(3),
+        };
+        let shortened = StoredObjectRetention {
+            mode: StoredObjectLockMode::Governance,
+            retain_until: now + Duration::days(1),
+        };
+        assert!(validate_retention_update(None, None, false, now).is_ok());
+        assert!(validate_retention_update(Some(&current), Some(&extended), false, now).is_ok());
+        assert!(validate_retention_update(Some(&current), Some(&shortened), false, now).is_err());
+        assert!(validate_retention_update(Some(&current), Some(&shortened), true, now).is_ok());
+
+        let compliance = StoredObjectRetention {
+            mode: StoredObjectLockMode::Compliance,
+            retain_until: now + Duration::days(2),
+        };
+        assert!(validate_retention_update(Some(&compliance), None, true, now).is_err());
     }
 }

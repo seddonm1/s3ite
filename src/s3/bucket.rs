@@ -510,7 +510,7 @@ pub(super) async fn list_buckets(
 
 #[cfg(test)]
 mod tests {
-    use super::is_valid_bucket_name;
+    use super::*;
 
     #[test]
     fn validates_dns_bucket_names() {
@@ -534,5 +534,55 @@ mod tests {
         ] {
             assert!(!is_valid_bucket_name(bucket), "{bucket}");
         }
+    }
+
+    #[test]
+    fn bucket_encryption_validation_rejects_unsupported_shapes() {
+        assert!(
+            validate_sse_s3_bucket_encryption_configuration(&ServerSideEncryptionConfiguration {
+                rules: Vec::new()
+            })
+            .is_err()
+        );
+        assert!(
+            validate_sse_s3_bucket_encryption_configuration(&ServerSideEncryptionConfiguration {
+                rules: vec![ServerSideEncryptionRule {
+                    apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
+                        kms_master_key_id: None,
+                        sse_algorithm: ServerSideEncryption::from_static(
+                            ServerSideEncryption::AES256
+                        ),
+                    },),
+                    bucket_key_enabled: Some(true),
+                }],
+            },)
+            .is_err()
+        );
+        assert!(
+            validate_sse_s3_bucket_encryption_configuration(&ServerSideEncryptionConfiguration {
+                rules: vec![ServerSideEncryptionRule {
+                    apply_server_side_encryption_by_default: None,
+                    bucket_key_enabled: None,
+                }],
+            },)
+            .is_err()
+        );
+        assert!(
+            validate_sse_s3_bucket_encryption_configuration(&ServerSideEncryptionConfiguration {
+                rules: vec![ServerSideEncryptionRule {
+                    apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
+                        kms_master_key_id: Some("key".to_string()),
+                        sse_algorithm: ServerSideEncryption::from_static(
+                            ServerSideEncryption::AES256
+                        ),
+                    },),
+                    bucket_key_enabled: None,
+                }],
+            },)
+            .is_err()
+        );
+
+        let configuration = sse_s3_bucket_encryption_configuration();
+        assert!(validate_sse_s3_bucket_encryption_configuration(&configuration).is_ok());
     }
 }

@@ -1468,12 +1468,13 @@ mod tests {
     use rusqlite::Connection;
 
     use crate::sqlite::{
-        ChecksumAlgorithmKind, ChecksumTypeKind, CompletedMultipartUploadRecord,
-        CompletedObjectPart, EncodedBlobChunk, FullObjectChecksum, MultipartChecksumConfig,
-        MultipartCompletion, MultipartCompletionChecksum, MultipartCompletionPart,
-        MultipartCompletionRequest, MultipartPartWrite, MultipartUploadState, NULL_VERSION_ID,
-        ObjectWriteConditions, Sqlite, SqliteError, SqliteResult, StoredChecksum, StoredObjectLock,
-        get::test_support as get_test_support,
+        ChecksumAlgorithmKind, ChecksumTypeKind, CompletedMultipartUploadOutcome,
+        CompletedMultipartUploadRecord, CompletedObjectPart, EncodedBlobChunk, FullObjectChecksum,
+        MultipartChecksumConfig, MultipartCompletion, MultipartCompletionChecksum,
+        MultipartCompletionPart, MultipartCompletionRequest, MultipartPartWrite,
+        MultipartUploadState, NULL_VERSION_ID, ObjectWriteConditions, Sqlite, SqliteError,
+        SqliteResult, StoredChecksum, StoredObjectLock, StoredObjectLockMode,
+        StoredObjectRetention, get::test_support as get_test_support,
     };
 
     use super::*;
@@ -1548,6 +1549,38 @@ mod tests {
         }
     }
 
+    fn require_completed(
+        completion: MultipartCompletion,
+    ) -> SqliteResult<CompletedMultipartUploadOutcome> {
+        match completion {
+            MultipartCompletion::AlreadyCompleted(outcome) => Ok(outcome),
+            MultipartCompletion::Prepared(_) => Err(SqliteError::InvalidMultipartPart),
+        }
+    }
+
+    fn multipart(upload_id: Uuid, value: &[u8], md5: &str) -> Multipart {
+        Multipart {
+            upload_id,
+            part_number: 1,
+            last_modified: time::OffsetDateTime::now_utc(),
+            value: value.to_vec(),
+            size: i64::try_from(value.len()).unwrap_or(i64::MAX),
+            md5: Some(md5.to_string()),
+            checksum: None,
+        }
+    }
+
+    fn one_part_request(upload_id: Uuid, md5: &str) -> MultipartCompletionRequest {
+        completion_request(
+            upload_id,
+            vec![MultipartCompletionPart {
+                part_number: 1,
+                md5: md5.to_string(),
+                checksum: None,
+            }],
+        )
+    }
+
     #[test]
     fn completion_prepare_rejects_empty_requested_parts() -> SqliteResult<()> {
         let mut connection = open_schema()?;
@@ -1581,7 +1614,7 @@ mod tests {
             },
         )?;
 
-        let completion = Sqlite::prepare_multipart_upload_completion(
+        let outcome = require_completed(Sqlite::prepare_multipart_upload_completion(
             &transaction,
             &completion_request(
                 upload_id,
@@ -1591,13 +1624,120 @@ mod tests {
                     checksum: None,
                 }],
             ),
-        )?;
-        let MultipartCompletion::AlreadyCompleted(outcome) = completion else {
-            panic!("expected already-completed multipart outcome");
-        };
+        )?)?;
         assert_eq!(outcome.md5, "etag-1");
         assert_eq!(outcome.returned_version_id.as_deref(), Some("returned"));
         assert_eq!(outcome.checksum, checksum);
+        Ok(())
+    }
+
+    #[test]
+    fn multipart_helpers_cover_metadata_and_unexpected_completion_variants() {
+        let upload_id = Uuid::new_v4();
+        let checksum = PartChecksum::Crc32("AAAAAA==".to_string());
+        let part = Multipart {
+            checksum: Some(checksum.clone()),
+            ..multipart(upload_id, b"abc", "md5")
+        };
+        let metadata = CompletionPartMetadata::from(&part);
+        assert_eq!(metadata.part_number, 1);
+        assert_eq!(metadata.size, 3);
+        assert_eq!(metadata.md5, Some("md5"));
+        assert_eq!(metadata.checksum, Some(&checksum));
+
+        let completed = CompletedMultipartUploadOutcome {
+            md5: "etag".to_string(),
+            returned_version_id: None,
+            checksum: StoredChecksum::Full(FullObjectChecksum::Crc64Nvme("crc".to_string())),
+            stored_sse: None,
+        };
+        assert!(matches!(
+            require_prepared(MultipartCompletion::AlreadyCompleted(completed)),
+            Err(SqliteError::InvalidMultipartPart)
+        ));
+
+        let prepared = PreparedMultipartUpload {
+            size: 0,
+            md5: "etag".to_string(),
+            checksum: StoredChecksum::Full(FullObjectChecksum::Crc64Nvme("crc".to_string())),
+            upload_checksum: None,
+            stored_sse: None,
+            parts: Vec::new(),
+        };
+        assert!(matches!(
+            require_completed(MultipartCompletion::Prepared(prepared)),
+            Err(SqliteError::InvalidMultipartPart)
+        ));
+    }
+
+    #[test]
+    fn upload_state_round_trips_optional_checksum_sse_and_object_lock() -> SqliteResult<()> {
+        let mut connection = open_schema()?;
+        let transaction = connection.transaction()?;
+        let upload_id = Uuid::new_v4();
+        let mut metadata = HashMap::new();
+        metadata.insert("color".to_string(), "blue".to_string());
+        let retain_until = time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(1);
+
+        Sqlite::create_multipart_upload(
+            &transaction,
+            upload_id,
+            "bucket",
+            "key",
+            MultipartUploadState {
+                access_key: Some("owner".to_string()),
+                metadata: Some(metadata),
+                content_type: Some("text/plain".to_string()),
+                content_encoding: Some("gzip".to_string()),
+                cache_control: Some("max-age=60".to_string()),
+                expires: Some(retain_until),
+                checksum: Some(MultipartChecksumConfig::new(
+                    ChecksumAlgorithmKind::Sha256,
+                    ChecksumTypeKind::Composite,
+                )),
+                stored_sse: Some(StoredSse {
+                    nonce: vec![1; 12],
+                    ciphertext: vec![2; 32],
+                    tag: vec![3; 16],
+                }),
+                object_lock: StoredObjectLock {
+                    legal_hold: Some(true),
+                    retention: Some(StoredObjectRetention {
+                        mode: StoredObjectLockMode::Governance,
+                        retain_until,
+                    }),
+                },
+            },
+        )?;
+
+        let state = Sqlite::get_multipart_upload_state(&transaction, upload_id, "bucket", "key")?
+            .ok_or(SqliteError::MultipartUploadNotFound)?;
+        assert_eq!(state.access_key.as_deref(), Some("owner"));
+        assert_eq!(state.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(
+            state.checksum,
+            Some(MultipartChecksumConfig::new(
+                ChecksumAlgorithmKind::Sha256,
+                ChecksumTypeKind::Composite
+            ))
+        );
+        assert_eq!(
+            state.stored_sse,
+            Some(StoredSse {
+                nonce: vec![1; 12],
+                ciphertext: vec![2; 32],
+                tag: vec![3; 16],
+            })
+        );
+        assert_eq!(state.object_lock.legal_hold, Some(true));
+        assert_eq!(
+            state
+                .object_lock
+                .retention
+                .as_ref()
+                .map(|retention| retention.mode),
+            Some(StoredObjectLockMode::Governance)
+        );
         Ok(())
     }
 
@@ -1628,6 +1768,50 @@ mod tests {
             Err(SqliteError::Rusqlite(
                 rusqlite::Error::FromSqlConversionFailure(..)
             ))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn put_multipart_rejects_inconsistent_declared_sizes() -> SqliteResult<()> {
+        let mut connection = open_schema()?;
+        let transaction = connection.transaction()?;
+        let upload_id = Uuid::new_v4();
+        Sqlite::create_multipart_upload(&transaction, upload_id, "bucket", "key", upload_state())?;
+
+        assert!(matches!(
+            Sqlite::put_multipart_with_chunk_size(
+                &transaction,
+                &Multipart {
+                    size: 4,
+                    ..multipart(upload_id, b"abc", "md5")
+                },
+                2,
+            ),
+            Err(SqliteError::ObjectBodyInconsistent)
+        ));
+
+        assert!(matches!(
+            Sqlite::put_multipart_with_encoded_chunks(
+                &transaction,
+                &MultipartPartWrite {
+                    upload_id,
+                    part_number: 1,
+                    last_modified: time::OffsetDateTime::now_utc(),
+                    size: 4,
+                    md5: Some("md5".to_string()),
+                    checksum: None,
+                },
+                [EncodedBlobChunk {
+                    chunk_number: 1,
+                    offset: 0,
+                    size: 3,
+                    body: b"abc".to_vec(),
+                    sse_nonce: None,
+                    sse_tag: None,
+                }],
+            ),
+            Err(SqliteError::ObjectBodyInconsistent)
         ));
         Ok(())
     }
@@ -1712,6 +1896,114 @@ mod tests {
             )?,
             (5, "new-md5".to_string())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn upload_part_chunk_readers_validate_chunk_shape() -> SqliteResult<()> {
+        let mut connection = open_schema()?;
+        let transaction = connection.transaction()?;
+        let upload_id = Uuid::new_v4();
+        Sqlite::create_multipart_upload(&transaction, upload_id, "bucket", "key", upload_state())?;
+        Sqlite::put_multipart_with_chunk_size(
+            &transaction,
+            &multipart(upload_id, b"abc", "900150983cd24fb0d6963f7d28e17f72"),
+            2,
+        )?;
+
+        assert_eq!(
+            Sqlite::get_upload_part_blob_chunks(&transaction, upload_id, 1, 3)?.len(),
+            2
+        );
+        assert!(matches!(
+            Sqlite::get_upload_part_blob_chunks(&transaction, upload_id, 1, -1),
+            Err(SqliteError::ObjectBodyInconsistent)
+        ));
+        assert!(matches!(
+            Sqlite::get_upload_part_blob_chunks(&transaction, upload_id, 1, 4),
+            Err(SqliteError::ObjectBodyInconsistent)
+        ));
+
+        let corrupt_number = Uuid::new_v4();
+        Sqlite::create_multipart_upload(
+            &transaction,
+            corrupt_number,
+            "bucket",
+            "key",
+            upload_state(),
+        )?;
+        Sqlite::put_multipart_with_chunk_size(
+            &transaction,
+            &multipart(corrupt_number, b"abc", "900150983cd24fb0d6963f7d28e17f72"),
+            2,
+        )?;
+        transaction.execute(
+            "
+            UPDATE object_blob_chunk
+            SET chunk_number = 3
+            WHERE upload_id = ?1 AND part_number = 1 AND chunk_number = 2;",
+            [corrupt_number],
+        )?;
+        assert!(matches!(
+            Sqlite::get_upload_part_blob_chunks(&transaction, corrupt_number, 1, 3),
+            Err(SqliteError::ObjectBodyInconsistent)
+        ));
+
+        let corrupt_size = Uuid::new_v4();
+        Sqlite::create_multipart_upload(
+            &transaction,
+            corrupt_size,
+            "bucket",
+            "key",
+            upload_state(),
+        )?;
+        Sqlite::put_multipart_with_chunk_size(
+            &transaction,
+            &multipart(corrupt_size, b"abc", "900150983cd24fb0d6963f7d28e17f72"),
+            2,
+        )?;
+        transaction.execute("PRAGMA ignore_check_constraints = true;", [])?;
+        transaction.execute(
+            "
+            UPDATE object_blob_chunk
+            SET size = 9
+            WHERE upload_id = ?1 AND part_number = 1 AND chunk_number = 1;",
+            [corrupt_size],
+        )?;
+        transaction.execute("PRAGMA ignore_check_constraints = false;", [])?;
+        assert!(matches!(
+            Sqlite::get_upload_part_blob_chunks(&transaction, corrupt_size, 1, 3),
+            Err(SqliteError::ObjectBodyInconsistent)
+        ));
+
+        let support_upload = Uuid::new_v4();
+        Sqlite::create_multipart_upload(
+            &transaction,
+            support_upload,
+            "bucket",
+            "key",
+            upload_state(),
+        )?;
+        Sqlite::put_multipart_with_chunk_size(
+            &transaction,
+            &multipart(support_upload, b"abc", "900150983cd24fb0d6963f7d28e17f72"),
+            2,
+        )?;
+        assert_eq!(
+            test_support::get_multiparts(&transaction, support_upload)?[0].value,
+            b"abc".to_vec()
+        );
+        transaction.execute(
+            "
+            UPDATE object_part
+            SET size = 4
+            WHERE upload_id = ?1 AND part_number = 1;",
+            [support_upload],
+        )?;
+        assert!(matches!(
+            test_support::get_multiparts(&transaction, support_upload),
+            Err(SqliteError::ObjectBodyInconsistent)
+        ));
         Ok(())
     }
 
@@ -1808,6 +2100,233 @@ mod tests {
     }
 
     #[test]
+    fn completion_prepare_revalidates_missing_and_removed_parts() -> SqliteResult<()> {
+        let mut connection = open_schema()?;
+        let transaction = connection.transaction()?;
+        let upload_id = Uuid::new_v4();
+        let part_md5 = "900150983cd24fb0d6963f7d28e17f72";
+
+        assert!(matches!(
+            Sqlite::prepare_multipart_upload_completion(
+                &transaction,
+                &one_part_request(upload_id, part_md5),
+            ),
+            Err(SqliteError::MultipartUploadNotFound)
+        ));
+        Sqlite::create_multipart_upload(&transaction, upload_id, "bucket", "key", upload_state())?;
+        assert!(matches!(
+            Sqlite::prepare_multipart_upload_completion(
+                &transaction,
+                &one_part_request(upload_id, part_md5),
+            ),
+            Err(SqliteError::InvalidMultipartPart)
+        ));
+
+        Sqlite::put_multipart_with_chunk_size(
+            &transaction,
+            &multipart(upload_id, b"abc", part_md5),
+            2,
+        )?;
+        let request = one_part_request(upload_id, part_md5);
+        let prepared = require_prepared(Sqlite::prepare_multipart_upload_completion(
+            &transaction,
+            &request,
+        )?)?;
+        transaction.execute(
+            "DELETE FROM object_part WHERE upload_id = ?1 AND part_number = 1;",
+            [upload_id],
+        )?;
+        assert!(matches!(
+            Sqlite::put_prepared_multipart_upload(&transaction, &request, prepared),
+            Err(SqliteError::InvalidMultipartPart)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn completion_put_revalidates_checksum_config() -> SqliteResult<()> {
+        let mut connection = open_schema()?;
+        let transaction = connection.transaction()?;
+        let part_md5 = "900150983cd24fb0d6963f7d28e17f72";
+
+        let checksum_upload = Uuid::new_v4();
+        Sqlite::create_multipart_upload(
+            &transaction,
+            checksum_upload,
+            "bucket",
+            "key",
+            MultipartUploadState {
+                checksum: Some(MultipartChecksumConfig::new(
+                    ChecksumAlgorithmKind::Crc32,
+                    ChecksumTypeKind::FullObject,
+                )),
+                ..upload_state()
+            },
+        )?;
+        Sqlite::put_multipart_with_chunk_size(
+            &transaction,
+            &multipart(checksum_upload, b"abc", part_md5),
+            2,
+        )?;
+        let checksum_request = one_part_request(checksum_upload, part_md5);
+        let checksum_prepared = require_prepared(Sqlite::prepare_multipart_upload_completion(
+            &transaction,
+            &checksum_request,
+        )?)?;
+        transaction.execute(
+            "
+            UPDATE multipart_upload
+            SET checksum_algorithm = ?2
+            WHERE upload_id = ?1;",
+            (checksum_upload, ChecksumAlgorithmKind::Sha256),
+        )?;
+        assert!(matches!(
+            Sqlite::put_prepared_multipart_upload(
+                &transaction,
+                &checksum_request,
+                checksum_prepared,
+            ),
+            Err(SqliteError::ChecksumMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn completion_put_revalidates_sse_metadata_and_part_ownership() -> SqliteResult<()> {
+        let mut connection = open_schema()?;
+        let transaction = connection.transaction()?;
+        let part_md5 = "900150983cd24fb0d6963f7d28e17f72";
+
+        let sse_upload = Uuid::new_v4();
+        Sqlite::create_multipart_upload(
+            &transaction,
+            sse_upload,
+            "bucket",
+            "key",
+            MultipartUploadState {
+                stored_sse: Some(StoredSse {
+                    nonce: vec![1; 12],
+                    ciphertext: vec![2; 32],
+                    tag: vec![3; 16],
+                }),
+                ..upload_state()
+            },
+        )?;
+        Sqlite::put_multipart_with_chunk_size(
+            &transaction,
+            &multipart(sse_upload, b"abc", part_md5),
+            2,
+        )?;
+        let mut sse_request = one_part_request(sse_upload, part_md5);
+        sse_request.precomputed_full_object_checksum = Some(StoredChecksum::Full(
+            FullObjectChecksum::Crc64Nvme("crc".to_string()),
+        ));
+        let sse_prepared = require_prepared(Sqlite::prepare_multipart_upload_completion(
+            &transaction,
+            &sse_request,
+        )?)?;
+        transaction.execute(
+            "
+            UPDATE multipart_upload
+            SET sse_algorithm = NULL,
+                sse_key_nonce = NULL,
+                sse_key_ciphertext = NULL,
+                sse_key_tag = NULL
+            WHERE upload_id = ?1;",
+            [sse_upload],
+        )?;
+        assert!(matches!(
+            Sqlite::put_prepared_multipart_upload(&transaction, &sse_request, sse_prepared),
+            Err(SqliteError::ObjectBodyInconsistent)
+        ));
+
+        assert!(matches!(
+            Sqlite::reown_completed_multipart_rows(
+                &transaction,
+                Uuid::new_v4(),
+                1,
+                &[CompletedObjectPart {
+                    part_number: 1,
+                    start: 0,
+                    size: 1,
+                    checksum: None,
+                }],
+            ),
+            Err(SqliteError::InvalidMultipartPart)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn completed_multipart_checksum_validates_full_object_and_composite_inputs() {
+        let full_config = MultipartChecksumConfig::new(
+            ChecksumAlgorithmKind::Crc32,
+            ChecksumTypeKind::FullObject,
+        );
+        assert!(matches!(
+            Sqlite::completed_multipart_checksum(
+                full_config,
+                &MultipartCompletionChecksum::default(),
+                Some(&StoredChecksum::Full(FullObjectChecksum::Sha256(
+                    "AAAA".to_string()
+                ))),
+                None,
+                &[],
+            ),
+            Err(SqliteError::ChecksumMismatch)
+        ));
+        assert!(matches!(
+            Sqlite::completed_multipart_checksum(
+                full_config,
+                &MultipartCompletionChecksum {
+                    algorithm: Some(ChecksumAlgorithmKind::Crc32),
+                    checksum_type: Some(ChecksumTypeKind::FullObject),
+                    value: Some("BBBB".to_string()),
+                },
+                Some(&StoredChecksum::Full(FullObjectChecksum::Crc32(
+                    "AAAA".to_string()
+                ))),
+                None,
+                &[],
+            ),
+            Err(SqliteError::ChecksumMismatch)
+        ));
+
+        let composite_config =
+            MultipartChecksumConfig::new(ChecksumAlgorithmKind::Crc32, ChecksumTypeKind::Composite);
+        assert!(
+            Sqlite::completed_multipart_checksum(
+                composite_config,
+                &MultipartCompletionChecksum::default(),
+                None,
+                None,
+                &[CompletedObjectPart {
+                    part_number: 1,
+                    start: 0,
+                    size: 3,
+                    checksum: Some(PartChecksum::Crc32("AAAAAA==".to_string())),
+                }],
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            Sqlite::completed_multipart_checksum(
+                composite_config,
+                &MultipartCompletionChecksum::default(),
+                None,
+                None,
+                &[CompletedObjectPart {
+                    part_number: 1,
+                    start: 0,
+                    size: 3,
+                    checksum: None,
+                }],
+            ),
+            Err(SqliteError::ChecksumMismatch)
+        ));
+    }
+
+    #[test]
     fn list_multipart_uploads_honors_marker_combinations() -> SqliteResult<()> {
         let mut connection = open_schema()?;
         let transaction = connection.transaction()?;
@@ -1862,6 +2381,19 @@ mod tests {
         assert_eq!(
             listed_uploads(after_key_only),
             vec![("beta".to_string(), beta)]
+        );
+
+        let zero = Sqlite::list_multipart_upload_entries(&transaction, "", None, None, None, 0)?;
+        assert!(!zero.is_truncated);
+        assert!(zero.entries.is_empty());
+
+        let truncated_upload =
+            Sqlite::list_multipart_upload_entries(&transaction, "", None, None, None, 1)?;
+        assert!(truncated_upload.is_truncated);
+        assert_eq!(truncated_upload.next_key_marker.as_deref(), Some("alpha"));
+        assert_eq!(
+            truncated_upload.next_upload_id_marker,
+            Some(alpha_first.to_string())
         );
         Ok(())
     }

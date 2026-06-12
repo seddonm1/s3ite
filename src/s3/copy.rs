@@ -573,7 +573,10 @@ mod tests {
         s3::{ChecksumAlgorithmKind, FullObjectChecksum, StoredObjectLock},
         sqlite::KeyMetadata,
     };
-    use s3s::dto::{ChecksumAlgorithm, ETagCondition, ObjectCannedACL, Timestamp};
+    use s3s::dto::{
+        ChecksumAlgorithm, ETagCondition, ObjectCannedACL, ObjectLockLegalHoldStatus,
+        ObjectLockMode, Timestamp,
+    };
     use time::Duration;
 
     fn assert_error_code<T>(result: S3Result<T>, code: &S3ErrorCode) {
@@ -666,6 +669,18 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "expected")]
+    fn assert_error_code_panics_on_success() {
+        assert_error_code(Ok(()), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn assert_precondition_failed_panics_on_success() {
+        assert_precondition_failed(&Ok(()));
+    }
+
+    #[test]
     fn parses_copy_object_request_defaults() {
         let request = match parse_copy_object_request(copy_input()) {
             Ok(request) => request,
@@ -693,6 +708,7 @@ mod tests {
     #[test]
     fn parses_copy_object_replace_metadata_and_conditions() {
         let expires = Timestamp::from(OffsetDateTime::UNIX_EPOCH);
+        let retain_until = Timestamp::from(OffsetDateTime::now_utc() + Duration::days(1));
         let input = match CopyObjectInput::builder()
             .bucket("target-bucket".to_string())
             .key("target-key".to_string())
@@ -715,6 +731,13 @@ mod tests {
             .copy_source_if_none_match(Some(ETagCondition::ETag(ETag::Weak("other".to_string()))))
             .copy_source_if_modified_since(Some(Timestamp::from(OffsetDateTime::UNIX_EPOCH)))
             .copy_source_if_unmodified_since(Some(Timestamp::from(OffsetDateTime::UNIX_EPOCH)))
+            .object_lock_legal_hold_status(Some(ObjectLockLegalHoldStatus::from_static(
+                ObjectLockLegalHoldStatus::ON,
+            )))
+            .object_lock_mode(Some(ObjectLockMode::from_static(
+                ObjectLockMode::GOVERNANCE,
+            )))
+            .object_lock_retain_until_date(Some(retain_until))
             .build()
         {
             Ok(input) => input,
@@ -752,6 +775,7 @@ mod tests {
             Some(ETagCondition::ETag(ETag::Weak(value))) if value == "other"
         ));
         assert!(request.source_conditions.unmodified_since.is_some());
+        assert!(request.object_lock_headers.has_any());
     }
 
     #[test]
@@ -800,6 +824,21 @@ mod tests {
         assert_error_code(
             parse_copy_object_request(grant_header),
             &S3ErrorCode::AccessControlListNotSupported,
+        );
+
+        let unsupported_sse = match CopyObjectInput::builder()
+            .bucket("target-bucket".to_string())
+            .key("target-key".to_string())
+            .copy_source(source("source-bucket", "source-key", None))
+            .ssekms_key_id(Some("key".to_string()))
+            .build()
+        {
+            Ok(input) => input,
+            Err(err) => panic!("unexpected build error: {err:?}"),
+        };
+        assert_error_code(
+            parse_copy_object_request(unsupported_sse),
+            &S3ErrorCode::InvalidArgument,
         );
     }
 

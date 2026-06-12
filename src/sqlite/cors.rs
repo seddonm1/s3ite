@@ -200,6 +200,7 @@ impl Sqlite {
 mod tests {
     use rusqlite::Connection;
 
+    use super::CorsRuleValueTable;
     use crate::sqlite::{Sqlite, SqliteResult, StoredCorsRule};
 
     fn open_schema() -> SqliteResult<Connection> {
@@ -233,6 +234,31 @@ mod tests {
     }
 
     #[test]
+    fn cors_rule_value_table_sql_targets_each_value_table() {
+        for (table, name) in [
+            (
+                CorsRuleValueTable::AllowedOrigin,
+                "bucket_cors_allowed_origin",
+            ),
+            (
+                CorsRuleValueTable::AllowedMethod,
+                "bucket_cors_allowed_method",
+            ),
+            (
+                CorsRuleValueTable::AllowedHeader,
+                "bucket_cors_allowed_header",
+            ),
+            (
+                CorsRuleValueTable::ExposeHeader,
+                "bucket_cors_expose_header",
+            ),
+        ] {
+            assert!(table.select_sql().contains(name));
+            assert!(table.insert_sql().contains(name));
+        }
+    }
+
+    #[test]
     fn bucket_cors_rules_replace_and_read_in_rule_order() -> SqliteResult<()> {
         let mut connection = open_schema()?;
         let transaction = connection.transaction()?;
@@ -253,6 +279,18 @@ mod tests {
 
         Sqlite::replace_bucket_cors_rules(&transaction, &[])?;
         assert!(Sqlite::get_bucket_cors_rules(&transaction)?.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn bucket_cors_read_reports_missing_value_table() -> SqliteResult<()> {
+        let mut connection = open_schema()?;
+        let transaction = connection.transaction()?;
+
+        Sqlite::replace_bucket_cors_rules(&transaction, &rules())?;
+        transaction.execute("DROP TABLE bucket_cors_allowed_origin;", ())?;
+        assert!(Sqlite::get_bucket_cors_rules(&transaction).is_err());
 
         Ok(())
     }

@@ -939,11 +939,13 @@ mod tests {
     use super::*;
 
     use hyper::http::{Extensions, HeaderMap, Method, Uri};
+    use time::OffsetDateTime;
     use tokio::sync::RwLock;
 
     use crate::{
         Config,
         s3::{FullObjectChecksum, PartChecksum},
+        sqlite::StoredSse,
     };
 
     fn assert_error_code<T>(result: S3Result<T>, code: &S3ErrorCode) {
@@ -981,6 +983,12 @@ mod tests {
         }
     }
 
+    #[test]
+    #[should_panic(expected = "unexpected error")]
+    fn assert_s3_ok_panics_on_error() {
+        assert_s3_ok::<()>(Err(s3_error(S3ErrorCode::InvalidRequest)), &());
+    }
+
     fn completed_part(part_number: i32, start: i64, size: i64) -> CompletedObjectPart {
         CompletedObjectPart {
             part_number,
@@ -992,6 +1000,25 @@ mod tests {
 
     fn object_checksum() -> StoredChecksum {
         StoredChecksum::Full(FullObjectChecksum::Crc64Nvme("object-crc64".to_string()))
+    }
+
+    fn metadata(stored_sse: Option<StoredSse>) -> KeyMetadata {
+        KeyMetadata {
+            version_id: "version".to_string(),
+            size: 0,
+            metadata: None,
+            content_type: None,
+            content_encoding: None,
+            cache_control: None,
+            expires: None,
+            last_modified: OffsetDateTime::UNIX_EPOCH,
+            md5: Some("md5".to_string()),
+            checksum: Some(object_checksum()),
+            stored_sse,
+            object_lock: crate::sqlite::StoredObjectLock::default(),
+            is_latest: true,
+            is_delete_marker: false,
+        }
     }
 
     fn request<T: Default>() -> S3Request<T> {
@@ -1100,6 +1127,14 @@ mod tests {
             requested_object_range(None, Some(&range("bytes=-0")), None, 0, 10),
             &S3ErrorCode::InvalidRange,
         );
+        assert_error_code(
+            requested_object_range(None, Some(&range("bytes=0-")), None, 0, 0),
+            &S3ErrorCode::InvalidRange,
+        );
+        assert_error_code(
+            requested_object_range(None, Some(&range("bytes=-1")), None, 0, 0),
+            &S3ErrorCode::InvalidRange,
+        );
 
         let part = completed_part(2, 4, 3);
         assert_s3_ok(
@@ -1139,6 +1174,14 @@ mod tests {
             requested_object_range_sqlite(None, Some(&range("bytes=-0")), None, 0, 10),
             Err(SqliteError::InvalidObjectRange)
         ));
+        assert!(matches!(
+            requested_object_range_sqlite(None, Some(&range("bytes=0-")), None, 0, 0),
+            Err(SqliteError::InvalidObjectRange)
+        ));
+        assert!(matches!(
+            requested_object_range_sqlite(None, Some(&range("bytes=-1")), None, 0, 0),
+            Err(SqliteError::InvalidObjectRange)
+        ));
 
         let part = completed_part(2, 4, 3);
         assert_sqlite_ok(
@@ -1159,6 +1202,27 @@ mod tests {
             requested_object_range_sqlite(Some(1), None, Some(&invalid_part), 1, 10),
             Err(SqliteError::ObjectBodyInconsistent)
         ));
+    }
+
+    #[test]
+    fn encrypted_body_without_master_key_reports_sse_not_configured() -> SqliteResult<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        let transaction = connection.transaction()?;
+        let object = ObjectBodyReference {
+            version_id: "version".to_string(),
+            sequence: 1,
+            key_metadata: metadata(Some(StoredSse {
+                nonce: vec![0; 12],
+                ciphertext: vec![0; 32],
+                tag: vec![0; 16],
+            })),
+        };
+
+        assert!(matches!(
+            decrypt_object_body_if_needed(&transaction, &object, &(0..0), None)?,
+            ObjectBodyDecryption::SseNotConfigured
+        ));
+        Ok(())
     }
 
     #[test]

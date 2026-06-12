@@ -871,6 +871,11 @@ mod tests {
         invalid_method.allowed_methods = vec!["PATCH".to_string()];
         assert!(validate_stored_cors_rules(&[invalid_method]).is_err());
 
+        let mut empty_origin = valid_rule();
+        empty_origin.allowed_origins = vec![String::new()];
+        assert!(validate_stored_cors_rules(&[empty_origin]).is_err());
+        assert!(validate_header_pattern("*").is_ok());
+
         let mut invalid_allowed_header = valid_rule();
         invalid_allowed_header.allowed_headers = vec!["bad header".to_string()];
         assert!(validate_stored_cors_rules(&[invalid_allowed_header]).is_err());
@@ -936,6 +941,61 @@ mod tests {
             HeaderValue::from_static("PUT"),
         );
         assert!(bucket_preflight_headers(&rules, &origin, &headers).is_none());
+    }
+
+    #[test]
+    fn fallback_and_configured_cors_helpers_cover_response_shapes() {
+        let origin = HeaderValue::from_static("https://app.example.test");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ACCESS_CONTROL_REQUEST_METHOD,
+            HeaderValue::from_static("GET"),
+        );
+        headers.insert(
+            ACCESS_CONTROL_REQUEST_HEADERS,
+            HeaderValue::from_static("authorization"),
+        );
+        headers.insert(
+            hyper::header::HeaderName::from_static(ACCESS_CONTROL_REQUEST_PRIVATE_NETWORK),
+            HeaderValue::from_static(TRUE),
+        );
+
+        let permissive_preflight = permissive_preflight_headers(&origin, &headers);
+        assert!(permissive_preflight.allow_private_network);
+        let permissive_actual = permissive_actual_headers(&origin);
+        assert!(permissive_actual.allow_credentials);
+        assert!(!permissive_actual.allow_private_network);
+
+        let custom = ConfiguredCors {
+            rule: valid_rule(),
+            allow_credentials: true,
+            allow_private_network: true,
+        };
+        let custom_preflight = custom_preflight_headers(&custom, &origin, &headers);
+        assert!(custom_preflight.is_some_and(|headers| headers.allow_private_network));
+        assert!(
+            custom_preflight_headers(
+                &custom,
+                &HeaderValue::from_static("https://other.example.test"),
+                &headers,
+            )
+            .is_none()
+        );
+        assert!(custom_actual_headers(&custom, &origin, "PUT").is_none());
+        let custom_actual = custom_actual_headers(&custom, &origin, "GET");
+        assert!(custom_actual.is_some_and(|headers| headers.expose_headers.is_some()));
+
+        assert!(FallbackCors::Disabled.is_disabled());
+        assert!(CorsMatchSource::select(&FallbackCors::Disabled, None).is_none());
+        assert!(matches!(
+            CorsMatchSource::select(&FallbackCors::Permissive, None),
+            Some(CorsMatchSource::Permissive)
+        ));
+        let bucket_rules = vec![valid_rule()];
+        assert!(matches!(
+            CorsMatchSource::select(&FallbackCors::Disabled, Some(&bucket_rules)),
+            Some(CorsMatchSource::Bucket(_))
+        ));
     }
 
     #[test]
