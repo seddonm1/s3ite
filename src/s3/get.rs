@@ -234,6 +234,7 @@ fn response_checksum(
     }
 }
 
+/// Formats lifecycle expiration metadata for object read response headers.
 fn lifecycle_expiration_response_header(
     expiration: Option<LifecycleExpirationHeader>,
 ) -> S3Result<Option<String>> {
@@ -242,6 +243,7 @@ fn lifecycle_expiration_response_header(
         .transpose()
 }
 
+/// Loads the current or exact-version body reference for a `GetObject` read.
 fn load_object_body_reference(
     transaction: &rusqlite::Transaction<'_>,
     key: &str,
@@ -256,6 +258,7 @@ fn load_object_body_reference(
     })
 }
 
+/// Resolves range, part, and lifecycle metadata for a found object body.
 fn load_object_body_read_found(
     transaction: &rusqlite::Transaction<'_>,
     key: &str,
@@ -292,6 +295,7 @@ fn load_object_body_read_found(
     })
 }
 
+/// Decrypts encrypted object chunks when a body read needs plaintext slicing.
 fn decrypt_object_body_if_needed(
     transaction: &rusqlite::Transaction<'_>,
     object: &ObjectBodyReference,

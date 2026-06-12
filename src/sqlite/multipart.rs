@@ -54,6 +54,7 @@ impl<'a> From<&'a MultipartMetadata> for CompletionPartMetadata<'a> {
 }
 
 impl MultipartUploadListEntry {
+    /// Returns the key/upload pair used as the next multipart listing marker.
     fn marker(&self) -> (&str, Option<Uuid>) {
         match self {
             Self::Upload(summary) => (&summary.key, Some(summary.upload_id)),
@@ -101,6 +102,7 @@ fn multipart_upload_list_page(
     }
 }
 
+/// Decodes one emitted multipart-upload listing row from the storage query.
 fn multipart_upload_entry_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<MultipartUploadListEntry> {

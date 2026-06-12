@@ -701,6 +701,7 @@ async fn upload_part_copy_cross_bucket(
         .map_err(s3_error_from_sqlite)
 }
 
+/// Maps one storage multipart upload summary into the S3 listing DTO.
 fn multipart_upload_from_summary(
     summary: crate::sqlite::MultipartUploadSummary,
     encode_keys: bool,
@@ -719,6 +720,7 @@ fn multipart_upload_from_summary(
     }
 }
 
+/// Splits storage multipart listing entries into upload and common-prefix DTOs.
 fn multipart_upload_listing_entries(
     entries: Vec<MultipartUploadListEntry>,
     encode_keys: bool,
@@ -837,7 +839,7 @@ pub(super) async fn list_multipart_uploads(
     Ok(S3Response::new(output))
 }
 
-/// Creates multipart upload state for a future object.
+/// Validates that create-multipart ACL inputs are owner-equivalent no-ops.
 fn validate_create_multipart_upload_acl(input: &CreateMultipartUploadInput) -> S3Result<()> {
     validate_object_acl(&ObjectAclRequest {
         acl: input.acl.as_ref(),
@@ -854,6 +856,7 @@ fn validate_create_multipart_upload_acl(input: &CreateMultipartUploadInput) -> S
     })
 }
 
+/// Creates multipart upload state for a future object.
 pub(super) async fn create_multipart_upload(
     sqlite: &Sqlite,
     req: S3Request<CreateMultipartUploadInput>,
@@ -960,6 +963,7 @@ pub(super) async fn create_multipart_upload(
     Ok(S3Response::new(output))
 }
 
+/// Reads, encrypts, and stores one multipart upload part as encoded chunks.
 async fn upload_encrypted_part(
     sqlite: &Sqlite,
     context: UploadPartWriteContext,
@@ -1032,6 +1036,7 @@ async fn upload_encrypted_part(
     )))
 }
 
+/// Reads and stores one plain multipart upload part.
 async fn upload_plain_part(
     sqlite: &Sqlite,
     context: UploadPartWriteContext,
@@ -1099,6 +1104,7 @@ async fn upload_plain_part(
     )))
 }
 
+/// Loads active multipart upload state before an `UploadPart` body is consumed.
 async fn load_upload_part_state(
     sqlite: &Sqlite,
     bucket: &str,
@@ -1524,6 +1530,7 @@ async fn precompute_encrypted_full_object_checksum(
         .map_err(s3_error_from_sqlite)
 }
 
+/// Normalizes and validates the S3 complete-multipart request shape.
 fn normalize_multipart_completion_request(
     input: CompleteMultipartUploadInput,
     access_key: Option<String>,
@@ -1577,6 +1584,7 @@ fn normalize_multipart_completion_request(
     })
 }
 
+/// Precomputes completion checksums that require reading encrypted part bodies.
 async fn precompute_multipart_completion_checksum(
     sqlite: &Sqlite,
     request: &MultipartCompletionRequest,
@@ -1596,6 +1604,7 @@ async fn precompute_multipart_completion_checksum(
     .await
 }
 
+/// Prepares multipart completion against a read snapshot before the write.
 async fn prepare_multipart_completion(
     sqlite: &Sqlite,
     request: MultipartCompletionRequest,
@@ -1614,6 +1623,7 @@ async fn prepare_multipart_completion(
         .map_err(s3_error_from_sqlite)
 }
 
+/// Writes a prepared multipart completion or returns an idempotent retry result.
 async fn write_multipart_completion(
     sqlite: &Sqlite,
     bucket: &str,
@@ -1637,6 +1647,7 @@ async fn write_multipart_completion(
     }
 }
 
+/// Builds the S3 completion response from stored completion metadata.
 fn complete_multipart_upload_output(
     bucket: String,
     key: String,

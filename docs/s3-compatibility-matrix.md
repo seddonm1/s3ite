@@ -9,7 +9,7 @@ This document compares feature-level S3 coverage across:
 - `MinIO`: whether MinIO documents support for the equivalent S3 feature/API.
 - `s3ite`: whether this repository currently implements and tests the feature.
 
-The matrix was last reconciled on 2026-06-08. It uses colored status markers in
+The matrix was last reconciled on 2026-06-12. It uses colored status markers in
 the feature columns:
 
 - ✅ means covered/supported.
@@ -38,9 +38,9 @@ compatibility-limited, the note says so.
   [Amazon S3 Multi-Region Access Points](https://docs.aws.amazon.com/en_en/AmazonS3/latest/userguide/MultiRegionAccessPoints.html),
   [Amazon S3 Object Lambda availability change](https://docs.aws.amazon.com/AmazonS3/latest/userguide/amazons3-ol-change.html),
   and [S3 Express One Zone](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-express-getting-started.html).
-- MinIO surface: [MinIO S3 API Compatibility](https://minio.community/community/minio-object-store/reference/s3-api-compatibility.html),
+- MinIO surface: [MinIO S3 API Compatibility](https://docs.min.io/aistor/developers/s3-api-compatibility/),
   [MinIO server-side encryption](https://docs.min.io/aistor/installation/linux/server-side-encryption/),
-  [MinIO Object Lambda transforms](https://docs.min.io/enterprise/aistor-object-store/developers/transforms-with-object-lambda/),
+  [MinIO Object Lambda transforms](https://docs.min.io/aistor/developers/transforms-with-object-lambda/),
   and [MinIO S3 compatibility product overview](https://www.min.io/product/s3-compatibility).
 - s3ite surface: [README.md](../README.md), [src/s3](../src/s3),
   [src/s3/sse.rs](../src/s3/sse.rs), and [tests](../tests).
@@ -118,7 +118,7 @@ compatibility-limited, the note says so.
 | Multipart | UploadPart | ✅ | ✅ | ✅ | ✅ | Includes size and part-number validation. |
 | Multipart | CompleteMultipartUpload | ✅ | ✅ | ✅ | ✅ | Includes ordering, ETag, and missing/incorrect part validation. |
 | Multipart | AbortMultipartUpload | ✅ | ✅ | ✅ | ✅ | Includes missing upload behavior. |
-| Multipart | ListMultipartUploads | ✅ | ✅ | ✅ | ✅ | s3ite supports prefix, delimiter, pagination, and owner fields. |
+| Multipart | ListMultipartUploads | ✅ | ✅ | ✅ | ✅ | s3ite supports prefix, delimiter, pagination, and owner fields. MinIO documents an exact-prefix limitation. |
 | Multipart | ListParts | ✅ | ✅ | ✅ | ✅ | s3ite supports pagination and ETags. |
 | Multipart | UploadPartCopy | ✅ | ✅ | ✅ | ✅ | Includes ranges, conditions, special names, and versions. |
 | Multipart | Multipart idempotent complete retry | ✅ | ✅ | ✅ | ✅ | s3ite records completion results for retries. |
@@ -165,7 +165,7 @@ compatibility-limited, the note says so.
 | Lifecycle | Storage-class transitions | ✅ | ✅ | ✅ | ❌ | Out of scope for s3ite. |
 | Lifecycle | RestoreObject from archive/tier | ✅ | ✅ | ✅ | ❌ | MinIO lists `RestoreObject`; s3ite has no restore/tiering. |
 | Lifecycle | Restore status in list outputs | ✅ | ✅ | ✅ | ❌ | Out of scope for s3ite. |
-| CORS | Bucket CORS API | ✅ | ✅ | ❌ | ✅ | s3ite stores per-bucket CORS rules in each bucket DB; MinIO documents bucket CORS APIs as unsupported because CORS is enabled by default. |
+| CORS | Bucket CORS API | ✅ | ✅ | ✅ | ✅ | s3ite stores per-bucket CORS rules in each bucket DB; current MinIO docs list `PutBucketCors` and `DeleteBucketCors`. |
 | CORS | CORS preflight behavior | ✅ | ✅ | ✅ | ✅ | s3ite applies bucket CORS first and falls back to configurable server-level CORS when no bucket config exists. |
 | POST | POST Object form uploads | ✅ | ✅ | ✅ | ✅ | Browser form uploads reuse the normal object write path. |
 | POST | POST Object policy validation | ✅ | ✅ | ✅ | ✅ | SigV4 POST policy validation is handled by `s3s`. |
@@ -184,7 +184,7 @@ compatibility-limited, the note says so.
 | Logging | S3 server access logging | ✅ | ✅ | ❌ | ❌ | MinIO documents bucket logging APIs as unsupported; s3ite has application logs only. |
 | Website | Static website bucket configuration | ❌ | ✅ | ❌ | ❌ | MinIO documents website APIs as unsupported. |
 | Inventory | Bucket inventory configuration | ❌ | ✅ | ❌ | ❌ | MinIO documents inventory APIs as unsupported. |
-| Analytics | Bucket analytics configuration | ❌ | ✅ | ❌ | ❌ | MinIO documents analytics APIs as unsupported. |
+| Analytics | Bucket analytics configuration | ❌ | ✅ | ❌ | ❌ | MinIO documents some analytics operations but still lists `GetBucketAnalyticsConfiguration` as unsupported, so full configuration parity is not present. |
 | Metrics | Bucket metrics configuration | ❌ | ✅ | ❌ | ❌ | MinIO documents metrics APIs as unsupported. |
 | Accelerate | Bucket accelerate configuration | ❌ | ✅ | ❌ | ❌ | MinIO documents accelerate APIs as unsupported. |
 | Storage class | STANDARD storage-class reporting | ✅ | ✅ | ✅ | ✅ | s3ite reports `STANDARD` in list/object-attribute shapes. |

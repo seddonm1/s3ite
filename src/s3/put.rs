@@ -125,6 +125,7 @@ fn validate_put_object_acl_input(input: &PutObjectInput) -> S3Result<()> {
     })
 }
 
+/// Returns whether the request explicitly asks for SSE-S3 encryption.
 fn requested_put_object_sse_s3(input: &PutObjectInput) -> S3Result<bool> {
     requested_sse_s3(
         input.server_side_encryption.as_ref(),
@@ -158,6 +159,7 @@ fn put_object_output(
     }
 }
 
+/// Reads, encrypts, and writes a `PutObject` body as encoded encrypted chunks.
 async fn put_encrypted_object(
     sqlite: &Sqlite,
     body: StreamingBlob,
@@ -238,6 +240,7 @@ async fn put_encrypted_object(
     ))
 }
 
+/// Reads and writes a plain buffered `PutObject` body.
 async fn put_plain_object(
     sqlite: &Sqlite,
     body: StreamingBlob,
@@ -312,6 +315,7 @@ async fn put_plain_object(
     ))
 }
 
+/// Dispatches a normalized object write to the encrypted or plain storage path.
 async fn write_put_object(
     sqlite: &Sqlite,
     body: StreamingBlob,

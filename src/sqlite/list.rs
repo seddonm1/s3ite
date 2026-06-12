@@ -11,6 +11,7 @@ const OBJECT_ENTRY_KIND: i64 = 0;
 const COMMON_PREFIX_ENTRY_KIND: i64 = 1;
 
 impl ObjectVersionListEntry {
+    /// Returns the key/version pair used as the next listing marker.
     fn marker(&self) -> (&str, &str) {
         match self {
             Self::Object(summary) => (&summary.key, &summary.version_id),
@@ -89,6 +90,7 @@ fn object_version_marker_state(
     Ok((marker_kind, after_sequence))
 }
 
+/// Decodes one emitted object-version listing row from the storage query.
 fn object_version_entry_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<ObjectVersionListEntry> {
