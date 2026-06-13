@@ -709,6 +709,27 @@ mod tests {
         );
     }
 
+    /// Covers supported RFC 2047 Q words and unsupported metadata encodings.
+    #[test]
+    fn decodes_rfc2047_q_metadata_and_rejects_unsupported_words() {
+        assert_eq!(
+            decode_rfc2047_header_value("=?UTF-8?Q?Hello_World=C3=A9?=").as_deref(),
+            Some("Hello World\u{e9}")
+        );
+        assert_eq!(
+            decode_rfc2047_header_value("=?utf-8?q?=c3=a9?=").as_deref(),
+            Some("\u{e9}")
+        );
+        assert_eq!(
+            decode_rfc2047_header_value("=?us-ascii?Q?AZaz09=21?=").as_deref(),
+            Some("AZaz09!")
+        );
+        assert_eq!(decode_rfc2047_header_value("=?iso-8859-1?Q?caf=E9?="), None);
+        assert_eq!(decode_rfc2047_header_value("=?UTF-8?X?abc?="), None);
+        assert_eq!(decode_rfc2047_header_value("=?UTF-8?Q?bad=GG?="), None);
+        assert_eq!(decode_rfc2047_header_value("plain"), None);
+    }
+
     #[tokio::test]
     async fn rewrites_object_lock_invalid_retention_error_code() -> Result<(), HttpError> {
         let mut response = HttpResponse::new(Body::from(
@@ -721,6 +742,97 @@ mod tests {
         let body = response_body_text(response).await?;
         assert!(body.contains("<Code>InvalidRetentionPeriod</Code>"));
         assert!(!body.contains("<Code>InvalidRequest</Code>"));
+
+        Ok(())
+    }
+
+    /// Keeps XML error rewrites scoped to matching status, marker, and UTF-8 bodies.
+    #[tokio::test]
+    async fn leaves_non_target_xml_error_rewrites_alone() -> Result<(), HttpError> {
+        let mut wrong_status = HttpResponse::new(Body::from(
+            "<Error><Code>InvalidRequest</Code><Message>InvalidRetentionPeriod</Message></Error>"
+                .to_string(),
+        ));
+        *wrong_status.status_mut() = StatusCode::NOT_FOUND;
+        let wrong_status = rewrite_invalid_retention_period_code(wrong_status).await?;
+        assert_eq!(wrong_status.status(), StatusCode::NOT_FOUND);
+        assert!(
+            response_body_text(wrong_status)
+                .await?
+                .contains("InvalidRequest")
+        );
+
+        let mut missing_marker = HttpResponse::new(Body::from(
+            "<Error><Code>InvalidRequest</Code><Message>other</Message></Error>".to_string(),
+        ));
+        *missing_marker.status_mut() = StatusCode::BAD_REQUEST;
+        let missing_marker = rewrite_invalid_retention_period_code(missing_marker).await?;
+        assert!(
+            response_body_text(missing_marker)
+                .await?
+                .contains("InvalidRequest")
+        );
+
+        let mut non_utf8 = HttpResponse::new(Body::from(Bytes::from_static(&[0xff, b'<'])));
+        *non_utf8.status_mut() = StatusCode::BAD_REQUEST;
+        let non_utf8 = rewrite_invalid_retention_period_code(non_utf8).await?;
+        let bytes = non_utf8
+            .into_body()
+            .collect()
+            .await
+            .map_err(HttpError::new)?
+            .to_bytes();
+        assert_eq!(bytes.as_ref(), &[0xff, b'<']);
+
+        Ok(())
+    }
+
+    /// Covers POST Object status compatibility rewrites for parsed policy errors.
+    #[tokio::test]
+    async fn rewrites_post_policy_condition_statuses() -> Result<(), HttpError> {
+        let mut invalid_policy = HttpResponse::new(Body::from(
+            "<Error><Code>InvalidPolicyDocument</Code><Message>Policy condition failed</Message></Error>"
+                .to_string(),
+        ));
+        *invalid_policy.status_mut() = StatusCode::BAD_REQUEST;
+        let invalid_policy = rewrite_post_policy_condition_status(invalid_policy).await?;
+        assert_eq!(invalid_policy.status(), StatusCode::FORBIDDEN);
+
+        let mut access_denied = HttpResponse::new(Body::from(
+            "<Error><Code>AccessDenied</Code><Message>condition mismatch</Message></Error>"
+                .to_string(),
+        ));
+        *access_denied.status_mut() = StatusCode::FORBIDDEN;
+        let access_denied = rewrite_post_policy_condition_status(access_denied).await?;
+        assert_eq!(access_denied.status(), StatusCode::BAD_REQUEST);
+
+        let mut expired = HttpResponse::new(Body::from(
+            "<Error><Code>AccessDenied</Code><Message>Request has expired</Message></Error>"
+                .to_string(),
+        ));
+        *expired.status_mut() = StatusCode::FORBIDDEN;
+        let expired = rewrite_post_policy_condition_status(expired).await?;
+        assert_eq!(expired.status(), StatusCode::FORBIDDEN);
+
+        let mut field_missing = HttpResponse::new(Body::from(
+            "<Error><Code>AccessDenied</Code><Message>Each form field must appear</Message></Error>"
+                .to_string(),
+        ));
+        *field_missing.status_mut() = StatusCode::FORBIDDEN;
+        let field_missing = rewrite_post_policy_condition_status(field_missing).await?;
+        assert_eq!(field_missing.status(), StatusCode::FORBIDDEN);
+
+        let mut non_utf8 = HttpResponse::new(Body::from(Bytes::from_static(&[0xff, b'a'])));
+        *non_utf8.status_mut() = StatusCode::FORBIDDEN;
+        let non_utf8 = rewrite_post_policy_condition_status(non_utf8).await?;
+        assert_eq!(non_utf8.status(), StatusCode::FORBIDDEN);
+        let bytes = non_utf8
+            .into_body()
+            .collect()
+            .await
+            .map_err(HttpError::new)?
+            .to_bytes();
+        assert_eq!(bytes.as_ref(), &[0xff, b'a']);
 
         Ok(())
     }
@@ -868,6 +980,10 @@ mod tests {
             ),
             "EpELyoQzABuh9lHQ+KwND1xJ+Uc="
         );
+        assert_eq!(
+            sig_v2_signature(&"k".repeat(65), "data"),
+            "zmngYEpYGiC5dY+v6heIjy+/Few="
+        );
     }
 
     #[test]
@@ -921,6 +1037,22 @@ mod tests {
             rewrite_create_bucket_sig_v2(&mut req, "secret", &auth);
             assert!(req.headers().get(header::AUTHORIZATION).is_none());
         }
+        Ok(())
+    }
+
+    /// Leaves create-bucket `SigV2` authorization alone when the slash signature is invalid.
+    #[test]
+    fn skips_create_bucket_sig_v2_rewrite_for_signature_mismatch() -> Result<(), hyper::http::Error>
+    {
+        let auth = AuthorizationV2 {
+            access_key: "access".to_string(),
+            signature: "signature".to_string(),
+        };
+        let mut req = request(Method::PUT, "/bucket")?;
+
+        rewrite_create_bucket_sig_v2(&mut req, "secret", &auth);
+
+        assert!(req.headers().get(header::AUTHORIZATION).is_none());
         Ok(())
     }
 
