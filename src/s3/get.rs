@@ -2,21 +2,22 @@
 
 use std::ops::Range as ByteRange;
 
+use crate::sqlite::{CompletedObjectPart, KeyMetadata, ObjectBodyReference, StoredChecksum};
+
 use super::{
-    Bytes, ChecksumMode, CompletedObjectPart, ETag, GetObjectAttributesInput,
-    GetObjectAttributesOutput, GetObjectAttributesParts, GetObjectInput, GetObjectOutput,
-    GetObjectTorrentInput, GetObjectTorrentOutput, HeadObjectInput, HeadObjectOutput, HeaderValue,
-    KeyMetadata, LifecycleExpirationHeader, Not, ObjectAttributes, ObjectBodyReference, ObjectPart,
-    ObjectReadConditionFailure, ObjectReadConditions, S3Error, S3ErrorCode, S3Range, S3Request,
-    S3Response, S3Result, Sqlite, SqliteError, SqliteResult, StorageClass, StoredChecksum,
-    StreamExt, StreamingBlob, X_AMZ_TAGGING_COUNT, active_sse_from_stored, checksum_crc32,
-    checksum_crc32c, checksum_crc64nvme, checksum_mode_enabled, checksum_sha1, checksum_sha256,
-    checksum_struct, checksum_type_output, decrypt_stored_chunks, list_limit,
-    not_found_delete_marker_error, not_modified_error, object_checksum_for_part,
-    object_lock_legal_hold_status, object_lock_mode, object_lock_retain_until_date,
-    requested_part_range, s3_error, s3_error_from_sqlite, s3_error_with_message, sse_s3_output,
-    stream, validate_expected_bucket_owner, validate_no_sse_headers, validate_part_number,
-    validate_read_conditions,
+    Bytes, ChecksumMode, ETag, GetObjectAttributesInput, GetObjectAttributesOutput,
+    GetObjectAttributesParts, GetObjectInput, GetObjectOutput, GetObjectTorrentInput,
+    GetObjectTorrentOutput, HeadObjectInput, HeadObjectOutput, HeaderValue,
+    LifecycleExpirationHeader, Not, ObjectAttributes, ObjectPart, ObjectReadConditionFailure,
+    ObjectReadConditions, S3Error, S3ErrorCode, S3Range, S3Request, S3Response, S3Result, Sqlite,
+    SqliteError, SqliteResult, StorageClass, StreamExt, StreamingBlob, X_AMZ_TAGGING_COUNT,
+    active_sse_from_stored, checksum_crc32, checksum_crc32c, checksum_crc64nvme,
+    checksum_mode_enabled, checksum_sha1, checksum_sha256, checksum_struct, checksum_type_output,
+    decrypt_stored_chunks, list_limit, not_found_delete_marker_error, not_modified_error,
+    object_checksum_for_part, object_lock_legal_hold_status, object_lock_mode,
+    object_lock_retain_until_date, requested_part_range, s3_error, s3_error_from_sqlite,
+    s3_error_with_message, sse_s3_output, stream, validate_expected_bucket_owner,
+    validate_no_sse_headers, validate_part_number, validate_read_conditions,
 };
 
 use crate::database::{BlobReadReceiver, BlobReadRequest};
@@ -944,8 +945,7 @@ mod tests {
 
     use crate::{
         Config,
-        s3::{FullObjectChecksum, PartChecksum},
-        sqlite::StoredSse,
+        sqlite::{FullObjectChecksum, PartChecksum, StoredSse},
     };
 
     fn assert_error_code<T>(result: S3Result<T>, code: &S3ErrorCode) {

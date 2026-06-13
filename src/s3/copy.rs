@@ -2,21 +2,24 @@
 
 use std::collections::HashMap;
 
+use crate::sqlite::{
+    ChecksumAlgorithmKind, KeyMetadata, KeyValue, ObjectBodyReference, StoredChecksum,
+    StoredObjectLock, StoredSse, StoredTag,
+};
+
 use super::{
-    ChecksumAlgorithmKind, CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource,
-    CopyTaggingDirective, ETag, InternalError, KeyMetadata, KeyValue, MetadataDirective, Not,
-    ObjectAclRequest, ObjectBodyReference, ObjectLockWriteHeaders, ObjectReadConditions,
-    OffsetDateTime, S3_SINGLE_REQUEST_BODY_MAX, S3ErrorCode, S3Request, S3Response, S3Result,
-    Sqlite, SqliteError, SqliteResult, StoredChecksum, StoredSse, StoredTag,
-    active_sse_from_stored, checksum_algorithm_from_request, checksum_crc32, checksum_crc32c,
-    checksum_crc64nvme, checksum_sha1, checksum_sha256, checksum_type_output,
-    copy_tagging_directive, decrypt_stored_chunks, encrypt_value_chunks, http_date_time,
-    load_bucket_object_lock_config, normalize_content_encoding, normalize_metadata,
-    object_lock_for_copied_version, object_lock_write_headers, object_write_checksum_from_value,
-    requested_sse_s3, resolve_write_encryption, s3_error, s3_error_from_sqlite,
-    s3_error_with_message, sse_s3_output, strong_etag_condition_matches,
-    validate_expected_bucket_owner, validate_no_unsupported_sse_headers, validate_object_acl,
-    weak_etag_condition_matches,
+    CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource, CopyTaggingDirective, ETag,
+    InternalError, MetadataDirective, Not, ObjectAclRequest, ObjectLockWriteHeaders,
+    ObjectReadConditions, OffsetDateTime, S3_SINGLE_REQUEST_BODY_MAX, S3ErrorCode, S3Request,
+    S3Response, S3Result, Sqlite, SqliteError, SqliteResult, active_sse_from_stored,
+    checksum_algorithm_from_request, checksum_crc32, checksum_crc32c, checksum_crc64nvme,
+    checksum_sha1, checksum_sha256, checksum_type_output, copy_tagging_directive,
+    decrypt_stored_chunks, encrypt_value_chunks, http_date_time, load_bucket_object_lock_config,
+    normalize_content_encoding, normalize_metadata, object_lock_for_copied_version,
+    object_lock_write_headers, object_write_checksum_from_value, requested_sse_s3,
+    resolve_write_encryption, s3_error, s3_error_from_sqlite, s3_error_with_message, sse_s3_output,
+    strong_etag_condition_matches, validate_expected_bucket_owner,
+    validate_no_unsupported_sse_headers, validate_object_acl, weak_etag_condition_matches,
 };
 
 /// Parsed copy request with source, destination, metadata, and checksum intent.
@@ -221,7 +224,7 @@ fn prepare_copied_object(
     mut object: KeyValue,
     request: &CopyObjectRequest,
     target_stored_sse: Option<StoredSse>,
-    target_object_lock: super::StoredObjectLock,
+    target_object_lock: StoredObjectLock,
 ) -> SqliteResult<(KeyValue, StoredChecksum)> {
     object.key.clone_from(&request.target_key);
     object.key_metadata.last_modified = OffsetDateTime::now_utc();
@@ -569,10 +572,7 @@ pub(super) async fn copy_object(
 mod tests {
     use super::*;
 
-    use crate::{
-        s3::{ChecksumAlgorithmKind, FullObjectChecksum, StoredObjectLock},
-        sqlite::KeyMetadata,
-    };
+    use crate::sqlite::{ChecksumAlgorithmKind, FullObjectChecksum, KeyMetadata, StoredObjectLock};
     use s3s::dto::{
         ChecksumAlgorithm, ETagCondition, ObjectCannedACL, ObjectLockLegalHoldStatus,
         ObjectLockMode, Timestamp,

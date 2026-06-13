@@ -2,13 +2,15 @@
 
 use std::collections::HashSet;
 
+use crate::sqlite::StoredTag;
+
 use super::{
     DeleteBucketTaggingInput, DeleteBucketTaggingOutput, DeleteObjectTaggingInput,
     DeleteObjectTaggingOutput, GetBucketTaggingInput, GetBucketTaggingOutput,
     GetObjectTaggingInput, GetObjectTaggingOutput, PutBucketTaggingInput, PutBucketTaggingOutput,
     PutObjectTaggingInput, PutObjectTaggingOutput, S3ErrorCode, S3Request, S3Response, S3Result,
-    Sqlite, StoredTag, Tag, TagSet, Tagging, TaggingDirective, TaggingHeader, s3_error,
-    s3_error_from_sqlite, s3_error_with_message, validate_expected_bucket_owner,
+    Sqlite, Tag, TagSet, Tagging, TaggingDirective, TaggingHeader, s3_error, s3_error_from_sqlite,
+    s3_error_with_message, validate_expected_bucket_owner,
 };
 
 /// Maximum number of S3 tags allowed on one resource.

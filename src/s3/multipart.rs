@@ -1,31 +1,34 @@
-use crate::sqlite::EncodedBlobChunk;
+use crate::sqlite::{
+    ChecksumAccumulator, ChecksumTypeKind, CompletedMultipartUploadOutcome, CompletedObjectPart,
+    EncodedBlobChunk, KeyValue, Multipart, MultipartChecksumConfig, MultipartCompletion,
+    MultipartCompletionChecksum, MultipartCompletionPart, MultipartCompletionRequest,
+    MultipartPartWrite, MultipartUploadListEntry, MultipartUploadState, PartChecksum,
+    StoredChecksum, StoredSse,
+};
 
 use super::copy::{load_copy_source_object, validate_copy_source_conditions};
 use super::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, ActiveSse, ByteRange, CONTENT_MD5,
-    ChecksumAccumulator, ChecksumInput, ChecksumTypeKind, CommonPrefix,
-    CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CompletedMultipartUploadOutcome,
-    CompletedObjectPart, CompletedPart, CopyPartResult, CopySource, CreateMultipartUploadInput,
-    CreateMultipartUploadOutput, Digest, ETag, Initiator, InternalError, KeyValue,
-    ListMultipartUploadsInput, ListMultipartUploadsOutput, ListPartsInput, ListPartsOutput, Md5,
-    Multipart, MultipartChecksumConfig, MultipartCompletion, MultipartCompletionChecksum,
-    MultipartCompletionPart, MultipartCompletionRequest, MultipartPartWrite, MultipartUpload,
-    MultipartUploadListEntry, MultipartUploadState, Not, ObjectAclRequest, ObjectReadConditions,
-    OffsetDateTime, Owner, Part, PartChecksum, S3_SINGLE_REQUEST_BODY_MAX, S3Error, S3ErrorCode,
-    S3Range, S3Request, S3Response, S3Result, Sqlite, SqliteError, SqliteResult, StorageClass,
-    StoredChecksum, StoredSse, StreamingBlob, TryStreamExt, UploadPartCopyInput,
-    UploadPartCopyOutput, UploadPartInput, UploadPartOutput, Uuid, active_sse_from_stored,
-    checksum_algorithm_output, checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_sha1,
-    checksum_sha256, checksum_type_output, configured_part_checksum, copy_bytes,
-    decode_list_input_value, decrypt_stored_chunks, default_crc64nvme_full_object_checksum,
-    encode_list_value, encrypt_value_chunks, finish_part_checksum, hex, is_url_encoding,
-    load_bucket_object_lock_config, multipart_checksum_config, normalize_content_encoding,
-    normalize_metadata, object_lock_for_new_version, object_lock_write_headers,
-    object_write_conditions, output_delimiter, owner, part_checksum_accumulator,
-    read_part_body_encrypted, requested_sse_s3, resolve_write_encryption, s3_error,
-    s3_error_from_sqlite, s3_error_with_message, sse_s3_output, stored_tags_from_header,
-    validate_content_md5, validate_declared_object_write_length, validate_expected_bucket_owner,
-    validate_no_sse_headers, validate_no_unsupported_sse_headers, validate_object_acl,
+    ChecksumInput, CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
+    CompletedPart, CopyPartResult, CopySource, CreateMultipartUploadInput,
+    CreateMultipartUploadOutput, Digest, ETag, Initiator, InternalError, ListMultipartUploadsInput,
+    ListMultipartUploadsOutput, ListPartsInput, ListPartsOutput, Md5, MultipartUpload, Not,
+    ObjectAclRequest, ObjectReadConditions, OffsetDateTime, Owner, Part,
+    S3_SINGLE_REQUEST_BODY_MAX, S3Error, S3ErrorCode, S3Range, S3Request, S3Response, S3Result,
+    Sqlite, SqliteError, SqliteResult, StorageClass, StreamingBlob, TryStreamExt,
+    UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput, Uuid,
+    active_sse_from_stored, checksum_algorithm_output, checksum_crc32, checksum_crc32c,
+    checksum_crc64nvme, checksum_sha1, checksum_sha256, checksum_type_output,
+    configured_part_checksum, copy_bytes, decode_list_input_value, decrypt_stored_chunks,
+    default_crc64nvme_full_object_checksum, encode_list_value, encrypt_value_chunks,
+    finish_part_checksum, hex, is_url_encoding, load_bucket_object_lock_config,
+    multipart_checksum_config, normalize_content_encoding, normalize_metadata,
+    object_lock_for_new_version, object_lock_write_headers, object_write_conditions,
+    output_delimiter, owner, part_checksum_accumulator, read_part_body_encrypted, requested_sse_s3,
+    resolve_write_encryption, s3_error, s3_error_from_sqlite, s3_error_with_message, sse_s3_output,
+    stored_tags_from_header, validate_content_md5, validate_declared_object_write_length,
+    validate_expected_bucket_owner, validate_no_sse_headers, validate_no_unsupported_sse_headers,
+    validate_object_acl,
 };
 
 /// Normalizes a completed multipart part list while preserving S3 ordering rules.
@@ -1698,10 +1701,7 @@ pub(super) async fn complete_multipart_upload(
 mod tests {
     use super::*;
 
-    use crate::{
-        s3::{PartChecksum, StoredObjectLock},
-        sqlite::KeyMetadata,
-    };
+    use crate::sqlite::{KeyMetadata, PartChecksum, StoredObjectLock};
 
     fn assert_error_code<T>(result: S3Result<T>, code: &S3ErrorCode) {
         let err = result.err();

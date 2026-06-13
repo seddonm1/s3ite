@@ -1,7 +1,9 @@
+use crate::sqlite::BucketVersioningState;
+
 use super::{
-    Bucket, BucketAclRequest, BucketVersioningState, BucketVersioningStatus, CreateBucketInput,
-    CreateBucketOutput, DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput,
-    DeleteBucketInput, DeleteBucketOutput, GetBucketEncryptionInput, GetBucketEncryptionOutput,
+    Bucket, BucketAclRequest, BucketVersioningStatus, CreateBucketInput, CreateBucketOutput,
+    DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput, DeleteBucketInput,
+    DeleteBucketOutput, GetBucketEncryptionInput, GetBucketEncryptionOutput,
     GetBucketLocationInput, GetBucketLocationOutput, GetBucketVersioningInput,
     GetBucketVersioningOutput, HeadBucketInput, HeadBucketOutput, InternalError, ListBucketsInput,
     ListBucketsOutput, MFADelete, Not, PutBucketEncryptionInput, PutBucketEncryptionOutput,

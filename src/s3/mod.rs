@@ -69,11 +69,7 @@ use uuid::Uuid;
 
 use crate::ClientAddress;
 use crate::sqlite::{
-    BucketVersioningState, CompletedMultipartUploadOutcome, CompletedObjectPart, KeyMetadata,
-    KeyValue, Multipart, MultipartCompletion, MultipartCompletionPart, MultipartCompletionRequest,
-    MultipartPartWrite, MultipartUploadListEntry, MultipartUploadState, ObjectBodyReference,
-    ObjectDeleteOutcome, ObjectTagCondition, ObjectWriteConditions, Sqlite, SqliteError,
-    SqliteResult,
+    KeyMetadata, ObjectTagCondition, ObjectWriteConditions, Sqlite, SqliteError, SqliteResult,
 };
 
 const LIST_BATCH_SIZE: i64 = 1024;
@@ -131,18 +127,6 @@ mod post;
 mod put;
 mod sse;
 mod tagging;
-
-pub(crate) use crate::sqlite::{
-    ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKind, MultipartChecksumConfig,
-    MultipartCompletionChecksum, ObjectLifecycleExpiration, PartChecksum, StoredChecksum,
-    StoredCorsRule, StoredLifecycleAndFilter, StoredLifecycleExpiration, StoredLifecycleFilter,
-    StoredLifecycleRule, StoredNoncurrentVersionExpiration, StoredObjectLock,
-    StoredObjectLockConfig, StoredObjectLockDefaultRetention, StoredObjectLockMode,
-    StoredObjectRetention, StoredSse, StoredTag,
-};
-
-#[cfg(test)]
-pub(crate) use crate::sqlite::FullObjectChecksum;
 
 pub(crate) use self::{
     cors::BucketCorsLayer, lifecycle::LifecycleExpirationHeader, sse::parse_master_key,
@@ -1113,6 +1097,7 @@ impl S3 for Sqlite {
 mod tests {
     use super::*;
 
+    use crate::sqlite::StoredObjectLock;
     use time::Duration;
 
     fn metadata(md5: Option<&str>, last_modified: OffsetDateTime, size: i64) -> KeyMetadata {

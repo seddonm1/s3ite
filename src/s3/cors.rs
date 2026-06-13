@@ -28,10 +28,11 @@ use tower::{Layer, Service};
 use crate::{
     Config, Sqlite,
     config::{CorsConfig, CorsMode},
+    sqlite::StoredCorsRule,
 };
 
 use super::{
-    S3ErrorCode, S3Request, S3Response, S3Result, StoredCorsRule, s3_error, s3_error_from_sqlite,
+    S3ErrorCode, S3Request, S3Response, S3Result, s3_error, s3_error_from_sqlite,
     s3_error_with_message, validate_expected_bucket_owner,
 };
 

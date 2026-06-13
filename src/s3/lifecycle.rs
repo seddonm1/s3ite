@@ -4,15 +4,18 @@ use std::{collections::HashSet, ops::Not};
 
 use time::{OffsetDateTime, format_description::well_known::Rfc2822};
 
+use crate::sqlite::{
+    ObjectLifecycleExpiration, StoredLifecycleAndFilter, StoredLifecycleExpiration,
+    StoredLifecycleFilter, StoredLifecycleRule, StoredNoncurrentVersionExpiration, StoredTag,
+};
+
 use super::{
     DeleteBucketLifecycleInput, DeleteBucketLifecycleOutput, ExpirationStatus,
     GetBucketLifecycleConfigurationInput, GetBucketLifecycleConfigurationOutput,
     LifecycleExpiration, LifecycleRule, LifecycleRuleAndOperator, LifecycleRuleFilter,
-    LifecycleRules, NoncurrentVersionExpiration, ObjectLifecycleExpiration,
-    PutBucketLifecycleConfigurationInput, PutBucketLifecycleConfigurationOutput, S3ErrorCode,
-    S3Request, S3Response, S3Result, Sqlite, StoredLifecycleAndFilter, StoredLifecycleExpiration,
-    StoredLifecycleFilter, StoredLifecycleRule, StoredNoncurrentVersionExpiration, StoredTag, Tag,
-    TagSet, Timestamp, s3_error, s3_error_from_sqlite, s3_error_with_message,
+    LifecycleRules, NoncurrentVersionExpiration, PutBucketLifecycleConfigurationInput,
+    PutBucketLifecycleConfigurationOutput, S3ErrorCode, S3Request, S3Response, S3Result, Sqlite,
+    Tag, TagSet, Timestamp, s3_error, s3_error_from_sqlite, s3_error_with_message,
     validate_expected_bucket_owner,
 };
 
@@ -146,6 +149,7 @@ pub(super) async fn put_bucket_lifecycle_configuration(
     ))
 }
 
+/// Converts an S3 lifecycle configuration request body into storage rules.
 pub(crate) fn stored_lifecycle_rules_from_configuration(
     configuration: Option<BucketLifecycleConfiguration>,
 ) -> S3Result<Vec<StoredLifecycleRule>> {
@@ -160,6 +164,7 @@ pub(crate) fn stored_lifecycle_rules_from_configuration(
     Ok(rules)
 }
 
+/// Validates the lifecycle rule count accepted by the service.
 fn validate_rule_count(count: usize) -> S3Result<()> {
     if count == 0 {
         return Err(s3_error_with_message(
@@ -176,6 +181,7 @@ fn validate_rule_count(count: usize) -> S3Result<()> {
     Ok(())
 }
 
+/// Rejects duplicate lifecycle rule IDs before rules are stored.
 fn validate_unique_rule_ids(rules: &[StoredLifecycleRule]) -> S3Result<()> {
     let mut ids = HashSet::new();
     for id in rules.iter().filter_map(|rule| rule.id.as_deref()) {
@@ -186,6 +192,7 @@ fn validate_unique_rule_ids(rules: &[StoredLifecycleRule]) -> S3Result<()> {
     Ok(())
 }
 
+/// Converts one S3 lifecycle rule into the storage representation.
 fn stored_lifecycle_rule_from_dto(rule: LifecycleRule) -> S3Result<StoredLifecycleRule> {
     if rule
         .transitions
@@ -254,6 +261,7 @@ fn stored_lifecycle_rule_from_dto(rule: LifecycleRule) -> S3Result<StoredLifecyc
     })
 }
 
+/// Converts the legacy prefix/filter pair into one storage filter.
 fn stored_filter_from_dto(
     legacy_prefix: Option<String>,
     filter: Option<LifecycleRuleFilter>,
@@ -265,6 +273,7 @@ fn stored_filter_from_dto(
     }
 }
 
+/// Converts the modern lifecycle filter union into a storage filter.
 fn stored_filter_element_from_dto(filter: LifecycleRuleFilter) -> S3Result<StoredLifecycleFilter> {
     let mut shape_count = 0;
     shape_count += usize::from(filter.and.is_some());
@@ -295,6 +304,7 @@ fn stored_filter_element_from_dto(filter: LifecycleRuleFilter) -> S3Result<Store
     Ok(StoredLifecycleFilter::Empty)
 }
 
+/// Converts a lifecycle `And` filter into its storage representation.
 fn stored_and_filter_from_dto(and: LifecycleRuleAndOperator) -> S3Result<StoredLifecycleAndFilter> {
     let tags = and
         .tags
@@ -313,6 +323,7 @@ fn stored_and_filter_from_dto(and: LifecycleRuleAndOperator) -> S3Result<StoredL
     })
 }
 
+/// Converts an S3 tag DTO into a required storage tag.
 fn stored_tag_from_dto(tag: Tag) -> S3Result<StoredTag> {
     Ok(StoredTag {
         key: tag.key.ok_or_else(|| s3_error(S3ErrorCode::MalformedXML))?,
@@ -322,6 +333,7 @@ fn stored_tag_from_dto(tag: Tag) -> S3Result<StoredTag> {
     })
 }
 
+/// Converts a current-version expiration action into storage form.
 fn stored_expiration_from_dto(
     expiration: LifecycleExpiration,
 ) -> S3Result<StoredLifecycleExpiration> {
@@ -339,6 +351,7 @@ fn stored_expiration_from_dto(
     })
 }
 
+/// Converts a noncurrent-version expiration action into storage form.
 fn stored_noncurrent_expiration_from_dto(
     expiration: &NoncurrentVersionExpiration,
 ) -> S3Result<StoredNoncurrentVersionExpiration> {
@@ -356,6 +369,7 @@ fn stored_noncurrent_expiration_from_dto(
     })
 }
 
+/// Validates lifecycle day counts that must be strictly positive.
 fn validate_positive_days(days: i32) -> S3Result<i32> {
     if days <= 0 {
         return Err(s3_error_with_message(
@@ -366,6 +380,7 @@ fn validate_positive_days(days: i32) -> S3Result<i32> {
     Ok(days)
 }
 
+/// Validates the supported noncurrent-version retention count.
 fn validate_newer_noncurrent_versions(count: i32) -> S3Result<i32> {
     if !(1..=MAX_NEWER_NONCURRENT_VERSIONS).contains(&count) {
         return Err(s3_error_with_message(
@@ -376,6 +391,7 @@ fn validate_newer_noncurrent_versions(count: i32) -> S3Result<i32> {
     Ok(count)
 }
 
+/// Validates lifecycle object-size filter bounds.
 fn validate_size(size: i64) -> S3Result<i64> {
     if size < 0 {
         return Err(s3_error(S3ErrorCode::MalformedXML));
@@ -383,10 +399,12 @@ fn validate_size(size: i64) -> S3Result<i64> {
     Ok(size)
 }
 
+/// Converts storage lifecycle rules back into S3 response DTOs.
 fn lifecycle_rules_from_stored(rules: Vec<StoredLifecycleRule>) -> LifecycleRules {
     rules.into_iter().map(lifecycle_rule_from_stored).collect()
 }
 
+/// Converts one storage lifecycle rule into an S3 response rule.
 fn lifecycle_rule_from_stored(rule: StoredLifecycleRule) -> LifecycleRule {
     let (prefix, filter) = filter_to_dto(rule.filter);
     LifecycleRule {
@@ -413,6 +431,7 @@ fn lifecycle_rule_from_stored(rule: StoredLifecycleRule) -> LifecycleRule {
     }
 }
 
+/// Converts a storage filter into the legacy prefix or modern filter DTO field.
 fn filter_to_dto(filter: StoredLifecycleFilter) -> (Option<String>, Option<LifecycleRuleFilter>) {
     match filter {
         StoredLifecycleFilter::LegacyPrefix(prefix) => (Some(prefix), None),
@@ -455,6 +474,7 @@ fn filter_to_dto(filter: StoredLifecycleFilter) -> (Option<String>, Option<Lifec
     }
 }
 
+/// Converts a storage `And` filter into the S3 response DTO.
 fn and_filter_to_dto(and: StoredLifecycleAndFilter) -> LifecycleRuleAndOperator {
     LifecycleRuleAndOperator {
         object_size_greater_than: and.object_size_greater_than,
@@ -468,6 +488,7 @@ fn and_filter_to_dto(and: StoredLifecycleAndFilter) -> LifecycleRuleAndOperator 
     }
 }
 
+/// Converts a storage tag into an S3 tag DTO.
 fn tag_to_dto(tag: StoredTag) -> Tag {
     Tag {
         key: Some(tag.key),
@@ -475,6 +496,7 @@ fn tag_to_dto(tag: StoredTag) -> Tag {
     }
 }
 
+/// Converts a storage current-version expiration action into an S3 DTO.
 fn expiration_to_dto(expiration: &StoredLifecycleExpiration) -> LifecycleExpiration {
     LifecycleExpiration {
         date: expiration.date.map(Timestamp::from),
@@ -483,6 +505,7 @@ fn expiration_to_dto(expiration: &StoredLifecycleExpiration) -> LifecycleExpirat
     }
 }
 
+/// Converts a storage noncurrent-version expiration action into an S3 DTO.
 fn noncurrent_expiration_to_dto(
     expiration: &StoredNoncurrentVersionExpiration,
 ) -> NoncurrentVersionExpiration {
@@ -492,6 +515,7 @@ fn noncurrent_expiration_to_dto(
     }
 }
 
+/// Percent-encodes lifecycle rule IDs for `x-amz-expiration`.
 fn percent_encode_rule_id(value: &str) -> String {
     value
         .bytes()

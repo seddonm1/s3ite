@@ -1,9 +1,14 @@
 //! Storage-owned entities shared between `SQLite` operations and S3 mapping.
 
-use std::ops::Not;
+use std::{collections::HashMap, ops::Not};
 
+use rusqlite::{
+    ToSql,
+    types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef},
+};
 use s3s::crypto::{Checksum as _, Crc32, Crc32c, Crc64Nvme, Sha1, Sha256};
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 /// Compact database code for bucket default SSE-S3.
 pub(crate) const SSE_S3_ALGORITHM_CODE: i64 = 1;
@@ -725,6 +730,364 @@ pub(crate) struct StoredObjectLockDefaultRetention {
 pub(crate) struct StoredObjectLockConfig {
     pub(crate) enabled: bool,
     pub(crate) default_retention: Option<StoredObjectLockDefaultRetention>,
+}
+
+/// Bucket-level S3 object versioning state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(i64)]
+pub(crate) enum BucketVersioningState {
+    /// Versioning has never been configured on this bucket.
+    NeverConfigured = 0,
+    /// New object writes create generated version IDs.
+    Enabled = 1,
+    /// New object writes replace the special `null` version.
+    Suspended = 2,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid bucket versioning state: {0}")]
+struct InvalidBucketVersioningState(i64);
+
+impl BucketVersioningState {
+    /// Returns the serialized `SQLite` representation.
+    #[must_use]
+    pub(crate) fn sql_code(self) -> i64 {
+        self as i64
+    }
+
+    /// Parses a `SQLite` representation.
+    fn from_sql_code(value: i64) -> FromSqlResult<Self> {
+        match value {
+            value if value == Self::NeverConfigured.sql_code() => Ok(Self::NeverConfigured),
+            value if value == Self::Enabled.sql_code() => Ok(Self::Enabled),
+            value if value == Self::Suspended.sql_code() => Ok(Self::Suspended),
+            _ => Err(FromSqlError::Other(Box::new(InvalidBucketVersioningState(
+                value,
+            )))),
+        }
+    }
+
+    /// Returns whether write responses expose the stored version ID.
+    #[must_use]
+    pub(crate) fn returns_write_version_id(self) -> bool {
+        self == Self::Enabled
+    }
+}
+
+impl ToSql for BucketVersioningState {
+    /// Serializes a bucket versioning state as its stable database code.
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.sql_code()))
+    }
+}
+
+impl FromSql for BucketVersioningState {
+    /// Deserializes a bucket versioning state from its database code.
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let ValueRef::Integer(value) = value else {
+            return Err(FromSqlError::InvalidType);
+        };
+        Self::from_sql_code(value)
+    }
+}
+
+/// Object body and metadata loaded from the bucket database.
+#[derive(Debug)]
+pub(crate) struct KeyValue {
+    pub(crate) key: String,
+    pub(crate) value: Option<Vec<u8>>,
+    pub(crate) key_metadata: KeyMetadata,
+}
+
+/// Pre-encoded object blob chunk ready to insert into storage.
+#[derive(Debug)]
+pub(crate) struct EncodedBlobChunk {
+    pub(crate) chunk_number: i32,
+    pub(crate) offset: i64,
+    pub(crate) size: i64,
+    pub(crate) body: Vec<u8>,
+    pub(crate) sse_nonce: Option<Vec<u8>>,
+    pub(crate) sse_tag: Option<Vec<u8>>,
+}
+
+/// Stored object blob chunk loaded directly from storage.
+#[derive(Debug)]
+pub(crate) struct StoredBlobChunk {
+    pub(crate) offset: i64,
+    pub(crate) size: i64,
+    pub(crate) body: Vec<u8>,
+    pub(crate) sse_nonce: Option<Vec<u8>>,
+    pub(crate) sse_tag: Option<Vec<u8>>,
+}
+
+impl From<EncodedBlobChunk> for StoredBlobChunk {
+    /// Converts an insert-ready encoded chunk into a stored chunk value.
+    fn from(chunk: EncodedBlobChunk) -> Self {
+        Self {
+            offset: chunk.offset,
+            size: chunk.size,
+            body: chunk.body,
+            sse_nonce: chunk.sse_nonce,
+            sse_tag: chunk.sse_tag,
+        }
+    }
+}
+
+/// Metadata plus rowid needed to stream an object body from `SQLite`.
+#[derive(Debug)]
+pub(crate) struct ObjectBodyReference {
+    pub(crate) version_id: String,
+    pub(crate) sequence: i64,
+    pub(crate) key_metadata: KeyMetadata,
+}
+
+/// Minimal object metadata returned by list queries.
+#[derive(Debug)]
+pub(crate) struct ObjectSummary {
+    pub(crate) key: String,
+    pub(crate) version_id: String,
+    pub(crate) size: i64,
+    pub(crate) last_modified: OffsetDateTime,
+    pub(crate) md5: Option<String>,
+    pub(crate) is_latest: bool,
+    pub(crate) is_delete_marker: bool,
+}
+
+/// Storage-level entry emitted by object-version listing.
+#[derive(Debug)]
+pub(crate) enum ObjectVersionListEntry {
+    Object(ObjectSummary),
+    CommonPrefix {
+        prefix: String,
+        marker_key: String,
+        marker_version_id: String,
+    },
+}
+
+/// Page of storage-level object-version listing entries.
+#[derive(Debug)]
+pub(crate) struct ObjectVersionListPage {
+    pub(crate) entries: Vec<ObjectVersionListEntry>,
+    pub(crate) next_key_marker: Option<String>,
+    pub(crate) next_version_id_marker: Option<String>,
+    pub(crate) is_truncated: bool,
+}
+
+/// ETag-like object identity condition evaluated by the storage layer.
+#[derive(Clone, Debug)]
+pub(crate) enum ObjectTagCondition {
+    Any,
+    Md5(String),
+    Never,
+}
+
+/// Preconditions that must hold before replacing an object.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ObjectWriteConditions {
+    pub(crate) if_match: Option<ObjectTagCondition>,
+    pub(crate) if_none_match: Option<ObjectTagCondition>,
+}
+
+/// Initiated multipart upload state shared by all uploaded parts.
+#[derive(Debug)]
+pub(crate) struct MultipartUploadState {
+    pub(crate) access_key: Option<String>,
+    pub(crate) metadata: Option<HashMap<String, String>>,
+    pub(crate) content_type: Option<String>,
+    pub(crate) content_encoding: Option<String>,
+    pub(crate) cache_control: Option<String>,
+    pub(crate) expires: Option<OffsetDateTime>,
+    pub(crate) checksum: Option<MultipartChecksumConfig>,
+    pub(crate) stored_sse: Option<StoredSse>,
+    pub(crate) object_lock: StoredObjectLock,
+}
+
+/// Active multipart upload row returned by multipart upload listing.
+#[derive(Debug)]
+pub(crate) struct MultipartUploadSummary {
+    pub(crate) key: String,
+    pub(crate) upload_id: Uuid,
+    pub(crate) initiated: OffsetDateTime,
+    pub(crate) checksum: Option<MultipartChecksumConfig>,
+}
+
+/// Storage-level multipart upload list entry.
+#[derive(Debug)]
+pub(crate) enum MultipartUploadListEntry {
+    Upload(MultipartUploadSummary),
+    CommonPrefix { prefix: String },
+}
+
+/// Page of multipart upload list entries returned by storage.
+#[derive(Debug)]
+pub(crate) struct MultipartUploadListPage {
+    pub(crate) entries: Vec<MultipartUploadListEntry>,
+    pub(crate) next_key_marker: Option<String>,
+    pub(crate) next_upload_id_marker: Option<String>,
+    pub(crate) is_truncated: bool,
+}
+
+/// Completion ledger entry used to make multipart completion idempotent.
+#[derive(Debug)]
+pub(crate) struct CompletedMultipartUploadState {
+    pub(crate) access_key: Option<String>,
+    pub(crate) md5: String,
+    pub(crate) returned_version_id: Option<String>,
+    pub(crate) checksum: StoredChecksum,
+}
+
+/// Values inserted into the multipart completion ledger.
+#[derive(Debug)]
+pub(crate) struct CompletedMultipartUploadRecord<'a> {
+    pub(crate) upload_id: Uuid,
+    pub(crate) bucket: &'a str,
+    pub(crate) key: &'a str,
+    pub(crate) access_key: Option<String>,
+    pub(crate) md5: &'a str,
+    pub(crate) version_id: &'a str,
+    pub(crate) returned_version_id: Option<&'a str>,
+    pub(crate) checksum: &'a StoredChecksum,
+}
+
+/// Result of materializing multipart upload parts into an object version.
+#[derive(Debug)]
+pub(crate) struct CompletedMultipartUploadOutcome {
+    pub(crate) md5: String,
+    pub(crate) returned_version_id: Option<String>,
+    pub(crate) checksum: StoredChecksum,
+    pub(crate) stored_sse: Option<StoredSse>,
+}
+
+/// Read-side multipart completion state.
+#[derive(Debug)]
+pub(crate) enum MultipartCompletion {
+    AlreadyCompleted(CompletedMultipartUploadOutcome),
+    Prepared(PreparedMultipartUpload),
+}
+
+/// Buffered completed multipart object and its persisted part boundaries.
+#[derive(Debug)]
+pub(crate) struct PreparedMultipartUpload {
+    pub(crate) size: i64,
+    pub(crate) md5: String,
+    pub(crate) checksum: StoredChecksum,
+    pub(crate) upload_checksum: Option<MultipartChecksumConfig>,
+    pub(crate) stored_sse: Option<StoredSse>,
+    pub(crate) parts: Vec<CompletedObjectPart>,
+}
+
+/// Object metadata loaded without the object body.
+#[derive(Debug)]
+pub(crate) struct KeyMetadata {
+    pub(crate) version_id: String,
+    pub(crate) size: i64,
+    pub(crate) metadata: Option<HashMap<String, String>>,
+    pub(crate) content_type: Option<String>,
+    pub(crate) content_encoding: Option<String>,
+    pub(crate) cache_control: Option<String>,
+    pub(crate) expires: Option<OffsetDateTime>,
+    pub(crate) last_modified: OffsetDateTime,
+    pub(crate) md5: Option<String>,
+    pub(crate) checksum: Option<StoredChecksum>,
+    pub(crate) stored_sse: Option<StoredSse>,
+    pub(crate) object_lock: StoredObjectLock,
+    pub(crate) is_latest: bool,
+    pub(crate) is_delete_marker: bool,
+}
+
+/// Result of storing an object version.
+#[derive(Debug)]
+pub(crate) struct ObjectWriteOutcome {
+    pub(crate) sequence: i64,
+    pub(crate) version_id: String,
+    pub(crate) returned_version_id: Option<String>,
+    pub(crate) md5: Option<String>,
+    pub(crate) last_modified: OffsetDateTime,
+}
+
+/// Object version selected for tag reads or writes.
+#[derive(Debug)]
+pub(crate) struct ObjectTaggingTarget {
+    pub(crate) sequence: i64,
+    pub(crate) version_id: String,
+}
+
+/// Object version selected for metadata updates.
+#[derive(Debug)]
+pub(crate) struct ObjectVersionTarget {
+    pub(crate) sequence: i64,
+}
+
+/// Result of deleting an object or object version.
+#[derive(Debug)]
+pub(crate) struct ObjectDeleteOutcome {
+    pub(crate) version_id: Option<String>,
+    pub(crate) is_delete_marker: bool,
+    pub(crate) delete_marker_version_id: Option<String>,
+}
+
+/// Stored multipart upload part with its body and checksum metadata.
+#[derive(Debug)]
+pub(crate) struct Multipart {
+    pub(crate) upload_id: Uuid,
+    pub(crate) part_number: i32,
+    pub(crate) last_modified: OffsetDateTime,
+    pub(crate) value: Vec<u8>,
+    pub(crate) size: i64,
+    pub(crate) md5: Option<String>,
+    pub(crate) checksum: Option<PartChecksum>,
+}
+
+/// Metadata for a multipart part whose chunks are already encoded.
+#[derive(Debug)]
+pub(crate) struct MultipartPartWrite {
+    pub(crate) upload_id: Uuid,
+    pub(crate) part_number: i32,
+    pub(crate) last_modified: OffsetDateTime,
+    pub(crate) size: i64,
+    pub(crate) md5: Option<String>,
+    pub(crate) checksum: Option<PartChecksum>,
+}
+
+/// Multipart upload part metadata returned by list-parts queries.
+#[derive(Debug)]
+pub(crate) struct MultipartMetadata {
+    pub(crate) part_number: i32,
+    pub(crate) last_modified: OffsetDateTime,
+    pub(crate) size: i64,
+    pub(crate) md5: Option<String>,
+    pub(crate) checksum: Option<PartChecksum>,
+}
+
+/// Stored part boundary for a completed multipart object.
+#[derive(Debug)]
+pub(crate) struct CompletedObjectPart {
+    pub(crate) part_number: i32,
+    pub(crate) start: i64,
+    pub(crate) size: i64,
+    pub(crate) checksum: Option<PartChecksum>,
+}
+
+/// Client-requested multipart part checksum used during completion.
+#[derive(Debug)]
+pub(crate) struct MultipartCompletionPart {
+    pub(crate) part_number: i32,
+    pub(crate) md5: String,
+    pub(crate) checksum: Option<PartChecksum>,
+}
+
+/// Request data needed to complete a multipart upload transactionally.
+#[derive(Debug)]
+pub(crate) struct MultipartCompletionRequest {
+    pub(crate) bucket: String,
+    pub(crate) key: String,
+    pub(crate) upload_id: Uuid,
+    pub(crate) requested_parts: Vec<MultipartCompletionPart>,
+    pub(crate) requested_checksum: MultipartCompletionChecksum,
+    pub(crate) default_checksum: MultipartChecksumConfig,
+    pub(crate) access_key: Option<String>,
+    pub(crate) write_conditions: ObjectWriteConditions,
+    pub(crate) precomputed_full_object_checksum: Option<StoredChecksum>,
 }
 
 /// Returns whether background lifecycle cleanup may permanently delete stored object data.

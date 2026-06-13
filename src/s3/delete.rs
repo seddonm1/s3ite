@@ -1,11 +1,13 @@
 //! S3 object delete request handling.
 
+use crate::sqlite::{KeyMetadata, ObjectDeleteOutcome};
+
 use super::{
     DeleteError, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput,
-    DeletedObject, ETagCondition, KeyMetadata, Not, ObjectDeleteOutcome, OffsetDateTime,
-    S3ErrorCode, S3Request, S3Response, S3Result, Sqlite, SqliteError,
-    delete_requires_object_lock_check, http_date_time, s3_error_from_sqlite, s3_error_with_message,
-    strong_etag_condition_matches, validate_expected_bucket_owner, validate_object_lock_delete,
+    DeletedObject, ETagCondition, Not, OffsetDateTime, S3ErrorCode, S3Request, S3Response,
+    S3Result, Sqlite, SqliteError, delete_requires_object_lock_check, http_date_time,
+    s3_error_from_sqlite, s3_error_with_message, strong_etag_condition_matches,
+    validate_expected_bucket_owner, validate_object_lock_delete,
 };
 use s3s::dto::Delete;
 
@@ -282,7 +284,7 @@ pub(super) async fn delete_objects(
 mod tests {
     use super::*;
 
-    use crate::s3::StoredObjectLock;
+    use crate::sqlite::StoredObjectLock;
     use s3s::dto::{ETag, ETagCondition};
     use time::Duration;
 

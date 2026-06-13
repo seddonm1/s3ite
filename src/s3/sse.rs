@@ -13,12 +13,12 @@ use md5::{Digest, Md5};
 use s3s::{S3Error, S3ErrorCode, S3Result, dto::ServerSideEncryption};
 
 use crate::sqlite::{
-    EncodedBlobChunk, Sqlite, SqliteError, SqliteResult, StoredBlobChunk, StoredSse,
+    ChecksumAccumulator, ChecksumTypeKind, EncodedBlobChunk, MultipartChecksumConfig, PartChecksum,
+    Sqlite, SqliteError, SqliteResult, StoredBlobChunk, StoredChecksum, StoredSse,
 };
 
 use super::{
-    ChecksumAccumulator, ChecksumInput, ChecksumPolicy, ChecksumTypeKind, InternalError,
-    MultipartChecksumConfig, PartChecksum, StoredChecksum, StreamingBlob, finish_part_checksum,
+    ChecksumInput, ChecksumPolicy, InternalError, StreamingBlob, finish_part_checksum,
     finish_payload_checksum, hex, part_checksum_accumulator, payload_checksum_accumulator,
     s3_error_from_sqlite, s3_error_with_message, validate_content_md5,
 };
@@ -532,8 +532,10 @@ mod tests {
     use super::*;
     use crate::{
         Config,
-        s3::{ChecksumAlgorithmKind, ChecksumTypeKind},
-        sqlite::{DEFAULT_OBJECT_BLOB_CHUNK_SIZE, checksum_test_support},
+        sqlite::{
+            ChecksumAlgorithmKind, ChecksumTypeKind, DEFAULT_OBJECT_BLOB_CHUNK_SIZE,
+            checksum_test_support,
+        },
     };
 
     fn sqlite_with_config(config: Config) -> Sqlite {

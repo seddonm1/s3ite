@@ -2,18 +2,22 @@
 
 use time::{Duration, OffsetDateTime};
 
-use super::{
-    BucketVersioningState, GetObjectLegalHoldInput, GetObjectLegalHoldOutput,
-    GetObjectLockConfigurationInput, GetObjectLockConfigurationOutput, GetObjectRetentionInput,
-    GetObjectRetentionOutput, KeyMetadata, ObjectLockConfiguration, ObjectLockEnabled,
-    ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention,
-    ObjectLockRetentionMode, ObjectLockRule, PutObjectLegalHoldInput, PutObjectLegalHoldOutput,
-    PutObjectLockConfigurationInput, PutObjectLockConfigurationOutput, PutObjectRetentionInput,
-    PutObjectRetentionOutput, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, Sqlite,
-    SqliteError, StoredObjectLock, StoredObjectLockConfig, StoredObjectLockDefaultRetention,
-    StoredObjectLockMode, StoredObjectRetention, Timestamp, validate_expected_bucket_owner,
+use crate::sqlite::{
+    BucketVersioningState, KeyMetadata, StoredObjectLock, StoredObjectLockConfig,
+    StoredObjectLockDefaultRetention, StoredObjectLockMode, StoredObjectRetention,
 };
+
 use super::{DefaultRetention, s3_error, s3_error_from_sqlite, s3_error_with_message};
+use super::{
+    GetObjectLegalHoldInput, GetObjectLegalHoldOutput, GetObjectLockConfigurationInput,
+    GetObjectLockConfigurationOutput, GetObjectRetentionInput, GetObjectRetentionOutput,
+    ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
+    ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode, ObjectLockRule,
+    PutObjectLegalHoldInput, PutObjectLegalHoldOutput, PutObjectLockConfigurationInput,
+    PutObjectLockConfigurationOutput, PutObjectRetentionInput, PutObjectRetentionOutput, S3Error,
+    S3ErrorCode, S3Request, S3Response, S3Result, Sqlite, SqliteError, Timestamp,
+    validate_expected_bucket_owner,
+};
 
 /// Parsed Object Lock headers for object writes.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

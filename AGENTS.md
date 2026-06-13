@@ -35,6 +35,9 @@ it moves, and let CI enforce quality instead of papering over failures.
   semantics they preserve.
 - Do not mix named and positional SQL parameters casually. Consistency matters
   more than local cleverness here.
+- Prefer `FromSql` and `ToSql` implementations for SQLite/domain value mapping
+  instead of scattering ad hoc string or integer conversions through queries.
+  Keep encoding decisions close to the storage type that owns them.
 
 ## Testing And CI
 
