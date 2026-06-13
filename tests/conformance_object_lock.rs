@@ -20,7 +20,7 @@ use aws_sdk_s3::{
 use reqwest::{Method, StatusCode};
 use serial_test::serial;
 use support::{
-    assertions::{assert_error_contains, assert_status},
+    assertions::{assert_error_code, assert_error_contains, assert_status},
     fixtures::{bucket_name, put_bucket_versioning},
     raw_http, sdk,
     server::TestServer,
@@ -452,7 +452,7 @@ async fn test_object_lock_put_obj_lock_invalid_days() -> Result<()> {
         .send()
         .await
         .expect_err("zero Days should be rejected");
-    assert_error_contains(&error, "InvalidRetentionPeriod");
+    assert_error_code(&error, "InvalidRetentionPeriod");
 
     Ok(())
 }
@@ -477,7 +477,7 @@ async fn test_object_lock_put_obj_lock_invalid_years() -> Result<()> {
         .send()
         .await
         .expect_err("negative Years should be rejected");
-    assert_error_contains(&error, "InvalidRetentionPeriod");
+    assert_error_code(&error, "InvalidRetentionPeriod");
 
     Ok(())
 }

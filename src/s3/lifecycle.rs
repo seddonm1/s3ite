@@ -208,7 +208,7 @@ fn stored_lifecycle_rule_from_dto(rule: LifecycleRule) -> S3Result<StoredLifecyc
         .is_some_and(|id| id.chars().count() > MAX_LIFECYCLE_RULE_ID_CHARS)
     {
         return Err(s3_error_with_message(
-            S3ErrorCode::InvalidRequest,
+            S3ErrorCode::InvalidArgument,
             "Lifecycle rule ID cannot be longer than 255 characters",
         ));
     }
@@ -359,7 +359,7 @@ fn stored_noncurrent_expiration_from_dto(
 fn validate_positive_days(days: i32) -> S3Result<i32> {
     if days <= 0 {
         return Err(s3_error_with_message(
-            S3ErrorCode::InvalidRequest,
+            S3ErrorCode::InvalidArgument,
             "Lifecycle days must be a positive integer",
         ));
     }
@@ -612,7 +612,7 @@ mod tests {
         })
         .err()
         .ok_or(s3_error(S3ErrorCode::InternalError))?;
-        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
 
         let err = stored_lifecycle_rule_from_dto(LifecycleRule {
             abort_incomplete_multipart_upload: None,

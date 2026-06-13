@@ -215,7 +215,7 @@ async fn test_list_multipart_upload() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_list_multipart_upload_owner() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_list_multipart_upload_owner
+    // Adapted from s3tests/functional/test_s3.py::test_list_multipart_upload_owner: uses s3ite synthetic owner instead of ACL owner setup
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-mpu");

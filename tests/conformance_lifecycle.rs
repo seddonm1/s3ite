@@ -21,12 +21,12 @@ use reqwest::{Method, StatusCode};
 use rusqlite::Connection;
 use serial_test::serial;
 use support::{
-    assertions::{assert_error_contains, assert_status},
+    assertions::{assert_error_code, assert_error_contains, assert_status},
     fixtures::{bucket_name, create_bucket, put_bucket_versioning},
     raw_http, sdk,
     server::{TestServer, TestServerOptions},
 };
-use time::{Duration, OffsetDateTime};
+use time::{Duration, OffsetDateTime, format_description::well_known::Rfc2822};
 
 fn expiration_rule(id: &str, prefix: &str, days: i32) -> Result<LifecycleRule> {
     Ok(LifecycleRule::builder()
@@ -209,15 +209,7 @@ async fn wait_for_objects(
         .collect::<Vec<_>>();
     expected.sort();
     for _ in 0..20 {
-        let mut actual = client
-            .list_objects_v2()
-            .bucket(bucket)
-            .send()
-            .await?
-            .contents()
-            .iter()
-            .filter_map(|object| object.key().map(str::to_string))
-            .collect::<Vec<_>>();
+        let mut actual = list_live_keys(client, bucket).await?;
         actual.sort();
         if actual == expected {
             return Ok(());
@@ -227,20 +219,59 @@ async fn wait_for_objects(
     bail!("timed out waiting for object set {expected:?}");
 }
 
-async fn wait_for_version_counts(
+/// Lists the current live object keys in a bucket.
+async fn list_live_keys(client: &aws_sdk_s3::Client, bucket: &str) -> Result<Vec<String>> {
+    Ok(client
+        .list_objects_v2()
+        .bucket(bucket)
+        .send()
+        .await?
+        .contents()
+        .iter()
+        .filter_map(|object| object.key().map(str::to_string))
+        .collect())
+}
+
+/// Waits for exact object-version and delete-marker key sets.
+async fn wait_for_version_keys(
     client: &aws_sdk_s3::Client,
     bucket: &str,
-    versions: usize,
-    delete_markers: usize,
+    expected_versions: &[&str],
+    expected_delete_markers: &[&str],
 ) -> Result<()> {
+    let mut expected_versions = expected_versions
+        .iter()
+        .map(|key| (*key).to_string())
+        .collect::<Vec<_>>();
+    expected_versions.sort();
+    let mut expected_delete_markers = expected_delete_markers
+        .iter()
+        .map(|key| (*key).to_string())
+        .collect::<Vec<_>>();
+    expected_delete_markers.sort();
+
     for _ in 0..20 {
         let output = client.list_object_versions().bucket(bucket).send().await?;
-        if output.versions().len() == versions && output.delete_markers().len() == delete_markers {
+        let mut versions = output
+            .versions()
+            .iter()
+            .filter_map(|version| version.key().map(str::to_string))
+            .collect::<Vec<_>>();
+        versions.sort();
+        let mut delete_markers = output
+            .delete_markers()
+            .iter()
+            .filter_map(|marker| marker.key().map(str::to_string))
+            .collect::<Vec<_>>();
+        delete_markers.sort();
+        if versions == expected_versions && delete_markers == expected_delete_markers {
             return Ok(());
         }
         tokio::time::sleep(StdDuration::from_millis(250)).await;
     }
-    bail!("timed out waiting for {versions} versions and {delete_markers} delete markers");
+    bail!(
+        "timed out waiting for versions {expected_versions:?} and delete markers {expected_delete_markers:?}"
+    );
 }
 
 async fn wait_for_multipart_uploads(
@@ -260,6 +291,39 @@ async fn wait_for_multipart_uploads(
         tokio::time::sleep(StdDuration::from_millis(250)).await;
     }
     bail!("timed out waiting for {uploads} multipart uploads");
+}
+
+/// Asserts an `x-amz-expiration` header has the expected rule and expiry window.
+fn assert_expiration_header(
+    value: &str,
+    rule_id: &str,
+    request_started_at: OffsetDateTime,
+    days: i64,
+) -> Result<()> {
+    let (expires_at, actual_rule_id) = parse_expiration_header(value)?;
+    assert_eq!(actual_rule_id, rule_id);
+    let earliest = request_started_at + Duration::days(days) - Duration::seconds(1);
+    let latest = OffsetDateTime::now_utc() + Duration::days(days) + Duration::seconds(2);
+    assert!(
+        expires_at >= earliest && expires_at <= latest,
+        "expiration {expires_at} outside expected window {earliest}..={latest}"
+    );
+    Ok(())
+}
+
+/// Parses the `x-amz-expiration` header shape emitted by S3 object reads.
+fn parse_expiration_header(value: &str) -> Result<(OffsetDateTime, String)> {
+    let value = value
+        .strip_prefix("expiry-date=\"")
+        .context("missing expiry-date prefix")?;
+    let (expires_at, rule_id) = value
+        .split_once("\", rule-id=\"")
+        .context("missing rule-id separator")?;
+    let rule_id = rule_id
+        .strip_suffix('"')
+        .context("missing rule-id suffix")?
+        .to_string();
+    Ok((OffsetDateTime::parse(expires_at, &Rfc2822)?, rule_id))
 }
 
 async fn put_text_object(client: &aws_sdk_s3::Client, bucket: &str, key: &str) -> Result<()> {
@@ -512,7 +576,7 @@ async fn test_lifecycle_expiration_versioning_enabled() -> Result<()> {
     )
     .await?;
 
-    wait_for_version_counts(&client, &bucket, 1, 1).await?;
+    wait_for_version_keys(&client, &bucket, &["test1/a"], &["test1/a"]).await?;
 
     Ok(())
 }
@@ -654,9 +718,9 @@ async fn test_lifecycle_expiration_noncur_tags1() -> Result<()> {
         .build()?;
     put_lifecycle(&client, &bucket, vec![rule]).await?;
 
-    wait_for_version_counts(&client, &bucket, 10, 0).await?;
+    wait_for_version_keys(&client, &bucket, &["myobject_"; 10], &[]).await?;
     age_noncurrent_versions(&server, &bucket, "myobject_", 5)?;
-    wait_for_version_counts(&client, &bucket, 1, 0).await?;
+    wait_for_version_keys(&client, &bucket, &["myobject_"], &[]).await?;
 
     Ok(())
 }
@@ -687,7 +751,7 @@ async fn test_lifecycle_expiration_newer_noncurrent() -> Result<()> {
     put_lifecycle(&client, &bucket, vec![rule]).await?;
 
     age_noncurrent_versions(&server, &bucket, "myobject_", 2)?;
-    wait_for_version_counts(&client, &bucket, 6, 0).await?;
+    wait_for_version_keys(&client, &bucket, &["myobject_"; 6], &[]).await?;
 
     Ok(())
 }
@@ -783,7 +847,7 @@ async fn test_lifecycle_id_too_long() -> Result<()> {
         .send()
         .await
         .expect_err("overlong lifecycle rule ID should fail");
-    assert_error_contains(&error, "InvalidRequest");
+    assert_error_code(&error, "InvalidArgument");
 
     Ok(())
 }
@@ -917,7 +981,7 @@ async fn test_lifecycle_expiration_days0() -> Result<()> {
         .send()
         .await
         .expect_err("zero lifecycle expiration days should fail");
-    assert_error_contains(&error, "InvalidRequest");
+    assert_error_code(&error, "InvalidArgument");
 
     Ok(())
 }
@@ -970,7 +1034,13 @@ async fn test_lifecycle_noncur_expiration() -> Result<()> {
     put_lifecycle(&client, &bucket, vec![rule]).await?;
 
     age_noncurrent_versions(&server, &bucket, "test1/a", 3)?;
-    wait_for_version_counts(&client, &bucket, 4, 0).await?;
+    wait_for_version_keys(
+        &client,
+        &bucket,
+        &["test1/a", "test2/abc", "test2/abc", "test2/abc"],
+        &[],
+    )
+    .await?;
 
     Ok(())
 }
@@ -1040,7 +1110,7 @@ async fn test_lifecycle_deletemarker_expiration() -> Result<()> {
     put_lifecycle(&client, &bucket, vec![rule]).await?;
 
     age_noncurrent_versions(&server, &bucket, "test1/a", 2)?;
-    wait_for_version_counts(&client, &bucket, 1, 1).await?;
+    wait_for_version_keys(&client, &bucket, &["test2/abc"], &["test2/abc"]).await?;
 
     Ok(())
 }
@@ -1077,9 +1147,9 @@ async fn test_lifecycle_deletemarker_expiration_with_days_tag() -> Result<()> {
     put_lifecycle(&client, &bucket, vec![rule]).await?;
 
     age_noncurrent_versions(&server, &bucket, "test1/a", 2)?;
-    wait_for_version_counts(&client, &bucket, 0, 1).await?;
+    wait_for_version_keys(&client, &bucket, &[], &["test1/a"]).await?;
     age_keys(&server, &bucket, &["test1/a"], 6)?;
-    wait_for_version_counts(&client, &bucket, 0, 0).await?;
+    wait_for_version_keys(&client, &bucket, &[], &[]).await?;
 
     Ok(())
 }
@@ -1227,18 +1297,22 @@ async fn test_lifecycle_expiration_header_put() -> Result<()> {
         vec![expiration_rule("expire-put", "foo/", 1)?],
     )
     .await?;
-    client
+    let request_started_at = OffsetDateTime::now_utc();
+    let response = client
         .put_object()
         .bucket(&bucket)
         .key(key)
         .body(ByteStream::from_static(b"body"))
         .send()
         .await?;
+    let expiration = response
+        .expiration()
+        .context("missing PutObject expiration header")?;
+    assert_expiration_header(expiration, "expire-put", request_started_at, 1)?;
 
     let response = client.get_object().bucket(&bucket).key(key).send().await?;
     let expiration = response.expiration().context("missing expiration header")?;
-    assert!(expiration.contains("rule-id=\"expire-put\""));
-    assert!(expiration.contains("expiry-date=\""));
+    assert_expiration_header(expiration, "expire-put", request_started_at, 1)?;
 
     Ok(())
 }
@@ -1256,6 +1330,7 @@ async fn test_lifecycle_expiration_header_head() -> Result<()> {
         vec![expiration_rule("expire-head", "foo/", 1)?],
     )
     .await?;
+    let request_started_at = OffsetDateTime::now_utc();
     client
         .put_object()
         .bucket(&bucket)
@@ -1266,8 +1341,7 @@ async fn test_lifecycle_expiration_header_head() -> Result<()> {
 
     let response = client.head_object().bucket(&bucket).key(key).send().await?;
     let expiration = response.expiration().context("missing expiration header")?;
-    assert!(expiration.contains("rule-id=\"expire-head\""));
-    assert!(expiration.contains("expiry-date=\""));
+    assert_expiration_header(expiration, "expire-head", request_started_at, 1)?;
 
     Ok(())
 }
@@ -1290,6 +1364,7 @@ async fn test_lifecycle_expiration_header_tags_head() -> Result<()> {
         .build()?;
 
     put_lifecycle(&client, &bucket, vec![rule]).await?;
+    let request_started_at = OffsetDateTime::now_utc();
     client
         .put_object()
         .bucket(&bucket)
@@ -1301,7 +1376,7 @@ async fn test_lifecycle_expiration_header_tags_head() -> Result<()> {
 
     let response = client.head_object().bucket(&bucket).key(key).send().await?;
     let expiration = response.expiration().context("missing expiration header")?;
-    assert!(expiration.contains("rule-id=\"tag-head\""));
+    assert_expiration_header(expiration, "tag-head", request_started_at, 1)?;
 
     Ok(())
 }
@@ -1330,6 +1405,7 @@ async fn test_lifecycle_expiration_header_and_tags_head() -> Result<()> {
         .build()?;
 
     put_lifecycle(&client, &bucket, vec![rule]).await?;
+    let request_started_at = OffsetDateTime::now_utc();
     client
         .put_object()
         .bucket(&bucket)
@@ -1341,7 +1417,7 @@ async fn test_lifecycle_expiration_header_and_tags_head() -> Result<()> {
 
     let response = client.head_object().bucket(&bucket).key(key).send().await?;
     let expiration = response.expiration().context("missing expiration header")?;
-    assert!(expiration.contains("rule-id=\"and-head\""));
+    assert_expiration_header(expiration, "and-head", request_started_at, 1)?;
 
     Ok(())
 }

@@ -246,7 +246,7 @@ async fn test_set_cors() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_cors_origin_response() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_cors_origin_response
+    // Adapted from s3tests/functional/test_s3.py::test_cors_origin_response: uses s3ite owner-only auth instead of public ACL setup
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cors-origin");
@@ -480,7 +480,7 @@ async fn test_cors_origin_response() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_cors_origin_wildcard() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_cors_origin_wildcard
+    // Adapted from s3tests/functional/test_s3.py::test_cors_origin_wildcard: uses s3ite owner-only auth instead of public ACL setup
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cors-wildcard");
@@ -515,7 +515,7 @@ async fn test_cors_origin_wildcard() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_cors_header_option() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_cors_header_option
+    // Adapted from s3tests/functional/test_s3.py::test_cors_header_option: uses s3ite owner-only auth instead of public ACL setup
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cors-header");
@@ -561,7 +561,7 @@ async fn test_cors_header_option() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_cors_presigned_get_object() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_cors_presigned_get_object
+    // Adapted from s3tests/functional/test_s3.py::test_cors_presigned_get_object: uses s3ite owner-only auth instead of public ACL setup
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cors-presign-get");
@@ -588,7 +588,7 @@ async fn test_cors_presigned_get_object() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_cors_presigned_put_object() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_cors_presigned_put_object
+    // Adapted from s3tests/functional/test_s3.py::test_cors_presigned_put_object: uses s3ite owner-only auth instead of public ACL setup
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cors-presign-put");
@@ -606,7 +606,7 @@ async fn test_cors_presigned_put_object() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_cors_presigned_put_object_with_acl() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_cors_presigned_put_object_with_acl
+    // Adapted from s3tests/functional/test_s3.py::test_cors_presigned_put_object_with_acl: uses s3ite owner-only auth instead of public ACL setup
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cors-presign-put-acl");

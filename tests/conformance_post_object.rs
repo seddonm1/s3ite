@@ -4,9 +4,10 @@
 //! `cargo test --test conformance_post_object`, or set
 //! `S3ITE_TEST_BIN` to an existing binary path.
 //!
-//! Tests whose names match `test_post_object_*` are direct conversions from
-//! `s3tests/functional/test_s3.py`. Extra s3ite coverage uses an `s3ite_`
-//! prefix so it does not masquerade as a 1:1 upstream conversion.
+//! Tests whose names match `test_post_object_*` are conversions from
+//! `s3tests/functional/test_s3.py`, with per-test comments marking exact
+//! mirrors or adapted SigV4 form-flow ports. Extra s3ite coverage uses an
+//! `s3ite_` prefix so it does not masquerade as a 1:1 upstream conversion.
 //!
 //! Not directly converted: `test_post_object_anonymous_request` depends on
 //! anonymous/public ACL behavior that s3ite intentionally does not support, and
@@ -371,18 +372,22 @@ async fn assert_post_error(
 ) -> Result<()> {
     assert_eq!(response.status(), expected_status);
     let body = response.text().await?;
-    assert!(
-        body.contains(expected_code),
-        "expected POST error body to contain {expected_code:?}, got {body}"
-    );
+    assert_eq!(xml_error_code(&body), Some(expected_code), "got {body}");
     Ok(())
+}
+
+/// Extracts the first S3 XML error code from a POST response body.
+fn xml_error_code(body: &str) -> Option<&str> {
+    body.split("<Code>")
+        .nth(1)
+        .and_then(|value| value.split("</Code>").next())
 }
 
 /// Verifies signed browser-form POST uploads create ordinary readable objects.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_authenticated_request() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_authenticated_request
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_authenticated_request: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post");
@@ -401,7 +406,7 @@ async fn test_post_object_authenticated_request() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_authenticated_no_content_type() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_authenticated_no_content_type
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_authenticated_no_content_type: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-no-ct");
@@ -419,7 +424,7 @@ async fn test_post_object_authenticated_no_content_type() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_authenticated_request_bad_access_key() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_authenticated_request_bad_access_key
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_authenticated_request_bad_access_key: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-bad-access");
@@ -444,7 +449,7 @@ async fn test_post_object_authenticated_request_bad_access_key() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_upload_larger_than_chunk() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_upload_larger_than_chunk
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_upload_larger_than_chunk: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-large");
@@ -470,7 +475,7 @@ async fn test_post_object_upload_larger_than_chunk() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_upload_size_rgw_chunk_size_bug() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_upload_size_rgw_chunk_size_bug
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_upload_size_rgw_chunk_size_bug: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-rgw-chunk");
@@ -499,7 +504,7 @@ async fn test_post_object_upload_size_rgw_chunk_size_bug() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_user_specified_header() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_user_specified_header
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_user_specified_header: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-meta");
@@ -530,7 +535,7 @@ async fn test_post_object_user_specified_header() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_tags_authenticated_request() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_tags_authenticated_request
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_tags_authenticated_request: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-tags");
@@ -581,7 +586,7 @@ async fn test_post_object_tags_authenticated_request() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_upload_checksum() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_upload_checksum
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_upload_checksum: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-checksum");
@@ -616,10 +621,11 @@ async fn test_post_object_upload_checksum() -> Result<()> {
         body.as_slice()
     );
 
+    let bad_body = b"y".repeat(2 * 1024 * 1024);
     let response = send_signed_post(
         &server,
         &bucket,
-        PostFormOptions::new(key, &body)
+        PostFormOptions::new(key, &bad_body)
             .extra_fields(vec![
                 field("content-type", "text/plain"),
                 field("x-amz-checksum-sha256", "sailorjerry"),
@@ -627,7 +633,8 @@ async fn test_post_object_upload_checksum() -> Result<()> {
             .content_length_range(0, 5 * 1024 * 1024),
     )
     .await?;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_post_error(response, StatusCode::BAD_REQUEST, "BadDigest").await?;
+    assert_eq!(get_object_bytes(&client, &bucket, key).await?, body);
 
     Ok(())
 }
@@ -636,7 +643,7 @@ async fn test_post_object_upload_checksum() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_sse_s3_default_post_object_authenticated_request() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_sse_s3_default_post_object_authenticated_request
+    // Adapted from s3tests/functional/test_s3.py::test_sse_s3_default_post_object_authenticated_request: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = spawn_sse_server().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-default-sse");
@@ -774,7 +781,7 @@ async fn s3ite_post_object_object_lock_headers() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_ignored_header() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_ignored_header
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_ignored_header: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-ignore");
@@ -802,7 +809,7 @@ async fn test_post_object_ignored_header() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_case_insensitive_condition_fields() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_case_insensitive_condition_fields
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_case_insensitive_condition_fields: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-case-fields");
@@ -835,7 +842,7 @@ async fn test_post_object_case_insensitive_condition_fields() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_escaped_field_values() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_escaped_field_values
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_escaped_field_values: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-escaped");
@@ -858,7 +865,7 @@ async fn test_post_object_escaped_field_values() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_request_missing_policy_specified_field() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_request_missing_policy_specified_field
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_request_missing_policy_specified_field: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-missing-field");
@@ -883,7 +890,7 @@ async fn test_post_object_request_missing_policy_specified_field() -> Result<()>
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_invalid_request_field_value() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_invalid_request_field_value
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_invalid_request_field_value: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-field-value");
@@ -911,7 +918,7 @@ async fn test_post_object_invalid_request_field_value() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_upload_size_limit_exceeded() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_upload_size_limit_exceeded
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_upload_size_limit_exceeded: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-range-max");
@@ -934,7 +941,7 @@ async fn test_post_object_upload_size_limit_exceeded() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_upload_size_below_minimum() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_upload_size_below_minimum
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_upload_size_below_minimum: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-range-min");
@@ -957,7 +964,7 @@ async fn test_post_object_upload_size_below_minimum() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_invalid_signature() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_invalid_signature
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_invalid_signature: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-sig");
@@ -981,7 +988,7 @@ async fn test_post_object_invalid_signature() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_invalid_access_key() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_invalid_access_key
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_invalid_access_key: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-invalid-access");
@@ -1007,7 +1014,7 @@ async fn test_post_object_invalid_access_key() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_invalid_date_format() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_invalid_date_format
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_invalid_date_format: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-date-format");
@@ -1069,7 +1076,7 @@ async fn s3ite_post_object_success_status_200() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_set_success_code() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_set_success_code
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_set_success_code: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-201");
@@ -1101,7 +1108,7 @@ async fn test_post_object_set_success_code() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_set_invalid_success_code() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_set_invalid_success_code
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_set_invalid_success_code: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-404");
@@ -1125,7 +1132,7 @@ async fn test_post_object_set_invalid_success_code() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_condition_is_case_sensitive() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_condition_is_case_sensitive
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_condition_is_case_sensitive: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-cond-case");
@@ -1161,7 +1168,7 @@ async fn test_post_object_condition_is_case_sensitive() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_expires_is_case_sensitive() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_expires_is_case_sensitive
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_expires_is_case_sensitive: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-exp-case");
@@ -1197,7 +1204,7 @@ async fn test_post_object_expires_is_case_sensitive() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_expired_policy() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_expired_policy
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_expired_policy: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-expired");
@@ -1233,7 +1240,7 @@ async fn test_post_object_expired_policy() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_wrong_bucket() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_wrong_bucket
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_wrong_bucket: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-right-bucket");
@@ -1258,7 +1265,7 @@ async fn test_post_object_wrong_bucket() -> Result<()> {
             .custom_policy(post_policy(conditions)),
     )
     .await?;
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_post_error(response, StatusCode::FORBIDDEN, "InvalidPolicyDocument").await?;
     assert_object_absent(&client, &bucket, key).await?;
     assert_object_absent(&client, &bad_bucket, key).await?;
 
@@ -1269,7 +1276,7 @@ async fn test_post_object_wrong_bucket() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_success_redirect_action() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_success_redirect_action
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_success_redirect_action: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-redirect");
@@ -1343,7 +1350,7 @@ async fn s3ite_post_object_malformed_form_fails_without_write() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_no_key_specified() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_no_key_specified
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_no_key_specified: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-no-key");
@@ -1367,7 +1374,7 @@ async fn test_post_object_no_key_specified() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_missing_signature() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_missing_signature
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_missing_signature: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-no-sig");
@@ -1382,7 +1389,7 @@ async fn test_post_object_missing_signature() -> Result<()> {
             .omit_signature(),
     )
     .await?;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_post_error(response, StatusCode::BAD_REQUEST, "AccessDenied").await?;
     assert_object_absent(&client, &bucket, key).await?;
 
     Ok(())
@@ -1392,7 +1399,7 @@ async fn test_post_object_missing_signature() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_missing_policy_condition() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_missing_policy_condition
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_missing_policy_condition: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-miss-cond");
@@ -1422,7 +1429,7 @@ async fn test_post_object_missing_policy_condition() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_missing_expires_condition() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_missing_expires_condition
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_missing_expires_condition: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-no-exp");
@@ -1455,7 +1462,7 @@ async fn test_post_object_missing_expires_condition() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_missing_conditions_list() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_missing_conditions_list
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_missing_conditions_list: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-no-conditions");
@@ -1480,7 +1487,7 @@ async fn test_post_object_missing_conditions_list() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_empty_conditions() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_empty_conditions
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_empty_conditions: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-empty");
@@ -1505,7 +1512,7 @@ async fn test_post_object_empty_conditions() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_missing_content_length_argument() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_missing_content_length_argument
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_missing_content_length_argument: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-short-range");
@@ -1538,7 +1545,7 @@ async fn test_post_object_missing_content_length_argument() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_post_object_invalid_content_length_argument() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_post_object_invalid_content_length_argument
+    // Adapted from s3tests/functional/test_s3.py::test_post_object_invalid_content_length_argument: uses s3ite SigV4 POST form path instead of Ceph SigV2 form fields
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-invalid-range");

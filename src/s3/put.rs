@@ -5,17 +5,17 @@ use std::collections::HashMap;
 use super::sse::ActiveSse;
 use super::{
     CONTENT_MD5, ChecksumInput, ChecksumPolicy, ChecksumTypeKind, Digest, ETag, KeyMetadata,
-    KeyValue, Md5, Not, ObjectAclRequest, ObjectWriteConditions, OffsetDateTime, PutObjectInput,
-    PutObjectOutput, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, Sqlite, StorageClass,
-    StoredChecksum, StoredObjectLock, StoredTag, StreamingBlob, TryStreamExt, checksum_crc32,
-    checksum_crc32c, checksum_crc64nvme, checksum_sha1, checksum_sha256, checksum_type_output,
-    copy_bytes, finish_payload_checksum, hex, load_bucket_object_lock_config,
-    normalize_content_encoding, normalize_metadata, object_lock_for_new_version,
-    object_lock_write_headers, object_write_conditions, payload_checksum_accumulator,
-    read_object_body_encrypted, requested_sse_s3, resolve_write_encryption, s3_error,
-    s3_error_from_sqlite, sse_s3_output, stored_tags_from_header, validate_content_md5,
-    validate_declared_object_write_length, validate_expected_bucket_owner,
-    validate_no_unsupported_sse_headers, validate_object_acl,
+    KeyValue, LifecycleExpirationHeader, Md5, Not, ObjectAclRequest, ObjectWriteConditions,
+    OffsetDateTime, PutObjectInput, PutObjectOutput, S3Error, S3ErrorCode, S3Request, S3Response,
+    S3Result, Sqlite, StorageClass, StoredChecksum, StoredObjectLock, StoredTag, StreamingBlob,
+    TryStreamExt, checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_sha1,
+    checksum_sha256, checksum_type_output, copy_bytes, finish_payload_checksum, hex,
+    load_bucket_object_lock_config, normalize_content_encoding, normalize_metadata,
+    object_lock_for_new_version, object_lock_write_headers, object_write_conditions,
+    payload_checksum_accumulator, read_object_body_encrypted, requested_sse_s3,
+    resolve_write_encryption, s3_error, s3_error_from_sqlite, sse_s3_output,
+    stored_tags_from_header, validate_content_md5, validate_declared_object_write_length,
+    validate_expected_bucket_owner, validate_no_unsupported_sse_headers, validate_object_acl,
 };
 
 /// Fully buffered object body plus hashes needed by the storage write.
@@ -142,12 +142,17 @@ fn put_object_output(
     md5: String,
     checksum: &StoredChecksum,
     version_id: Option<String>,
+    expiration: Option<LifecycleExpirationHeader>,
     encrypted: bool,
-) -> PutObjectOutput {
+) -> S3Result<PutObjectOutput> {
     let checksum_type = checksum_type_output(checksum);
-    PutObjectOutput {
+    let expiration = expiration
+        .map(|expiration| expiration.to_header_value())
+        .transpose()?;
+    Ok(PutObjectOutput {
         e_tag: Some(ETag::Strong(md5)),
         version_id,
+        expiration,
         checksum_crc32: checksum_crc32(checksum),
         checksum_crc32c: checksum_crc32c(checksum),
         checksum_crc64nvme: checksum_crc64nvme(checksum),
@@ -156,7 +161,7 @@ fn put_object_output(
         checksum_type,
         server_side_encryption: sse_s3_output(encrypted),
         ..Default::default()
-    }
+    })
 }
 
 /// Reads, encrypts, and writes a `PutObject` body as encoded encrypted chunks.
@@ -202,9 +207,10 @@ async fn put_encrypted_object(
         .get_connection(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
-    let write_outcome = connection
+    let (write_outcome, expiration) = connection
         .write(move |transaction| {
             Sqlite::check_object_write_conditions(transaction, &key, &write_conditions)?;
+            let last_modified = OffsetDateTime::now_utc();
             let outcome = Sqlite::put_object_with_encoded_chunks(
                 transaction,
                 &key,
@@ -216,7 +222,7 @@ async fn put_encrypted_object(
                     content_encoding,
                     cache_control,
                     expires,
-                    last_modified: OffsetDateTime::now_utc(),
+                    last_modified,
                     md5: Some(md5_clone),
                     checksum: Some(checksum_clone),
                     stored_sse: stored_encryption,
@@ -227,17 +233,26 @@ async fn put_encrypted_object(
                 chunks,
             )?;
             Sqlite::replace_object_tags(transaction, outcome.sequence, &tags)?;
-            Ok(outcome)
+            let expiration = Sqlite::lifecycle_expiration_for_object(
+                transaction,
+                &key,
+                &outcome.version_id,
+                size,
+                last_modified,
+            )?
+            .map(LifecycleExpirationHeader::from);
+            Ok((outcome, expiration))
         })
         .await
         .map_err(s3_error_from_sqlite)?;
 
-    Ok(put_object_output(
+    put_object_output(
         md5,
         &checksum,
         write_outcome.returned_version_id,
+        expiration,
         true,
-    ))
+    )
 }
 
 /// Reads and writes a plain buffered `PutObject` body.
@@ -274,9 +289,11 @@ async fn put_plain_object(
         .get_connection(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
-    let write_outcome = connection
+    let (write_outcome, expiration) = connection
         .write(move |transaction| {
             Sqlite::check_object_write_conditions(transaction, &key, &write_conditions)?;
+            let last_modified = OffsetDateTime::now_utc();
+            let key_for_expiration = key.clone();
             let outcome = Sqlite::put_object_with_chunk_size(
                 transaction,
                 KeyValue {
@@ -290,7 +307,7 @@ async fn put_plain_object(
                         content_encoding,
                         cache_control,
                         expires,
-                        last_modified: OffsetDateTime::now_utc(),
+                        last_modified,
                         md5: Some(md5_clone),
                         checksum: Some(checksum_clone),
                         stored_sse: None,
@@ -302,17 +319,26 @@ async fn put_plain_object(
                 chunk_size,
             )?;
             Sqlite::replace_object_tags(transaction, outcome.sequence, &tags)?;
-            Ok(outcome)
+            let expiration = Sqlite::lifecycle_expiration_for_object(
+                transaction,
+                &key_for_expiration,
+                &outcome.version_id,
+                size,
+                last_modified,
+            )?
+            .map(LifecycleExpirationHeader::from);
+            Ok((outcome, expiration))
         })
         .await
         .map_err(s3_error_from_sqlite)?;
 
-    Ok(put_object_output(
+    put_object_output(
         md5,
         &checksum,
         write_outcome.returned_version_id,
+        expiration,
         false,
-    ))
+    )
 }
 
 /// Dispatches a normalized object write to the encrypted or plain storage path.

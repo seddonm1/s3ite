@@ -25,10 +25,11 @@ use tower::{Layer, Service};
 ///
 /// This layer keeps client quirks that are independent of storage operations in
 /// one place: presigned expiry bounds, `SigV2` header edge cases, the
-/// `CreateBucket` `SigV2` trailing-slash canonical-resource mismatch, and the
-/// `GetObjectAttributes` `ETag` XML shape. `s3s` remains the primary request
-/// router and signer; this layer only adjusts cases where supported clients or
-/// conformance tests expect AWS-compatible behavior before or after that path.
+/// `CreateBucket` `SigV2` trailing-slash canonical-resource mismatch, user
+/// metadata header decoding, and small serialized response-shape fixes. `s3s`
+/// remains the primary request router and signer; this layer only adjusts cases
+/// where supported clients or conformance tests expect AWS-compatible behavior
+/// before or after that path.
 #[derive(Clone, Debug)]
 pub(crate) struct HeaderAuthCompatLayer {
     secret_key: Option<Arc<str>>,
@@ -87,6 +88,7 @@ where
 
         let rewrite_object_attributes = is_get_object_attributes(&req);
         let rewrite_post_policy_condition = is_post_object_form(&req);
+        let rewrite_object_lock_invalid_retention = is_put_object_lock_configuration(&req);
         if let Some(response) = sig_v2_header_compat(&mut req, self.secret_key.as_deref()) {
             return Box::pin(async move { Ok(response) });
         }
@@ -94,8 +96,12 @@ where
         let future = self.inner.call(req);
         Box::pin(async move {
             let mut response = future.await?;
+            response = rewrite_metadata_headers(response);
             if rewrite_post_policy_condition {
                 response = rewrite_post_policy_condition_status(response).await?;
+            }
+            if rewrite_object_lock_invalid_retention {
+                response = rewrite_invalid_retention_period_code(response).await?;
             }
             if rewrite_object_attributes {
                 rewrite_get_object_attributes_etag(response).await
@@ -129,6 +135,135 @@ fn is_post_object_form<B>(req: &Request<B>) -> bool {
                 .next()
                 .is_some_and(|media_type| media_type.eq_ignore_ascii_case("multipart/form-data"))
         })
+}
+
+/// Detects `PutObjectLockConfiguration` requests before `s3s` routes them.
+fn is_put_object_lock_configuration<B>(req: &Request<B>) -> bool {
+    req.method() == Method::PUT
+        && req.uri().query().is_some_and(|query| {
+            query.split('&').any(|pair| {
+                pair == "object-lock"
+                    || pair
+                        .split_once('=')
+                        .is_some_and(|(name, _)| name == "object-lock")
+            })
+        })
+}
+
+/// Decodes RFC 2047 user metadata headers before SDK clients observe them.
+fn rewrite_metadata_headers(mut response: HttpResponse) -> HttpResponse {
+    let updates = response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            name.as_str().starts_with("x-amz-meta-").then(|| {
+                let value = value.to_str().ok()?;
+                let decoded = decode_rfc2047_header_value(value)?;
+                let decoded = HeaderValue::from_bytes(decoded.as_bytes()).ok()?;
+                Some((name.clone(), decoded))
+            })?
+        })
+        .collect::<Vec<_>>();
+
+    for (name, value) in updates {
+        response.headers_mut().insert(name, value);
+    }
+    response
+}
+
+/// Decodes one supported RFC 2047 header word.
+fn decode_rfc2047_header_value(value: &str) -> Option<String> {
+    let encoded = value.strip_prefix("=?")?.strip_suffix("?=")?;
+    let mut parts = encoded.splitn(3, '?');
+    let charset = parts.next()?;
+    let encoding = parts.next()?;
+    let payload = parts.next()?;
+    if !charset.eq_ignore_ascii_case("utf-8") && !charset.eq_ignore_ascii_case("us-ascii") {
+        return None;
+    }
+
+    let bytes = match encoding {
+        encoding if encoding.eq_ignore_ascii_case("b") => base64_decode(payload)?,
+        encoding if encoding.eq_ignore_ascii_case("q") => decode_rfc2047_q(payload)?,
+        _ => return None,
+    };
+    String::from_utf8(bytes).ok()
+}
+
+/// Decodes the RFC 2047 quoted-printable subset used by S3 SDK metadata.
+fn decode_rfc2047_q(payload: &str) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(payload.len());
+    let mut iter = payload.as_bytes().iter().copied();
+    while let Some(byte) = iter.next() {
+        match byte {
+            b'_' => bytes.push(b' '),
+            b'=' => {
+                let high = hex_digit(iter.next()?)?;
+                let low = hex_digit(iter.next()?)?;
+                bytes.push((high << 4) | low);
+            }
+            byte => bytes.push(byte),
+        }
+    }
+    Some(bytes)
+}
+
+/// Converts one ASCII hexadecimal digit into its numeric value.
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Rewrites the serialized Object Lock default-retention error code.
+async fn rewrite_invalid_retention_period_code(
+    response: HttpResponse,
+) -> Result<HttpResponse, HttpError> {
+    rewrite_xml_error_code(
+        response,
+        StatusCode::BAD_REQUEST,
+        "InvalidRequest",
+        "InvalidRetentionPeriod",
+        "InvalidRetentionPeriod",
+    )
+    .await
+}
+
+/// Rewrites a targeted serialized S3 XML error code while preserving the body otherwise.
+async fn rewrite_xml_error_code(
+    response: HttpResponse,
+    status: StatusCode,
+    from: &str,
+    to: &str,
+    marker: &str,
+) -> Result<HttpResponse, HttpError> {
+    if response.status() != status {
+        return Ok(response);
+    }
+
+    let (mut parts, body) = response.into_parts();
+    let bytes = body.collect().await.map_err(HttpError::new)?.to_bytes();
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return Ok(HttpResponse::from_parts(parts, Body::from(bytes)));
+    };
+    if !text.contains(marker) {
+        return Ok(HttpResponse::from_parts(parts, Body::from(bytes)));
+    }
+
+    let text = text.replace(
+        &format!("<Code>{from}</Code>"),
+        &format!("<Code>{to}</Code>"),
+    );
+    let content_length = text
+        .len()
+        .to_string()
+        .parse()
+        .map_err(|err| HttpError::new(Box::new(err)))?;
+    parts.headers.insert(CONTENT_LENGTH, content_length);
+    Ok(HttpResponse::from_parts(parts, Body::from(text)))
 }
 
 /// Maps POST Object response statuses to the Ceph/AWS-compatible shape.
@@ -434,6 +569,12 @@ fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; 20] {
     outer.finalize()
 }
 
+/// Decodes bytes with the standard base64 alphabet used by RFC 2047 metadata words.
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.decode(input).ok()
+}
+
 /// Encodes bytes with the standard base64 alphabet used by `SigV2`.
 fn base64_encode(input: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -546,6 +687,40 @@ mod tests {
             .map_err(HttpError::new)?
             .to_bytes();
         assert_eq!(bytes.as_ref(), &[0xff, b'"']);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rewrites_rfc2047_user_metadata_headers() {
+        let mut response = HttpResponse::new(Body::empty());
+        response.headers_mut().insert(
+            "x-amz-meta-meta1",
+            HeaderValue::from_static("=?UTF-8?B?SGVsbG8gV29ybGTDqQ==?="),
+        );
+
+        let response = rewrite_metadata_headers(response);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-amz-meta-meta1")
+                .map(HeaderValue::as_bytes),
+            Some("Hello World\u{e9}".as_bytes())
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrites_object_lock_invalid_retention_error_code() -> Result<(), HttpError> {
+        let mut response = HttpResponse::new(Body::from(
+            "<Error><Code>InvalidRequest</Code><Message>InvalidRetentionPeriod: retention period must be positive</Message></Error>"
+                .to_string(),
+        ));
+        *response.status_mut() = StatusCode::BAD_REQUEST;
+
+        let response = rewrite_invalid_retention_period_code(response).await?;
+        let body = response_body_text(response).await?;
+        assert!(body.contains("<Code>InvalidRetentionPeriod</Code>"));
+        assert!(!body.contains("<Code>InvalidRequest</Code>"));
 
         Ok(())
     }

@@ -10,7 +10,9 @@ from pathlib import Path
 
 TEST_ATTR = re.compile(r"^\s*#\[(?:tokio::test|test)\]")
 TEST_FN = re.compile(r"\b(?:async\s+)?fn\s+([A-Za-z0-9_]+)\s*\(")
-MIRROR = re.compile(r"Mirrors s3tests/functional/test_s3\.py::([^\s]+)")
+SOURCE_COMMENT = re.compile(
+    r"(Mirrors|Adapted from) s3tests/functional/test_s3\.py::([^\s:]+)(?::\s*(.+))?"
+)
 SUPPORTED_COPY_ENCRYPTIONS = ("unencrypted", "sse-s3")
 SUPPORTED_COPY_SIZES = (1, 1024, 1024 * 1024, 8 * 1024 * 1024)
 SUPPORTED_COPY_PART_SIZE = 8 * 1024 * 1024
@@ -21,7 +23,7 @@ REQUIRED_SINGLE_TEST_PORTS = (
 )
 
 
-MirrorRecord = tuple[str, Path, int, str]
+SourceRecord = tuple[str, str, Path, int, str]
 
 
 def is_parametrized_mirror(mirror: str) -> bool:
@@ -42,10 +44,10 @@ def required_mirror_comments() -> set[str]:
     return required
 
 
-def audit_file(path: Path, display_path: Path) -> tuple[list[str], list[MirrorRecord]]:
+def audit_file(path: Path, display_path: Path) -> tuple[list[str], list[SourceRecord]]:
     lines = path.read_text(encoding="utf-8").splitlines()
     errors: list[str] = []
-    mirror_records: list[MirrorRecord] = []
+    source_records: list[SourceRecord] = []
     index = 0
     while index < len(lines):
         if not TEST_ATTR.match(lines[index]):
@@ -65,58 +67,64 @@ def audit_file(path: Path, display_path: Path) -> tuple[list[str], list[MirrorRe
             index += 1
             continue
 
-        mirrors: list[str] = []
+        sources: list[tuple[str, str, str | None, int]] = []
         for cursor in range(fn_line, min(fn_line + 12, len(lines))):
-            match = MIRROR.search(lines[cursor])
+            match = SOURCE_COMMENT.search(lines[cursor])
             if match:
-                mirrors.append(match.group(1))
+                sources.append(
+                    (match.group(1), match.group(2), match.group(3), cursor + 1)
+                )
             if cursor > fn_line and TEST_FN.search(lines[cursor]):
                 break
 
-        if not mirrors:
+        if not sources:
             if not fn_name.startswith("s3ite_"):
                 errors.append(
-                    f"{display_path}:{fn_line}: {fn_name} has no Ceph mirror comment or s3ite_ prefix"
+                    f"{display_path}:{fn_line}: {fn_name} has no Ceph source comment or s3ite_ prefix"
                 )
-        elif len(mirrors) > 1:
+        elif len(sources) > 1:
             errors.append(
-                f"{display_path}:{fn_line}: {fn_name} has multiple Ceph mirror comments"
+                f"{display_path}:{fn_line}: {fn_name} has multiple Ceph source comments"
             )
         else:
-            mirror = mirrors[0]
-            mirror_records.append((mirror, display_path, fn_line, fn_name))
-            if not is_parametrized_mirror(mirror) and mirror != fn_name:
+            kind, source, reason, comment_line = sources[0]
+            source_records.append((kind, source, display_path, fn_line, fn_name))
+            if kind == "Adapted from" and not reason:
                 errors.append(
-                    f"{display_path}:{fn_line}: {fn_name} mirrors {mirror}; non-parametrized mirrors must use the Ceph name"
+                    f"{display_path}:{comment_line}: {fn_name} adapted source comment needs a reason"
+                )
+            if kind == "Mirrors" and not is_parametrized_mirror(source) and source != fn_name:
+                errors.append(
+                    f"{display_path}:{fn_line}: {fn_name} mirrors {source}; non-parametrized mirrors must use the Ceph name"
                 )
 
         index = fn_line
 
-    return errors, mirror_records
+    return errors, source_records
 
 
 def main() -> int:
     repo = Path(__file__).resolve().parents[1]
     errors: list[str] = []
-    mirror_records: list[MirrorRecord] = []
+    source_records: list[SourceRecord] = []
     for path in sorted((repo / "tests").glob("conformance_*.rs")):
-        file_errors, file_mirrors = audit_file(path, path.relative_to(repo))
+        file_errors, file_sources = audit_file(path, path.relative_to(repo))
         errors.extend(file_errors)
-        mirror_records.extend(file_mirrors)
+        source_records.extend(file_sources)
 
-    seen_mirrors: dict[str, MirrorRecord] = {}
-    for mirror, path, line, fn_name in mirror_records:
-        if mirror in seen_mirrors:
-            _, first_path, first_line, first_fn_name = seen_mirrors[mirror]
+    seen_sources: dict[str, SourceRecord] = {}
+    for kind, source, path, line, fn_name in source_records:
+        if source in seen_sources:
+            first_kind, _, first_path, first_line, first_fn_name = seen_sources[source]
             errors.append(
-                f"{path}:{line}: {fn_name} duplicates Ceph mirror {mirror}; first seen at {first_path}:{first_line} in {first_fn_name}"
+                f"{path}:{line}: {fn_name} duplicates Ceph source {source}; first seen as {first_kind} at {first_path}:{first_line} in {first_fn_name}"
             )
         else:
-            seen_mirrors[mirror] = (mirror, path, line, fn_name)
+            seen_sources[source] = (kind, source, path, line, fn_name)
 
-    mirrored = {mirror for mirror, _, _, _ in mirror_records}
-    for missing in sorted(required_mirror_comments() - mirrored):
-        errors.append(f"tests: missing required Ceph mirror port {missing}")
+    sourced = {source for _, source, _, _, _ in source_records}
+    for missing in sorted(required_mirror_comments() - sourced):
+        errors.append(f"tests: missing required Ceph source port {missing}")
 
     object_lock = repo / "tests" / "conformance_object_lock.rs"
     object_lock_count = len(

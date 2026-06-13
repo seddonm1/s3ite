@@ -31,7 +31,7 @@ const SHARED_CONTENT: &[u8] = b"shared through a presigned URL";
 #[tokio::test]
 #[serial(conformance)]
 async fn test_object_raw_authenticated() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_object_raw_authenticated
+    // Adapted from s3tests/functional/test_s3.py::test_object_raw_authenticated: uses s3ite owner-only auth instead of public ACL setup
     let (_server, client, bucket) = shared_object().await?;
 
     let signed = client
@@ -64,7 +64,7 @@ async fn s3ite_owner_unsigned_get_denied() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_object_raw_get_x_amz_expires_not_expired() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_not_expired
+    // Adapted from s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_not_expired: uses s3ite owner-only auth instead of public ACL setup
     let (_server, client, bucket) = shared_object().await?;
     let presigned = client
         .get_object()
@@ -83,7 +83,7 @@ async fn test_object_raw_get_x_amz_expires_not_expired() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_object_raw_get_x_amz_expires_out_range_zero() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_out_range_zero
+    // Adapted from s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_out_range_zero: uses s3ite owner-only auth instead of public ACL setup
     let (_server, client, bucket) = shared_object().await?;
     let presigned = client
         .get_object()
@@ -105,7 +105,7 @@ async fn test_object_raw_get_x_amz_expires_out_range_zero() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_object_raw_get_x_amz_expires_out_max_range() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_out_max_range
+    // Adapted from s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_out_max_range: uses s3ite owner-only auth instead of public ACL setup
     let (_server, client, bucket) = shared_object().await?;
     let presigned = client
         .get_object()
@@ -127,7 +127,7 @@ async fn test_object_raw_get_x_amz_expires_out_max_range() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_object_raw_get_x_amz_expires_out_positive_range() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_out_positive_range
+    // Adapted from s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_out_positive_range: uses s3ite owner-only auth instead of public ACL setup
     let (_server, client, bucket) = shared_object().await?;
     let presigned = client
         .get_object()
