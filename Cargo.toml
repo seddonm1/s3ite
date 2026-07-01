@@ -99,4 +99,4 @@ strip = true
 cpus = ["x86-64", "x86-64-v2", "x86-64-v3", "x86-64-v4"]
 
 [package.metadata.multivers.aarch64]
-cpus = ["generic", "neoverse-n1", "neoverse-v1"]
+cpus = ["generic", "apple-a14"]
