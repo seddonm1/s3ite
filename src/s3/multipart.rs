@@ -341,7 +341,7 @@ struct UploadPartCopyRequest {
     access_key: Option<String>,
 }
 
-/// Normalizes an `UploadPartCopy` input into the local copy-part request shape.
+/// Normalizes `UploadPartCopy` input into storage-neutral source and destination identifiers.
 fn parse_upload_part_copy_request(
     input: UploadPartCopyInput,
     access_key: Option<String>,
@@ -382,7 +382,9 @@ fn parse_upload_part_copy_request(
         ));
     }
     let (source_bucket, source_key, source_version_id) = match copy_source {
-        CopySource::AccessPoint { .. } => return Err(s3_error(S3ErrorCode::NotImplemented)),
+        CopySource::AccessPoint { .. } | CopySource::Outpost { .. } => {
+            return Err(s3_error(S3ErrorCode::NotImplemented));
+        }
         CopySource::Bucket {
             bucket,
             key,
@@ -1761,12 +1763,15 @@ mod tests {
         }
     }
 
+    /// Builds an unsupported access point copy source for parser rejection tests.
     fn access_point_source() -> CopySource {
         CopySource::AccessPoint {
+            partition: "aws".into(),
             region: "us-east-1".into(),
             account_id: "123456789012".into(),
             access_point_name: "ap".into(),
             key: "key".into(),
+            version_id: None,
         }
     }
 

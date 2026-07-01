@@ -23,7 +23,7 @@ use aws_sdk_s3::types::{
     ChecksumMode, ObjectLockLegalHoldStatus, ObjectLockMode, ServerSideEncryption, Tag,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use reqwest::{Response, StatusCode, Url, header};
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -40,8 +40,6 @@ type HmacSha256 = Hmac<Sha256>;
 
 const REGION: &str = "us-east-1";
 const SERVICE: &str = "s3";
-const POST_DATE: &str = "20260609";
-const POST_AMZ_DATE: &str = "20260609T000000Z";
 const POST_EXPIRATION: &str = "2030-01-01T00:00:00.000Z";
 
 #[derive(Clone, Copy)]
@@ -50,9 +48,16 @@ struct ExtraField<'a> {
     value: &'a str,
 }
 
+/// Current SigV4 POST signing dates shared by policy fields and signatures.
+struct PostSigningContext {
+    date: String,
+    amz_date: String,
+}
+
 struct PostFormOptions<'a> {
     key: Option<&'a str>,
     file_body: Option<&'a [u8]>,
+    signing: PostSigningContext,
     extra_fields: Vec<ExtraField<'a>>,
     content_length_range: Option<(u64, u64)>,
     omit_policy_condition_for: Option<&'a str>,
@@ -64,10 +69,12 @@ struct PostFormOptions<'a> {
 }
 
 impl<'a> PostFormOptions<'a> {
+    /// Builds a signed POST form fixture using current UTC SigV4 date fields.
     fn new(key: &'a str, file_body: &'a [u8]) -> Self {
         Self {
             key: Some(key),
             file_body: Some(file_body),
+            signing: PostSigningContext::now(),
             extra_fields: Vec::new(),
             content_length_range: None,
             omit_policy_condition_for: None,
@@ -130,6 +137,26 @@ impl<'a> PostFormOptions<'a> {
     }
 }
 
+impl PostSigningContext {
+    /// Builds current UTC SigV4 POST date fields accepted by `s3s` clock-skew validation.
+    fn now() -> Self {
+        let now = time::OffsetDateTime::now_utc();
+        let date = format!(
+            "{:04}{:02}{:02}",
+            now.year(),
+            u8::from(now.month()),
+            now.day()
+        );
+        let amz_date = format!(
+            "{date}T{:02}{:02}{:02}Z",
+            now.hour(),
+            now.minute(),
+            now.second()
+        );
+        Self { date, amz_date }
+    }
+}
+
 fn field<'a>(name: &'a str, value: &'a str) -> ExtraField<'a> {
     ExtraField { name, value }
 }
@@ -140,15 +167,18 @@ fn tag_map(tags: &[Tag]) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn sigv4_credential(access_key: &str) -> String {
-    format!("{access_key}/{POST_DATE}/{REGION}/{SERVICE}/aws4_request")
+/// Builds the SigV4 credential scope used by POST policy fields.
+fn sigv4_credential(access_key: &str, signing: &PostSigningContext) -> String {
+    let date = &signing.date;
+    format!("{access_key}/{date}/{REGION}/{SERVICE}/aws4_request")
 }
 
-fn sigv4_auth_conditions(credential: &str) -> [Value; 3] {
+/// Builds policy conditions that require the generated SigV4 authentication fields.
+fn sigv4_auth_conditions(credential: &str, signing: &PostSigningContext) -> [Value; 3] {
     [
         json!(["eq", "$x-amz-algorithm", "AWS4-HMAC-SHA256"]),
         json!(["eq", "$x-amz-credential", credential]),
-        json!(["eq", "$x-amz-date", POST_AMZ_DATE]),
+        json!(["eq", "$x-amz-date", signing.amz_date]),
     ]
 }
 
@@ -166,13 +196,15 @@ fn post_policy_with_expiration(expiration: &str, conditions: Vec<Value>) -> Valu
     })
 }
 
+/// Builds the common POST policy conditions for bucket, auth, and optional key matching.
 fn base_policy_conditions(
     bucket: &str,
     credential: &str,
+    signing: &PostSigningContext,
     key_condition: Option<Value>,
 ) -> Vec<Value> {
     let mut conditions = vec![json!({ "bucket": bucket })];
-    conditions.extend(sigv4_auth_conditions(credential));
+    conditions.extend(sigv4_auth_conditions(credential, signing));
     if let Some(key_condition) = key_condition {
         conditions.push(key_condition);
     }
@@ -209,13 +241,14 @@ async fn send_post_body(
         .await?)
 }
 
+/// Builds a multipart form body and policy signature for a POST Object request.
 fn build_signed_post_body(
     server: &TestServer,
     bucket: &str,
     options: PostFormOptions<'_>,
 ) -> Result<(String, Vec<u8>)> {
     let access_key = options.access_key_override.unwrap_or(server.access_key());
-    let credential = sigv4_credential(access_key);
+    let credential = sigv4_credential(access_key, &options.signing);
     let mut fields = vec![
         ("bucket".to_string(), bucket.to_string()),
         (
@@ -223,7 +256,7 @@ fn build_signed_post_body(
             "AWS4-HMAC-SHA256".to_string(),
         ),
         ("x-amz-credential".to_string(), credential.clone()),
-        ("x-amz-date".to_string(), POST_AMZ_DATE.to_string()),
+        ("x-amz-date".to_string(), options.signing.amz_date.clone()),
     ];
 
     if let Some(key) = options.key {
@@ -239,7 +272,7 @@ fn build_signed_post_body(
         .map_or_else(|| build_policy(bucket, &credential, &fields, &options), Ok)?;
     let policy_json = serde_json::to_string(&policy)?;
     let policy_base64 = BASE64_STANDARD.encode(policy_json.as_bytes());
-    let signature = sign_post_policy(server.secret_key(), &policy_base64)?;
+    let signature = sign_post_policy(server.secret_key(), &policy_base64, &options.signing)?;
     fields.push(("policy".to_string(), policy_base64));
     if !options.omit_signature {
         fields.push((
@@ -261,6 +294,7 @@ fn build_signed_post_body(
     Ok((boundary, body))
 }
 
+/// Builds the default POST policy from submitted form fields and requested test options.
 fn build_policy(
     bucket: &str,
     credential: &str,
@@ -274,7 +308,7 @@ fn build_policy(
         json!({ "bucket": bucket }),
         json!(["eq", "$x-amz-algorithm", "AWS4-HMAC-SHA256"]),
         json!(["eq", "$x-amz-credential", credential]),
-        json!(["eq", "$x-amz-date", POST_AMZ_DATE]),
+        json!(["eq", "$x-amz-date", options.signing.amz_date]),
     ];
 
     for (name, value) in fields {
@@ -299,8 +333,16 @@ fn build_policy(
     }))
 }
 
-fn sign_post_policy(secret_key: &str, policy_base64: &str) -> Result<String> {
-    let date_key = hmac_sha256(format!("AWS4{secret_key}").as_bytes(), POST_DATE.as_bytes())?;
+/// Signs a base64-encoded POST policy with the SigV4 key derived from the test date.
+fn sign_post_policy(
+    secret_key: &str,
+    policy_base64: &str,
+    signing: &PostSigningContext,
+) -> Result<String> {
+    let date_key = hmac_sha256(
+        format!("AWS4{secret_key}").as_bytes(),
+        signing.date.as_bytes(),
+    )?;
     let region_key = hmac_sha256(&date_key, REGION.as_bytes())?;
     let service_key = hmac_sha256(&region_key, SERVICE.as_bytes())?;
     let signing_key = hmac_sha256(&service_key, b"aws4_request")?;
@@ -540,10 +582,12 @@ async fn test_post_object_tags_authenticated_request() -> Result<()> {
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-tags");
     let key = "foo.txt";
-    let credential = sigv4_credential(server.access_key());
+    let options = PostFormOptions::new(key, b"bar");
+    let credential = sigv4_credential(server.access_key(), &options.signing);
     let mut conditions = base_policy_conditions(
         &bucket,
         &credential,
+        &options.signing,
         Some(json!(["starts-with", "$key", "foo"])),
     );
     conditions.push(json!(["starts-with", "$Content-Type", "text/plain"]));
@@ -554,7 +598,7 @@ async fn test_post_object_tags_authenticated_request() -> Result<()> {
     let response = send_signed_post(
         &server,
         &bucket,
-        PostFormOptions::new(key, b"bar")
+        options
             .extra_fields(vec![
                 field("content-type", "text/plain"),
                 field("x-amz-tagging", "0=0&1=1"),
@@ -648,10 +692,12 @@ async fn test_sse_s3_default_post_object_authenticated_request() -> Result<()> {
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-default-sse");
     let key = "foo.txt";
-    let credential = sigv4_credential(server.access_key());
+    let options = PostFormOptions::new(key, b"bar");
+    let credential = sigv4_credential(server.access_key(), &options.signing);
     let mut conditions = base_policy_conditions(
         &bucket,
         &credential,
+        &options.signing,
         Some(json!(["starts-with", "$key", "foo"])),
     );
     conditions.push(json!(["starts-with", "$Content-Type", "text/plain"]));
@@ -668,7 +714,7 @@ async fn test_sse_s3_default_post_object_authenticated_request() -> Result<()> {
     let response = send_signed_post(
         &server,
         &bucket,
-        PostFormOptions::new(key, b"bar")
+        options
             .extra_fields(vec![field("content-type", "text/plain")])
             .custom_policy(post_policy(conditions)),
     )
@@ -814,20 +860,21 @@ async fn test_post_object_case_insensitive_condition_fields() -> Result<()> {
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-case-fields");
     let key = "foo.txt";
-    let credential = sigv4_credential(server.access_key());
+    let options = PostFormOptions::new(key, b"bar");
+    let credential = sigv4_credential(server.access_key(), &options.signing);
     let mut conditions = vec![
         json!({ "bUcKeT": bucket }),
         json!(["StArTs-WiTh", "$KeY", "foo"]),
         json!(["StArTs-WiTh", "$CoNtEnT-TyPe", "text/plain"]),
         json!(["content-length-range", 0, 1024]),
     ];
-    conditions.extend(sigv4_auth_conditions(&credential));
+    conditions.extend(sigv4_auth_conditions(&credential, &options.signing));
 
     create_bucket(&client, &bucket).await?;
     let response = send_signed_post(
         &server,
         &bucket,
-        PostFormOptions::new(key, b"bar")
+        options
             .extra_fields(vec![field("content-type", "text/plain")])
             .custom_policy(post_policy(conditions)),
     )
@@ -1019,10 +1066,12 @@ async fn test_post_object_invalid_date_format() -> Result<()> {
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-date-format");
     let key = r"\$foo.txt";
-    let credential = sigv4_credential(server.access_key());
+    let options = PostFormOptions::new(key, b"bar");
+    let credential = sigv4_credential(server.access_key(), &options.signing);
     let mut conditions = base_policy_conditions(
         &bucket,
         &credential,
+        &options.signing,
         Some(json!(["starts-with", "$key", r"\$foo"])),
     );
     conditions.push(json!(["starts-with", "$Content-Type", "text/plain"]));
@@ -1032,7 +1081,7 @@ async fn test_post_object_invalid_date_format() -> Result<()> {
     let response = send_signed_post(
         &server,
         &bucket,
-        PostFormOptions::new(key, b"bar")
+        options
             .extra_fields(vec![field("content-type", "text/plain")])
             .custom_policy(post_policy_with_expiration(
                 "2026-06-09 00:00:00 +00:00",
@@ -1137,10 +1186,12 @@ async fn test_post_object_condition_is_case_sensitive() -> Result<()> {
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-cond-case");
     let key = "foo.txt";
-    let credential = sigv4_credential(server.access_key());
+    let options = PostFormOptions::new(key, b"bar");
+    let credential = sigv4_credential(server.access_key(), &options.signing);
     let mut conditions = base_policy_conditions(
         &bucket,
         &credential,
+        &options.signing,
         Some(json!(["starts-with", "$key", "foo"])),
     );
     conditions.push(json!(["starts-with", "$Content-Type", "text/plain"]));
@@ -1150,7 +1201,7 @@ async fn test_post_object_condition_is_case_sensitive() -> Result<()> {
     let response = send_signed_post(
         &server,
         &bucket,
-        PostFormOptions::new(key, b"bar")
+        options
             .extra_fields(vec![field("content-type", "text/plain")])
             .custom_policy(json!({
                 "expiration": POST_EXPIRATION,
@@ -1173,10 +1224,12 @@ async fn test_post_object_expires_is_case_sensitive() -> Result<()> {
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-exp-case");
     let key = "foo.txt";
-    let credential = sigv4_credential(server.access_key());
+    let options = PostFormOptions::new(key, b"bar");
+    let credential = sigv4_credential(server.access_key(), &options.signing);
     let mut conditions = base_policy_conditions(
         &bucket,
         &credential,
+        &options.signing,
         Some(json!(["starts-with", "$key", "foo"])),
     );
     conditions.push(json!(["starts-with", "$Content-Type", "text/plain"]));
@@ -1186,7 +1239,7 @@ async fn test_post_object_expires_is_case_sensitive() -> Result<()> {
     let response = send_signed_post(
         &server,
         &bucket,
-        PostFormOptions::new(key, b"bar")
+        options
             .extra_fields(vec![field("content-type", "text/plain")])
             .custom_policy(json!({
                 "EXPIRATION": POST_EXPIRATION,
@@ -1209,10 +1262,12 @@ async fn test_post_object_expired_policy() -> Result<()> {
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-expired");
     let key = "foo.txt";
-    let credential = sigv4_credential(server.access_key());
+    let options = PostFormOptions::new(key, b"bar");
+    let credential = sigv4_credential(server.access_key(), &options.signing);
     let mut conditions = base_policy_conditions(
         &bucket,
         &credential,
+        &options.signing,
         Some(json!(["starts-with", "$key", "foo"])),
     );
     conditions.push(json!(["starts-with", "$Content-Type", "text/plain"]));
@@ -1222,7 +1277,7 @@ async fn test_post_object_expired_policy() -> Result<()> {
     let response = send_signed_post(
         &server,
         &bucket,
-        PostFormOptions::new(key, b"bar")
+        options
             .extra_fields(vec![field("content-type", "text/plain")])
             .custom_policy(post_policy_with_expiration(
                 "2020-01-01T00:00:00.000Z",
@@ -1246,10 +1301,12 @@ async fn test_post_object_wrong_bucket() -> Result<()> {
     let bucket = bucket_name("s3ite-post-right-bucket");
     let bad_bucket = bucket_name("s3ite-post-wrong-bucket");
     let key = "foo.txt";
-    let credential = sigv4_credential(server.access_key());
+    let options = PostFormOptions::new(key, b"bar");
+    let credential = sigv4_credential(server.access_key(), &options.signing);
     let mut conditions = base_policy_conditions(
         &bucket,
         &credential,
+        &options.signing,
         Some(json!(["starts-with", "$key", "foo"])),
     );
     conditions.push(json!(["starts-with", "$Content-Type", "text/plain"]));
@@ -1260,7 +1317,7 @@ async fn test_post_object_wrong_bucket() -> Result<()> {
     let response = send_signed_post(
         &server,
         &bad_bucket,
-        PostFormOptions::new(key, b"bar")
+        options
             .extra_fields(vec![field("content-type", "text/plain")])
             .custom_policy(post_policy(conditions)),
     )
@@ -1404,9 +1461,10 @@ async fn test_post_object_missing_policy_condition() -> Result<()> {
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-miss-cond");
     let key = "foo.txt";
-    let credential = sigv4_credential(server.access_key());
+    let options = PostFormOptions::new(key, b"bar");
+    let credential = sigv4_credential(server.access_key(), &options.signing);
     let mut conditions = vec![json!(["starts-with", "$key", "foo"])];
-    conditions.extend(sigv4_auth_conditions(&credential));
+    conditions.extend(sigv4_auth_conditions(&credential, &options.signing));
     conditions.push(json!(["starts-with", "$Content-Type", "text/plain"]));
     conditions.push(json!(["content-length-range", 0, 1024]));
 
@@ -1414,7 +1472,7 @@ async fn test_post_object_missing_policy_condition() -> Result<()> {
     let response = send_signed_post(
         &server,
         &bucket,
-        PostFormOptions::new(key, b"bar")
+        options
             .extra_fields(vec![field("content-type", "text/plain")])
             .custom_policy(post_policy(conditions)),
     )
@@ -1434,10 +1492,12 @@ async fn test_post_object_missing_expires_condition() -> Result<()> {
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-no-exp");
     let key = "foo.txt";
-    let credential = sigv4_credential(server.access_key());
+    let options = PostFormOptions::new(key, b"bar");
+    let credential = sigv4_credential(server.access_key(), &options.signing);
     let mut conditions = base_policy_conditions(
         &bucket,
         &credential,
+        &options.signing,
         Some(json!(["starts-with", "$key", "foo"])),
     );
     conditions.push(json!(["starts-with", "$Content-Type", "text/plain"]));
@@ -1447,7 +1507,7 @@ async fn test_post_object_missing_expires_condition() -> Result<()> {
     let response = send_signed_post(
         &server,
         &bucket,
-        PostFormOptions::new(key, b"bar")
+        options
             .extra_fields(vec![field("content-type", "text/plain")])
             .custom_policy(json!({ "conditions": conditions })),
     )
@@ -1517,10 +1577,12 @@ async fn test_post_object_missing_content_length_argument() -> Result<()> {
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-short-range");
     let key = "foo.txt";
-    let credential = sigv4_credential(server.access_key());
+    let options = PostFormOptions::new(key, b"bar");
+    let credential = sigv4_credential(server.access_key(), &options.signing);
     let mut conditions = base_policy_conditions(
         &bucket,
         &credential,
+        &options.signing,
         Some(json!(["starts-with", "$key", "foo"])),
     );
     conditions.push(json!(["starts-with", "$Content-Type", "text/plain"]));
@@ -1530,7 +1592,7 @@ async fn test_post_object_missing_content_length_argument() -> Result<()> {
     let response = send_signed_post(
         &server,
         &bucket,
-        PostFormOptions::new(key, b"bar")
+        options
             .extra_fields(vec![field("content-type", "text/plain")])
             .custom_policy(post_policy(conditions)),
     )
@@ -1550,10 +1612,12 @@ async fn test_post_object_invalid_content_length_argument() -> Result<()> {
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-post-invalid-range");
     let key = "foo.txt";
-    let credential = sigv4_credential(server.access_key());
+    let options = PostFormOptions::new(key, b"bar");
+    let credential = sigv4_credential(server.access_key(), &options.signing);
     let mut conditions = base_policy_conditions(
         &bucket,
         &credential,
+        &options.signing,
         Some(json!(["starts-with", "$key", "foo"])),
     );
     conditions.push(json!(["starts-with", "$Content-Type", "text/plain"]));
@@ -1563,7 +1627,7 @@ async fn test_post_object_invalid_content_length_argument() -> Result<()> {
     let response = send_signed_post(
         &server,
         &bucket,
-        PostFormOptions::new(key, b"bar")
+        options
             .extra_fields(vec![field("content-type", "text/plain")])
             .custom_policy(post_policy(conditions)),
     )

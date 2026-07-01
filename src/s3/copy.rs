@@ -88,9 +88,12 @@ fn validate_copy_source_size(metadata: &KeyMetadata) -> SqliteResult<()> {
     Ok(())
 }
 
+/// Converts supported S3 copy sources into bucket, key, and optional version identifiers.
 fn parse_copy_source(source: CopySource) -> S3Result<(String, String, Option<String>)> {
     match source {
-        CopySource::AccessPoint { .. } => Err(s3_error(S3ErrorCode::NotImplemented)),
+        CopySource::AccessPoint { .. } | CopySource::Outpost { .. } => {
+            Err(s3_error(S3ErrorCode::NotImplemented))
+        }
         CopySource::Bucket {
             bucket,
             key,
@@ -594,12 +597,15 @@ mod tests {
         }
     }
 
+    /// Builds an unsupported access point copy source for parser rejection tests.
     fn access_point_source() -> CopySource {
         CopySource::AccessPoint {
+            partition: "aws".into(),
             region: "us-east-1".into(),
             account_id: "123456789012".into(),
             access_point_name: "ap".into(),
             key: "key".into(),
+            version_id: None,
         }
     }
 

@@ -4,7 +4,7 @@ use std::ops::Not;
 
 use aes_gcm::{
     Aes256Gcm, Nonce,
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, consts::U12},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures::StreamExt;
@@ -125,8 +125,9 @@ fn encrypt_bytes(
     plaintext: &[u8],
 ) -> Result<Vec<u8>, String> {
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|err| err.to_string())?;
+    let nonce = <&Nonce<U12>>::try_from(nonce.as_slice()).map_err(|err| err.to_string())?;
     cipher
-        .encrypt(Nonce::from_slice(nonce), plaintext)
+        .encrypt(nonce, plaintext)
         .map_err(|err| err.to_string())
 }
 
@@ -137,8 +138,9 @@ fn decrypt_bytes(
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, String> {
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|err| err.to_string())?;
+    let nonce = <&Nonce<U12>>::try_from(nonce.as_slice()).map_err(|err| err.to_string())?;
     cipher
-        .decrypt(Nonce::from_slice(nonce), ciphertext)
+        .decrypt(nonce, ciphertext)
         .map_err(|err| err.to_string())
 }
 
@@ -754,6 +756,29 @@ mod tests {
         )
         .await?;
         assert_eq!(object.checksum.algorithm(), ChecksumAlgorithmKind::Sha256);
+        Ok(())
+    }
+
+    /// Verifies encrypted object writes return the checksum validation error.
+    #[tokio::test]
+    async fn object_body_rejects_mismatched_explicit_checksum() -> S3Result<()> {
+        let encryption =
+            new_active_sse(&[12; 32]).map_err(|err| S3Error::with_message(InternalError, err))?;
+        let result = read_object_body_encrypted(
+            streaming_blob(&[b"abc"]),
+            false,
+            None,
+            ChecksumInput::value_fields(None, None, None, None, Some("wrong".to_string())),
+            3,
+            &encryption,
+        )
+        .await;
+
+        assert!(matches!(
+            result.err().as_ref().map(S3Error::code),
+            Some(&S3ErrorCode::BadDigest)
+        ));
+
         Ok(())
     }
 
