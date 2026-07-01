@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Docker images now build a fully static musl binary for a `scratch` runtime image, using `tikv-jemallocator`, fat LTO, and `cargo-multivers` 0.12.0.
+- AArch64 musl C builds pass `-mno-outline-atomics` so bundled SQLite and jemalloc avoid GCC outline atomics that depend on `getauxval` support unavailable in this musl build path.
+
 ## [0.7.0] - 2026-05-30
 
 ### Changed

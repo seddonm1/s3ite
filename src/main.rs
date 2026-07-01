@@ -29,6 +29,12 @@ mod database;
 mod s3;
 mod sqlite;
 
+/// Routes Linux builds through jemalloc for steadier allocation behavior in the
+/// static container binary.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use self::compat::HeaderAuthCompatLayer;
 pub(crate) use self::{
     config::{Config, ConfigError},
