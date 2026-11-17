@@ -519,6 +519,35 @@ mod tests {
         }
     }
 
+    /// A body write failure rolls back both the replacement and its new headers.
+    #[test]
+    fn failed_replacement_preserves_body_and_content_headers() -> SqliteResult<()> {
+        let mut connection = open_schema()?;
+        let original = connection.transaction()?;
+        let mut object = key_value("report", b"original");
+        object.key_metadata.content_disposition = Some("inline".to_owned());
+        object.key_metadata.content_language = Some("en".to_owned());
+        Sqlite::put_object_with_chunk_size(&original, object, 8)?;
+        original.commit()?;
+
+        let replacement = connection.transaction()?;
+        let result =
+            Sqlite::put_object_with_chunk_size(&replacement, key_value("report", b"new"), 0);
+        assert!(matches!(result, Err(SqliteError::Configuration(_))));
+        replacement.rollback()?;
+
+        let reader = connection.transaction()?;
+        let object =
+            test_support::get_object(&reader, "report")?.ok_or(SqliteError::ObjectNotFound)?;
+        assert_eq!(object.value.as_deref(), Some(b"original".as_slice()));
+        assert_eq!(
+            object.key_metadata.content_disposition.as_deref(),
+            Some("inline")
+        );
+        assert_eq!(object.key_metadata.content_language.as_deref(), Some("en"));
+        Ok(())
+    }
+
     #[test]
     fn put_object_with_small_chunk_size_splits_body() -> SqliteResult<()> {
         let mut connection = open_schema()?;
