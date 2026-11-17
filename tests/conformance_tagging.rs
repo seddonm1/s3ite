@@ -18,7 +18,7 @@ use aws_sdk_s3::{
 };
 use serial_test::serial;
 use support::{
-    assertions::assert_error_contains,
+    assertions::{assert_error_code, assert_error_contains},
     fixtures::{bucket_name, create_bucket, put_bucket_versioning},
     sdk,
     server::{TestServer, TestServerOptions},
@@ -691,6 +691,54 @@ async fn s3ite_object_tagging_copy_directives() -> Result<()> {
         .await?;
     assert_tag_set(replaced.tag_set(), &[("c", "three")]);
 
+    Ok(())
+}
+
+/// Verifies a tag-only self-copy fails and preserves the source tags.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_object_copy_to_itself_replacing_tagging() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_object_copy_to_itself_replacing_tagging
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-tagging-copy");
+    let key = "source";
+    create_bucket(&client, &bucket).await?;
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .tagging("stage=old")
+        .body(ByteStream::from_static(b"body"))
+        .send()
+        .await?;
+
+    let error = client
+        .copy_object()
+        .bucket(&bucket)
+        .key(key)
+        .copy_source(format!("{bucket}/{key}"))
+        .tagging_directive(TaggingDirective::Replace)
+        .tagging("stage=new")
+        .send()
+        .await
+        .expect_err("tag-only self-copy should fail");
+    assert_eq!(
+        error
+            .raw_response()
+            .ok_or_else(|| anyhow!("missing error response"))?
+            .status()
+            .as_u16(),
+        400
+    );
+    assert_error_code(&error, "InvalidRequest");
+    let tags = client
+        .get_object_tagging()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+    assert_tag_set(tags.tag_set(), &[("stage", "old")]);
     Ok(())
 }
 

@@ -20,6 +20,11 @@ const CHECKSUM_ALGORITHM_CRC32C: i64 = 2;
 const CHECKSUM_ALGORITHM_CRC64NVME: i64 = 3;
 const CHECKSUM_ALGORITHM_SHA1: i64 = 4;
 const CHECKSUM_ALGORITHM_SHA256: i64 = 5;
+const CHECKSUM_ALGORITHM_SHA512: i64 = 6;
+const CHECKSUM_ALGORITHM_MD5: i64 = 7;
+const CHECKSUM_ALGORITHM_XXHASH3: i64 = 8;
+const CHECKSUM_ALGORITHM_XXHASH64: i64 = 9;
+const CHECKSUM_ALGORITHM_XXHASH128: i64 = 10;
 const CHECKSUM_TYPE_COMPOSITE: i64 = 1;
 const CHECKSUM_TYPE_FULL_OBJECT: i64 = 2;
 
@@ -32,6 +37,11 @@ impl ToSql for ChecksumAlgorithmKind {
             Self::Crc64Nvme => CHECKSUM_ALGORITHM_CRC64NVME,
             Self::Sha1 => CHECKSUM_ALGORITHM_SHA1,
             Self::Sha256 => CHECKSUM_ALGORITHM_SHA256,
+            Self::Sha512 => CHECKSUM_ALGORITHM_SHA512,
+            Self::Md5 => CHECKSUM_ALGORITHM_MD5,
+            Self::XxHash3 => CHECKSUM_ALGORITHM_XXHASH3,
+            Self::XxHash64 => CHECKSUM_ALGORITHM_XXHASH64,
+            Self::XxHash128 => CHECKSUM_ALGORITHM_XXHASH128,
         };
         Ok(ToSqlOutput::from(code))
     }
@@ -49,6 +59,11 @@ impl FromSql for ChecksumAlgorithmKind {
             CHECKSUM_ALGORITHM_CRC64NVME => Ok(Self::Crc64Nvme),
             CHECKSUM_ALGORITHM_SHA1 => Ok(Self::Sha1),
             CHECKSUM_ALGORITHM_SHA256 => Ok(Self::Sha256),
+            CHECKSUM_ALGORITHM_SHA512 => Ok(Self::Sha512),
+            CHECKSUM_ALGORITHM_MD5 => Ok(Self::Md5),
+            CHECKSUM_ALGORITHM_XXHASH3 => Ok(Self::XxHash3),
+            CHECKSUM_ALGORITHM_XXHASH64 => Ok(Self::XxHash64),
+            CHECKSUM_ALGORITHM_XXHASH128 => Ok(Self::XxHash128),
             _ => Err(FromSqlError::Other(Box::new(SqliteError::ChecksumMismatch))),
         }
     }
@@ -190,6 +205,11 @@ mod tests {
             ChecksumAlgorithmKind::Crc64Nvme,
             ChecksumAlgorithmKind::Sha1,
             ChecksumAlgorithmKind::Sha256,
+            ChecksumAlgorithmKind::Sha512,
+            ChecksumAlgorithmKind::Md5,
+            ChecksumAlgorithmKind::XxHash3,
+            ChecksumAlgorithmKind::XxHash64,
+            ChecksumAlgorithmKind::XxHash128,
         ] {
             let decoded = connection.query_row("SELECT ?1;", [algorithm], |row| {
                 row.get::<_, ChecksumAlgorithmKind>(0)

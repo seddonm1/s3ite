@@ -7,19 +7,21 @@ use crate::sqlite::{
     StoredObjectLock, StoredTag,
 };
 
+use super::metadata::parse_expires;
 use super::sse::ActiveSse;
 use super::{
     CONTENT_MD5, ChecksumInput, ChecksumPolicy, Digest, ETag, LifecycleExpirationHeader, Md5, Not,
     ObjectAclRequest, OffsetDateTime, PutObjectInput, PutObjectOutput, S3Error, S3ErrorCode,
     S3Request, S3Response, S3Result, Sqlite, StorageClass, StreamingBlob, TryStreamExt,
-    checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_sha1, checksum_sha256,
-    checksum_type_output, copy_bytes, finish_payload_checksum, hex, load_bucket_object_lock_config,
-    normalize_content_encoding, normalize_metadata, object_lock_for_new_version,
-    object_lock_write_headers, object_write_conditions, payload_checksum_accumulator,
-    read_object_body_encrypted, requested_sse_s3, resolve_write_encryption, s3_error,
-    s3_error_from_sqlite, sse_s3_output, stored_tags_from_header, validate_content_md5,
-    validate_declared_object_write_length, validate_expected_bucket_owner,
-    validate_no_unsupported_sse_headers, validate_object_acl,
+    checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_input, checksum_md5,
+    checksum_sha1, checksum_sha256, checksum_sha512, checksum_type_output, checksum_xxhash3,
+    checksum_xxhash64, checksum_xxhash128, copy_bytes, finish_payload_checksum, hex,
+    load_bucket_object_lock_config, normalize_content_encoding, normalize_metadata,
+    object_lock_for_new_version, object_lock_write_headers, object_write_conditions,
+    payload_checksum_accumulator, read_object_body_encrypted, requested_sse_s3,
+    resolve_write_encryption, s3_error, s3_error_from_sqlite, sse_s3_output,
+    stored_tags_from_header, validate_content_md5, validate_declared_object_write_length,
+    validate_expected_bucket_owner, validate_no_unsupported_sse_headers, validate_object_acl,
 };
 
 /// Fully buffered object body plus hashes needed by the storage write.
@@ -43,6 +45,8 @@ struct PutObjectWriteContext {
     metadata: Option<HashMap<String, String>>,
     content_type: Option<String>,
     content_encoding: Option<String>,
+    content_disposition: Option<String>,
+    content_language: Option<String>,
     cache_control: Option<String>,
     expires: Option<OffsetDateTime>,
     write_conditions: ObjectWriteConditions,
@@ -162,6 +166,11 @@ fn put_object_output(
         checksum_crc64nvme: checksum_crc64nvme(checksum),
         checksum_sha1: checksum_sha1(checksum),
         checksum_sha256: checksum_sha256(checksum),
+        checksum_sha512: checksum_sha512(checksum),
+        checksum_md5: checksum_md5(checksum),
+        checksum_xxhash3: checksum_xxhash3(checksum),
+        checksum_xxhash64: checksum_xxhash64(checksum),
+        checksum_xxhash128: checksum_xxhash128(checksum),
         checksum_type,
         server_side_encryption: sse_s3_output(encrypted),
         ..Default::default()
@@ -201,6 +210,8 @@ async fn put_encrypted_object(
         metadata,
         content_type,
         content_encoding,
+        content_disposition,
+        content_language,
         cache_control,
         expires,
         write_conditions,
@@ -224,6 +235,8 @@ async fn put_encrypted_object(
                     metadata,
                     content_type,
                     content_encoding,
+                    content_disposition,
+                    content_language,
                     cache_control,
                     expires,
                     last_modified,
@@ -283,6 +296,8 @@ async fn put_plain_object(
         metadata,
         content_type,
         content_encoding,
+        content_disposition,
+        content_language,
         cache_control,
         expires,
         write_conditions,
@@ -309,6 +324,8 @@ async fn put_plain_object(
                         metadata,
                         content_type,
                         content_encoding,
+                        content_disposition,
+                        content_language,
                         cache_control,
                         expires,
                         last_modified,
@@ -392,6 +409,8 @@ pub(super) async fn put_object(
     validate_put_object_acl_input(&input)?;
     let explicit_sse_s3 = requested_put_object_sse_s3(&input)?;
 
+    let checksum_input =
+        checksum_input!(input, input.checksum_algorithm, None).with_sdk_algorithm(&headers)?;
     let PutObjectInput {
         body,
         bucket,
@@ -399,15 +418,11 @@ pub(super) async fn put_object(
         metadata,
         cache_control,
         content_encoding,
+        content_disposition,
+        content_language,
         content_length,
         content_md5,
         content_type,
-        checksum_algorithm,
-        checksum_crc32,
-        checksum_crc32c,
-        checksum_crc64nvme,
-        checksum_sha1,
-        checksum_sha256,
         expires,
         if_match,
         if_none_match,
@@ -444,22 +459,16 @@ pub(super) async fn put_object(
         header_present: headers.contains_key(CONTENT_MD5),
         value: content_md5.as_deref(),
     };
-    let checksum_input = ChecksumInput::write_request(
-        checksum_algorithm,
-        checksum_crc32,
-        checksum_crc32c,
-        checksum_crc64nvme,
-        checksum_sha1,
-        checksum_sha256,
-    );
     let context = PutObjectWriteContext {
         bucket,
         key,
         metadata,
         content_type,
         content_encoding,
+        content_disposition,
+        content_language,
         cache_control,
-        expires: expires.map(Into::into),
+        expires: parse_expires(expires.as_deref())?,
         write_conditions,
         tags,
         object_lock,

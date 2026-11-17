@@ -7,9 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Stored MD5, SHA512, XXHASH3, XXHASH64, and XXHASH128 checksums for object writes, reads, copies, and composite multipart uploads.
+
+- Object writes and multipart uploads preserve `Content-Disposition` and `Content-Language` for GET, HEAD, and COPY.
+
+### Fixed
+
+- Object writes reject an empty `x-amz-server-side-encryption` header with `400 InvalidArgument`.
+- Copying an object onto itself solely to replace tags returns `400 InvalidRequest`.
+
+- Bucket encryption configurations containing multiple rules return `400 MalformedXML`. Reading an unconfigured bucket’s encryption settings returns `404 ServerSideEncryptionConfigurationNotFoundError`.
+
+- Bucket CORS rules now reject cross-origin requests with a disallowed origin or HTTP method before the operation runs, including requests made with presigned URLs.
+
+- CopyObject now checks destination If-Match and If-None-Match conditions before writing. A rejected copy preserves the destination body and version history.
+
 ### Changed
 
-- Docker images now build a fully static musl binary for a `scratch` runtime image, using `tikv-jemallocator`, fat LTO, and `cargo-multivers` 0.12.0.
+- Updated Rust dependencies and delegated SigV2 authentication to `s3s` 0.17. Clients sending RFC 2822 dates in `x-amz-date` should use the compact UTC format or send an RFC 1123 `Date` header. Bucket creation signatures must match the path on the wire.
+
+- Docker images now build a fully static musl binary for a `scratch` runtime image, using `tikv-jemallocator`, fat LTO, and `cargo-multivers` 0.13.0.
 - AArch64 musl C builds pass `-mno-outline-atomics` so bundled SQLite and jemalloc avoid GCC outline atomics that depend on `getauxval` support unavailable in this musl build path.
 
 ## [0.7.0] - 2026-05-30

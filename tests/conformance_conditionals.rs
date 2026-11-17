@@ -6,9 +6,11 @@
 
 mod support;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use aws_sdk_s3::{
     Client,
+    error::ProvideErrorMetadata,
+    operation::copy_object::builders::CopyObjectFluentBuilder,
     primitives::{ByteStream, DateTime},
     types::{
         BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier,
@@ -938,6 +940,223 @@ async fn test_put_object_current_if_match() -> Result<()> {
     Ok(())
 }
 
+/// Creates a fresh destination namespace and uploads the source used by Ceph's copy matrix.
+async fn conditional_copy_source(
+    client: &Client,
+    versioned: bool,
+    body: &[u8],
+) -> Result<(String, String)> {
+    let bucket = bucket_name("s3ite-cond-copy");
+    create_bucket(client, &bucket).await?;
+    if versioned {
+        put_bucket_versioning(client, &bucket, BucketVersioningStatus::Enabled).await?;
+    }
+    let source = client
+        .put_object()
+        .bucket(&bucket)
+        .key("src")
+        .body(ByteStream::from(body.to_vec()))
+        .send()
+        .await?;
+    Ok((
+        bucket,
+        source
+            .e_tag()
+            .context("source PUT missing ETag")?
+            .to_owned(),
+    ))
+}
+
+/// Checks both the HTTP status and the S3 error for a rejected conditional copy.
+async fn assert_copy_error(copy: CopyObjectFluentBuilder, status: u16, code: &str) -> Result<()> {
+    let error = copy.send().await.expect_err("conditional copy should fail");
+    assert_eq!(
+        error
+            .raw_response()
+            .context("missing HTTP response")?
+            .status()
+            .as_u16(),
+        status
+    );
+    assert_eq!(
+        error
+            .as_service_error()
+            .and_then(ProvideErrorMetadata::code),
+        Some(code)
+    );
+    Ok(())
+}
+
+/// Checks that a failed copy leaves the destination body and version history intact.
+async fn assert_copy_preserved_destination(
+    client: &Client,
+    bucket: &str,
+    versioned: bool,
+    version_count: usize,
+) -> Result<()> {
+    assert_eq!(get_object_bytes(client, bucket, "dst").await?, b"old");
+    if versioned {
+        let page = client
+            .list_object_versions()
+            .bucket(bucket)
+            .prefix("dst")
+            .send()
+            .await?;
+        assert_eq!(page.versions().len(), version_count);
+    }
+    Ok(())
+}
+
+/// Checks destination If-Match independently of a satisfied source precondition.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_copy_object_dest_if_match() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_copy_object_dest_if_match
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    for versioned in [false, true] {
+        for size in [1, 5 * 1024 * 1024] {
+            let body = vec![b'a'; size];
+            let (bucket, src_etag) = conditional_copy_source(&client, versioned, &body).await?;
+            let copy = |condition: &str| {
+                client
+                    .copy_object()
+                    .bucket(&bucket)
+                    .key("dst")
+                    .copy_source(format!("{bucket}/src"))
+                    .copy_source_if_match(&src_etag)
+                    .if_match(condition)
+            };
+            for condition in ["*", "badetag"] {
+                assert_copy_error(copy(condition), 404, "NoSuchKey").await?;
+            }
+            put_object(&client, &bucket, "dst", b"old").await?;
+            let dst_etag = head_state(&client, &bucket, "dst").await?.etag;
+            for condition in ["badetag", &src_etag] {
+                assert_copy_error(copy(condition), 412, "PreconditionFailed").await?;
+            }
+            assert_copy_preserved_destination(&client, &bucket, versioned, 1).await?;
+            copy(&dst_etag).send().await?;
+            assert_eq!(get_object_bytes(&client, &bucket, "dst").await?, body);
+            copy("*").send().await?;
+
+            let deleted = client
+                .delete_object()
+                .bucket(&bucket)
+                .key("dst")
+                .send()
+                .await?;
+            if versioned {
+                assert_eq!(deleted.delete_marker(), Some(true));
+            }
+            for condition in ["*", &src_etag] {
+                assert_copy_error(copy(condition), 404, "NoSuchKey").await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Concurrent create-only copies must leave exactly the winning source in version history.
+#[tokio::test]
+#[serial(conformance)]
+async fn s3ite_concurrent_copy_if_none_match() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let (bucket, _) = conditional_copy_source(&client, true, b"first").await?;
+    put_object(&client, &bucket, "other", b"second").await?;
+    let copy = |key| {
+        client
+            .copy_object()
+            .bucket(&bucket)
+            .key("dst")
+            .copy_source(format!("{bucket}/{key}"))
+            .if_none_match("*")
+            .send()
+    };
+    let (first, second) = tokio::join!(copy("src"), copy("other"));
+    let (winner, body, error) = match (first, second) {
+        (Ok(winner), Err(error)) => (winner, b"first".as_slice(), error),
+        (Err(error), Ok(winner)) => (winner, b"second".as_slice(), error),
+        results => bail!("expected exactly one successful copy, got {results:?}"),
+    };
+    assert_eq!(
+        error
+            .raw_response()
+            .context("missing HTTP response")?
+            .status()
+            .as_u16(),
+        412
+    );
+    assert_eq!(
+        error
+            .as_service_error()
+            .and_then(ProvideErrorMetadata::code),
+        Some("PreconditionFailed")
+    );
+    assert_eq!(get_object_bytes(&client, &bucket, "dst").await?, body);
+    let versions = client
+        .list_object_versions()
+        .bucket(&bucket)
+        .prefix("dst")
+        .send()
+        .await?;
+    let version_id = winner
+        .version_id()
+        .context("winning copy missing version ID")?;
+    assert_eq!(versions.versions().len(), 1);
+    assert_eq!(versions.versions()[0].version_id(), Some(version_id));
+    assert!(versions.delete_markers().is_empty());
+    Ok(())
+}
+
+/// Checks destination If-None-Match when the current object exists, is absent, or is deleted.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_copy_object_dest_if_none_match() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_copy_object_dest_if_none_match
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    for versioned in [false, true] {
+        for size in [1, 5 * 1024 * 1024] {
+            let body = vec![b'a'; size];
+            let (bucket, src_etag) = conditional_copy_source(&client, versioned, &body).await?;
+            let copy = |condition: &str| {
+                client
+                    .copy_object()
+                    .bucket(&bucket)
+                    .key("dst")
+                    .copy_source(format!("{bucket}/src"))
+                    .copy_source_if_none_match("badetag")
+                    .if_none_match(condition)
+            };
+            copy("*").send().await?;
+            assert_eq!(get_object_bytes(&client, &bucket, "dst").await?, body);
+            for condition in ["*", &src_etag] {
+                assert_copy_error(copy(condition), 412, "PreconditionFailed").await?;
+            }
+            put_object(&client, &bucket, "dst", b"old").await?;
+            let dst_etag = head_state(&client, &bucket, "dst").await?.etag;
+            assert_copy_error(copy(&dst_etag), 412, "PreconditionFailed").await?;
+            assert_copy_preserved_destination(&client, &bucket, versioned, 2).await?;
+            copy(&src_etag).send().await?;
+            assert_eq!(get_object_bytes(&client, &bucket, "dst").await?, body);
+
+            let deleted = client
+                .delete_object()
+                .bucket(&bucket)
+                .key("dst")
+                .send()
+                .await?;
+            if versioned {
+                assert_eq!(deleted.delete_marker(), Some(true));
+            }
+            copy("*").send().await?;
+        }
+    }
+    Ok(())
+}
+
 /// Verifies CopyObject succeeds when source If-Match matches.
 #[tokio::test]
 #[serial(conformance)]
@@ -1058,6 +1277,129 @@ async fn s3ite_copy_object_source_date_conditionals() -> Result<()> {
         .await?;
     assert_eq!(get_object_bytes(&client, &bucket, "before").await?, b"bar");
 
+    Ok(())
+}
+
+/// Creates the null-version namespace used by the suspended conditional-write cases.
+async fn suspended_bucket(client: &Client) -> Result<String> {
+    let bucket = bucket_name("s3ite-cond");
+    create_bucket(client, &bucket).await?;
+    for status in [
+        BucketVersioningStatus::Enabled,
+        BucketVersioningStatus::Suspended,
+    ] {
+        put_bucket_versioning(client, &bucket, status).await?;
+    }
+    Ok(bucket)
+}
+
+/// Checks a conditional PUT across creation, deletion, and replacement of the null version.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_put_object_suspended_if_match() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_object_suspended_if_match
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = suspended_bucket(&client).await?;
+    let put = || {
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(KEY)
+            .body(ByteStream::from_static(b"data"))
+    };
+    let created = put().if_none_match("*").send().await?;
+    let exists = put().if_none_match("*").send().await.unwrap_err();
+    assert_eq!(
+        exists
+            .raw_response()
+            .context("missing HTTP response")?
+            .status()
+            .as_u16(),
+        412
+    );
+    assert_error_contains(&exists, "PreconditionFailed");
+    put()
+        .if_match(created.e_tag().context("missing ETag")?)
+        .send()
+        .await?;
+    let marker = client
+        .delete_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .send()
+        .await?;
+    assert_eq!(marker.delete_marker(), Some(true));
+    for condition in ["*", "badetag"] {
+        let missing = put().if_match(condition).send().await.unwrap_err();
+        assert_eq!(
+            missing
+                .raw_response()
+                .context("missing HTTP response")?
+                .status()
+                .as_u16(),
+            404
+        );
+        assert_error_contains(&missing, "NoSuchKey");
+    }
+    put().if_none_match("*").send().await?;
+    let exists = put().if_none_match("*").send().await.unwrap_err();
+    assert_eq!(
+        exists
+            .raw_response()
+            .context("missing HTTP response")?
+            .status()
+            .as_u16(),
+        412
+    );
+    assert_error_contains(&exists, "PreconditionFailed");
+    Ok(())
+}
+
+/// Checks create-only multipart completion before and after a null delete marker.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_multipart_put_object_suspended_if_none_match() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_multipart_put_object_suspended_if_none_match
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = suspended_bucket(&client).await?;
+    let complete =
+        || successful_conditional_multipart_upload(&client, &bucket, KEY, b"data", None, Some("*"));
+    complete().await?;
+    let (upload_id, parts) = prepare_multipart_upload(&client, &bucket, KEY, b"other").await?;
+    let error = client
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key(KEY)
+        .upload_id(upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(parts))
+                .build(),
+        )
+        .if_none_match("*")
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error
+            .raw_response()
+            .context("missing HTTP response")?
+            .status()
+            .as_u16(),
+        412
+    );
+    assert_error_contains(&error, "PreconditionFailed");
+    let marker = client
+        .delete_object()
+        .bucket(&bucket)
+        .key(KEY)
+        .send()
+        .await?;
+    assert_eq!(marker.delete_marker(), Some(true));
+    complete().await?;
+    assert_eq!(get_object_bytes(&client, &bucket, KEY).await?, b"data");
     Ok(())
 }
 

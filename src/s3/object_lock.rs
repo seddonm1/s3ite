@@ -1,5 +1,6 @@
 //! S3 Object Lock metadata, DTO conversion, and enforcement.
 
+use hyper::StatusCode;
 use time::{Duration, OffsetDateTime};
 
 use crate::sqlite::{
@@ -590,12 +591,14 @@ fn default_retention_from_dto(
     }
 }
 
+/// Returns the S3 error for a nonpositive default retention period.
 fn invalid_retention_period() -> S3Error {
-    // s3s 0.13.0 does not expose InvalidRetentionPeriod as an S3ErrorCode.
-    s3_error_with_message(
-        S3ErrorCode::InvalidRequest,
+    let mut error = s3_error_with_message(
+        S3ErrorCode::Custom("InvalidRetentionPeriod".into()),
         "InvalidRetentionPeriod: retention period must be positive",
-    )
+    );
+    error.set_status_code(StatusCode::BAD_REQUEST);
+    error
 }
 
 fn config_to_dto(config: &StoredObjectLockConfig) -> ObjectLockConfiguration {
@@ -708,6 +711,7 @@ type SqliteResult<T> = Result<T, SqliteError>;
 mod tests {
     use super::*;
 
+    /// Builds a live object version with the specified lock settings.
     fn metadata_with_lock(object_lock: StoredObjectLock) -> KeyMetadata {
         KeyMetadata {
             version_id: "version".to_string(),
@@ -715,6 +719,8 @@ mod tests {
             metadata: None,
             content_type: None,
             content_encoding: None,
+            content_disposition: None,
+            content_language: None,
             cache_control: None,
             expires: None,
             last_modified: OffsetDateTime::UNIX_EPOCH,

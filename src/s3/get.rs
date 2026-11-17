@@ -4,6 +4,7 @@ use std::ops::Range as ByteRange;
 
 use crate::sqlite::{CompletedObjectPart, KeyMetadata, ObjectBodyReference, StoredChecksum};
 
+use super::metadata::format_expires;
 use super::{
     Bytes, ChecksumMode, ETag, GetObjectAttributesInput, GetObjectAttributesOutput,
     GetObjectAttributesParts, GetObjectInput, GetObjectOutput, GetObjectTorrentInput,
@@ -11,8 +12,9 @@ use super::{
     LifecycleExpirationHeader, Not, ObjectAttributes, ObjectPart, ObjectReadConditionFailure,
     ObjectReadConditions, S3Error, S3ErrorCode, S3Range, S3Request, S3Response, S3Result, Sqlite,
     SqliteError, SqliteResult, StorageClass, StreamExt, StreamingBlob, X_AMZ_TAGGING_COUNT,
-    active_sse_from_stored, checksum_crc32, checksum_crc32c, checksum_crc64nvme,
-    checksum_mode_enabled, checksum_sha1, checksum_sha256, checksum_struct, checksum_type_output,
+    active_sse_from_stored, checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_md5,
+    checksum_mode_enabled, checksum_sha1, checksum_sha256, checksum_sha512, checksum_struct,
+    checksum_type_output, checksum_xxhash3, checksum_xxhash64, checksum_xxhash128,
     decrypt_stored_chunks, list_limit, not_found_delete_marker_error, not_modified_error,
     object_checksum_for_part, object_lock_legal_hold_status, object_lock_mode,
     object_lock_retain_until_date, requested_part_range, s3_error, s3_error_from_sqlite,
@@ -579,8 +581,15 @@ fn get_object_output(
         checksum_crc64nvme: checksum_crc64nvme(&response_checksum),
         checksum_sha1: checksum_sha1(&response_checksum),
         checksum_sha256: checksum_sha256(&response_checksum),
+        checksum_sha512: checksum_sha512(&response_checksum),
+        checksum_md5: checksum_md5(&response_checksum),
+        checksum_xxhash3: checksum_xxhash3(&response_checksum),
+        checksum_xxhash64: checksum_xxhash64(&response_checksum),
+        checksum_xxhash128: checksum_xxhash128(&response_checksum),
         checksum_type,
         content_encoding: key_metadata.content_encoding,
+        content_disposition: key_metadata.content_disposition,
+        content_language: key_metadata.content_language,
         content_range: content_range_header(
             range.is_some(),
             part_number.is_some(),
@@ -589,7 +598,7 @@ fn get_object_output(
         ),
         content_length: Some(content_length_i64),
         content_type: key_metadata.content_type,
-        expires: key_metadata.expires.map(Into::into),
+        expires: key_metadata.expires.map(format_expires).transpose()?,
         last_modified: Some(key_metadata.last_modified.into()),
         metadata: key_metadata.metadata,
         e_tag: key_metadata.md5.map(ETag::Strong),
@@ -646,8 +655,15 @@ fn head_object_output(
         checksum_crc64nvme: checksum_crc64nvme(&response_checksum),
         checksum_sha1: checksum_sha1(&response_checksum),
         checksum_sha256: checksum_sha256(&response_checksum),
+        checksum_sha512: checksum_sha512(&response_checksum),
+        checksum_md5: checksum_md5(&response_checksum),
+        checksum_xxhash3: checksum_xxhash3(&response_checksum),
+        checksum_xxhash64: checksum_xxhash64(&response_checksum),
+        checksum_xxhash128: checksum_xxhash128(&response_checksum),
         checksum_type,
         content_encoding: object.content_encoding,
+        content_disposition: object.content_disposition,
+        content_language: object.content_language,
         content_length: Some(content_length),
         content_range: content_range_header(
             range.is_some(),
@@ -658,7 +674,7 @@ fn head_object_output(
         content_type: Some(content_type),
         e_tag: object.md5.map(ETag::Strong),
         expiration,
-        expires: object.expires.map(Into::into),
+        expires: object.expires.map(format_expires).transpose()?,
         last_modified: Some(object.last_modified.into()),
         metadata: object.metadata,
         object_lock_legal_hold_status,
@@ -813,6 +829,11 @@ fn object_attributes_parts(
             checksum_crc64nvme: checksum_crc64nvme(&part.checksum),
             checksum_sha1: checksum_sha1(&part.checksum),
             checksum_sha256: checksum_sha256(&part.checksum),
+            checksum_sha512: checksum_sha512(&part.checksum),
+            checksum_md5: checksum_md5(&part.checksum),
+            checksum_xxhash3: checksum_xxhash3(&part.checksum),
+            checksum_xxhash64: checksum_xxhash64(&part.checksum),
+            checksum_xxhash128: checksum_xxhash128(&part.checksum),
             part_number: Some(part.part_number),
             size: Some(part.size),
         })
@@ -1002,6 +1023,7 @@ mod tests {
         StoredChecksum::Full(FullObjectChecksum::Crc64Nvme("object-crc64".to_string()))
     }
 
+    /// Builds metadata for read tests with optional stored encryption settings.
     fn metadata(stored_sse: Option<StoredSse>) -> KeyMetadata {
         KeyMetadata {
             version_id: "version".to_string(),
@@ -1009,6 +1031,8 @@ mod tests {
             metadata: None,
             content_type: None,
             content_encoding: None,
+            content_disposition: None,
+            content_language: None,
             cache_control: None,
             expires: None,
             last_modified: OffsetDateTime::UNIX_EPOCH,

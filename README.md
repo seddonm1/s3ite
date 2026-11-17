@@ -28,8 +28,8 @@ The supported S3 surface is intentionally focused:
   version IDs.
 - Multipart: create, upload part, upload part copy, list parts, list uploads,
   complete, abort, completed-part reads, and idempotent completion responses.
-- Checksums: `CRC32`, `CRC32C`, `CRC64NVME`, `SHA1`, and `SHA256` request,
-  storage, copy, multipart, and response behavior.
+- Checksums: CRC32, CRC32C, CRC64NVME, SHA-1, SHA-256, SHA-512, MD5,
+  XXHash3, XXHash64, and XXHash128 for uploads, reads, copies, and multipart uploads.
 - Tagging: bucket tag create/read/replace/delete, object tag
   create/read/replace/delete, version-specific object tags, `PutObject` tags,
   `CopyObject` tag directives, multipart upload tags, and POST form upload
@@ -105,7 +105,7 @@ s3ite. The matrix was last reconciled on 2026-06-12.
 | Objects | HeadObject | ✅ | ✅ | ✅ | Metadata-only read. |
 | Objects | DeleteObject | ✅ | ✅ | ✅ | Includes missing-key no-op semantics. |
 | Objects | DeleteObjects | ✅ | ✅ | ✅ | Includes v1/v2 multi-delete behavior. |
-| Objects | CopyObject | ✅ | ✅ | ✅ | Same-bucket, cross-bucket, versioned, metadata-copy, and metadata-replace behavior. |
+| Objects | CopyObject | ✅ | ✅ | ✅ | Same-bucket and cross-bucket copies support versioned sources, metadata directives, and destination If-Match and If-None-Match conditions. |
 | Objects | CopyObject from access point ARN | ✅ | ❌ | ❌ | s3ite explicitly returns `NotImplemented` for access point copy sources. |
 | Objects | Range GET | ✅ | ✅ | ✅ | Includes leading/trailing/invalid/empty-object range cases. |
 | Objects | Completed multipart part reads with `partNumber` | ✅ | ✅ | ✅ | s3ite supports `GetObject` and `HeadObject` part-number reads. |
@@ -114,6 +114,7 @@ s3ite. The matrix was last reconciled on 2026-06-12.
 | Objects | Cache-Control object header | ✅ | ✅ | ✅ | Stored and returned by s3ite. |
 | Objects | Expires object header | ✅ | ✅ | ✅ | Stored and returned by s3ite. |
 | Objects | Content-Type object header | ✅ | ✅ | ✅ | Stored and returned by s3ite. |
+| Objects | Content-Disposition and Content-Language object headers | ✅ | ✅ | ✅ | PUT and multipart uploads store both headers. GET and HEAD return them. CopyObject honors the metadata directive. |
 | Objects | Content-Encoding object header | ✅ | ✅ | ✅ | s3ite normalizes AWS chunked encoding. |
 | Objects | Response header overrides on GET | ✅ | ✅ | ✅ | s3ite supports response-header override behavior. |
 | Objects | Request ID/error header compatibility | ✅ | ✅ | ✅ | s3ite emits request IDs on supported error paths. |
@@ -129,7 +130,7 @@ s3ite. The matrix was last reconciled on 2026-06-12.
 | Auth | SigV4 signed owner requests | ✅ | ✅ | ✅ | s3ite supports a single configured owner identity. |
 | Auth | Presigned GET URLs | ✅ | ✅ | ✅ | Includes expiry and tamper rejection. |
 | Auth | Presigned PUT URLs | ✅ | ✅ | ✅ | Includes owner-equivalent ACL compatibility. |
-| Auth | SigV2 legacy compatibility edges | ❌ | ✅ | ✅ | s3ite keeps SigV2 edge behavior for legacy client compatibility. |
+| Auth | SigV2 legacy compatibility edges | ❌ | ✅ | ✅ | Uses the upstream SigV2 verifier and its date and canonical path rules. |
 | Auth | Unsigned public/anonymous access | ✅ | ✅ | ❌ | s3ite denies unsigned requests when auth is configured. |
 | Auth | Bucket policy API and enforcement | ✅ | ✅ | ❌ | Out of scope for s3ite. |
 | Auth | IAM user/group/role/account APIs | ✅ | ❌ | ❌ | MinIO has IAM concepts, but not the AWS IAM API surface. |
@@ -143,7 +144,7 @@ s3ite. The matrix was last reconciled on 2026-06-12.
 | ACLs | Object ownership controls | ✅ | ❌ | ❌ | MinIO documents bucket ownership controls as unsupported. |
 | Versioning | GetBucketVersioning | ✅ | ✅ | ✅ | s3ite supports enabled/suspended/unset states. |
 | Versioning | PutBucketVersioning enabled/suspended | ✅ | ✅ | ✅ | s3ite supports enabled and suspended. |
-| Versioning | Null version behavior while suspended | ✅ | ✅ | ✅ | s3ite preserves null-version behavior across suspended versioning writes. |
+| Versioning | Null version behavior while suspended | ✅ | ✅ | ✅ | Includes conditional PUT and multipart completion before and after a null delete marker. |
 | Versioning | Version-specific GetObject/HeadObject | ✅ | ✅ | ✅ | s3ite supports versioned reads and heads. |
 | Versioning | Version-specific CopyObject | ✅ | ✅ | ✅ | s3ite supports copy by source version. |
 | Versioning | Version-specific DeleteObject | ✅ | ✅ | ✅ | s3ite supports deleting explicit versions. |
@@ -164,6 +165,7 @@ s3ite. The matrix was last reconciled on 2026-06-12.
 | Checksums | Content-MD5 validation | ✅ | ✅ | ✅ | Includes invalid short, malformed, bad, empty, and missing forms. |
 | Checksums | PutObject SHA256 checksum | ✅ | ✅ | ✅ | s3ite validates and stores the checksum. |
 | Checksums | PutObject CRC64NVME checksum | ✅ | ✅ | ✅ | s3ite validates and stores the checksum. |
+| Checksums | Stored MD5, SHA512, XXHASH3, XXHASH64, XXHASH128 | ✅ | ✅ | ✅ | PUT validates the digest, GET and HEAD return it with checksum mode enabled, and multipart uploads support composite checksums. [AWS](https://aws.amazon.com/about-aws/whats-new/2026/04/s3-five-additional-checksum-algorithms/) · [MinIO AIStor](https://docs.min.io/aistor/developers/s3-api-compatibility/#object-checksums) |
 | Checksums | Multipart SHA256 checksum | ✅ | ✅ | ✅ | Includes composite checksum behavior. |
 | Checksums | Multipart CRC32 checksum | ✅ | ✅ | ✅ | Includes full-object checksum behavior. |
 | Checksums | Multipart CRC32C checksum | ✅ | ✅ | ✅ | Includes full-object checksum behavior. |
@@ -176,9 +178,9 @@ s3ite. The matrix was last reconciled on 2026-06-12.
 | Attributes | GetObjectAttributes versioned objects | ✅ | ✅ | ✅ | Supported by s3ite. |
 | Attributes | GetObjectAttributes multipart parts | ✅ | ✅ | ✅ | Includes part pagination. |
 | Attributes | GetObjectAttributes multipart part checksums | ✅ | ✅ | ✅ | Includes checksum attributes for parts. |
-| Encryption | Explicit SSE-S3 PutObject (`AES256`) | ✅ | ✅ | ✅ | s3ite encrypts stored bytes and returns plaintext on read. |
+| Encryption | Explicit SSE-S3 PutObject (`AES256`) | ✅ | ✅ | ✅ | s3ite encrypts stored bytes and returns plaintext on read. An empty algorithm returns `400 InvalidArgument`. |
 | Encryption | SSE-S3 HeadObject/GetObject response headers | ✅ | ✅ | ✅ | s3ite returns `AES256` for encrypted objects. |
-| Encryption | Bucket default SSE-S3 config | ✅ | ✅ | ✅ | s3ite supports Put/Get/DeleteBucketEncryption for SSE-S3. |
+| Encryption | Bucket default SSE-S3 config | ✅ | ✅ | ✅ | Supports Put/Get/DeleteBucketEncryption for SSE-S3. Malformed configurations return `400 MalformedXML`. |
 | Encryption | SSE-S3 multipart upload | ✅ | ✅ | ✅ | Works with default bucket encryption and multipart writes. |
 | Encryption | SSE-S3 CopyObject | ✅ | ✅ | ✅ | Supports plaintext/encrypted source and destination permutations. |
 | Encryption | SSE-S3 UploadPartCopy | ✅ | ✅ | ✅ | Supports plaintext/encrypted source and destination permutations. |
@@ -191,7 +193,7 @@ s3ite. The matrix was last reconciled on 2026-06-12.
 | Encryption | Encryption conflict validation | ✅ | ✅ | ✅ | s3ite rejects mixed SSE-C/SSE-KMS/SSE-S3 request shapes. |
 | Tagging | Bucket tagging API | ✅ | ✅ | ✅ | Supports Get/Put/DeleteBucketTagging. |
 | Tagging | Object tagging API | ✅ | ✅ | ✅ | Supports Get/Put/DeleteObjectTagging with version-specific tags. |
-| Tagging | Object tags on PutObject | ✅ | ✅ | ✅ | Supports PutObject tags, CopyObject tag directives, and multipart upload tags. |
+| Tagging | Object tags on PutObject | ✅ | ✅ | ✅ | Supports PutObject tags, CopyObject tag directives, and multipart upload tags. A tag-only self-copy returns `400 InvalidRequest`. |
 | Tagging | Object tags on POST Object | ✅ | ✅ | ✅ | POST Object forwards `x-amz-tagging` through the normal object write path. |
 | Tagging | Tag-based bucket policy conditions | ✅ | ✅ | ❌ | Requires bucket policy support. |
 | Lifecycle | Put/Get/DeleteBucketLifecycle | ✅ | ✅ | ✅ | s3ite stores normalized lifecycle rules in each bucket DB. |
@@ -207,7 +209,7 @@ s3ite. The matrix was last reconciled on 2026-06-12.
 | POST | POST Object form uploads | ✅ | ✅ | ✅ | Browser form uploads reuse the normal object write path. |
 | POST | POST Object policy validation | ✅ | ✅ | ✅ | SigV4 POST policy validation is handled by `s3s`. |
 | POST | POST Object success redirects/status codes | ✅ | ✅ | ✅ | Supports default 204 responses, 200/201 statuses, and 303 redirects. |
-| Object Lock | Bucket Object Lock configuration | ✅ | ✅ | ✅ | s3ite supports configuration for buckets created with Object Lock enabled. |
+| Object Lock | Bucket Object Lock configuration | ✅ | ✅ | ✅ | Enable Object Lock at creation or later on an existing bucket with versioning enabled. |
 | Object Lock | Object retention governance/compliance | ✅ | ✅ | ✅ | Includes default retention, explicit retention, extension, and active-retention shortening rules. |
 | Object Lock | Object legal hold | ✅ | ✅ | ✅ | Legal hold is stored per object version and exposed through the S3 APIs. |
 | Object Lock | Delete blocked by retention/legal hold | ✅ | ✅ | ✅ | Exact-version deletes are blocked by legal hold, compliance retention, and governance retention unless bypass is supplied. |
@@ -264,10 +266,12 @@ Each bucket is stored in one SQLite database named `<bucket>.sqlite3`. Bucket
 databases are opened at startup from the configured root path, and new buckets
 create new database files in that same directory.
 
-The current bucket schema is versioned and validated on open. Unsupported older
-schemas are rejected rather than migrated in place. Tables are `STRICT`, use
-normal rowid tables, and include foreign keys and indexes for the storage queries
-used by the S3 handlers.
+The 0.7.0 bucket schema stores the integer `70` in `PRAGMA user_version`.
+Startup checks every bucket, including read-only buckets, and rejects unsupported
+schema versions before serving requests. To inspect an existing bucket, run
+`sqlite3 -readonly path/to/bucket.sqlite3 'PRAGMA user_version;'`.
+Tables are `STRICT`, use normal rowid tables, and include foreign keys and
+indexes for the storage queries used by the S3 handlers.
 
 Object metadata and object bodies are split:
 
@@ -285,12 +289,53 @@ Writes are performed transactionally. Larger request work such as multipart
 normalization and checksum calculation is kept outside SQLite write transactions
 where practical, so the single writer is held for the database mutation itself.
 
+## Migrate from v0.6.0 over HTTP
+
+Start the v0.6.0 server with its existing data directory and `--read-only true`
+so the source stays consistent. Start the new server on a separate endpoint
+with its own data directory. The migration script creates missing buckets,
+including empty ones, and copies the current object at each key with its user
+metadata. Allow enough temporary disk space on the machine running the script
+for the largest source object. [Migration script](scripts/migration.py)
+
+From the repository root, using the URLs for your two servers, run
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install 'boto3>=1.36'
+.venv/bin/python scripts/migration.py \
+  --source http://localhost:8000 \
+  --destination http://localhost:8001
+```
+
+Both endpoints use the standard AWS credential chain, including
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. If the servers use different
+credentials, add `--source-profile old --destination-profile new`, replacing
+`old` and `new` with your configured AWS profile names.
+
+The script checks a source object's stored MD5 ETag when available and computes
+SHA-256 over its bytes. The destination checks that SHA-256 during upload. The
+script then reads the object back and compares its hash and metadata. On a
+rerun, it skips an existing key only after the same comparison. A conflict
+stops the run and preserves the destination object.
+
+The destination assigns fresh modification timestamps. The transfer covers
+live objects and empty buckets. Bucket configuration, historical versions, and
+unfinished multipart uploads are outside its scope. A v0.6.0 bucket containing
+a directory marker (an empty object with a key ending in `/`) can return
+`InternalError` on listing. The script reports the affected bucket and exits.
+
 ## Auth Model
 
 When `access_key` and `secret_key` are configured, signed requests and valid
 presigned URLs from that identity act as the single owner. Unsigned requests are
 denied. When both values are omitted, authentication is disabled and every
 request behaves as that owner.
+
+SigV2 header authentication follows `s3s`. Send an RFC 1123 HTTP date in
+`Date` or a UTC timestamp such as `20261117T120000Z` in `x-amz-date`.
+Sign the request path exactly as sent, including any trailing slash.
+The server rejects malformed dates and checks clock skew.
 
 ACLs are compatibility-only. `GetBucketAcl` and `GetObjectAcl` return a
 synthetic owner `FULL_CONTROL` ACL, and owner-equivalent ACL writes such as
@@ -432,6 +477,9 @@ buckets:
 ### CORS
 
 S3 bucket CORS APIs are supported and store rules in the bucket database.
+When a request includes an Origin header and the bucket has CORS rules, the
+origin and HTTP method must match a rule. A mismatch returns 403 before the
+operation runs. This also applies to presigned URLs.
 Server-level CORS remains the fallback for buckets without a bucket CORS
 configuration and for non-bucket requests.
 
@@ -454,12 +502,11 @@ for `cors.mode`.
 
 ## Tests
 
-The conformance suite is now native Rust. Many scenarios were ported from or
-inspired by [ceph/s3-tests](https://github.com/ceph/s3-tests), and the Rust
-tests keep per-test comments for that traceability. Thanks to the Ceph
-`s3-tests` maintainers for making that compatibility surface concrete. The old
-local shell wrapper for running the external suite is no longer in the
-repository.
+The Rust conformance suite includes scenarios ported from or inspired by
+Ceph's S3 tests. Ceph maintains its suite under
+`src/test/rgw/s3-tests` in `ceph/ceph`. Source paths in the Rust test comments
+are relative to that directory. The presigned expiry, Unicode metadata, and
+POST policy expectations were checked against [Ceph revision 6ffb1fc](https://github.com/ceph/ceph/tree/6ffb1fc533b38a153f91b46eba6deb3ec3fa5788/src/test/rgw/s3-tests).
 
 Run all tests:
 

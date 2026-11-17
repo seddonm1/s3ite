@@ -157,6 +157,7 @@ mod tests {
         Ok(connection)
     }
 
+    /// Builds an object without a lock so each test can set its own retention rules.
     fn key_value(key: &str, value: &[u8]) -> KeyValue {
         KeyValue {
             key: key.to_string(),
@@ -168,6 +169,8 @@ mod tests {
                 metadata: None,
                 content_type: None,
                 content_encoding: None,
+                content_disposition: None,
+                content_language: None,
                 cache_control: None,
                 expires: None,
                 last_modified: OffsetDateTime::UNIX_EPOCH,

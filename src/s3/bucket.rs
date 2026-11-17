@@ -1,3 +1,5 @@
+use hyper::StatusCode;
+
 use crate::sqlite::BucketVersioningState;
 
 use super::{
@@ -105,6 +107,7 @@ pub(super) async fn create_bucket(
     }
 
     let output = CreateBucketOutput {
+        bucket_arn: None,
         location: Some(format!("/{bucket}")),
     };
     Ok(S3Response::new(output))
@@ -241,10 +244,9 @@ pub(super) async fn get_bucket_encryption(
         .map_err(s3_error_from_sqlite)?;
 
     if enabled.not() {
-        let code = "ServerSideEncryptionConfigurationNotFoundError"
-            .parse()
-            .unwrap_or_else(|err| match err {});
-        return Err(s3_error(code));
+        let mut error = s3_error(S3ErrorCode::ServerSideEncryptionConfigurationNotFoundError);
+        error.set_status_code(StatusCode::NOT_FOUND);
+        return Err(error);
     }
 
     Ok(S3Response::new(GetBucketEncryptionOutput {
@@ -290,6 +292,7 @@ pub(super) async fn put_bucket_encryption(
 fn sse_s3_bucket_encryption_configuration() -> ServerSideEncryptionConfiguration {
     ServerSideEncryptionConfiguration {
         rules: vec![ServerSideEncryptionRule {
+            blocked_encryption_types: None,
             apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
                 kms_master_key_id: None,
                 sse_algorithm: ServerSideEncryption::from_static(ServerSideEncryption::AES256),
@@ -305,7 +308,7 @@ fn validate_sse_s3_bucket_encryption_configuration(
 ) -> S3Result<()> {
     let [rule] = configuration.rules.as_slice() else {
         return Err(s3_error_with_message(
-            S3ErrorCode::InvalidArgument,
+            S3ErrorCode::MalformedXML,
             "bucket encryption must contain exactly one rule",
         ));
     };
@@ -424,6 +427,7 @@ pub(super) async fn head_bucket(
     }
 
     let output = HeadBucketOutput {
+        bucket_arn: None,
         access_point_alias: None,
         bucket_location_name: None,
         bucket_location_type: None,
@@ -491,6 +495,7 @@ pub(super) async fn list_buckets(
         );
 
         let bucket = Bucket {
+            bucket_arn: None,
             bucket_region: None,
             creation_date: Some(created_or_modified_date),
             name: Some(name.clone()),
@@ -538,6 +543,7 @@ mod tests {
         }
     }
 
+    /// Checks the supported SSE-S3 rule shape and rejects invalid configurations.
     #[test]
     fn bucket_encryption_validation_rejects_unsupported_shapes() {
         assert!(
@@ -549,6 +555,7 @@ mod tests {
         assert!(
             validate_sse_s3_bucket_encryption_configuration(&ServerSideEncryptionConfiguration {
                 rules: vec![ServerSideEncryptionRule {
+                    blocked_encryption_types: None,
                     apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
                         kms_master_key_id: None,
                         sse_algorithm: ServerSideEncryption::from_static(
@@ -563,6 +570,7 @@ mod tests {
         assert!(
             validate_sse_s3_bucket_encryption_configuration(&ServerSideEncryptionConfiguration {
                 rules: vec![ServerSideEncryptionRule {
+                    blocked_encryption_types: None,
                     apply_server_side_encryption_by_default: None,
                     bucket_key_enabled: None,
                 }],
@@ -572,6 +580,7 @@ mod tests {
         assert!(
             validate_sse_s3_bucket_encryption_configuration(&ServerSideEncryptionConfiguration {
                 rules: vec![ServerSideEncryptionRule {
+                    blocked_encryption_types: None,
                     apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
                         kms_master_key_id: Some("key".to_string()),
                         sse_algorithm: ServerSideEncryption::from_static(

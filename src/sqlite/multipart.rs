@@ -287,6 +287,8 @@ impl Sqlite {
                 metadata: upload_state.metadata,
                 content_type: upload_state.content_type,
                 content_encoding: upload_state.content_encoding,
+                content_disposition: upload_state.content_disposition,
+                content_language: upload_state.content_language,
                 cache_control: upload_state.cache_control,
                 expires: upload_state.expires,
                 last_modified: OffsetDateTime::now_utc(),
@@ -380,11 +382,11 @@ impl Sqlite {
             return Err(SqliteError::InvalidMultipartPart);
         }
 
-        let checksum_config = Self::completed_multipart_checksum_config(
+        let checksum_config = MultipartChecksumConfig::for_completion(
             upload_checksum,
             requested_checksum,
             default_checksum,
-        );
+        )?;
         let mut completed_parts = Vec::with_capacity(parts.len());
         let mut md5_hash = Md5::new();
         let mut full_object_checksum = (checksum_config.checksum_type
@@ -484,25 +486,6 @@ impl Sqlite {
         }
 
         Ok(())
-    }
-
-    /// Resolves the final checksum algorithm and type for multipart completion.
-    fn completed_multipart_checksum_config(
-        upload_checksum: Option<MultipartChecksumConfig>,
-        requested_checksum: &MultipartCompletionChecksum,
-        default_checksum: MultipartChecksumConfig,
-    ) -> MultipartChecksumConfig {
-        let algorithm = upload_checksum
-            .map(|checksum| checksum.algorithm)
-            .or(requested_checksum.algorithm())
-            .unwrap_or(default_checksum.algorithm);
-
-        let checksum_type = requested_checksum
-            .checksum_type()
-            .or(upload_checksum.map(|checksum| checksum.checksum_type))
-            .unwrap_or(default_checksum.checksum_type);
-
-        MultipartChecksumConfig::new(algorithm, checksum_type)
     }
 
     /// Returns the total body size for uploaded multipart parts.
@@ -617,6 +600,12 @@ impl Sqlite {
         if part.md5 != Some(requested_part.md5.as_str()) {
             return Err(SqliteError::InvalidMultipartPart);
         }
+        if requested_part.checksum.as_ref().is_some_and(|value| {
+            value.algorithm().requires_explicit_multipart_config()
+                && Some(value.algorithm()) != algorithm
+        }) {
+            return Err(SqliteError::InvalidMultipartChecksumConfig);
+        }
         if let Some(algorithm) = algorithm {
             match requested_part
                 .checksum
@@ -629,7 +618,11 @@ impl Sqlite {
                         .and_then(|checksum| checksum.value_for(algorithm))
                         == Some(requested_checksum) => {}
                 Some(_) => return Err(SqliteError::ChecksumMismatch),
-                None if require_requested_checksum => return Err(SqliteError::ChecksumMismatch),
+                None if require_requested_checksum
+                    || algorithm.requires_explicit_multipart_config() =>
+                {
+                    return Err(SqliteError::ChecksumMismatch);
+                }
                 None => {}
             }
         }
@@ -705,6 +698,8 @@ impl Sqlite {
                 metadata,
                 content_type,
                 content_encoding,
+                content_disposition,
+                content_language,
                 cache_control,
                 expires,
                 checksum_algorithm,
@@ -718,7 +713,7 @@ impl Sqlite {
                 object_lock_retention_mode,
                 object_lock_retain_until
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21);",
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23);",
         )?;
 
         let now = OffsetDateTime::now_utc();
@@ -736,6 +731,8 @@ impl Sqlite {
                 .map_err(|err| ToSqlConversionFailure(Box::new(err)))?,
             state.content_type,
             state.content_encoding,
+            state.content_disposition,
+            state.content_language,
             state.cache_control,
             state.expires,
             state.checksum.map(|checksum| checksum.algorithm),
@@ -782,6 +779,8 @@ impl Sqlite {
                 metadata,
                 content_type,
                 content_encoding,
+                content_disposition,
+                content_language,
                 cache_control,
                 expires,
                 checksum_algorithm,
@@ -815,23 +814,25 @@ impl Sqlite {
                         })?,
                     content_type: row.get(2)?,
                     content_encoding: row.get(3)?,
-                    cache_control: row.get(4)?,
-                    expires: row.get(5)?,
+                    content_disposition: row.get(4)?,
+                    content_language: row.get(5)?,
+                    cache_control: row.get(6)?,
+                    expires: row.get(7)?,
                     checksum: optional_multipart_checksum_config(
-                        row.get(6)?,
-                        row.get(7)?,
                         row.get(8)?,
-                    )?,
-                    stored_sse: optional_stored_sse(
                         row.get(9)?,
                         row.get(10)?,
+                    )?,
+                    stored_sse: optional_stored_sse(
                         row.get(11)?,
                         row.get(12)?,
-                    )?,
-                    object_lock: optional_stored_object_lock(
                         row.get(13)?,
                         row.get(14)?,
+                    )?,
+                    object_lock: optional_stored_object_lock(
                         row.get(15)?,
+                        row.get(16)?,
+                        row.get(17)?,
                     )?,
                 })
             })
@@ -1488,12 +1489,15 @@ mod tests {
         Ok(connection)
     }
 
+    /// Builds an upload with all optional metadata unset.
     fn upload_state() -> MultipartUploadState {
         MultipartUploadState {
             access_key: None,
             metadata: None,
             content_type: None,
             content_encoding: None,
+            content_disposition: None,
+            content_language: None,
             cache_control: None,
             expires: None,
             checksum: None,
@@ -1670,6 +1674,7 @@ mod tests {
         ));
     }
 
+    /// Checks that an upload retains its optional settings across a database write and read.
     #[test]
     fn upload_state_round_trips_optional_checksum_sse_and_object_lock() -> SqliteResult<()> {
         let mut connection = open_schema()?;
@@ -1689,6 +1694,8 @@ mod tests {
                 metadata: Some(metadata),
                 content_type: Some("text/plain".to_string()),
                 content_encoding: Some("gzip".to_string()),
+                content_disposition: None,
+                content_language: None,
                 cache_control: Some("max-age=60".to_string()),
                 expires: Some(retain_until),
                 checksum: Some(MultipartChecksumConfig::new(

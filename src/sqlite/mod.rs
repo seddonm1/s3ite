@@ -7,7 +7,10 @@ use std::{
 };
 
 use clap::ValueEnum;
-use rusqlite::{Error::ToSqlConversionFailure, Transaction, limits::Limit};
+use rusqlite::{
+    Connection, Error::ToSqlConversionFailure, OpenFlags, Transaction, TransactionBehavior,
+    limits::Limit,
+};
 use time::{Duration, OffsetDateTime};
 use tokio::sync::RwLock;
 
@@ -59,7 +62,8 @@ pub(crate) use self::model::{
 
 pub(crate) const NULL_VERSION_ID: &str = "null";
 
-const BUCKET_SCHEMA_VERSION: i32 = 11;
+/// On-disk schema for the 0.7.0 release. Bump when the storage layout changes.
+const BUCKET_SCHEMA_VERSION: i32 = 70;
 pub(crate) const DEFAULT_OBJECT_BLOB_CHUNK_SIZE: usize = 128 * 1024 * 1024;
 const BUCKET_SCHEMA_SQL: &str = "
 -- Singleton bucket metadata, currently the object versioning state.
@@ -196,12 +200,14 @@ CREATE TABLE object_version (
     metadata TEXT,
     content_type TEXT,
     content_encoding TEXT,
+    content_disposition TEXT,
+    content_language TEXT,
     cache_control TEXT,
     expires TEXT,
     last_modified TEXT NOT NULL,
     noncurrent_since TEXT,
     md5 TEXT,
-    checksum_algorithm INTEGER CHECK(checksum_algorithm BETWEEN 1 AND 5),
+    checksum_algorithm INTEGER CHECK(checksum_algorithm BETWEEN 1 AND 10),
     checksum_type INTEGER CHECK(checksum_type BETWEEN 1 AND 2),
     checksum_value TEXT,
     sse_algorithm INTEGER CHECK(sse_algorithm IN (1)),
@@ -253,6 +259,8 @@ CREATE TABLE object_version (
             AND metadata IS NULL
             AND content_type IS NULL
             AND content_encoding IS NULL
+            AND content_disposition IS NULL
+            AND content_language IS NULL
             AND cache_control IS NULL
             AND expires IS NULL
             AND md5 IS NULL
@@ -299,9 +307,11 @@ CREATE TABLE multipart_upload (
     metadata TEXT,
     content_type TEXT,
     content_encoding TEXT,
+    content_disposition TEXT,
+    content_language TEXT,
     cache_control TEXT,
     expires TEXT,
-    checksum_algorithm INTEGER CHECK(checksum_algorithm BETWEEN 1 AND 5),
+    checksum_algorithm INTEGER CHECK(checksum_algorithm BETWEEN 1 AND 10),
     checksum_type INTEGER CHECK(checksum_type BETWEEN 1 AND 2),
     checksum_value TEXT,
     sse_algorithm INTEGER CHECK(sse_algorithm IN (1)),
@@ -377,7 +387,7 @@ CREATE TABLE object_part (
     start INTEGER CHECK(start >= 0),
     size INTEGER NOT NULL CHECK(size >= 0),
     md5 TEXT,
-    checksum_algorithm INTEGER CHECK(checksum_algorithm BETWEEN 1 AND 5),
+    checksum_algorithm INTEGER CHECK(checksum_algorithm BETWEEN 1 AND 10),
     checksum_type INTEGER CHECK(checksum_type BETWEEN 1 AND 2),
     checksum_value TEXT,
     FOREIGN KEY (object_sequence) REFERENCES object_version (sequence) ON DELETE CASCADE,
@@ -500,7 +510,7 @@ CREATE TABLE completed_multipart_upload (
     md5 TEXT NOT NULL,
     version_id TEXT NOT NULL,
     returned_version_id TEXT,
-    checksum_algorithm INTEGER NOT NULL CHECK(checksum_algorithm BETWEEN 1 AND 5),
+    checksum_algorithm INTEGER NOT NULL CHECK(checksum_algorithm BETWEEN 1 AND 10),
     checksum_type INTEGER NOT NULL CHECK(checksum_type BETWEEN 1 AND 2),
     checksum_value TEXT NOT NULL,
     last_modified TEXT NOT NULL,
@@ -512,8 +522,6 @@ CREATE INDEX completed_multipart_upload_expiry
 
 INSERT INTO bucket_state (id, versioning_state)
 VALUES (1, 0);
-
-PRAGMA user_version = 11;
 ";
 
 /// Reads a nonnegative object size column from a row.
@@ -718,44 +726,45 @@ impl Sqlite {
         Ok(stmt.query_row((), |row| row.get(0))?)
     }
 
-    /// Ensures the bucket database schema exists at the supported version.
-    pub(crate) fn create_tables(transaction: &Transaction) -> SqliteResult<()> {
-        let version = Self::schema_version(transaction)?;
-        if version == BUCKET_SCHEMA_VERSION {
-            return Ok(());
-        }
-
-        if version != 0 || Self::user_table_count(transaction)? > 0 {
+    /// Rejects unsupported schemas before opening the bucket's worker connections.
+    fn check_schema_version(found: i32) -> SqliteResult<()> {
+        if found != BUCKET_SCHEMA_VERSION {
             return Err(SqliteError::UnsupportedSchemaVersion {
-                found: version,
+                found,
                 expected: BUCKET_SCHEMA_VERSION,
             });
         }
-
-        transaction.execute_batch(BUCKET_SCHEMA_SQL)?;
-
         Ok(())
     }
 
-    /// Prepares a writable bucket database before long-lived worker pools open it.
-    ///
-    /// This creates or validates schema, removes expired multipart state, and
-    /// refreshes planner statistics before read-only worker connections cache a
-    /// schema view.
+    /// Initializes an empty writable database and stamps its version in the same transaction.
+    pub(crate) fn create_tables(transaction: &Transaction) -> SqliteResult<()> {
+        let version = Self::schema_version(transaction)?;
+        if version == 0 && Self::user_table_count(transaction)? == 0 {
+            transaction.execute_batch(BUCKET_SCHEMA_SQL)?;
+            transaction.pragma_update(None, "user_version", BUCKET_SCHEMA_VERSION)?;
+            return Ok(());
+        }
+        Self::check_schema_version(version)
+    }
+
+    /// Validates the schema before starting bucket workers. Writable buckets also run startup maintenance.
     pub(super) async fn prepare_bucket_file(
         path: PathBuf,
         config: &crate::Config,
         bucket: &str,
     ) -> SqliteResult<()> {
-        if config.read_only(Some(bucket)) {
-            return Ok(());
-        }
-
         let config = config.clone();
         let bucket = bucket.to_string();
         tokio::task::spawn_blocking(move || {
-            let mut connection = rusqlite::Connection::open(path)?;
-            connection.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
+            if config.read_only(Some(&bucket)) {
+                let mut connection =
+                    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                let transaction = connection.transaction()?;
+                return Self::check_schema_version(Self::schema_version(&transaction)?);
+            }
+            let mut connection = Connection::open(path)?;
+            connection.set_transaction_behavior(TransactionBehavior::Immediate);
             Self::prepare_writable_bucket_connection(&mut connection, &config, &bucket)
         })
         .await
@@ -1449,8 +1458,9 @@ mod tests {
         Ok(())
     }
 
+    /// Read-only startup rejects an unstamped file and accepts the current schema.
     #[tokio::test]
-    async fn prepare_bucket_file_skips_read_only_buckets() -> SqliteResult<()> {
+    async fn read_only_startup_checks_schema_without_initializing_it() -> SqliteResult<()> {
         let root = temp_root("prepare-read-only")?;
         let path = root.join("bucket.sqlite3");
         Connection::open(&path)?.close().map_err(|(_, err)| err)?;
@@ -1459,10 +1469,25 @@ mod tests {
             ..Default::default()
         };
 
-        Sqlite::prepare_bucket_file(path.clone(), &config, "bucket").await?;
+        let err = Sqlite::new(&Config {
+            root: root.clone(),
+            ..config.clone()
+        })
+        .await
+        .err();
+        assert!(matches!(
+            err,
+            Some(SqliteError::UnsupportedSchemaVersion {
+                found: 0,
+                expected: 70
+            })
+        ));
         let connection = Connection::open(&path)?;
         let version: i32 = connection.query_row("PRAGMA user_version;", (), |row| row.get(0))?;
         assert_eq!(version, 0);
+        drop(connection);
+        Sqlite::prepare_bucket_file(path.clone(), &Config::default(), "bucket").await?;
+        Sqlite::prepare_bucket_file(path, &config, "bucket").await?;
 
         remove_root(&root);
         Ok(())
@@ -1818,6 +1843,7 @@ mod tests {
         Ok(())
     }
 
+    /// Checks that periodic maintenance removes expired uploads from writable buckets.
     #[tokio::test]
     async fn maintenance_task_runs_periodic_cleanup_for_writable_buckets() -> SqliteResult<()> {
         let root = temp_root("periodic-maintenance")?;
@@ -1838,6 +1864,8 @@ mod tests {
                         metadata: None,
                         content_type: None,
                         content_encoding: None,
+                        content_disposition: None,
+                        content_language: None,
                         cache_control: None,
                         expires: None,
                         checksum: None,
@@ -1904,6 +1932,7 @@ mod maintenance_tests {
         Ok(connection)
     }
 
+    /// Checks that recent part activity keeps a pending upload eligible for completion.
     #[test]
     fn multipart_touch_keeps_active_upload_out_of_cleanup() -> SqliteResult<()> {
         let mut connection = open_test_connection()?;
@@ -1921,6 +1950,8 @@ mod maintenance_tests {
                 metadata: None,
                 content_type: None,
                 content_encoding: None,
+                content_disposition: None,
+                content_language: None,
                 cache_control: None,
                 expires: None,
                 checksum: None,
@@ -1949,6 +1980,7 @@ mod maintenance_tests {
         Ok(())
     }
 
+    /// Checks that cleaning pending uploads preserves the record of completed uploads.
     #[test]
     fn multipart_cleanup_keeps_completed_ledger_separate() -> SqliteResult<()> {
         let mut connection = open_test_connection()?;
@@ -1966,6 +1998,8 @@ mod maintenance_tests {
                 metadata: None,
                 content_type: None,
                 content_encoding: None,
+                content_disposition: None,
+                content_language: None,
                 cache_control: None,
                 expires: None,
                 checksum: None,

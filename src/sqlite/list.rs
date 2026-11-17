@@ -330,6 +330,7 @@ mod tests {
         connection
     }
 
+    /// Builds a live object with a predictable `ETag` for listing tests.
     fn key_value(key: &str, value: &[u8]) -> KeyValue {
         let size = match i64::try_from(value.len()) {
             Ok(size) => size,
@@ -344,6 +345,8 @@ mod tests {
                 metadata: None,
                 content_type: None,
                 content_encoding: None,
+                content_disposition: None,
+                content_language: None,
                 cache_control: None,
                 expires: None,
                 last_modified: time::OffsetDateTime::UNIX_EPOCH,

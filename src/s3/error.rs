@@ -1,6 +1,6 @@
 use super::{
-    CONTENT_TYPE, ETAG, ETag, InternalError, S3Error, S3ErrorCode, S3Response, S3Result,
-    SqliteError, Uuid, X_AMZ_DELETE_MARKER, X_AMZ_REQUEST_ID,
+    CONTENT_TYPE, ETAG, ETag, HeaderValue, InternalError, S3Error, S3ErrorCode, S3Response,
+    S3Result, SqliteError, Uuid, X_AMZ_DELETE_MARKER, X_AMZ_REQUEST_ID,
 };
 
 /// Maps storage-layer failures into S3 protocol errors at the service boundary.
@@ -23,6 +23,7 @@ pub(super) fn s3_error_from_sqlite(error: SqliteError) -> S3Error {
             S3Error::with_message(InternalError, "object body read timed out")
         }
         SqliteError::PreconditionFailed => S3Error::new(S3ErrorCode::PreconditionFailed),
+        SqliteError::InvalidMultipartChecksumConfig => S3Error::new(S3ErrorCode::InvalidRequest),
         SqliteError::ChecksumMismatch => S3Error::new(S3ErrorCode::BadDigest),
         SqliteError::MultipartUploadNotFound => S3Error::new(S3ErrorCode::NoSuchUpload),
         SqliteError::MultipartAccessDenied => S3Error::new(S3ErrorCode::AccessDenied),
@@ -100,15 +101,7 @@ pub(super) fn not_modified_error(md5: Option<&str>) -> S3Result<S3Error> {
                 )
             })?,
     );
-    headers.insert(
-        CONTENT_TYPE,
-        "application/xml".parse().map_err(|err| {
-            S3Error::with_message(
-                InternalError,
-                format!("invalid not-modified content type: {err}"),
-            )
-        })?,
-    );
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/xml"));
     error.set_headers(headers);
     Ok(error)
 }

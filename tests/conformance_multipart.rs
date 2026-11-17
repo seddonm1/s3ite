@@ -967,7 +967,7 @@ async fn test_multipart_copy_versioned() -> Result<()> {
     put_bucket_versioning(&client, &source_bucket, BucketVersioningStatus::Enabled).await?;
 
     let mut versions = Vec::new();
-    for byte in [b'a', b'b', b'c'] {
+    for &byte in b"abc" {
         let body = vec![byte; 6 * MIB];
         let version_id = put_bytes(&client, &source_bucket, source_key, body.clone())
             .await?
@@ -1428,6 +1428,35 @@ async fn test_abort_multipart_upload_not_found() -> Result<()> {
     };
     assert_error_contains(&error, "NoSuchUpload");
 
+    Ok(())
+}
+
+/// Verifies completion publishes the content headers supplied at initiation.
+#[tokio::test]
+#[serial(conformance)]
+async fn s3ite_multipart_preserves_content_headers() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-mpu");
+    let key = "report";
+    create_bucket(&client, &bucket).await?;
+    let upload = client
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .content_disposition("inline")
+        .content_language("de")
+        .send()
+        .await?;
+    let upload_id = upload
+        .upload_id()
+        .ok_or_else(|| anyhow::anyhow!("missing upload ID"))?;
+    let part = upload_part(&client, &bucket, key, upload_id, 1, b"body".to_vec()).await?;
+    complete_upload(&client, &bucket, key, upload_id, vec![part]).await?;
+
+    let object = client.get_object().bucket(&bucket).key(key).send().await?;
+    assert_eq!(object.content_disposition(), Some("inline"));
+    assert_eq!(object.content_language(), Some("de"));
     Ok(())
 }
 

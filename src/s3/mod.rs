@@ -129,17 +129,20 @@ mod sse;
 mod tagging;
 
 pub(crate) use self::{
-    cors::BucketCorsLayer, lifecycle::LifecycleExpirationHeader, sse::parse_master_key,
+    cors::BucketCorsLayer, lifecycle::LifecycleExpirationHeader, metadata::decode_rfc2047_word,
+    sse::parse_master_key,
 };
 
 use self::{
     checksum::{
         ChecksumInput, ChecksumPolicy, checksum_algorithm_from_request, checksum_algorithm_output,
-        checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_mode_enabled, checksum_sha1,
-        checksum_sha256, checksum_struct, checksum_type_output, configured_part_checksum,
-        default_crc64nvme_full_object_checksum, finish_part_checksum, finish_payload_checksum, hex,
-        multipart_checksum_config, object_checksum_for_part, object_write_checksum_from_value,
-        part_checksum_accumulator, payload_checksum_accumulator, validate_content_md5,
+        checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_input, checksum_md5,
+        checksum_mode_enabled, checksum_sha1, checksum_sha256, checksum_sha512, checksum_struct,
+        checksum_type_output, checksum_xxhash3, checksum_xxhash64, checksum_xxhash128,
+        configured_part_checksum, default_crc64nvme_full_object_checksum, finish_part_checksum,
+        finish_payload_checksum, hex, multipart_checksum_config, object_checksum_for_part,
+        object_write_checksum_from_value, part_checksum_accumulator, payload_checksum_accumulator,
+        validate_content_md5,
     },
     error::{
         not_found_delete_marker_error, not_modified_error, s3_error, s3_error_from_sqlite,
@@ -1100,6 +1103,7 @@ mod tests {
     use crate::sqlite::StoredObjectLock;
     use time::Duration;
 
+    /// Builds a live version with the `ETag`, timestamp, and size used by condition checks.
     fn metadata(md5: Option<&str>, last_modified: OffsetDateTime, size: i64) -> KeyMetadata {
         KeyMetadata {
             version_id: "version".to_string(),
@@ -1107,6 +1111,8 @@ mod tests {
             metadata: None,
             content_type: None,
             content_encoding: None,
+            content_disposition: None,
+            content_language: None,
             cache_control: None,
             expires: None,
             last_modified,

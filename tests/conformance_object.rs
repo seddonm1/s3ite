@@ -206,8 +206,8 @@ async fn test_object_put_authenticated() -> Result<()> {
 /// Verifies a failed PutObject does not poison later successful writes.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_100_continue_error_retry() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_100_continue_error_retry
+async fn s3ite_100_continue_error_retry() -> Result<()> {
+    // Retained from ceph/s3-tests@5b39871, test_s3.py::test_100_continue_error_retry.
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let missing_bucket = bucket_name("s3ite-missing");
@@ -1036,7 +1036,15 @@ async fn test_object_raw_response_headers() -> Result<()> {
     let bucket = bucket_name("s3ite-obj");
 
     create_bucket(&client, &bucket).await?;
-    put_object(&client, &bucket, "foo", b"bar").await?;
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key("foo")
+        .content_disposition(r#"attachment; filename="report.txt""#)
+        .content_language("en-GB")
+        .body(ByteStream::from_static(b"bar"))
+        .send()
+        .await?;
 
     let response = client
         .get_object()
@@ -1055,6 +1063,18 @@ async fn test_object_raw_response_headers() -> Result<()> {
     assert_eq!(response.content_language(), Some("esperanto"));
     assert_eq!(response.content_encoding(), Some("aaa"));
     assert_eq!(response.cache_control(), Some("no-cache"));
+
+    let stored = client
+        .head_object()
+        .bucket(&bucket)
+        .key("foo")
+        .send()
+        .await?;
+    assert_eq!(
+        stored.content_disposition(),
+        Some(r#"attachment; filename="report.txt""#)
+    );
+    assert_eq!(stored.content_language(), Some("en-GB"));
 
     Ok(())
 }

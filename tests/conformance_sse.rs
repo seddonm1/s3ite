@@ -27,6 +27,119 @@ use support::{
     },
 };
 
+/// Mirrors Ceph's empty-algorithm PUT and checks that the rejected write preserves the object.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_sse_empty_algorithm() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_sse_empty_algorithm
+    let server = spawn_sse_server().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-sse-empty");
+    let key = "original";
+    create_bucket(&client, &bucket).await?;
+    put_object(&client, &bucket, key, b"original").await?;
+    let response = signed(
+        &server,
+        Method::PUT,
+        &object_path(&bucket, key),
+        b"replacement".to_vec(),
+        &[("x-amz-server-side-encryption", "")],
+    )
+    .await?;
+    assert_status(&response, StatusCode::BAD_REQUEST);
+    let body = response.text().await?;
+    assert!(body.contains("<Code>InvalidArgument</Code>"), "{body}");
+    assert_eq!(get_object_bytes(&client, &bucket, key).await?, b"original");
+    Ok(())
+}
+
+/// Sends raw XML so malformed element names reach the S3 parser unchanged.
+async fn check_malformed_bucket_encryption(rules: &str) -> Result<()> {
+    let server = spawn_sse_server().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-sse-xml");
+    create_bucket(&client, &bucket).await?;
+    let xml = format!(
+        r#"<ServerSideEncryptionConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">{rules}</ServerSideEncryptionConfiguration>"#
+    );
+    let response = signed(
+        &server,
+        Method::PUT,
+        &format!("/{bucket}?encryption"),
+        xml.into_bytes(),
+        &[],
+    )
+    .await?;
+    assert_status(&response, StatusCode::BAD_REQUEST);
+    let body = response.text().await?;
+    assert!(body.contains("<Code>MalformedXML</Code>"), "{body}");
+    assert_bucket_encryption_missing(&client, &bucket).await
+}
+
+/// Checks that an empty rule list is rejected without changing the bucket.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_put_bucket_encryption_missing_rule() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_bucket_encryption_missing_rule
+    check_malformed_bucket_encryption("").await
+}
+
+/// Checks that a rule without an SSE algorithm is rejected without changing the bucket.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_put_bucket_encryption_missing_sse_algorithm() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_bucket_encryption_missing_sse_algorithm
+    check_malformed_bucket_encryption("<Rule><ApplyServerSideEncryptionByDefault><KMSMasterKeyID>testkey-1</KMSMasterKeyID></ApplyServerSideEncryptionByDefault></Rule>").await
+}
+
+/// Checks that a misspelled SSE algorithm element is rejected without changing the bucket.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_put_bucket_encryption_misspelled_sse_algorithm() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_bucket_encryption_misspelled_sse_algorithm
+    check_malformed_bucket_encryption("<Rule><ApplyServerSideEncryptionByDefault><SseAlgorithm>AES256</SseAlgorithm></ApplyServerSideEncryptionByDefault></Rule>").await
+}
+
+/// Checks that an SSE algorithm outside its default configuration is rejected without changing the bucket.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_put_bucket_encryption_misplaced_sse_algorithm() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_bucket_encryption_misplaced_sse_algorithm
+    check_malformed_bucket_encryption("<Rule><SSEAlgorithm>AES256</SSEAlgorithm></Rule>").await
+}
+
+/// Checks that an unknown rule element is rejected without changing the bucket.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_put_bucket_encryption_misspelled_rule() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_bucket_encryption_misspelled_rule
+    check_malformed_bucket_encryption("<Rules><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rules>").await
+}
+
+/// Checks that an unknown blocked-encryption element is rejected without changing the bucket.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_put_bucket_encryption_misspelled_blocked_encryption_types() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_bucket_encryption_misspelled_blocked_encryption_types
+    check_malformed_bucket_encryption("<Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault><BlockedEncryptionType><EncryptionType>SSE-C</EncryptionType></BlockedEncryptionType></Rule>").await
+}
+
+/// Checks that an unknown encryption type element is rejected without changing the bucket.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_put_bucket_encryption_misspelled_encryption_type() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_bucket_encryption_misspelled_encryption_type
+    check_malformed_bucket_encryption("<Rule><BlockedEncryptionTypes><EncryptionTypes>SSE-C</EncryptionTypes></BlockedEncryptionTypes></Rule>").await
+}
+
+/// Checks that a second encryption rule is rejected without changing the bucket.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_put_bucket_encryption_two_rules() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_put_bucket_encryption_two_rules
+    check_malformed_bucket_encryption("<Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule><Rule><BlockedEncryptionTypes><EncryptionType>SSE-C</EncryptionType></BlockedEncryptionTypes></Rule>").await
+}
+
 async fn put_bucket_encryption_s3(client: &aws_sdk_s3::Client, bucket: &str) -> Result<()> {
     client
         .put_bucket_encryption()
@@ -37,6 +150,7 @@ async fn put_bucket_encryption_s3(client: &aws_sdk_s3::Client, bucket: &str) -> 
     Ok(())
 }
 
+/// Checks both the HTTP status and the S3 error for an unconfigured bucket.
 async fn assert_bucket_encryption_missing(client: &aws_sdk_s3::Client, bucket: &str) -> Result<()> {
     let error = client
         .get_bucket_encryption()
@@ -44,6 +158,14 @@ async fn assert_bucket_encryption_missing(client: &aws_sdk_s3::Client, bucket: &
         .send()
         .await
         .expect_err("bucket encryption should be absent");
+    assert_eq!(
+        error
+            .raw_response()
+            .context("missing HTTP response")?
+            .status()
+            .as_u16(),
+        404
+    );
     assert_error_contains(&error, "ServerSideEncryptionConfigurationNotFoundError");
     Ok(())
 }

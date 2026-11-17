@@ -16,16 +16,16 @@ jobs:
         # "1" means line tables only, which is useful for panic tracebacks.
         RUSTFLAGS: "-C debuginfo=1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - name: Cache Cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: /home/runner/.cargo
           key: cargo-cache-
       - name: Cache Rust dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: /home/runner/target
           key: target-cache-
@@ -37,7 +37,7 @@ jobs:
           rustup component add clippy
           rustup component add llvm-tools-preview
       - name: Install coverage tool
-        run: cargo install cargo-llvm-cov --version 0.8.7 --locked
+        run: cargo install cargo-llvm-cov --version 0.9.1 --locked
       - name: Run tests with coverage limits
         run: >
           cargo llvm-cov --all-targets --workspace

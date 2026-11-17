@@ -849,6 +849,8 @@ impl WorkerRole {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
+    use tokio::runtime::Builder;
 
     fn temp_path() -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("s3ite-{}.sqlite3", uuid::Uuid::new_v4()));
@@ -1128,6 +1130,31 @@ mod tests {
         );
         drop(chunk_sender);
         assert!(chunk_receiver.recv().await.is_none());
+        Ok(())
+    }
+
+    /// A BLOB shorter than the requested body delivers an error through the response stream.
+    #[test]
+    fn blob_stream_reports_unexpected_eof() -> SqliteResult<()> {
+        let runtime = Builder::new_current_thread().build()?;
+        let connection = Connection::open_in_memory()?;
+        connection.execute_batch(
+            "CREATE TABLE data (body BLOB); INSERT INTO data VALUES (zeroblob(1));",
+        )?;
+        let mut blob = connection.blob_open(MAIN_DB, "data", "body", 1, true)?;
+        let (sender, mut receiver) = tokio_mpsc::channel(1);
+        BucketConnectionInner::stream_blob_chunks(
+            &mut blob,
+            2,
+            &sender,
+            None,
+            &AtomicBool::new(false),
+            runtime.handle(),
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Err(SqliteError::ObjectBodyInconsistent))
+        ));
         Ok(())
     }
 

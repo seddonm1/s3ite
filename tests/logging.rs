@@ -2,7 +2,10 @@
 
 mod support;
 
-use std::time::{Duration, Instant};
+use std::{
+    process::Command,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 use aws_sdk_s3::{
@@ -20,10 +23,23 @@ use support::{
     raw_http, sdk,
     server::{TestServer, TestServerOptions},
 };
+use yaml_serde::{Value, from_slice};
 
 const DEFAULT_LOG_TIMEOUT: Duration = Duration::from_secs(5);
 const COVERAGE_LOG_TIMEOUT: Duration = Duration::from_secs(30);
 const LOG_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// The CLI template action writes YAML to stdout and exits before binding a listener.
+#[test]
+fn print_config_template_exits_with_yaml() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_s3ite"))
+        .arg("--print-config-template")
+        .output()?;
+    assert!(output.status.success());
+    let template: Value = from_slice(&output.stdout)?;
+    assert_eq!(template["port"].as_u64(), Some(8014));
+    Ok(())
+}
 
 #[tokio::test]
 #[serial(conformance)]

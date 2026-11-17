@@ -19,7 +19,7 @@ use reqwest::{Method, Response, StatusCode};
 use serial_test::serial;
 use support::{
     assertions::{assert_error_contains, assert_status},
-    fixtures::{bucket_name, create_bucket},
+    fixtures::{bucket_name, create_bucket, put_object},
     raw_http, sdk,
     server::{TestServer, TestServerOptions},
 };
@@ -243,6 +243,7 @@ async fn test_set_cors() -> Result<()> {
     Ok(())
 }
 
+/// Checks bucket origin and method matching on actual requests and preflights.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_cors_origin_response() -> Result<()> {
@@ -289,7 +290,7 @@ async fn test_cors_origin_response() -> Result<()> {
 
     let response =
         signed_cors_request(&server, Method::GET, &bucket_path, &[("Origin", "foo.bar")]).await?;
-    assert_cors_response(&response, StatusCode::OK, None, None);
+    assert_cors_response(&response, StatusCode::FORBIDDEN, None, None);
 
     let response = signed_cors_request(
         &server,
@@ -298,7 +299,21 @@ async fn test_cors_origin_response() -> Result<()> {
         &[("Origin", "foo.suffix.get")],
     )
     .await?;
-    assert_cors_response(&response, StatusCode::OK, None, None);
+    assert_cors_response(&response, StatusCode::FORBIDDEN, None, None);
+
+    let response = signed_cors_request(
+        &server,
+        Method::GET,
+        &bucket_path,
+        &[("Origin", "foo.get.suffix")],
+    )
+    .await?;
+    assert_cors_response(
+        &response,
+        StatusCode::OK,
+        Some("foo.get.suffix"),
+        Some("GET"),
+    );
 
     for origin in ["startend", "start1end", "start12end"] {
         let response =
@@ -313,7 +328,7 @@ async fn test_cors_origin_response() -> Result<()> {
         &[("Origin", "0start12end")],
     )
     .await?;
-    assert_cors_response(&response, StatusCode::OK, None, None);
+    assert_cors_response(&response, StatusCode::FORBIDDEN, None, None);
 
     for origin in ["prefix", "prefix.suffix"] {
         let response =
@@ -328,7 +343,7 @@ async fn test_cors_origin_response() -> Result<()> {
         &[("Origin", "bla.prefix")],
     )
     .await?;
-    assert_cors_response(&response, StatusCode::OK, None, None);
+    assert_cors_response(&response, StatusCode::FORBIDDEN, None, None);
 
     let response = signed_cors_request(
         &server,
@@ -583,6 +598,70 @@ async fn test_cors_presigned_get_object() -> Result<()> {
         .presigned(PresigningConfig::expires_in(Duration::from_secs(100_000))?)
         .await?;
     assert_presigned_options_method(&client, &bucket, presigned.uri(), "GET").await
+}
+
+/// Checks actual presigned requests with an Origin before and after configuring bucket CORS.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_cors_presigned_url_non_preflight() -> Result<()> {
+    // Adapted from s3tests/functional/test_s3.py::test_cors_presigned_url_non_preflight: uses owner credentials and disables s3ite's server-wide CORS fallback.
+    let server = TestServer::spawn_with(TestServerOptions {
+        cors: Some("disabled".to_owned()),
+        ..Default::default()
+    })
+    .await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-cors-actual");
+    create_bucket(&client, &bucket).await?;
+    put_object(&client, &bucket, "foo", b"str").await?;
+    let get = client
+        .get_object()
+        .bucket(&bucket)
+        .key("foo")
+        .presigned(PresigningConfig::expires_in(Duration::from_secs(60))?)
+        .await?;
+    let http = raw_http::client()?;
+    let response = http
+        .get(get.uri())
+        .header("Origin", "example1.com")
+        .send()
+        .await?;
+    assert_cors_response(&response, StatusCode::OK, None, None);
+    assert_eq!(response.bytes().await?.as_ref(), b"str");
+
+    client
+        .put_bucket_cors()
+        .bucket(&bucket)
+        .cors_configuration(cors_config(vec![ceph_cors_rule(&["*"], &["GET"])?])?)
+        .send()
+        .await?;
+    let url = raw_http::presigned_url(&server, Method::POST, &format!("/{bucket}/foo?uploads"))?;
+    let response = http
+        .post(&url)
+        .header("Origin", "example1.com")
+        .send()
+        .await?;
+    assert_cors_response(&response, StatusCode::FORBIDDEN, None, None);
+    assert!(response.text().await?.contains("<Code>AccessDenied</Code>"));
+    let uploads = client
+        .list_multipart_uploads()
+        .bucket(&bucket)
+        .send()
+        .await?;
+    assert!(uploads.uploads().is_empty());
+    client
+        .put_bucket_cors()
+        .bucket(&bucket)
+        .cors_configuration(cors_config(vec![ceph_cors_rule(&["*"], &["POST"])?])?)
+        .send()
+        .await?;
+    let response = http
+        .post(&url)
+        .header("Origin", "example1.com")
+        .send()
+        .await?;
+    assert_cors_response(&response, StatusCode::OK, Some("*"), Some("POST"));
+    Ok(())
 }
 
 #[tokio::test]

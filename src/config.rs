@@ -5,7 +5,9 @@ use std::{
     time::Duration,
 };
 
-use clap::{Parser, ValueEnum};
+use clap::{
+    ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum, parser::ValueSource,
+};
 use hyper::http::{HeaderName, HeaderValue, Method};
 use serde::{Deserialize, de};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
@@ -29,114 +31,129 @@ pub enum ConfigError {
 
 /// Command-line arguments that override YAML or default configuration.
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    author,
+    version,
+    about,
+    long_about = None,
+    after_long_help = "Configuration precedence: built-in defaults, then optional YAML from `--config`, then explicit CLI flags. Values shown as defaults are built-in defaults and can be overridden by YAML when the corresponding CLI flag is omitted."
+)]
 struct ConfigArgs {
+    /// Print an example YAML configuration to stdout and exit.
+    #[arg(long, exclusive = true)]
+    print_config_template: bool,
+
     /// The base path where the `.sqlite3` files will be created.
     /// All `.sqlite3` files at this path will be loaded at startup and exposed via this service.
-    #[clap(long)]
-    root: Option<PathBuf>,
+    #[arg(long, default_value_os_t = default_root())]
+    root: PathBuf,
 
     /// Path to a YAML configuration file.
-    #[clap(long)]
+    #[arg(long)]
     config: Option<PathBuf>,
 
     /// The IP address to listen on for this service. Use `0.0.0.0` to listen on all interfaces.
-    #[clap(long)]
-    host: Option<IpAddr>,
+    #[arg(long, default_value_t = default_host())]
+    host: IpAddr,
 
     /// The port to listen on for this service.
-    #[clap(long)]
-    port: Option<u16>,
+    #[arg(long, default_value_t = default_port())]
+    port: u16,
 
     /// Configures Cross-Origin Resource Sharing (`CORS`) handling.
-    #[clap(long, value_enum, conflicts_with = "permissive_cors")]
-    cors: Option<CliCorsMode>,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = default_cli_cors_mode(),
+        conflicts_with = "permissive_cors"
+    )]
+    cors: CliCorsMode,
 
     /// Allow permissive Cross-Origin Resource Sharing (`CORS`) requests.
     /// This can be enabled to allow users to access this service from a web service running on a different host.
-    #[clap(long, conflicts_with = "cors")]
+    #[arg(long, conflicts_with = "cors", hide = true)]
     permissive_cors: Option<bool>,
 
     /// The access key ID that is used to authenticate for this service.
-    #[clap(long, requires = "secret_key")]
+    #[arg(long, requires = "secret_key")]
     access_key: Option<String>,
 
     /// The secret access key that is used to authenticate for this service.
-    #[clap(long, requires = "access_key")]
+    #[arg(long, requires = "access_key")]
     secret_key: Option<String>,
 
     /// Base64-encoded 32-byte master key used for SSE-S3 object encryption.
-    #[clap(long)]
+    #[arg(long)]
     sse_s3_key: Option<String>,
 
     /// The domain to use to allow parsing virtual-hosted-style requests.
-    #[clap(long)]
+    #[arg(long)]
     domain_name: Option<String>,
 
     /// Enforces a limit on the concurrent number of requests the underlying service can handle.
     /// This can be tuned depending on infrastructure as `SSD`/`HDD` will deal with resource contention very differently.
-    #[clap(long)]
-    concurrency_limit: Option<u16>,
+    #[arg(long, default_value_t = default_concurrency_limit())]
+    concurrency_limit: u16,
 
-    /// If this service should be read-only.
-    #[clap(long)]
-    read_only: Option<bool>,
+    /// Whether this service should be read-only.
+    #[arg(long, action = ArgAction::Set, default_value_t = default_read_only())]
+    read_only: bool,
 
     /// Controls the `SQLite` `journal_mode` flag pragma.
-    #[clap(long)]
-    journal_mode: Option<JournalMode>,
+    #[arg(long, value_enum, default_value_t = default_journal_mode())]
+    journal_mode: JournalMode,
 
     /// Controls the `SQLite` `synchronous` pragma.
-    #[clap(long)]
-    synchronous: Option<Synchronous>,
+    #[arg(long, value_enum, default_value_t = default_synchronous())]
+    synchronous: Synchronous,
 
     /// Controls the `SQLite` `temp_store` pragma.
-    #[clap(long)]
-    temp_store: Option<TempStore>,
+    #[arg(long, value_enum, default_value_t = default_temp_store())]
+    temp_store: TempStore,
 
     /// Controls the `SQLite` `cache_size` pragma in kilobytes.
-    #[clap(long)]
-    cache_size: Option<u32>,
+    #[arg(long, default_value_t = default_cache_size())]
+    cache_size: u32,
 
     /// Controls the `SQLite` `busy_timeout` pragma in milliseconds.
-    #[clap(long)]
-    busy_timeout_milliseconds: Option<u64>,
+    #[arg(long, default_value_t = default_busy_timeout_milliseconds())]
+    busy_timeout_milliseconds: u64,
 
     /// Controls the `SQLite` `journal_size_limit` pragma in bytes.
-    #[clap(long)]
-    journal_size_limit: Option<i64>,
+    #[arg(long, default_value_t = default_journal_size_limit())]
+    journal_size_limit: i64,
 
     /// Controls the number of reader connections to `SQLite`.
-    #[clap(long)]
-    readers: Option<usize>,
+    #[arg(long, default_value_t = default_readers())]
+    readers: usize,
 
     /// Controls the number of long-lived BLOB reader connections to `SQLite`.
-    #[clap(long)]
-    blob_readers: Option<usize>,
+    #[arg(long, default_value_t = default_blob_readers())]
+    blob_readers: usize,
 
     /// Seconds a BLOB reader may stay blocked by an unconsumed response. Set to `0` to disable.
-    #[clap(long)]
-    blob_read_timeout_seconds: Option<u64>,
+    #[arg(long, default_value_t = default_blob_read_timeout_seconds())]
+    blob_read_timeout_seconds: u64,
 
     /// Interval, in seconds, for background database maintenance. Set to `0` to disable.
-    #[clap(long)]
-    maintenance_interval_seconds: Option<u64>,
+    #[arg(long, default_value_t = default_maintenance_interval_seconds())]
+    maintenance_interval_seconds: u64,
 
     /// Number of free pages to reclaim during each maintenance pass. Set to `0` to disable.
-    #[clap(long)]
-    maintenance_vacuum_pages: Option<u32>,
+    #[arg(long, default_value_t = default_maintenance_vacuum_pages())]
+    maintenance_vacuum_pages: u32,
 
     /// TTL, in seconds, for inactive incomplete multipart uploads. Set to `0` to disable.
-    #[clap(long)]
-    multipart_upload_ttl_seconds: Option<u64>,
+    #[arg(long, default_value_t = default_multipart_upload_ttl_seconds())]
+    multipart_upload_ttl_seconds: u64,
 
     /// TTL, in seconds, for completed multipart idempotency records. Set to `0` to disable.
-    #[clap(long)]
-    completed_multipart_upload_ttl_seconds: Option<u64>,
+    #[arg(long, default_value_t = default_completed_upload_ttl_seconds())]
+    completed_multipart_upload_ttl_seconds: u64,
 }
 
 /// CLI-accessible `CORS` modes.
-#[derive(Copy, Clone, Debug, ValueEnum)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum CliCorsMode {
     /// Disable CORS response handling.
     Disabled,
@@ -150,6 +167,49 @@ impl From<CliCorsMode> for CorsMode {
             CliCorsMode::Disabled => Self::Disabled,
             CliCorsMode::Permissive => Self::Permissive,
         }
+    }
+}
+
+/// Top-level action requested by command-line parsing.
+#[derive(Debug)]
+pub(crate) enum ConfigAction {
+    /// Run the service with the resolved configuration.
+    Run(Box<Config>),
+    /// Print a starter YAML configuration and exit.
+    PrintConfigTemplate,
+}
+
+impl ConfigAction {
+    /// Loads the requested startup action from command-line arguments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a YAML config file requested by runtime startup
+    /// cannot be read or parsed.
+    pub(crate) fn from_args() -> ConfigResult<Self> {
+        let matches = ConfigArgs::command().get_matches();
+        Self::from_arg_matches(&matches)
+    }
+
+    /// Loads the requested startup action from parsed command-line matches.
+    ///
+    /// `--print-config-template` is handled before YAML loading so the template
+    /// path is independent of user configuration and service validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if runtime startup requests a YAML file that cannot be
+    /// read or parsed.
+    fn from_arg_matches(matches: &ArgMatches) -> ConfigResult<Self> {
+        let args = ConfigArgs::from_arg_matches(matches)
+            .map_err(|err| ConfigError::Configuration(err.to_string()))?;
+        if args.print_config_template {
+            return Ok(Self::PrintConfigTemplate);
+        }
+
+        Ok(Self::Run(Box::new(Config::from_config_args(
+            &args, matches,
+        )?)))
     }
 }
 
@@ -278,24 +338,32 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Loads configuration from command-line arguments and an optional YAML file.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the configured YAML file cannot be read or parsed.
-    pub fn from_args() -> ConfigResult<Self> {
-        Self::from_config_args(ConfigArgs::parse())
-    }
-
-    /// Loads configuration from parsed command-line arguments.
+    /// Loads configuration from parsed command-line matches.
     ///
     /// If a YAML config path is provided, values from the file are loaded first
-    /// and then overridden by any command-line values present in `args`.
+    /// and then overridden by any values explicitly supplied on the command
+    /// line. Clap defaults are used for help text and bare runs, but they do
+    /// not override YAML values.
     ///
     /// # Errors
     ///
     /// Returns an error if the YAML file cannot be read or parsed.
-    fn from_config_args(args: ConfigArgs) -> ConfigResult<Self> {
+    #[cfg(test)]
+    fn from_arg_matches(matches: &ArgMatches) -> ConfigResult<Self> {
+        let args = ConfigArgs::from_arg_matches(matches)
+            .map_err(|err| ConfigError::Configuration(err.to_string()))?;
+        Self::from_config_args(&args, matches)
+    }
+
+    /// Loads runtime configuration from parsed arguments and matches.
+    ///
+    /// Clap defaults are present in `args`, but only command-line sourced
+    /// values from `matches` override YAML.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the YAML file cannot be read or parsed.
+    fn from_config_args(args: &ConfigArgs, matches: &ArgMatches) -> ConfigResult<Self> {
         let mut config = args
             .config
             .as_ref()
@@ -306,37 +374,46 @@ impl Config {
             .transpose()?
             .unwrap_or_default();
 
-        config.apply_args(args);
+        config.apply_args(args, matches);
         config.validate()?;
 
         Ok(config)
     }
 
-    /// Applies command-line values over the current configuration.
-    fn apply_args(&mut self, args: ConfigArgs) {
-        if let Some(root) = args.root {
-            self.root = root;
+    /// Renders a starter YAML configuration using built-in defaults.
+    #[must_use]
+    pub(crate) fn config_template() -> String {
+        render_config_template(&Self::default())
+    }
+
+    /// Applies explicit command-line values over the current configuration.
+    fn apply_args(&mut self, args: &ConfigArgs, matches: &ArgMatches) {
+        if cli_supplied(matches, "root") {
+            self.root.clone_from(&args.root);
         }
-        if let Some(host) = args.host {
-            self.host = host;
+        if cli_supplied(matches, "host") {
+            self.host = args.host;
         }
-        if let Some(port) = args.port {
-            self.port = port;
+        if cli_supplied(matches, "port") {
+            self.port = args.port;
         }
-        if let Some(access_key) = args.access_key {
-            self.access_key = Some(access_key);
+        if cli_supplied(matches, "access_key") {
+            self.access_key.clone_from(&args.access_key);
         }
-        if let Some(secret_key) = args.secret_key {
-            self.secret_key = Some(secret_key);
+        if cli_supplied(matches, "secret_key") {
+            self.secret_key.clone_from(&args.secret_key);
         }
-        if let Some(sse_s3_key) = args.sse_s3_key {
-            self.sse_s3_key = Some(sse_s3_key);
+        if cli_supplied(matches, "sse_s3_key") {
+            self.sse_s3_key.clone_from(&args.sse_s3_key);
         }
-        if let Some(cors) = args.cors {
-            self.cors = cors.into();
+        if cli_supplied(matches, "cors") {
+            self.cors = args.cors.into();
             self.permissive_cors = None;
         }
-        if let Some(permissive_cors) = args.permissive_cors {
+        if let Some(permissive_cors) = args
+            .permissive_cors
+            .filter(|_| cli_supplied(matches, "permissive_cors"))
+        {
             self.cors = if permissive_cors {
                 CorsMode::Permissive
             } else {
@@ -344,55 +421,54 @@ impl Config {
             };
             self.permissive_cors = None;
         }
-        if let Some(domain_name) = args.domain_name {
-            self.domain_name = Some(domain_name);
+        if cli_supplied(matches, "domain_name") {
+            self.domain_name.clone_from(&args.domain_name);
         }
-        if let Some(concurrency_limit) = args.concurrency_limit {
-            self.concurrency_limit = concurrency_limit;
+        if cli_supplied(matches, "concurrency_limit") {
+            self.concurrency_limit = args.concurrency_limit;
         }
-        if let Some(readers) = args.readers {
-            self.readers = readers;
+        if cli_supplied(matches, "readers") {
+            self.readers = args.readers;
         }
-        if let Some(blob_readers) = args.blob_readers {
-            self.blob_readers = blob_readers;
+        if cli_supplied(matches, "blob_readers") {
+            self.blob_readers = args.blob_readers;
         }
-        if let Some(blob_read_timeout_seconds) = args.blob_read_timeout_seconds {
-            self.blob_read_timeout_seconds = blob_read_timeout_seconds;
+        if cli_supplied(matches, "blob_read_timeout_seconds") {
+            self.blob_read_timeout_seconds = args.blob_read_timeout_seconds;
         }
-        if let Some(maintenance_interval_seconds) = args.maintenance_interval_seconds {
-            self.maintenance_interval_seconds = maintenance_interval_seconds;
+        if cli_supplied(matches, "maintenance_interval_seconds") {
+            self.maintenance_interval_seconds = args.maintenance_interval_seconds;
         }
-        if let Some(maintenance_vacuum_pages) = args.maintenance_vacuum_pages {
-            self.maintenance_vacuum_pages = maintenance_vacuum_pages;
+        if cli_supplied(matches, "maintenance_vacuum_pages") {
+            self.maintenance_vacuum_pages = args.maintenance_vacuum_pages;
         }
-        if let Some(multipart_upload_ttl_seconds) = args.multipart_upload_ttl_seconds {
-            self.multipart_upload_ttl_seconds = multipart_upload_ttl_seconds;
+        if cli_supplied(matches, "multipart_upload_ttl_seconds") {
+            self.multipart_upload_ttl_seconds = args.multipart_upload_ttl_seconds;
         }
-        if let Some(completed_multipart_upload_ttl_seconds) =
-            args.completed_multipart_upload_ttl_seconds
-        {
-            self.completed_multipart_upload_ttl_seconds = completed_multipart_upload_ttl_seconds;
+        if cli_supplied(matches, "completed_multipart_upload_ttl_seconds") {
+            self.completed_multipart_upload_ttl_seconds =
+                args.completed_multipart_upload_ttl_seconds;
         }
-        if let Some(read_only) = args.read_only {
-            self.read_only = read_only;
+        if cli_supplied(matches, "read_only") {
+            self.read_only = args.read_only;
         }
-        if let Some(journal_mode) = args.journal_mode {
-            self.sqlite.journal_mode = journal_mode;
+        if cli_supplied(matches, "journal_mode") {
+            self.sqlite.journal_mode = args.journal_mode;
         }
-        if let Some(synchronous) = args.synchronous {
-            self.sqlite.synchronous = synchronous;
+        if cli_supplied(matches, "synchronous") {
+            self.sqlite.synchronous = args.synchronous;
         }
-        if let Some(temp_store) = args.temp_store {
-            self.sqlite.temp_store = temp_store;
+        if cli_supplied(matches, "temp_store") {
+            self.sqlite.temp_store = args.temp_store;
         }
-        if let Some(cache_size) = args.cache_size {
-            self.sqlite.cache_size = cache_size;
+        if cli_supplied(matches, "cache_size") {
+            self.sqlite.cache_size = args.cache_size;
         }
-        if let Some(busy_timeout_milliseconds) = args.busy_timeout_milliseconds {
-            self.sqlite.busy_timeout_milliseconds = busy_timeout_milliseconds;
+        if cli_supplied(matches, "busy_timeout_milliseconds") {
+            self.sqlite.busy_timeout_milliseconds = args.busy_timeout_milliseconds;
         }
-        if let Some(journal_size_limit) = args.journal_size_limit {
-            self.sqlite.journal_size_limit = journal_size_limit;
+        if cli_supplied(matches, "journal_size_limit") {
+            self.sqlite.journal_size_limit = args.journal_size_limit;
         }
     }
 
@@ -543,6 +619,128 @@ impl Config {
             })
             .unwrap_or(self.sqlite.journal_size_limit)
     }
+}
+
+/// Returns whether an argument value came from the command line.
+fn cli_supplied(matches: &ArgMatches, id: &str) -> bool {
+    matches.value_source(id) == Some(ValueSource::CommandLine)
+}
+
+/// Renders a starter YAML configuration from a default config value.
+fn render_config_template(config: &Config) -> String {
+    format!(
+        "\
+root: {root}
+host: {host}
+port: {port}
+
+# Authentication is disabled until both access_key and secret_key are set.
+# access_key: AKIAIOSFODNN7EXAMPLE
+# secret_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+# sse_s3_key: base64-encoded-32-byte-key
+# domain_name: s3ite.local
+
+concurrency_limit: {concurrency_limit}
+read_only: {read_only}
+
+readers: {readers}
+blob_readers: {blob_readers}
+blob_read_timeout_seconds: {blob_read_timeout_seconds}
+
+maintenance_interval_seconds: {maintenance_interval_seconds}
+maintenance_vacuum_pages: {maintenance_vacuum_pages}
+multipart_upload_ttl_seconds: {multipart_upload_ttl_seconds}
+completed_multipart_upload_ttl_seconds: {completed_multipart_upload_ttl_seconds}
+
+journal_mode: {journal_mode}
+synchronous: {synchronous}
+temp_store: {temp_store}
+cache_size: {cache_size}
+busy_timeout_milliseconds: {busy_timeout_milliseconds}
+journal_size_limit: {journal_size_limit}
+
+cors:
+{cors}
+
+# Bucket-specific overrides are optional.
+# buckets:
+#   example-bucket:
+#     read_only: false
+#     sqlite:
+#       cache_size: 131072
+#       synchronous: full
+",
+        root = config.root.display(),
+        host = config.host,
+        port = config.port,
+        concurrency_limit = config.concurrency_limit,
+        read_only = config.read_only,
+        readers = config.readers,
+        blob_readers = config.blob_readers,
+        blob_read_timeout_seconds = config.blob_read_timeout_seconds,
+        maintenance_interval_seconds = config.maintenance_interval_seconds,
+        maintenance_vacuum_pages = config.maintenance_vacuum_pages,
+        multipart_upload_ttl_seconds = config.multipart_upload_ttl_seconds,
+        completed_multipart_upload_ttl_seconds = config.completed_multipart_upload_ttl_seconds,
+        journal_mode = value_enum_name(&config.sqlite.journal_mode),
+        synchronous = value_enum_name(&config.sqlite.synchronous),
+        temp_store = value_enum_name(&config.sqlite.temp_store),
+        cache_size = config.sqlite.cache_size,
+        busy_timeout_milliseconds = config.sqlite.busy_timeout_milliseconds,
+        journal_size_limit = config.sqlite.journal_size_limit,
+        cors = render_cors_template(&config.cors_mode()),
+    )
+}
+
+/// Renders the YAML body for the server-level CORS section.
+fn render_cors_template(cors: &CorsMode) -> String {
+    match cors {
+        CorsMode::Disabled => "  mode: disabled".to_string(),
+        CorsMode::Permissive => "  mode: permissive".to_string(),
+        CorsMode::Custom(config) => {
+            let mut output = "  mode: custom\n".to_string();
+            render_yaml_list(&mut output, "  allow_origins", &config.allow_origins);
+            render_yaml_list(&mut output, "  allow_methods", &config.allow_methods);
+            render_yaml_list(&mut output, "  allow_headers", &config.allow_headers);
+            render_yaml_list(&mut output, "  expose_headers", &config.expose_headers);
+            output.push_str("  allow_credentials: ");
+            output.push_str(&config.allow_credentials.to_string());
+            output.push_str("\n  allow_private_network: ");
+            output.push_str(&config.allow_private_network.to_string());
+            output.push('\n');
+            if let Some(max_age_seconds) = config.max_age_seconds {
+                output.push_str("  max_age_seconds: ");
+                output.push_str(&max_age_seconds.to_string());
+            } else {
+                output.push_str("  max_age_seconds: null");
+            }
+            output
+        }
+    }
+}
+
+/// Appends a YAML string list to an existing output buffer.
+fn render_yaml_list(output: &mut String, key: &str, values: &[String]) {
+    output.push_str(key);
+    output.push_str(":\n");
+    for value in values {
+        output.push_str("    - ");
+        output.push_str(&yaml_single_quoted(value));
+        output.push('\n');
+    }
+}
+
+/// Returns a single-quoted YAML scalar for arbitrary text.
+fn yaml_single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Returns the configured command/config spelling for a value enum variant.
+fn value_enum_name<T: ValueEnum>(value: &T) -> String {
+    let Some(possible) = value.to_possible_value() else {
+        unreachable!("configuration enum variants must have clap values");
+    };
+    possible.get_name().to_string()
 }
 
 /// Cross-Origin Resource Sharing behavior.
@@ -928,6 +1126,15 @@ fn default_cors() -> CorsMode {
     CorsMode::default()
 }
 
+/// Returns the CLI spelling for the default server-level `CORS` mode.
+fn default_cli_cors_mode() -> CliCorsMode {
+    match default_cors() {
+        CorsMode::Disabled => CliCorsMode::Disabled,
+        CorsMode::Permissive => CliCorsMode::Permissive,
+        CorsMode::Custom(_) => unreachable!("custom CORS has no CLI default spelling"),
+    }
+}
+
 fn default_cors_allow_methods() -> Vec<String> {
     ["GET", "HEAD", "PUT", "POST", "DELETE"]
         .into_iter()
@@ -1038,6 +1245,12 @@ fn default_journal_size_limit() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        env::temp_dir,
+        fs::{remove_file, write},
+    };
+    use uuid::Uuid;
+    use yaml_serde::from_str;
 
     type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
@@ -1077,8 +1290,6 @@ mod tests {
 
     #[test]
     fn sqlite_pragma_modes_parse_cli_and_yaml_names() -> TestResult {
-        use clap::Parser as _;
-
         let lower: Config = yaml_serde::from_str(
             "
             journal_mode: wal
@@ -1105,7 +1316,7 @@ mod tests {
         assert_eq!(upper.sqlite.synchronous, Synchronous::Full);
         assert_eq!(upper.sqlite.temp_store, TempStore::File);
 
-        let args = ConfigArgs::try_parse_from([
+        let matches = ConfigArgs::command().try_get_matches_from([
             "s3ite",
             "--journal-mode",
             "truncate",
@@ -1118,7 +1329,7 @@ mod tests {
             "--journal-size-limit",
             "16384",
         ])?;
-        let cli = Config::from_config_args(args)?;
+        let cli = Config::from_arg_matches(&matches)?;
         assert_eq!(cli.sqlite.journal_mode, JournalMode::Truncate);
         assert_eq!(cli.sqlite.synchronous, Synchronous::Extra);
         assert_eq!(cli.sqlite.temp_store, TempStore::Default);
@@ -1245,6 +1456,287 @@ mod tests {
         Ok(())
     }
 
+    /// Verifies that public help lists the runtime defaults and configuration precedence.
+    #[test]
+    fn help_shows_runtime_defaults_and_hides_deprecated_alias() {
+        macro_rules! value_name {
+            ($value:expr) => {{
+                let Some(possible) = $value.to_possible_value() else {
+                    panic!("configuration enum variants must have clap values");
+                };
+                possible.get_name().to_string()
+            }};
+        }
+
+        let help = ConfigArgs::command().render_long_help().to_string();
+        let expected_defaults = [
+            format!("[default: {}]", default_root().display()),
+            format!("[default: {}]", default_host()),
+            format!("[default: {}]", default_port()),
+            format!("[default: {}]", value_name!(default_cli_cors_mode())),
+            format!("[default: {}]", default_concurrency_limit()),
+            format!("[default: {}]", default_read_only()),
+            format!("[default: {}]", value_name!(default_journal_mode())),
+            format!("[default: {}]", value_name!(default_synchronous())),
+            format!("[default: {}]", value_name!(default_temp_store())),
+            format!("[default: {}]", default_cache_size()),
+            format!("[default: {}]", default_busy_timeout_milliseconds()),
+            format!("[default: {}]", default_journal_size_limit()),
+            format!("[default: {}]", default_readers()),
+            format!("[default: {}]", default_blob_readers()),
+            format!("[default: {}]", default_blob_read_timeout_seconds()),
+            format!("[default: {}]", default_maintenance_interval_seconds()),
+            format!("[default: {}]", default_maintenance_vacuum_pages()),
+            format!("[default: {}]", default_multipart_upload_ttl_seconds()),
+            format!("[default: {}]", default_completed_upload_ttl_seconds()),
+        ];
+
+        assert!(help.contains("--print-config-template"));
+        assert!(help.contains("--cors <CORS>"));
+        assert!(!help.contains("--permissive-cors"));
+        assert!(help.contains("Configuration precedence: built-in defaults"));
+        assert!(help.contains("can be overridden by YAML"));
+        for expected in expected_defaults {
+            assert!(help.contains(&expected), "help is missing `{expected}`");
+        }
+    }
+
+    /// Verifies that omitted CLI options retain their default values and sources.
+    #[test]
+    fn omitted_cli_options_use_runtime_defaults() -> TestResult {
+        let matches = ConfigArgs::command().try_get_matches_from(["s3ite"])?;
+        for id in [
+            "root",
+            "print_config_template",
+            "host",
+            "port",
+            "cors",
+            "concurrency_limit",
+            "read_only",
+            "journal_mode",
+            "synchronous",
+            "temp_store",
+            "cache_size",
+            "busy_timeout_milliseconds",
+            "journal_size_limit",
+            "readers",
+            "blob_readers",
+            "blob_read_timeout_seconds",
+            "maintenance_interval_seconds",
+            "maintenance_vacuum_pages",
+            "multipart_upload_ttl_seconds",
+            "completed_multipart_upload_ttl_seconds",
+        ] {
+            assert_eq!(matches.value_source(id), Some(ValueSource::DefaultValue));
+        }
+        for id in [
+            "config",
+            "permissive_cors",
+            "access_key",
+            "secret_key",
+            "sse_s3_key",
+            "domain_name",
+        ] {
+            assert_eq!(matches.value_source(id), None);
+        }
+
+        let args = ConfigArgs::from_arg_matches(&matches)?;
+        assert!(!args.print_config_template);
+        assert_eq!(args.root, default_root());
+        assert!(args.config.is_none());
+        assert_eq!(args.host, default_host());
+        assert_eq!(args.port, default_port());
+        assert_eq!(args.cors, default_cli_cors_mode());
+        assert!(args.permissive_cors.is_none());
+        assert!(args.access_key.is_none());
+        assert!(args.secret_key.is_none());
+        assert!(args.sse_s3_key.is_none());
+        assert!(args.domain_name.is_none());
+        assert_eq!(args.concurrency_limit, default_concurrency_limit());
+        assert_eq!(args.read_only, default_read_only());
+        assert_eq!(args.journal_mode, default_journal_mode());
+        assert_eq!(args.synchronous, default_synchronous());
+        assert_eq!(args.temp_store, default_temp_store());
+        assert_eq!(args.cache_size, default_cache_size());
+        assert_eq!(
+            args.busy_timeout_milliseconds,
+            default_busy_timeout_milliseconds()
+        );
+        assert_eq!(args.journal_size_limit, default_journal_size_limit());
+        assert_eq!(args.readers, default_readers());
+        assert_eq!(args.blob_readers, default_blob_readers());
+        assert_eq!(
+            args.blob_read_timeout_seconds,
+            default_blob_read_timeout_seconds()
+        );
+        assert_eq!(
+            args.maintenance_interval_seconds,
+            default_maintenance_interval_seconds()
+        );
+        assert_eq!(
+            args.maintenance_vacuum_pages,
+            default_maintenance_vacuum_pages()
+        );
+        assert_eq!(
+            args.multipart_upload_ttl_seconds,
+            default_multipart_upload_ttl_seconds()
+        );
+        assert_eq!(
+            args.completed_multipart_upload_ttl_seconds,
+            default_completed_upload_ttl_seconds()
+        );
+
+        Ok(())
+    }
+
+    /// Verifies the template flag selects the early-exit startup action.
+    #[test]
+    fn print_config_template_action_is_selected() -> TestResult {
+        let matches =
+            ConfigArgs::command().try_get_matches_from(["s3ite", "--print-config-template"])?;
+
+        assert!(matches!(
+            ConfigAction::from_arg_matches(&matches)?,
+            ConfigAction::PrintConfigTemplate
+        ));
+
+        Ok(())
+    }
+
+    /// Verifies the template flag cannot be combined with runtime configuration.
+    #[test]
+    fn print_config_template_rejects_other_options() {
+        let result = ConfigArgs::command().try_get_matches_from([
+            "s3ite",
+            "--print-config-template",
+            "--port",
+            "9000",
+        ]);
+
+        assert!(result.is_err());
+    }
+
+    /// Verifies the generated template parses back to the built-in defaults.
+    #[test]
+    fn config_template_parses_as_default_config() -> TestResult {
+        let template = Config::config_template();
+        let config: Config = from_str(&template)?;
+        let default = Config::default();
+
+        assert!(template.contains("# access_key:"));
+        assert!(template.contains("# secret_key:"));
+        assert!(template.contains("# sse_s3_key:"));
+        assert!(template.contains("# domain_name:"));
+        assert!(template.contains("# buckets:"));
+
+        assert_eq!(config.root, default.root);
+        assert_eq!(config.host, default.host);
+        assert_eq!(config.port, default.port);
+        assert_eq!(config.access_key, default.access_key);
+        assert_eq!(config.secret_key, default.secret_key);
+        assert_eq!(config.sse_s3_key, default.sse_s3_key);
+        assert_eq!(config.domain_name, default.domain_name);
+        assert_eq!(config.concurrency_limit, default.concurrency_limit);
+        assert_eq!(config.read_only, default.read_only);
+        assert_eq!(config.readers, default.readers);
+        assert_eq!(config.blob_readers, default.blob_readers);
+        assert_eq!(
+            config.blob_read_timeout_seconds,
+            default.blob_read_timeout_seconds
+        );
+        assert_eq!(
+            config.maintenance_interval_seconds,
+            default.maintenance_interval_seconds
+        );
+        assert_eq!(
+            config.maintenance_vacuum_pages,
+            default.maintenance_vacuum_pages
+        );
+        assert_eq!(
+            config.multipart_upload_ttl_seconds,
+            default.multipart_upload_ttl_seconds
+        );
+        assert_eq!(
+            config.completed_multipart_upload_ttl_seconds,
+            default.completed_multipart_upload_ttl_seconds
+        );
+        assert_eq!(config.cors_mode(), default.cors_mode());
+        assert_eq!(config.sqlite.journal_mode, default.sqlite.journal_mode);
+        assert_eq!(config.sqlite.synchronous, default.sqlite.synchronous);
+        assert_eq!(config.sqlite.temp_store, default.sqlite.temp_store);
+        assert_eq!(config.sqlite.cache_size, default.sqlite.cache_size);
+        assert_eq!(
+            config.sqlite.busy_timeout_milliseconds,
+            default.sqlite.busy_timeout_milliseconds
+        );
+        assert_eq!(
+            config.sqlite.journal_size_limit,
+            default.sqlite.journal_size_limit
+        );
+        assert!(config.buckets.is_empty());
+
+        Ok(())
+    }
+
+    /// Verifies Clap defaults do not replace values loaded from a YAML file.
+    #[test]
+    fn clap_defaults_do_not_override_yaml_config() -> TestResult {
+        let path = temp_dir().join(format!("s3ite-{}.yaml", Uuid::new_v4()));
+        write(
+            &path,
+            "
+            root: /tmp/s3ite-yaml-root
+            host: 127.0.0.1
+            port: 9000
+            concurrency_limit: 7
+            read_only: true
+            readers: 2
+            blob_readers: 6
+            blob_read_timeout_seconds: 90
+            maintenance_interval_seconds: 30
+            maintenance_vacuum_pages: 5
+            multipart_upload_ttl_seconds: 100
+            completed_multipart_upload_ttl_seconds: 200
+            cors:
+              mode: disabled
+            journal_mode: delete
+            synchronous: full
+            temp_store: file
+            cache_size: 512
+            busy_timeout_milliseconds: 250
+            journal_size_limit: 4096
+            ",
+        )?;
+
+        let path_arg = path.to_string_lossy().into_owned();
+        let matches =
+            ConfigArgs::command().try_get_matches_from(["s3ite", "--config", &path_arg])?;
+        let config = Config::from_arg_matches(&matches)?;
+
+        assert_eq!(config.root, PathBuf::from("/tmp/s3ite-yaml-root"));
+        assert_eq!(config.host, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(config.port, 9000);
+        assert_eq!(config.concurrency_limit, 7);
+        assert!(config.read_only);
+        assert_eq!(config.readers, 2);
+        assert_eq!(config.blob_readers, 6);
+        assert_eq!(config.blob_read_timeout_seconds, 90);
+        assert_eq!(config.maintenance_interval_seconds, 30);
+        assert_eq!(config.maintenance_vacuum_pages, 5);
+        assert_eq!(config.multipart_upload_ttl_seconds, 100);
+        assert_eq!(config.completed_multipart_upload_ttl_seconds, 200);
+        assert_eq!(config.cors_mode(), CorsMode::Disabled);
+        assert_eq!(config.sqlite.journal_mode, JournalMode::Delete);
+        assert_eq!(config.sqlite.synchronous, Synchronous::Full);
+        assert_eq!(config.sqlite.temp_store, TempStore::File);
+        assert_eq!(config.sqlite.cache_size, 512);
+        assert_eq!(config.sqlite.busy_timeout_milliseconds, 250);
+        assert_eq!(config.sqlite.journal_size_limit, 4096);
+
+        remove_file(path).ok();
+        Ok(())
+    }
+
     #[test]
     fn custom_cors_rejects_invalid_combinations() -> TestResult {
         let config: Config = yaml_serde::from_str(
@@ -1296,14 +1788,14 @@ mod tests {
 
     #[test]
     fn legacy_permissive_cors_aliases_override_explicit_mode() -> TestResult {
-        use clap::Parser as _;
-
-        let args = ConfigArgs::try_parse_from(["s3ite", "--permissive-cors", "true"])?;
-        let config = Config::from_config_args(args)?;
+        let matches =
+            ConfigArgs::command().try_get_matches_from(["s3ite", "--permissive-cors", "true"])?;
+        let config = Config::from_arg_matches(&matches)?;
         assert_eq!(config.cors_mode(), CorsMode::Permissive);
 
-        let args = ConfigArgs::try_parse_from(["s3ite", "--permissive-cors", "false"])?;
-        let config = Config::from_config_args(args)?;
+        let matches =
+            ConfigArgs::command().try_get_matches_from(["s3ite", "--permissive-cors", "false"])?;
+        let config = Config::from_arg_matches(&matches)?;
         assert_eq!(config.cors_mode(), CorsMode::Disabled);
 
         let config = Config {
@@ -1457,12 +1949,11 @@ mod tests {
         }
     }
 
+    /// Checks that explicitly supplied CLI settings override values loaded from YAML.
     #[test]
     fn cli_args_override_yaml_config() -> TestResult {
-        use clap::Parser as _;
-
-        let path = std::env::temp_dir().join(format!("s3ite-{}.yaml", uuid::Uuid::new_v4()));
-        std::fs::write(
+        let path = temp_dir().join(format!("s3ite-{}.yaml", Uuid::new_v4()));
+        write(
             &path,
             "
             port: 9000
@@ -1480,10 +1971,10 @@ mod tests {
         )?;
 
         let path_arg = path.to_string_lossy().into_owned();
-        let root = std::env::temp_dir().join(format!("s3ite-root-{}", uuid::Uuid::new_v4()));
+        let root = temp_dir().join(format!("s3ite-root-{}", Uuid::new_v4()));
         let root_arg = root.to_string_lossy().into_owned();
 
-        let args = ConfigArgs::try_parse_from([
+        let matches = ConfigArgs::command().try_get_matches_from([
             "s3ite",
             "--config",
             &path_arg,
@@ -1528,7 +2019,7 @@ mod tests {
             "--temp-store",
             "file",
         ])?;
-        let config = Config::from_config_args(args)?;
+        let config = Config::from_arg_matches(&matches)?;
 
         assert_eq!(config.root, root);
         assert_eq!(config.host, IpAddr::V4(Ipv4Addr::LOCALHOST));
@@ -1551,7 +2042,7 @@ mod tests {
         assert_eq!(config.sqlite.synchronous, Synchronous::Full);
         assert_eq!(config.sqlite.temp_store, TempStore::File);
 
-        std::fs::remove_file(path).ok();
+        remove_file(path).ok();
         Ok(())
     }
 }

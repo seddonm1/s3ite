@@ -100,6 +100,8 @@ async fn test_object_copy_verify_contenttype() -> Result<()> {
         .bucket(&bucket)
         .key("foo123bar")
         .content_type(content_type)
+        .content_disposition("inline")
+        .content_language("fr-CA")
         .body(ByteStream::from_static(b"foo"))
         .send()
         .await?;
@@ -118,6 +120,8 @@ async fn test_object_copy_verify_contenttype() -> Result<()> {
         .key("bar321foo")
         .send()
         .await?;
+    assert_eq!(response.content_disposition(), Some("inline"));
+    assert_eq!(response.content_language(), Some("fr-CA"));
     assert_eq!(response.content_type(), Some(content_type));
     assert_eq!(response.body.collect().await?.into_bytes().as_ref(), b"foo");
 
@@ -162,13 +166,22 @@ async fn test_object_copy_to_itself_with_metadata() -> Result<()> {
     let bucket = bucket_name("s3ite-copy");
 
     create_bucket(&client, &bucket).await?;
-    put_object(&client, &bucket, "foo123bar", b"foo").await?;
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key("foo123bar")
+        .content_disposition("attachment")
+        .content_language("fr-CA")
+        .body(ByteStream::from_static(b"foo"))
+        .send()
+        .await?;
 
     client
         .copy_object()
         .bucket(&bucket)
         .key("foo123bar")
         .copy_source(format!("{bucket}/foo123bar"))
+        .content_disposition("inline")
         .metadata("foo", "bar")
         .metadata_directive(MetadataDirective::Replace)
         .send()
@@ -180,6 +193,8 @@ async fn test_object_copy_to_itself_with_metadata() -> Result<()> {
         .key("foo123bar")
         .send()
         .await?;
+    assert_eq!(response.content_disposition(), Some("inline"));
+    assert_eq!(response.content_language(), None);
     let metadata = response
         .metadata()
         .ok_or_else(|| anyhow::anyhow!("copied object missing metadata"))?;

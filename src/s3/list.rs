@@ -49,13 +49,13 @@ pub(super) fn decode_hex(value: &str) -> Option<Vec<u8>> {
         }
     }
 
-    let bytes = value.as_bytes();
-    if !bytes.len().is_multiple_of(2) {
+    let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
         return None;
     }
 
-    let mut decoded = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    let mut decoded = Vec::with_capacity(pairs.len());
+    for pair in pairs {
         decoded.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
     }
     Some(decoded)

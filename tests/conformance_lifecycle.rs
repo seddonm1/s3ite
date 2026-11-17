@@ -10,11 +10,12 @@ use std::time::Duration as StdDuration;
 
 use anyhow::{Context, Result, bail};
 use aws_sdk_s3::{
+    Client,
     primitives::{ByteStream, DateTime},
     types::{
-        AbortIncompleteMultipartUpload, BucketLifecycleConfiguration, ExpirationStatus,
-        LifecycleExpiration, LifecycleRule, LifecycleRuleAndOperator, LifecycleRuleFilter,
-        NoncurrentVersionExpiration, Tag, Tagging,
+        AbortIncompleteMultipartUpload, BucketLifecycleConfiguration, BucketVersioningStatus,
+        ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleAndOperator,
+        LifecycleRuleFilter, NoncurrentVersionExpiration, Tag, Tagging,
     },
 };
 use reqwest::{Method, StatusCode};
@@ -27,6 +28,9 @@ use support::{
     server::{TestServer, TestServerOptions},
 };
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc2822};
+use tokio::time::sleep;
+
+const MAINTENANCE_INTERVAL_SECONDS: u64 = 1;
 
 fn expiration_rule(id: &str, prefix: &str, days: i32) -> Result<LifecycleRule> {
     Ok(LifecycleRule::builder()
@@ -131,11 +135,12 @@ async fn create_bucket_with_client(
     Ok((server, client, bucket))
 }
 
+/// Starts the lifecycle worker on a short interval and creates a bucket for its tests.
 async fn create_bucket_with_maintenance(
     prefix: &str,
 ) -> Result<(TestServer, aws_sdk_s3::Client, String)> {
     let server = TestServer::spawn_with(TestServerOptions {
-        maintenance_interval_seconds: Some(1),
+        maintenance_interval_seconds: Some(MAINTENANCE_INTERVAL_SECONDS),
         ..Default::default()
     })
     .await?;
@@ -754,6 +759,116 @@ async fn test_lifecycle_expiration_newer_noncurrent() -> Result<()> {
     wait_for_version_keys(&client, &bucket, &["myobject_"; 6], &[]).await?;
 
     Ok(())
+}
+
+// SQLite scans lifecycle candidates in one transaction. Use a short listing page
+// to reproduce the two upstream boundary layouts and check their actual markers.
+const BOUNDARY_PAGE_SIZE: i32 = 8;
+
+/// Places unversioned keys before the version chain in listing order.
+async fn fill_boundary_page(client: &Client, bucket: &str, versions_on_page: i32) -> Result<()> {
+    for index in 0..BOUNDARY_PAGE_SIZE - versions_on_page {
+        put_text_object(client, bucket, &format!("a{index:05}")).await?;
+    }
+    Ok(())
+}
+
+/// Lists the target key's live versions in newest-first order.
+async fn target_version_ids(client: &Client, bucket: &str) -> Result<Vec<String>> {
+    let output = client
+        .list_object_versions()
+        .bucket(bucket)
+        .prefix("k")
+        .send()
+        .await?;
+    assert!(output.delete_markers().is_empty());
+    output
+        .versions()
+        .iter()
+        .map(|v| {
+            v.version_id()
+                .map(str::to_owned)
+                .context("missing version ID")
+        })
+        .collect()
+}
+
+/// Checks the page marker and waits for exactly the specified version IDs to survive maintenance.
+async fn expire_boundary_versions(
+    server: &TestServer,
+    client: &Client,
+    bucket: &str,
+    keep: i32,
+    expected: &[String],
+) -> Result<()> {
+    let page = client
+        .list_object_versions()
+        .bucket(bucket)
+        .max_keys(BOUNDARY_PAGE_SIZE)
+        .send()
+        .await?;
+    assert_eq!(page.is_truncated(), Some(true));
+    assert_eq!(page.next_key_marker(), Some("k"));
+    assert_eq!(page.next_version_id_marker(), Some("null"));
+    age_noncurrent_versions(server, bucket, "k", 2)?;
+    let rule = LifecycleRule::builder()
+        .id("page-boundary")
+        .filter(LifecycleRuleFilter::builder().prefix("").build())
+        .noncurrent_version_expiration(
+            NoncurrentVersionExpiration::builder()
+                .noncurrent_days(1)
+                .newer_noncurrent_versions(keep)
+                .build(),
+        )
+        .status(ExpirationStatus::Enabled)
+        .build()?;
+    put_lifecycle(client, bucket, vec![rule]).await?;
+    for _ in 0..20 {
+        if target_version_ids(client, bucket).await? == expected {
+            sleep(StdDuration::from_secs(MAINTENANCE_INTERVAL_SECONDS)).await;
+            assert_eq!(target_version_ids(client, bucket).await?, expected);
+            return Ok(());
+        }
+        sleep(StdDuration::from_millis(250)).await;
+    }
+    bail!(
+        "expected {expected:?}, found {:?}",
+        target_version_ids(client, bucket).await?
+    )
+}
+
+/// Protects the current null version and the newest noncurrent version across the page boundary.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_lifecycle_expiration_newer_noncurrent_page_boundary_null_current() -> Result<()> {
+    // Adapted from s3tests/functional/test_s3.py::test_lifecycle_expiration_newer_noncurrent_page_boundary_null_current: uses a short listing page and backdates noncurrent versions.
+    let (server, client, bucket) = create_bucket_with_maintenance("s3ite-lc-null-cur").await?;
+    fill_boundary_page(&client, &bucket, 1).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    create_versions(&client, &bucket, "k", 2).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Suspended).await?;
+    put_text_object(&client, &bucket, "k").await?;
+    let ids = target_version_ids(&client, &bucket).await?;
+    assert_eq!(ids.len(), 3);
+    assert_eq!(ids[0], "null");
+    expire_boundary_versions(&server, &client, &bucket, 1, &ids[..2]).await
+}
+
+/// Expires only the oldest null version when it ends the first listing page.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_lifecycle_expiration_newer_noncurrent_page_boundary_null_noncurrent() -> Result<()> {
+    // Adapted from s3tests/functional/test_s3.py::test_lifecycle_expiration_newer_noncurrent_page_boundary_null_noncurrent: uses a short listing page and backdates noncurrent versions.
+    let (server, client, bucket) = create_bucket_with_maintenance("s3ite-lc-null-old").await?;
+    fill_boundary_page(&client, &bucket, 5).await?;
+    put_text_object(&client, &bucket, "k").await?;
+    put_text_object(&client, &bucket, "z").await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    create_versions(&client, &bucket, "k", 4).await?;
+    let ids = target_version_ids(&client, &bucket).await?;
+    assert_eq!(ids.len(), 5);
+    assert_eq!(ids[4], "null");
+    expire_boundary_versions(&server, &client, &bucket, 3, &ids[..4]).await
 }
 
 #[tokio::test]

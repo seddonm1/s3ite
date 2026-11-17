@@ -154,6 +154,8 @@ impl Sqlite {
                 metadata,
                 content_type,
                 content_encoding,
+                content_disposition,
+                content_language,
                 cache_control,
                 expires,
                 last_modified,
@@ -169,7 +171,7 @@ impl Sqlite {
                 object_lock_retention_mode,
                 object_lock_retain_until
             )
-            VALUES (?1, ?2, 1, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20);",
+            VALUES (?1, ?2, 1, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22);",
         )?;
 
         let size = sql_size(key_metadata.size)?;
@@ -177,6 +179,8 @@ impl Sqlite {
             .checksum
             .as_ref()
             .ok_or(SqliteError::ChecksumMismatch)?;
+        let stored_sse = key_metadata.stored_sse.as_ref();
+        let retention = key_metadata.object_lock.retention.as_ref();
         stmt.execute(rusqlite::params![
             &key,
             &version_id,
@@ -188,6 +192,8 @@ impl Sqlite {
                 .map_err(|err| ToSqlConversionFailure(Box::new(err)))?,
             key_metadata.content_type,
             key_metadata.content_encoding,
+            key_metadata.content_disposition,
+            key_metadata.content_language,
             key_metadata.cache_control,
             key_metadata.expires,
             key_metadata.last_modified,
@@ -195,33 +201,13 @@ impl Sqlite {
             checksum.algorithm(),
             checksum.checksum_type(),
             checksum.as_str(),
-            key_metadata
-                .stored_sse
-                .as_ref()
-                .map(|_| SSE_S3_ALGORITHM_CODE),
-            key_metadata
-                .stored_sse
-                .as_ref()
-                .map(|stored_sse| stored_sse.nonce.as_slice()),
-            key_metadata
-                .stored_sse
-                .as_ref()
-                .map(|stored_sse| stored_sse.ciphertext.as_slice()),
-            key_metadata
-                .stored_sse
-                .as_ref()
-                .map(|stored_sse| stored_sse.tag.as_slice()),
+            stored_sse.map(|_| SSE_S3_ALGORITHM_CODE),
+            stored_sse.map(|stored_sse| stored_sse.nonce.as_slice()),
+            stored_sse.map(|stored_sse| stored_sse.ciphertext.as_slice()),
+            stored_sse.map(|stored_sse| stored_sse.tag.as_slice()),
             key_metadata.object_lock.legal_hold,
-            key_metadata
-                .object_lock
-                .retention
-                .as_ref()
-                .map(|retention| retention.mode.as_str()),
-            key_metadata
-                .object_lock
-                .retention
-                .as_ref()
-                .map(|retention| retention.retain_until),
+            retention.map(|retention| retention.mode.as_str()),
+            retention.map(|retention| retention.retain_until),
         ])?;
         drop(stmt);
 
@@ -504,6 +490,7 @@ mod tests {
         Ok(connection)
     }
 
+    /// Builds a live object with a body for storage write tests.
     fn key_value(key: &str, value: &[u8]) -> KeyValue {
         KeyValue {
             key: key.to_string(),
@@ -515,6 +502,8 @@ mod tests {
                 metadata: None,
                 content_type: None,
                 content_encoding: None,
+                content_disposition: None,
+                content_language: None,
                 cache_control: None,
                 expires: None,
                 last_modified: OffsetDateTime::UNIX_EPOCH,

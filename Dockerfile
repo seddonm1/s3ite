@@ -1,4 +1,4 @@
-FROM rust:1.96.0 AS build-env
+FROM rust:1.100.0 AS build-env
 
 ARG TARGETARCH
 
@@ -12,7 +12,7 @@ RUN apt-get update \
     && apt-get install --yes --no-install-recommends musl-tools \
     && rm -rf /var/lib/apt/lists/*
 
-RUN cargo install --locked cargo-multivers --version 0.12.0
+RUN cargo install --locked cargo-multivers --version 0.13.0
 WORKDIR /app
 COPY . /app
 RUN set -eux; \

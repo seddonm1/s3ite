@@ -3,9 +3,11 @@
 //! `SQLite` owns the persisted checksum metadata. This module keeps the S3 wire
 //! parsing, checksum policy, and response header mapping.
 
+use hyper::HeaderMap;
 use s3s::{
     S3ErrorCode, S3Result,
     dto::{Checksum as S3Checksum, ChecksumAlgorithm, ChecksumMode, ChecksumType},
+    header::X_AMZ_SDK_CHECKSUM_ALGORITHM,
 };
 
 use crate::sqlite::{
@@ -162,72 +164,61 @@ pub(super) struct ChecksumInput {
     pub(super) sha1: Option<String>,
     /// Request-provided `SHA256` checksum.
     pub(super) sha256: Option<String>,
+    /// Request-provided `SHA512` checksum.
+    pub(super) sha512: Option<String>,
+    /// Request-provided `MD5` checksum.
+    pub(super) md5: Option<String>,
+    /// Request-provided `XXHASH3` checksum.
+    pub(super) xxhash3: Option<String>,
+    /// Request-provided `XXHASH64` checksum.
+    pub(super) xxhash64: Option<String>,
+    /// Request-provided `XXHASH128` checksum.
+    pub(super) xxhash128: Option<String>,
 }
 
+/// Extracts the common digest fields from the generated S3 request DTOs.
+macro_rules! checksum_input {
+    ($source:ident, $algorithm:expr, $checksum_type:expr) => {
+        ChecksumInput {
+            algorithm: $algorithm,
+            checksum_type: $checksum_type,
+            crc32: $source.checksum_crc32,
+            crc32c: $source.checksum_crc32c,
+            crc64nvme: $source.checksum_crc64nvme,
+            sha1: $source.checksum_sha1,
+            sha256: $source.checksum_sha256,
+            sha512: $source.checksum_sha512,
+            md5: $source.checksum_md5,
+            xxhash3: $source.checksum_xxhash3,
+            xxhash64: $source.checksum_xxhash64,
+            xxhash128: $source.checksum_xxhash128,
+        }
+    };
+}
+pub(super) use checksum_input;
+
 impl ChecksumInput {
-    /// Builds checksum input from object or upload-part request fields.
-    pub(super) fn write_request(
-        algorithm: Option<ChecksumAlgorithm>,
-        crc32: Option<String>,
-        crc32c: Option<String>,
-        crc64nvme: Option<String>,
-        sha1: Option<String>,
-        sha256: Option<String>,
-    ) -> Self {
-        Self {
-            algorithm,
-            crc32,
-            crc32c,
-            crc64nvme,
-            sha1,
-            sha256,
-            ..Self::default()
+    /// Reconciles the SDK header with the algorithm parsed from the S3 header or checksum trailer.
+    pub(super) fn with_sdk_algorithm(mut self, headers: &HeaderMap) -> S3Result<Self> {
+        if let Some(header) = headers.get(X_AMZ_SDK_CHECKSUM_ALGORITHM) {
+            let name = header
+                .to_str()
+                .map_err(|_| s3_error(S3ErrorCode::InvalidArgument))?;
+            if self
+                .algorithm
+                .as_ref()
+                .is_some_and(|value| value.as_str() != name)
+            {
+                return Err(s3_error(S3ErrorCode::BadDigest));
+            }
+            self.algorithm = Some(ChecksumAlgorithm::from(name.to_owned()));
         }
-    }
-
-    /// Builds checksum input from completion request checksum fields.
-    pub(super) fn completion_request(
-        checksum_type: Option<ChecksumType>,
-        crc32: Option<String>,
-        crc32c: Option<String>,
-        crc64nvme: Option<String>,
-        sha1: Option<String>,
-        sha256: Option<String>,
-    ) -> Self {
-        Self {
-            checksum_type,
-            crc32,
-            crc32c,
-            crc64nvme,
-            sha1,
-            sha256,
-            ..Self::default()
-        }
-    }
-
-    /// Builds checksum input from checksum value fields without an algorithm hint.
-    pub(super) fn value_fields(
-        crc32: Option<String>,
-        crc32c: Option<String>,
-        crc64nvme: Option<String>,
-        sha1: Option<String>,
-        sha256: Option<String>,
-    ) -> Self {
-        Self {
-            crc32,
-            crc32c,
-            crc64nvme,
-            sha1,
-            sha256,
-            ..Self::default()
-        }
+        Ok(self)
     }
 
     /// Returns the explicitly requested algorithm or infers it from one value field.
     fn algorithm_kind(&self) -> S3Result<Option<ChecksumAlgorithmKind>> {
-        if self.algorithm.is_some() {
-            return checksum_algorithm_from_request(self.algorithm.clone());
-        }
+        let explicit = checksum_algorithm_from_request(self.algorithm.clone())?;
 
         let mut inferred = [
             self.crc32.as_ref().map(|_| ChecksumAlgorithmKind::Crc32),
@@ -237,6 +228,17 @@ impl ChecksumInput {
                 .map(|_| ChecksumAlgorithmKind::Crc64Nvme),
             self.sha1.as_ref().map(|_| ChecksumAlgorithmKind::Sha1),
             self.sha256.as_ref().map(|_| ChecksumAlgorithmKind::Sha256),
+            self.sha512.as_ref().map(|_| ChecksumAlgorithmKind::Sha512),
+            self.md5.as_ref().map(|_| ChecksumAlgorithmKind::Md5),
+            self.xxhash3
+                .as_ref()
+                .map(|_| ChecksumAlgorithmKind::XxHash3),
+            self.xxhash64
+                .as_ref()
+                .map(|_| ChecksumAlgorithmKind::XxHash64),
+            self.xxhash128
+                .as_ref()
+                .map(|_| ChecksumAlgorithmKind::XxHash128),
         ]
         .into_iter()
         .flatten();
@@ -248,7 +250,10 @@ impl ChecksumInput {
                 "multiple checksum values were supplied",
             ));
         }
-        Ok(first)
+        if explicit.is_some() && first.is_some() && explicit != first {
+            return Err(s3_error(S3ErrorCode::BadDigest));
+        }
+        Ok(explicit.or(first))
     }
 
     /// Returns the request-provided checksum value for the selected algorithm.
@@ -259,7 +264,30 @@ impl ChecksumInput {
             ChecksumAlgorithmKind::Crc64Nvme => self.crc64nvme.as_deref(),
             ChecksumAlgorithmKind::Sha1 => self.sha1.as_deref(),
             ChecksumAlgorithmKind::Sha256 => self.sha256.as_deref(),
+            ChecksumAlgorithmKind::Sha512 => self.sha512.as_deref(),
+            ChecksumAlgorithmKind::Md5 => self.md5.as_deref(),
+            ChecksumAlgorithmKind::XxHash3 => self.xxhash3.as_deref(),
+            ChecksumAlgorithmKind::XxHash64 => self.xxhash64.as_deref(),
+            ChecksumAlgorithmKind::XxHash128 => self.xxhash128.as_deref(),
         }
+    }
+
+    /// Validates algorithms that must be declared when the multipart upload is initiated.
+    pub(super) fn validate_upload_part(
+        &self,
+        config: Option<MultipartChecksumConfig>,
+    ) -> S3Result<()> {
+        let explicit = self.algorithm_kind()?;
+        let configured = config.map(|c| c.algorithm);
+        if let Some(kind) = explicit
+            && Some(kind) != configured
+            && (kind.requires_explicit_multipart_config()
+                || configured
+                    .is_some_and(ChecksumAlgorithmKind::requires_explicit_multipart_config))
+        {
+            return Err(s3_error(S3ErrorCode::InvalidRequest));
+        }
+        Ok(())
     }
 
     /// Converts completion checksum fields into a typed request checksum.
@@ -317,6 +345,11 @@ fn checksum_algorithm_kind(algorithm: &ChecksumAlgorithm) -> Option<ChecksumAlgo
         ChecksumAlgorithm::CRC64NVME => ChecksumAlgorithmKind::Crc64Nvme,
         ChecksumAlgorithm::SHA1 => ChecksumAlgorithmKind::Sha1,
         ChecksumAlgorithm::SHA256 => ChecksumAlgorithmKind::Sha256,
+        ChecksumAlgorithm::SHA512 => ChecksumAlgorithmKind::Sha512,
+        ChecksumAlgorithm::MD5 => ChecksumAlgorithmKind::Md5,
+        ChecksumAlgorithm::XXHASH3 => ChecksumAlgorithmKind::XxHash3,
+        ChecksumAlgorithm::XXHASH64 => ChecksumAlgorithmKind::XxHash64,
+        ChecksumAlgorithm::XXHASH128 => ChecksumAlgorithmKind::XxHash128,
         _ => return None,
     };
     Some(kind)
@@ -330,6 +363,11 @@ fn checksum_algorithm_dto(kind: ChecksumAlgorithmKind) -> ChecksumAlgorithm {
         ChecksumAlgorithmKind::Crc64Nvme => ChecksumAlgorithm::CRC64NVME,
         ChecksumAlgorithmKind::Sha1 => ChecksumAlgorithm::SHA1,
         ChecksumAlgorithmKind::Sha256 => ChecksumAlgorithm::SHA256,
+        ChecksumAlgorithmKind::Sha512 => ChecksumAlgorithm::SHA512,
+        ChecksumAlgorithmKind::Md5 => ChecksumAlgorithm::MD5,
+        ChecksumAlgorithmKind::XxHash3 => ChecksumAlgorithm::XXHASH3,
+        ChecksumAlgorithmKind::XxHash64 => ChecksumAlgorithm::XXHASH64,
+        ChecksumAlgorithmKind::XxHash128 => ChecksumAlgorithm::XXHASH128,
     };
     ChecksumAlgorithm::from_static(value)
 }
@@ -372,7 +410,12 @@ pub(super) fn multipart_checksum_type(kind: ChecksumAlgorithmKind) -> ChecksumTy
         ChecksumAlgorithmKind::Crc32
         | ChecksumAlgorithmKind::Crc32c
         | ChecksumAlgorithmKind::Sha1
-        | ChecksumAlgorithmKind::Sha256 => ChecksumTypeKind::Composite,
+        | ChecksumAlgorithmKind::Sha256
+        | ChecksumAlgorithmKind::Sha512
+        | ChecksumAlgorithmKind::Md5
+        | ChecksumAlgorithmKind::XxHash3
+        | ChecksumAlgorithmKind::XxHash64
+        | ChecksumAlgorithmKind::XxHash128 => ChecksumTypeKind::Composite,
     }
 }
 
@@ -392,6 +435,14 @@ pub(super) fn multipart_checksum_config(
         }
         return Ok(None);
     };
+    if algorithm.requires_explicit_multipart_config()
+        && checksum_type == Some(ChecksumTypeKind::FullObject)
+    {
+        return Err(s3_error_with_message(
+            S3ErrorCode::InvalidRequest,
+            "this multipart checksum requires COMPOSITE",
+        ));
+    }
     Ok(Some(MultipartChecksumConfig::new(
         algorithm,
         checksum_type.unwrap_or_else(|| multipart_checksum_type(algorithm)),
@@ -573,6 +624,31 @@ pub(super) fn checksum_sha256<'a>(checksum: impl Into<ChecksumView<'a>>) -> Opti
     checksum_field(checksum.into(), ChecksumAlgorithmKind::Sha256)
 }
 
+/// Returns the `SHA512` checksum response field.
+pub(super) fn checksum_sha512<'a>(checksum: impl Into<ChecksumView<'a>>) -> Option<String> {
+    checksum_field(checksum.into(), ChecksumAlgorithmKind::Sha512)
+}
+
+/// Returns the `MD5` checksum response field.
+pub(super) fn checksum_md5<'a>(checksum: impl Into<ChecksumView<'a>>) -> Option<String> {
+    checksum_field(checksum.into(), ChecksumAlgorithmKind::Md5)
+}
+
+/// Returns the `XXHASH3` checksum response field.
+pub(super) fn checksum_xxhash3<'a>(checksum: impl Into<ChecksumView<'a>>) -> Option<String> {
+    checksum_field(checksum.into(), ChecksumAlgorithmKind::XxHash3)
+}
+
+/// Returns the `XXHASH64` checksum response field.
+pub(super) fn checksum_xxhash64<'a>(checksum: impl Into<ChecksumView<'a>>) -> Option<String> {
+    checksum_field(checksum.into(), ChecksumAlgorithmKind::XxHash64)
+}
+
+/// Returns the `XXHASH128` checksum response field.
+pub(super) fn checksum_xxhash128<'a>(checksum: impl Into<ChecksumView<'a>>) -> Option<String> {
+    checksum_field(checksum.into(), ChecksumAlgorithmKind::XxHash128)
+}
+
 /// Converts stored checksum metadata into the nested `GetObjectAttributes` checksum DTO.
 pub(super) fn checksum_struct<'a>(checksum: impl Into<ChecksumView<'a>>) -> Option<S3Checksum> {
     let checksum = checksum.into();
@@ -582,6 +658,11 @@ pub(super) fn checksum_struct<'a>(checksum: impl Into<ChecksumView<'a>>) -> Opti
         checksum_crc64nvme: checksum_crc64nvme(checksum),
         checksum_sha1: checksum_sha1(checksum),
         checksum_sha256: checksum_sha256(checksum),
+        checksum_sha512: checksum_sha512(checksum),
+        checksum_md5: checksum_md5(checksum),
+        checksum_xxhash3: checksum_xxhash3(checksum),
+        checksum_xxhash64: checksum_xxhash64(checksum),
+        checksum_xxhash128: checksum_xxhash128(checksum),
         checksum_type: checksum_type_output(checksum),
     })
 }
@@ -605,7 +686,10 @@ pub(super) fn object_checksum_for_part(
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use s3s::crypto::{Checksum as _, Crc32, Crc32c, Crc64Nvme, Sha1, Sha256};
+    use s3s::crypto::{
+        Checksum as _, Crc32, Crc32c, Crc64Nvme, Md5, Sha1, Sha256, Sha512, XxHash3, XxHash64,
+        XxHash128,
+    };
 
     use super::{ChecksumAlgorithmKind, encode_base64};
 
@@ -618,6 +702,11 @@ pub(crate) mod test_support {
             ChecksumAlgorithmKind::Crc64Nvme => encode_base64(Crc64Nvme::checksum(value).as_ref()),
             ChecksumAlgorithmKind::Sha1 => encode_base64(Sha1::checksum(value).as_ref()),
             ChecksumAlgorithmKind::Sha256 => encode_base64(Sha256::checksum(value).as_ref()),
+            ChecksumAlgorithmKind::Sha512 => encode_base64(Sha512::checksum(value).as_ref()),
+            ChecksumAlgorithmKind::Md5 => encode_base64(Md5::checksum(value).as_ref()),
+            ChecksumAlgorithmKind::XxHash3 => encode_base64(XxHash3::checksum(value).as_ref()),
+            ChecksumAlgorithmKind::XxHash64 => encode_base64(XxHash64::checksum(value).as_ref()),
+            ChecksumAlgorithmKind::XxHash128 => encode_base64(XxHash128::checksum(value).as_ref()),
         }
     }
 }
@@ -648,6 +737,11 @@ mod model_tests {
             ChecksumAlgorithmKind::Crc64Nvme,
             ChecksumAlgorithmKind::Sha1,
             ChecksumAlgorithmKind::Sha256,
+            ChecksumAlgorithmKind::Sha512,
+            ChecksumAlgorithmKind::Md5,
+            ChecksumAlgorithmKind::XxHash3,
+            ChecksumAlgorithmKind::XxHash64,
+            ChecksumAlgorithmKind::XxHash128,
         ] {
             let checksum = PartChecksum::new(algorithm, "value".to_string());
             assert_eq!(checksum.algorithm(), algorithm);
@@ -664,6 +758,11 @@ mod model_tests {
             ChecksumAlgorithmKind::Crc64Nvme,
             ChecksumAlgorithmKind::Sha1,
             ChecksumAlgorithmKind::Sha256,
+            ChecksumAlgorithmKind::Sha512,
+            ChecksumAlgorithmKind::Md5,
+            ChecksumAlgorithmKind::XxHash3,
+            ChecksumAlgorithmKind::XxHash64,
+            ChecksumAlgorithmKind::XxHash128,
         ] {
             let checksum = FullObjectChecksum::new(algorithm, "value".to_string());
             assert_eq!(checksum.algorithm(), algorithm);
@@ -678,6 +777,11 @@ mod model_tests {
             ChecksumAlgorithmKind::Crc32c,
             ChecksumAlgorithmKind::Sha1,
             ChecksumAlgorithmKind::Sha256,
+            ChecksumAlgorithmKind::Sha512,
+            ChecksumAlgorithmKind::Md5,
+            ChecksumAlgorithmKind::XxHash3,
+            ChecksumAlgorithmKind::XxHash64,
+            ChecksumAlgorithmKind::XxHash128,
         ] {
             let checksum = CompositeChecksum::new(algorithm, "value".to_string());
             let Some(checksum) = checksum else {
@@ -873,6 +977,11 @@ mod model_tests {
             ChecksumAlgorithmKind::Crc64Nvme,
             ChecksumAlgorithmKind::Sha1,
             ChecksumAlgorithmKind::Sha256,
+            ChecksumAlgorithmKind::Sha512,
+            ChecksumAlgorithmKind::Md5,
+            ChecksumAlgorithmKind::XxHash3,
+            ChecksumAlgorithmKind::XxHash64,
+            ChecksumAlgorithmKind::XxHash128,
         ] {
             let mut accumulator = ChecksumAccumulator::new(algorithm);
             accumulator.update(b"test ");
@@ -915,12 +1024,14 @@ mod model_tests {
         accumulator.update(b"digest");
         assert_eq!(
             accumulator.finish_composite(2),
-            Some(StoredChecksum::Composite(CompositeChecksum::Sha256(
+            StoredChecksum::new(
+                ChecksumAlgorithmKind::Sha256,
+                ChecksumTypeKind::Composite,
                 format!(
                     "{}-2",
                     test_support::checksum_value(ChecksumAlgorithmKind::Sha256, b"partdigest")
                 )
-            )))
+            )
         );
 
         let mut crc64 = ChecksumAccumulator::new(ChecksumAlgorithmKind::Crc64Nvme);
@@ -985,13 +1096,21 @@ mod tests {
             ),
             (ChecksumAlgorithm::SHA1, ChecksumAlgorithmKind::Sha1),
             (ChecksumAlgorithm::SHA256, ChecksumAlgorithmKind::Sha256),
+            (ChecksumAlgorithm::SHA512, ChecksumAlgorithmKind::Sha512),
+            (ChecksumAlgorithm::MD5, ChecksumAlgorithmKind::Md5),
+            (ChecksumAlgorithm::XXHASH3, ChecksumAlgorithmKind::XxHash3),
+            (ChecksumAlgorithm::XXHASH64, ChecksumAlgorithmKind::XxHash64),
+            (
+                ChecksumAlgorithm::XXHASH128,
+                ChecksumAlgorithmKind::XxHash128,
+            ),
         ] {
             let algorithm = ChecksumAlgorithm::from_static(name);
             assert_eq!(checksum_algorithm_kind(&algorithm), Some(kind));
             assert_eq!(checksum_algorithm_dto(kind).as_str(), name);
         }
         assert_eq!(
-            checksum_algorithm_kind(&ChecksumAlgorithm::from("MD5".to_string())),
+            checksum_algorithm_kind(&ChecksumAlgorithm::from("UNKNOWN".to_string())),
             None
         );
     }
@@ -1292,6 +1411,7 @@ mod tests {
         );
     }
 
+    /// Checks that computing a checksum requires the object body.
     #[test]
     fn object_write_checksum_requires_loaded_value() {
         let object = KeyValue {
@@ -1303,6 +1423,8 @@ mod tests {
                 metadata: None,
                 content_type: None,
                 content_encoding: None,
+                content_disposition: None,
+                content_language: None,
                 cache_control: None,
                 expires: None,
                 last_modified: time::OffsetDateTime::UNIX_EPOCH,

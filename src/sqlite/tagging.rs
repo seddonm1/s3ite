@@ -225,6 +225,7 @@ mod tests {
         ]
     }
 
+    /// Builds a live object to associate with version-specific tags.
     fn key_value(key: &str, value: &[u8]) -> KeyValue {
         let Ok(size) = i64::try_from(value.len()) else {
             panic!("test object fits i64");
@@ -238,6 +239,8 @@ mod tests {
                 metadata: None,
                 content_type: None,
                 content_encoding: None,
+                content_disposition: None,
+                content_language: None,
                 cache_control: None,
                 expires: None,
                 last_modified: OffsetDateTime::UNIX_EPOCH,
@@ -253,6 +256,7 @@ mod tests {
         }
     }
 
+    /// Checks that bucket tags are read in key order and can be cleared.
     #[test]
     fn bucket_tags_replace_and_read_in_key_order() -> SqliteResult<()> {
         let mut connection = open_schema()?;
@@ -274,10 +278,11 @@ mod tests {
         );
 
         Sqlite::replace_bucket_tags(&transaction, &[])?;
-        assert!(Sqlite::get_bucket_tags(&transaction)?.is_empty());
+        assert_eq!(Sqlite::get_bucket_tags(&transaction)?, []);
         Ok(())
     }
 
+    /// Checks that object version tags are read in key order and can be cleared.
     #[test]
     fn object_tags_replace_and_read_in_key_order() -> SqliteResult<()> {
         let mut connection = open_schema()?;
@@ -300,10 +305,11 @@ mod tests {
         );
 
         Sqlite::replace_object_tags(&transaction, outcome.sequence, &[])?;
-        assert!(Sqlite::get_object_tags(&transaction, outcome.sequence)?.is_empty());
+        assert_eq!(Sqlite::get_object_tags(&transaction, outcome.sequence)?, []);
         Ok(())
     }
 
+    /// Checks that deleting a version also removes its tags.
     #[test]
     fn object_tags_cascade_with_object_version() -> SqliteResult<()> {
         let mut connection = open_schema()?;
@@ -316,10 +322,11 @@ mod tests {
             (outcome.sequence,),
         )?;
 
-        assert!(Sqlite::get_object_tags(&transaction, outcome.sequence)?.is_empty());
+        assert_eq!(Sqlite::get_object_tags(&transaction, outcome.sequence)?, []);
         Ok(())
     }
 
+    /// Checks that completion transfers tags and that deleting their owning row removes them.
     #[test]
     fn multipart_tags_copy_to_completed_object_and_cascade() -> SqliteResult<()> {
         let mut connection = open_schema()?;
@@ -335,6 +342,8 @@ mod tests {
                 metadata: None,
                 content_type: None,
                 content_encoding: None,
+                content_disposition: None,
+                content_language: None,
                 cache_control: None,
                 expires: None,
                 checksum: None,

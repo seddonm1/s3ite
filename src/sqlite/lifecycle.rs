@@ -661,6 +661,7 @@ mod tests {
         StoredChecksum::Full(FullObjectChecksum::Crc64Nvme("crc".to_string()))
     }
 
+    /// Builds an object with a specified modification time for expiration tests.
     fn key_value(key: &str, value: &[u8], last_modified: OffsetDateTime) -> KeyValue {
         let Ok(size) = i64::try_from(value.len()) else {
             panic!("test object fits i64");
@@ -674,6 +675,8 @@ mod tests {
                 metadata: None,
                 content_type: None,
                 content_encoding: None,
+                content_disposition: None,
+                content_language: None,
                 cache_control: None,
                 expires: None,
                 last_modified,
@@ -702,6 +705,7 @@ mod tests {
         }
     }
 
+    /// Checks that lifecycle rules retain their order and can be cleared.
     #[test]
     fn lifecycle_rules_replace_and_read_in_rule_order() -> SqliteResult<()> {
         let mut connection = open_schema()?;
@@ -725,7 +729,7 @@ mod tests {
         assert_eq!(Sqlite::get_bucket_lifecycle_rules(&transaction)?, rules);
 
         Sqlite::replace_bucket_lifecycle_rules(&transaction, &[])?;
-        assert!(Sqlite::get_bucket_lifecycle_rules(&transaction)?.is_empty());
+        assert_eq!(Sqlite::get_bucket_lifecycle_rules(&transaction)?, []);
         Ok(())
     }
 
@@ -751,6 +755,7 @@ mod tests {
         Ok(())
     }
 
+    /// Checks that tag filters apply to pending uploads during lifecycle cleanup.
     #[test]
     fn lifecycle_abort_multipart_upload_uses_pending_tags() -> SqliteResult<()> {
         let mut connection = open_schema()?;
@@ -780,6 +785,8 @@ mod tests {
                 metadata: None,
                 content_type: None,
                 content_encoding: None,
+                content_disposition: None,
+                content_language: None,
                 cache_control: None,
                 expires: None,
                 checksum: None,

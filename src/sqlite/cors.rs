@@ -258,6 +258,7 @@ mod tests {
         }
     }
 
+    /// Checks that CORS rules retain their order across replacement and can be cleared.
     #[test]
     fn bucket_cors_rules_replace_and_read_in_rule_order() -> SqliteResult<()> {
         let mut connection = open_schema()?;
@@ -278,7 +279,7 @@ mod tests {
         assert_eq!(Sqlite::get_bucket_cors_rules(&transaction)?, replacement);
 
         Sqlite::replace_bucket_cors_rules(&transaction, &[])?;
-        assert!(Sqlite::get_bucket_cors_rules(&transaction)?.is_empty());
+        assert_eq!(Sqlite::get_bucket_cors_rules(&transaction)?, []);
 
         Ok(())
     }

@@ -6,9 +6,14 @@ use rusqlite::{
     ToSql,
     types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef},
 };
-use s3s::crypto::{Checksum as _, Crc32, Crc32c, Crc64Nvme, Sha1, Sha256};
+use s3s::crypto::{
+    Checksum as _, Crc32, Crc32c, Crc64Nvme, Md5, Sha1, Sha256, Sha512, XxHash3, XxHash64,
+    XxHash128,
+};
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+use super::{SqliteError, SqliteResult};
 
 /// Compact database code for bucket default SSE-S3.
 pub(crate) const SSE_S3_ALGORITHM_CODE: i64 = 1;
@@ -44,6 +49,26 @@ pub(crate) enum ChecksumAlgorithmKind {
     Sha1,
     /// SHA256 digest.
     Sha256,
+    /// SHA512 checksum.
+    Sha512,
+    /// MD5 checksum.
+    Md5,
+    /// XXHASH3 checksum.
+    XxHash3,
+    /// XXHASH64 checksum.
+    XxHash64,
+    /// XXHASH128 checksum.
+    XxHash128,
+}
+
+impl ChecksumAlgorithmKind {
+    /// These algorithms require a matching configuration at multipart initiation and composite completion.
+    pub(crate) fn requires_explicit_multipart_config(self) -> bool {
+        matches!(
+            self,
+            Self::Sha512 | Self::Md5 | Self::XxHash3 | Self::XxHash64 | Self::XxHash128
+        )
+    }
 }
 
 /// Checksum aggregation modes supported by stored object checksums.
@@ -68,6 +93,16 @@ pub(crate) enum PartChecksum {
     Sha1(String),
     /// Base64 `SHA256` checksum value.
     Sha256(String),
+    /// SHA512 checksum.
+    Sha512(String),
+    /// MD5 checksum.
+    Md5(String),
+    /// XXHASH3 checksum.
+    XxHash3(String),
+    /// XXHASH64 checksum.
+    XxHash64(String),
+    /// XXHASH128 checksum.
+    XxHash128(String),
 }
 
 impl PartChecksum {
@@ -80,6 +115,11 @@ impl PartChecksum {
             ChecksumAlgorithmKind::Crc64Nvme => Self::Crc64Nvme(value),
             ChecksumAlgorithmKind::Sha1 => Self::Sha1(value),
             ChecksumAlgorithmKind::Sha256 => Self::Sha256(value),
+            ChecksumAlgorithmKind::Sha512 => Self::Sha512(value),
+            ChecksumAlgorithmKind::Md5 => Self::Md5(value),
+            ChecksumAlgorithmKind::XxHash3 => Self::XxHash3(value),
+            ChecksumAlgorithmKind::XxHash64 => Self::XxHash64(value),
+            ChecksumAlgorithmKind::XxHash128 => Self::XxHash128(value),
         }
     }
 
@@ -91,6 +131,11 @@ impl PartChecksum {
             Self::Crc64Nvme(_) => ChecksumAlgorithmKind::Crc64Nvme,
             Self::Sha1(_) => ChecksumAlgorithmKind::Sha1,
             Self::Sha256(_) => ChecksumAlgorithmKind::Sha256,
+            Self::Sha512(_) => ChecksumAlgorithmKind::Sha512,
+            Self::Md5(_) => ChecksumAlgorithmKind::Md5,
+            Self::XxHash3(_) => ChecksumAlgorithmKind::XxHash3,
+            Self::XxHash64(_) => ChecksumAlgorithmKind::XxHash64,
+            Self::XxHash128(_) => ChecksumAlgorithmKind::XxHash128,
         }
     }
 
@@ -101,7 +146,12 @@ impl PartChecksum {
             | Self::Crc32c(value)
             | Self::Crc64Nvme(value)
             | Self::Sha1(value)
-            | Self::Sha256(value) => value,
+            | Self::Sha256(value)
+            | Self::Sha512(value)
+            | Self::Md5(value)
+            | Self::XxHash3(value)
+            | Self::XxHash64(value)
+            | Self::XxHash128(value) => value,
         }
     }
 
@@ -111,101 +161,28 @@ impl PartChecksum {
     }
 }
 
-/// Full-object checksum value, tagged by its algorithm.
+/// Full-object digests use the same algorithm and base64 representation as part digests.
+pub(crate) type FullObjectChecksum = PartChecksum;
+
+/// Digest of the concatenated binary part checksums for a completed multipart object.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum FullObjectChecksum {
-    /// Base64 `CRC32` checksum value.
-    Crc32(String),
-    /// Base64 `CRC32C` checksum value.
-    Crc32c(String),
-    /// Base64 `CRC64NVME` checksum value.
-    Crc64Nvme(String),
-    /// Base64 `SHA1` checksum value.
-    Sha1(String),
-    /// Base64 `SHA256` checksum value.
-    Sha256(String),
-}
-
-impl FullObjectChecksum {
-    /// Builds a full-object checksum value variant for an algorithm.
-    #[must_use]
-    pub(crate) fn new(algorithm: ChecksumAlgorithmKind, value: String) -> Self {
-        match algorithm {
-            ChecksumAlgorithmKind::Crc32 => Self::Crc32(value),
-            ChecksumAlgorithmKind::Crc32c => Self::Crc32c(value),
-            ChecksumAlgorithmKind::Crc64Nvme => Self::Crc64Nvme(value),
-            ChecksumAlgorithmKind::Sha1 => Self::Sha1(value),
-            ChecksumAlgorithmKind::Sha256 => Self::Sha256(value),
-        }
-    }
-
-    /// Returns the checksum algorithm.
-    pub(crate) fn algorithm(&self) -> ChecksumAlgorithmKind {
-        match self {
-            Self::Crc32(_) => ChecksumAlgorithmKind::Crc32,
-            Self::Crc32c(_) => ChecksumAlgorithmKind::Crc32c,
-            Self::Crc64Nvme(_) => ChecksumAlgorithmKind::Crc64Nvme,
-            Self::Sha1(_) => ChecksumAlgorithmKind::Sha1,
-            Self::Sha256(_) => ChecksumAlgorithmKind::Sha256,
-        }
-    }
-
-    /// Returns the base64 checksum text.
-    pub(crate) fn as_str(&self) -> &str {
-        match self {
-            Self::Crc32(value)
-            | Self::Crc32c(value)
-            | Self::Crc64Nvme(value)
-            | Self::Sha1(value)
-            | Self::Sha256(value) => value,
-        }
-    }
-}
-
-/// Composite checksum value, tagged by its algorithm.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum CompositeChecksum {
-    /// Base64 `CRC32` checksum value.
-    Crc32(String),
-    /// Base64 `CRC32C` checksum value.
-    Crc32c(String),
-    /// Base64 `SHA1` checksum value.
-    Sha1(String),
-    /// Base64 `SHA256` checksum value.
-    Sha256(String),
-}
+pub(crate) struct CompositeChecksum(PartChecksum);
 
 impl CompositeChecksum {
-    /// Builds a composite checksum value variant for a supported algorithm.
-    #[must_use]
+    /// A CRC64NVME checksum is always calculated over the whole object.
     pub(crate) fn new(algorithm: ChecksumAlgorithmKind, value: String) -> Option<Self> {
-        let checksum = match algorithm {
-            ChecksumAlgorithmKind::Crc32 => Self::Crc32(value),
-            ChecksumAlgorithmKind::Crc32c => Self::Crc32c(value),
-            ChecksumAlgorithmKind::Crc64Nvme => return None,
-            ChecksumAlgorithmKind::Sha1 => Self::Sha1(value),
-            ChecksumAlgorithmKind::Sha256 => Self::Sha256(value),
-        };
-        Some(checksum)
+        (algorithm != ChecksumAlgorithmKind::Crc64Nvme)
+            .then(|| Self(PartChecksum::new(algorithm, value)))
     }
 
-    /// Returns the checksum algorithm.
+    /// Returns the digest algorithm used for the composite value.
     pub(crate) fn algorithm(&self) -> ChecksumAlgorithmKind {
-        match self {
-            Self::Crc32(_) => ChecksumAlgorithmKind::Crc32,
-            Self::Crc32c(_) => ChecksumAlgorithmKind::Crc32c,
-            Self::Sha1(_) => ChecksumAlgorithmKind::Sha1,
-            Self::Sha256(_) => ChecksumAlgorithmKind::Sha256,
-        }
+        self.0.algorithm()
     }
 
-    /// Returns the base64 checksum text.
+    /// Returns the base64 digest with its multipart count suffix.
     pub(crate) fn as_str(&self) -> &str {
-        match self {
-            Self::Crc32(value) | Self::Crc32c(value) | Self::Sha1(value) | Self::Sha256(value) => {
-                value
-            }
-        }
+        self.0.as_str()
     }
 }
 
@@ -277,6 +254,16 @@ pub(crate) enum ChecksumAccumulator {
     Sha1(Sha1),
     /// Incremental `SHA256` checksum state.
     Sha256(Sha256),
+    /// SHA512 checksum.
+    Sha512(Sha512),
+    /// MD5 checksum.
+    Md5(Md5),
+    /// XXHASH3 checksum.
+    XxHash3(Box<XxHash3>),
+    /// XXHASH64 checksum.
+    XxHash64(XxHash64),
+    /// XXHASH128 checksum.
+    XxHash128(Box<XxHash128>),
 }
 
 impl ChecksumAccumulator {
@@ -289,6 +276,11 @@ impl ChecksumAccumulator {
             ChecksumAlgorithmKind::Crc64Nvme => Self::Crc64Nvme(Crc64Nvme::new()),
             ChecksumAlgorithmKind::Sha1 => Self::Sha1(Sha1::new()),
             ChecksumAlgorithmKind::Sha256 => Self::Sha256(Sha256::new()),
+            ChecksumAlgorithmKind::Sha512 => Self::Sha512(Sha512::new()),
+            ChecksumAlgorithmKind::Md5 => Self::Md5(Md5::new()),
+            ChecksumAlgorithmKind::XxHash3 => Self::XxHash3(Box::default()),
+            ChecksumAlgorithmKind::XxHash64 => Self::XxHash64(XxHash64::new()),
+            ChecksumAlgorithmKind::XxHash128 => Self::XxHash128(Box::default()),
         }
     }
 
@@ -300,6 +292,11 @@ impl ChecksumAccumulator {
             Self::Crc64Nvme(_) => ChecksumAlgorithmKind::Crc64Nvme,
             Self::Sha1(_) => ChecksumAlgorithmKind::Sha1,
             Self::Sha256(_) => ChecksumAlgorithmKind::Sha256,
+            Self::Sha512(_) => ChecksumAlgorithmKind::Sha512,
+            Self::Md5(_) => ChecksumAlgorithmKind::Md5,
+            Self::XxHash3(_) => ChecksumAlgorithmKind::XxHash3,
+            Self::XxHash64(_) => ChecksumAlgorithmKind::XxHash64,
+            Self::XxHash128(_) => ChecksumAlgorithmKind::XxHash128,
         }
     }
 
@@ -311,6 +308,11 @@ impl ChecksumAccumulator {
             Self::Crc64Nvme(checksum) => checksum.update(value),
             Self::Sha1(checksum) => checksum.update(value),
             Self::Sha256(checksum) => checksum.update(value),
+            Self::Sha512(checksum) => checksum.update(value),
+            Self::Md5(checksum) => checksum.update(value),
+            Self::XxHash3(checksum) => checksum.update(value),
+            Self::XxHash64(checksum) => checksum.update(value),
+            Self::XxHash128(checksum) => checksum.update(value),
         }
     }
 
@@ -323,6 +325,11 @@ impl ChecksumAccumulator {
             Self::Crc64Nvme(checksum) => encode_base64(checksum.finalize().as_ref()),
             Self::Sha1(checksum) => encode_base64(checksum.finalize().as_ref()),
             Self::Sha256(checksum) => encode_base64(checksum.finalize().as_ref()),
+            Self::Sha512(checksum) => encode_base64(checksum.finalize().as_ref()),
+            Self::Md5(checksum) => encode_base64(checksum.finalize().as_ref()),
+            Self::XxHash3(checksum) => encode_base64(checksum.finalize().as_ref()),
+            Self::XxHash64(checksum) => encode_base64(checksum.finalize().as_ref()),
+            Self::XxHash128(checksum) => encode_base64(checksum.finalize().as_ref()),
         }
     }
 
@@ -359,6 +366,36 @@ pub(crate) struct MultipartChecksumConfig {
 }
 
 impl MultipartChecksumConfig {
+    /// Resolves the final checksum algorithm and type for multipart completion.
+    pub(crate) fn for_completion(
+        upload_checksum: Option<MultipartChecksumConfig>,
+        requested_checksum: &MultipartCompletionChecksum,
+        default_checksum: MultipartChecksumConfig,
+    ) -> SqliteResult<Self> {
+        let algorithm = upload_checksum
+            .map(|checksum| checksum.algorithm)
+            .or(requested_checksum.algorithm())
+            .unwrap_or(default_checksum.algorithm);
+
+        let checksum_type = requested_checksum
+            .checksum_type()
+            .or(upload_checksum.map(|checksum| checksum.checksum_type))
+            .unwrap_or(default_checksum.checksum_type);
+
+        let requested_algorithm = requested_checksum.algorithm();
+        let requires_config = algorithm.requires_explicit_multipart_config()
+            || requested_algorithm
+                .is_some_and(ChecksumAlgorithmKind::requires_explicit_multipart_config);
+        if requires_config
+            && (upload_checksum.is_none()
+                || checksum_type != ChecksumTypeKind::Composite
+                || requested_algorithm.is_some_and(|kind| kind != algorithm))
+        {
+            return Err(SqliteError::InvalidMultipartChecksumConfig);
+        }
+        Ok(Self::new(algorithm, checksum_type))
+    }
+
     /// Builds a checksum configuration for an active multipart upload.
     #[must_use]
     pub(crate) fn new(algorithm: ChecksumAlgorithmKind, checksum_type: ChecksumTypeKind) -> Self {
@@ -434,7 +471,7 @@ pub(crate) fn decode_md5_hex(value: &str) -> Option<[u8; 16]> {
     }
 
     let mut decoded = [0; 16];
-    for (idx, pair) in bytes.chunks_exact(2).enumerate() {
+    for (idx, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
         let upper = nibble(pair[0])?;
         let lower = nibble(pair[1])?;
         decoded[idx] = (upper << 4) | lower;
@@ -486,14 +523,14 @@ pub(crate) fn decode_base64(value: &str) -> Option<Vec<u8>> {
         }
     }
 
-    let bytes = value.as_bytes();
-    if bytes.is_empty() || bytes.len().is_multiple_of(4).not() {
+    let (chunks, remainder) = value.as_bytes().as_chunks::<4>();
+    if chunks.is_empty() || !remainder.is_empty() {
         return None;
     }
 
-    let chunk_count = bytes.len() / 4;
+    let chunk_count = chunks.len();
     let mut decoded = Vec::with_capacity(chunk_count * 3);
-    for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+    for (index, chunk) in chunks.iter().enumerate() {
         let is_last = index + 1 == chunk_count;
         let padding = match (chunk[2], chunk[3]) {
             (b'=', b'=') => 2,
@@ -895,6 +932,8 @@ pub(crate) struct MultipartUploadState {
     pub(crate) metadata: Option<HashMap<String, String>>,
     pub(crate) content_type: Option<String>,
     pub(crate) content_encoding: Option<String>,
+    pub(crate) content_disposition: Option<String>,
+    pub(crate) content_language: Option<String>,
     pub(crate) cache_control: Option<String>,
     pub(crate) expires: Option<OffsetDateTime>,
     pub(crate) checksum: Option<MultipartChecksumConfig>,
@@ -984,6 +1023,8 @@ pub(crate) struct KeyMetadata {
     pub(crate) metadata: Option<HashMap<String, String>>,
     pub(crate) content_type: Option<String>,
     pub(crate) content_encoding: Option<String>,
+    pub(crate) content_disposition: Option<String>,
+    pub(crate) content_language: Option<String>,
     pub(crate) cache_control: Option<String>,
     pub(crate) expires: Option<OffsetDateTime>,
     pub(crate) last_modified: OffsetDateTime,
@@ -1108,38 +1149,12 @@ pub(crate) fn object_lock_allows_lifecycle_delete(
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use s3s::crypto::{Checksum as _, Crc32, Crc32c, Crc64Nvme, Sha1, Sha256};
+    use super::{ChecksumAccumulator, ChecksumAlgorithmKind};
 
-    use super::{ChecksumAlgorithmKind, encode_base64};
-
-    /// Computes a base64 checksum value for tests.
+    /// Computes a base64 checksum value for storage fixtures.
     pub(crate) fn checksum_value(algorithm: ChecksumAlgorithmKind, value: &[u8]) -> String {
-        match algorithm {
-            ChecksumAlgorithmKind::Crc32 => {
-                let mut checksum = Crc32::new();
-                checksum.update(value);
-                encode_base64(checksum.finalize().as_ref())
-            }
-            ChecksumAlgorithmKind::Crc32c => {
-                let mut checksum = Crc32c::new();
-                checksum.update(value);
-                encode_base64(checksum.finalize().as_ref())
-            }
-            ChecksumAlgorithmKind::Crc64Nvme => {
-                let mut checksum = Crc64Nvme::new();
-                checksum.update(value);
-                encode_base64(checksum.finalize().as_ref())
-            }
-            ChecksumAlgorithmKind::Sha1 => {
-                let mut checksum = Sha1::new();
-                checksum.update(value);
-                encode_base64(checksum.finalize().as_ref())
-            }
-            ChecksumAlgorithmKind::Sha256 => {
-                let mut checksum = Sha256::new();
-                checksum.update(value);
-                encode_base64(checksum.finalize().as_ref())
-            }
-        }
+        let mut checksum = ChecksumAccumulator::new(algorithm);
+        checksum.update(value);
+        checksum.finish_value()
     }
 }

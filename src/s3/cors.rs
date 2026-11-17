@@ -76,7 +76,7 @@ impl<S> Layer<S> for BucketCorsLayer {
     }
 }
 
-/// Service that applies bucket CORS before auth for preflight and after inner calls otherwise.
+/// Service that checks bucket CORS before dispatch and adds matching response headers.
 #[derive(Clone, Debug)]
 pub(crate) struct BucketCorsService<S> {
     inner: S,
@@ -320,6 +320,7 @@ fn validate_header_name(name: &str) -> S3Result<()> {
         })
 }
 
+/// Checks preflights and enforces configured bucket rules before dispatching cross-origin requests.
 async fn handle_cors_request<S>(
     sqlite: &Sqlite,
     fallback: &FallbackCors,
@@ -352,7 +353,7 @@ where
         ));
     }
 
-    let Some(origin) = req.headers().get(ORIGIN).cloned() else {
+    let Some(origin) = req.headers().get(ORIGIN).filter(|value| !value.is_empty()) else {
         return inner.call(req).await;
     };
 
@@ -360,20 +361,34 @@ where
     let bucket_rules = bucket_cors_rules(sqlite, bucket.as_deref()).await;
 
     let match_source = CorsMatchSource::select(fallback, bucket_rules.as_deref());
-    let method = actual_cors_method(&req);
-    let actual_headers = match_source.and_then(|source| source.actual_headers(&origin, method));
-    let mut response = inner.call(req).await?;
-    if let Some(headers) = actual_headers {
+    let actual_headers = match_source
+        .as_ref()
+        .and_then(|source| source.actual_headers(origin, req.method().as_str()));
+    let denied =
+        matches!(match_source, Some(CorsMatchSource::Bucket(_))) && actual_headers.is_none();
+    // The requested method can affect response headers, but only the HTTP method determines admission.
+    let response_headers = match req
+        .headers()
+        .get(ACCESS_CONTROL_REQUEST_METHOD)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(method) => match_source.and_then(|source| source.actual_headers(origin, method)),
+        None => actual_headers,
+    };
+    let mut response = if denied {
+        s3_error_with_message(
+            S3ErrorCode::AccessDenied,
+            "Origin or method is not allowed by bucket CORS",
+        )
+        .to_http_response()
+        .map_err(|error| HttpError::from_std_error(error.into()))?
+    } else {
+        inner.call(req).await?
+    };
+    if let Some(headers) = response_headers {
         headers.insert_actual(response.headers_mut());
     }
     Ok(response)
-}
-
-fn actual_cors_method(req: &Request<Incoming>) -> &str {
-    req.headers()
-        .get(ACCESS_CONTROL_REQUEST_METHOD)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_else(|| req.method().as_str())
 }
 
 fn handle_preflight(

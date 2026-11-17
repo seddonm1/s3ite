@@ -6,7 +6,11 @@
     clippy::unwrap_used
 )]
 
-use std::net::SocketAddr;
+use std::{
+    io::{Write, stdout},
+    net::SocketAddr,
+    sync::Arc,
+};
 
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
@@ -15,6 +19,7 @@ use hyper_util::{
 };
 use s3s::{
     auth::SimpleAuth,
+    config::{S3Config, StaticConfigProvider},
     host::MultiDomain,
     service::{S3Service, S3ServiceBuilder},
 };
@@ -35,9 +40,9 @@ mod sqlite;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use self::compat::HeaderAuthCompatLayer;
+use self::compat::S3CompatLayer;
 pub(crate) use self::{
-    config::{Config, ConfigError},
+    config::{Config, ConfigAction, ConfigError},
     sqlite::{Sqlite, SqliteError},
 };
 
@@ -58,25 +63,26 @@ enum MainError {
     Configuration(String),
 }
 
+/// Parses the startup action and runs the configured S3 server.
 #[tokio::main]
 async fn main() -> MainResult<()> {
     init_tracing();
 
-    let config = Config::from_args()?;
-    let auth_compat = HeaderAuthCompatLayer::new(config.secret_key.clone());
+    let config = match ConfigAction::from_args()? {
+        ConfigAction::Run(config) => *config,
+        ConfigAction::PrintConfigTemplate => {
+            stdout()
+                .lock()
+                .write_all(Config::config_template().as_bytes())?;
+            return Ok(());
+        }
+    };
     let sqlite = Sqlite::new(&config).await?;
     let cors_layer = s3::BucketCorsLayer::new(sqlite.clone(), &config);
     let svc = build_s3_service(&config, sqlite)?;
     let listener = bind_listener(&config).await?;
 
-    serve(
-        listener,
-        svc,
-        auth_compat,
-        cors_layer,
-        config.concurrency_limit,
-    )
-    .await
+    serve(listener, svc, cors_layer, config.concurrency_limit).await
 }
 
 fn init_tracing() {
@@ -87,8 +93,12 @@ fn init_tracing() {
         .init();
 }
 
+/// Builds the S3 service with the configured owner and addressing mode.
 fn build_s3_service(config: &Config, sqlite: Sqlite) -> MainResult<S3Service> {
     let mut s3 = S3ServiceBuilder::new(sqlite);
+    let mut protocol = S3Config::default();
+    protocol.enable_sig_v2 = true;
+    s3.set_config(Arc::new(StaticConfigProvider::new(protocol.into())));
 
     if let (Some(access_key), Some(secret_key)) =
         (config.access_key.clone(), config.secret_key.clone())
@@ -111,10 +121,10 @@ async fn bind_listener(config: &Config) -> MainResult<TcpListener> {
     Ok(TcpListener::bind(addr).await?)
 }
 
+/// Serves S3 connections until shutdown and gives active requests time to finish.
 async fn serve(
     listener: TcpListener,
     svc: S3Service,
-    auth_compat: HeaderAuthCompatLayer,
     cors_layer: s3::BucketCorsLayer,
     concurrency_limit: u16,
 ) -> MainResult<()> {
@@ -152,7 +162,7 @@ async fn serve(
                     })
                     .layer(ConcurrencyLimitLayer::new(concurrency_limit.into()))
                     .layer(cors_layer.clone())
-                    .layer(auth_compat.clone())
+                    .layer(S3CompatLayer)
                     .service(svc.clone()),
             ),
         );

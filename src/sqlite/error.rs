@@ -46,6 +46,9 @@ pub enum SqliteError {
     /// A supplied checksum does not match stored or computed object data.
     #[error("checksum mismatch")]
     ChecksumMismatch,
+    /// The requested multipart checksum does not match the initiated configuration.
+    #[error("invalid multipart checksum configuration")]
+    InvalidMultipartChecksumConfig,
     /// Storage configuration is invalid.
     #[error("configuration error: {0}")]
     Configuration(String),

@@ -6,7 +6,7 @@
 
 mod support;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use aws_sdk_s3::{
     Client,
     primitives::ByteStream,
@@ -206,8 +206,8 @@ async fn test_versioning_obj_create_read_remove_head() -> Result<()> {
 /// Verifies repeated deletes stack multiple delete markers.
 #[tokio::test]
 #[serial(conformance)]
-async fn test_versioning_stack_delete_merkers() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_versioning_stack_delete_merkers
+async fn test_versioning_stack_delete_markers() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_versioning_stack_delete_markers
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-ver");
@@ -639,7 +639,7 @@ async fn test_versioning_obj_create_overwrite_multipart() -> Result<()> {
     put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
 
     let mut versions = Vec::new();
-    for byte in [b'a', b'b', b'c'] {
+    for &byte in b"abc" {
         let body = vec![byte; 6 * MIB];
         let completed = multipart_upload(&client, &bucket, key, body.clone()).await?;
         let version_id = completed
@@ -981,6 +981,132 @@ async fn test_versioning_multi_object_delete() -> Result<()> {
             .is_empty()
     );
 
+    Ok(())
+}
+
+/// Pages past the literal null delete marker created while versioning is suspended.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_versioning_obj_list_marker_null_delete_marker() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_versioning_obj_list_marker_null_delete_marker
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ver");
+    let key = "testobj";
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    let id = put_versioned_object(&client, &bucket, key, b"data").await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Suspended).await?;
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+
+    let first = client
+        .list_object_versions()
+        .bucket(&bucket)
+        .max_keys(1)
+        .send()
+        .await?;
+    assert_eq!(first.delete_markers().len(), 1);
+    assert_eq!(first.delete_markers()[0].version_id(), Some("null"));
+    assert_eq!(first.is_truncated(), Some(true));
+    assert_eq!(first.next_key_marker(), Some(key));
+    assert_eq!(first.next_version_id_marker(), Some("null"));
+    let next = client
+        .list_object_versions()
+        .bucket(&bucket)
+        .max_keys(1)
+        .set_key_marker(first.next_key_marker)
+        .set_version_id_marker(first.next_version_id_marker)
+        .send()
+        .await?;
+    assert_eq!(next.versions().len(), 1);
+    assert_eq!(next.versions()[0].version_id(), Some(id.as_str()));
+    Ok(())
+}
+
+/// Verifies an absent trailing version leaves the preceding successful delete committed.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_versioning_multi_object_delete_last_missing() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_versioning_multi_object_delete_last_missing
+    check_mixed_version_delete(None).await
+}
+
+/// Verifies a trailing ETag mismatch preserves only the older object version.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_versioning_multi_object_delete_last_precondition_failed() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_versioning_multi_object_delete_last_precondition_failed
+    check_mixed_version_delete(Some("badetag")).await
+}
+
+/// Checks exact-version absence before reading the version promoted by a partial batch delete.
+async fn check_mixed_version_delete(trailing_etag: Option<&str>) -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ver");
+    let key = "key";
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    let versions = create_multiple_versions(&client, &bucket, key, 2).await?;
+    let older = &versions[0];
+    let current = &versions[1];
+    let first = ObjectIdentifier::builder()
+        .key(key)
+        .version_id(&current.version_id)
+        .build()?;
+    let last = ObjectIdentifier::builder().key(key);
+    let last = match trailing_etag {
+        Some(etag) => last.version_id(&older.version_id).e_tag(etag),
+        None => last.version_id("doesnotexist"),
+    };
+    let result = client
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(
+            Delete::builder()
+                .objects(first)
+                .objects(last.build()?)
+                .build()?,
+        )
+        .send()
+        .await?;
+    if trailing_etag.is_some() {
+        assert_eq!(result.errors().len(), 1);
+        assert_eq!(result.errors()[0].code(), Some("PreconditionFailed"));
+    } else {
+        assert!(result.errors().is_empty());
+    }
+    let missing = client
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .version_id(&current.version_id)
+        .send()
+        .await
+        .expect_err("deleted version still readable");
+    assert_eq!(
+        missing
+            .raw_response()
+            .context("missing HTTP response")?
+            .status()
+            .as_u16(),
+        404
+    );
+    let listed = client.list_object_versions().bucket(&bucket).send().await?;
+    assert_eq!(listed.versions().len(), 1);
+    assert_eq!(
+        listed.versions()[0].version_id(),
+        Some(older.version_id.as_str())
+    );
+    assert_eq!(
+        get_object_bytes(&client, &bucket, key).await?,
+        older.content
+    );
     Ok(())
 }
 

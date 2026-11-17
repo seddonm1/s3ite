@@ -2,6 +2,30 @@
 
 use std::{collections::HashMap, ops::Not};
 
+use s3s::{
+    S3Error, S3Result,
+    dto::{Timestamp, TimestampFormat},
+    s3_error,
+};
+use time::OffsetDateTime;
+
+/// Parses the S3 Expires header into the timestamp stored with an object.
+pub(super) fn parse_expires(value: Option<&str>) -> S3Result<Option<OffsetDateTime>> {
+    let Some(value) = value else { return Ok(None) };
+    Timestamp::parse(TimestampFormat::HttpDate, value)
+        .map(|timestamp| Some(timestamp.into()))
+        .map_err(|err| s3_error!(err, InvalidArgument, "invalid Expires header"))
+}
+
+/// Formats a stored expiration timestamp for GET and HEAD responses.
+pub(super) fn format_expires(value: OffsetDateTime) -> S3Result<String> {
+    let mut bytes = Vec::new();
+    Timestamp::from(value)
+        .format(TimestampFormat::HttpDate, &mut bytes)
+        .map_err(S3Error::internal_error)?;
+    String::from_utf8(bytes).map_err(S3Error::internal_error)
+}
+
 /// Stores HTTP content encodings while hiding S3's transport-only aws-chunked marker.
 pub(super) fn normalize_content_encoding(content_encoding: Option<String>) -> Option<String> {
     let content_encoding = content_encoding?;
@@ -35,7 +59,7 @@ fn decode_rfc2047_metadata_value(value: &str) -> String {
 }
 
 /// Decodes one supported RFC 2047 encoded word from SDK metadata.
-fn decode_rfc2047_word(value: &str) -> Option<String> {
+pub(crate) fn decode_rfc2047_word(value: &str) -> Option<String> {
     let encoded = value.strip_prefix("=?")?.strip_suffix("?=")?;
     let mut parts = encoded.splitn(3, '?');
     let charset = parts.next()?;
@@ -92,6 +116,22 @@ fn hex_digit(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use s3s::S3ErrorCode;
+
+    /// Checks the wire representation used by existing stored Expires timestamps.
+    #[test]
+    fn expires_header_round_trips() -> S3Result<()> {
+        let header = "Thu, 01 Jan 1970 00:00:00 GMT";
+        assert_eq!(
+            parse_expires(Some(header))?,
+            Some(OffsetDateTime::UNIX_EPOCH)
+        );
+        assert_eq!(format_expires(OffsetDateTime::UNIX_EPOCH)?, header);
+        assert!(
+            matches!(parse_expires(Some("invalid")), Err(err) if err.code() == &S3ErrorCode::InvalidArgument)
+        );
+        Ok(())
+    }
 
     #[test]
     fn normalizes_content_encoding_values() {

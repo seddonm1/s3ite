@@ -19,6 +19,7 @@ use support::{
     raw_http, sdk,
     server::TestServer,
 };
+use time::{OffsetDateTime, macros::format_description};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -230,102 +231,123 @@ async fn s3ite_object_create_bad_ua_none_aws2() -> Result<()> {
     assert_successful_sig_v2_put_with_headers(&[]).await
 }
 
+/// Checks how the upstream SigV2 verifier handles the two date headers.
+#[tokio::test]
+#[serial(conformance)]
+async fn s3ite_sig_v2_http_date_header() -> Result<()> {
+    let date = OffsetDateTime::now_utc().format(format_description!(
+        "[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT"
+    ))?;
+    assert_successful_sig_v2_put_with_headers(&[("Date", &date)]).await?;
+    assert_sig_v2_object_date_error(&date, StatusCode::BAD_REQUEST, "InvalidRequest").await
+}
+
+/// Checks object creation with invalid SigV2 dates.
 #[tokio::test]
 #[serial(conformance)]
 async fn s3ite_object_create_bad_date_invalid_aws2() -> Result<()> {
-    // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_date_invalid_aws2
-    assert_sig_v2_object_date_error("Bad Date", StatusCode::FORBIDDEN, "AccessDenied").await
+    // Adapted from s3tests/functional/test_headers.py::test_object_create_bad_date_invalid_aws2: use upstream SigV2 timestamp validation.
+    assert_sig_v2_object_date_error("Bad Date", StatusCode::BAD_REQUEST, "InvalidRequest").await
 }
 
+/// Checks object creation with empty SigV2 dates.
 #[tokio::test]
 #[serial(conformance)]
 async fn s3ite_object_create_bad_date_empty_aws2() -> Result<()> {
-    // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_date_empty_aws2
-    assert_sig_v2_object_date_error("", StatusCode::FORBIDDEN, "AccessDenied").await
+    // Adapted from s3tests/functional/test_headers.py::test_object_create_bad_date_empty_aws2: use upstream SigV2 timestamp validation.
+    assert_sig_v2_object_date_error("", StatusCode::BAD_REQUEST, "InvalidRequest").await
 }
 
+/// Checks object creation with stale SigV2 dates.
 #[tokio::test]
 #[serial(conformance)]
 async fn s3ite_object_create_bad_date_before_today_aws2() -> Result<()> {
-    // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_date_before_today_aws2
+    // Adapted from s3tests/functional/test_headers.py::test_object_create_bad_date_before_today_aws2: use upstream SigV2 timestamp validation.
     assert_sig_v2_object_date_error(
-        "Tue, 07 Jul 2010 21:53:04 GMT",
+        "20100707T215304Z",
         StatusCode::FORBIDDEN,
         "RequestTimeTooSkewed",
     )
     .await
 }
 
+/// Checks object creation with pre-epoch SigV2 dates.
 #[tokio::test]
 #[serial(conformance)]
 async fn s3ite_object_create_bad_date_before_epoch_aws2() -> Result<()> {
-    // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_date_before_epoch_aws2
+    // Adapted from s3tests/functional/test_headers.py::test_object_create_bad_date_before_epoch_aws2: use upstream SigV2 timestamp validation.
     assert_sig_v2_object_date_error(
-        "Tue, 07 Jul 1950 21:53:04 GMT",
+        "19500707T215304Z",
         StatusCode::FORBIDDEN,
-        "AccessDenied",
+        "RequestTimeTooSkewed",
     )
     .await
 }
 
+/// Checks object creation with far-future SigV2 dates.
 #[tokio::test]
 #[serial(conformance)]
 async fn s3ite_object_create_bad_date_after_end_aws2() -> Result<()> {
-    // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_date_after_end_aws2
+    // Adapted from s3tests/functional/test_headers.py::test_object_create_bad_date_after_end_aws2: use upstream SigV2 timestamp validation.
     assert_sig_v2_object_date_error(
-        "Tue, 07 Jul 9999 21:53:04 GMT",
+        "99990707T215304Z",
         StatusCode::FORBIDDEN,
         "RequestTimeTooSkewed",
     )
     .await
 }
 
+/// Checks bucket creation with invalid SigV2 dates.
 #[tokio::test]
 #[serial(conformance)]
 async fn s3ite_bucket_create_bad_date_invalid_aws2() -> Result<()> {
-    // Mirrors s3tests/functional/test_headers.py::test_bucket_create_bad_date_invalid_aws2
-    assert_sig_v2_bucket_date_error("Bad Date", StatusCode::FORBIDDEN, "AccessDenied").await
+    // Adapted from s3tests/functional/test_headers.py::test_bucket_create_bad_date_invalid_aws2: use upstream SigV2 timestamp validation.
+    assert_sig_v2_bucket_date_error("Bad Date", StatusCode::BAD_REQUEST, "InvalidRequest").await
 }
 
+/// Checks bucket creation with empty SigV2 dates.
 #[tokio::test]
 #[serial(conformance)]
 async fn s3ite_bucket_create_bad_date_empty_aws2() -> Result<()> {
-    // Mirrors s3tests/functional/test_headers.py::test_bucket_create_bad_date_empty_aws2
-    assert_sig_v2_bucket_date_error("", StatusCode::FORBIDDEN, "AccessDenied").await
+    // Adapted from s3tests/functional/test_headers.py::test_bucket_create_bad_date_empty_aws2: use upstream SigV2 timestamp validation.
+    assert_sig_v2_bucket_date_error("", StatusCode::BAD_REQUEST, "InvalidRequest").await
 }
 
+/// Checks bucket creation with stale SigV2 dates.
 #[tokio::test]
 #[serial(conformance)]
 async fn s3ite_bucket_create_bad_date_before_today_aws2() -> Result<()> {
-    // Mirrors s3tests/functional/test_headers.py::test_bucket_create_bad_date_before_today_aws2
+    // Adapted from s3tests/functional/test_headers.py::test_bucket_create_bad_date_before_today_aws2: use upstream SigV2 timestamp validation.
     assert_sig_v2_bucket_date_error(
-        "Tue, 07 Jul 2010 21:53:04 GMT",
+        "20100707T215304Z",
         StatusCode::FORBIDDEN,
         "RequestTimeTooSkewed",
     )
     .await
 }
 
+/// Checks bucket creation with future SigV2 dates.
 #[tokio::test]
 #[serial(conformance)]
 async fn s3ite_bucket_create_bad_date_after_today_aws2() -> Result<()> {
-    // Mirrors s3tests/functional/test_headers.py::test_bucket_create_bad_date_after_today_aws2
+    // Adapted from s3tests/functional/test_headers.py::test_bucket_create_bad_date_after_today_aws2: use upstream SigV2 timestamp validation.
     assert_sig_v2_bucket_date_error(
-        "Tue, 07 Jul 2030 21:53:04 GMT",
+        "20300707T215304Z",
         StatusCode::FORBIDDEN,
         "RequestTimeTooSkewed",
     )
     .await
 }
 
+/// Checks bucket creation with pre-epoch SigV2 dates.
 #[tokio::test]
 #[serial(conformance)]
 async fn s3ite_bucket_create_bad_date_before_epoch_aws2() -> Result<()> {
-    // Mirrors s3tests/functional/test_headers.py::test_bucket_create_bad_date_before_epoch_aws2
+    // Adapted from s3tests/functional/test_headers.py::test_bucket_create_bad_date_before_epoch_aws2: use upstream SigV2 timestamp validation.
     assert_sig_v2_bucket_date_error(
-        "Tue, 07 Jul 1950 21:53:04 GMT",
+        "19500707T215304Z",
         StatusCode::FORBIDDEN,
-        "AccessDenied",
+        "RequestTimeTooSkewed",
     )
     .await
 }
@@ -446,6 +468,7 @@ async fn assert_error(response: Response, expected: StatusCode, code: &str) -> R
     Ok(())
 }
 
+/// Signs a path-style request using the timestamp format accepted by s3s.
 async fn sig_v2_request(
     server: &TestServer,
     method: Method,
@@ -463,11 +486,13 @@ async fn sig_v2_request(
     {
         headers.push(("Content-Length".to_string(), body.len().to_string()));
     }
-    if header_value(&headers, "x-amz-date").is_none() {
+    if header_value(&headers, "x-amz-date").is_none() && header_value(&headers, "date").is_none() {
         headers.push((
             "x-amz-date".to_string(),
-            time::OffsetDateTime::now_utc()
-                .format(&time::format_description::well_known::Rfc2822)
+            OffsetDateTime::now_utc()
+                .format(format_description!(
+                    "[year][month][day]T[hour][minute][second]Z"
+                ))
                 .context("format SigV2 date")?,
         ));
     }

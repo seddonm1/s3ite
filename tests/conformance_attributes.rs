@@ -319,7 +319,7 @@ async fn test_get_multipart_checksum_object_attributes() -> Result<()> {
     let mut parts = Vec::with_capacity(part_checksums.len());
     for (index, checksum) in part_checksums.into_iter().enumerate() {
         let part_number = i32::try_from(index + 1)?;
-        let byte = [b'A', b'B', b'C'][index];
+        let byte = b"ABC"[index];
         let response = client
             .upload_part()
             .bucket(&bucket)

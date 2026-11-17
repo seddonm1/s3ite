@@ -6,7 +6,7 @@
 
 mod support;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use aws_sdk_s3::{
     Client,
     operation::{
@@ -19,10 +19,12 @@ use aws_sdk_s3::{
         CompletedPart, ObjectAttributes,
     },
 };
+use reqwest::{Method, StatusCode};
 use serial_test::serial;
 use support::{
     assertions::assert_error_contains,
     fixtures::{bucket_name, create_bucket, get_object_bytes, put_object},
+    raw_http::signed_request_with_headers,
     sdk,
     server::TestServer,
 };
@@ -52,6 +54,244 @@ const CRC64NVME_5_MIB_B: &str = "xW1l19VobYM=";
 const CRC64NVME_5_MIB_C: &str = "cK5MnNaWrW4=";
 const CRC64NVME_15_MIB_ABC: &str = "i+6LR0y3eFo=";
 const SHA256_MULTIPART_ETAG_ABC: &str = "b2add96cc9702bbf4efb0ccdfc6b7747-3";
+
+const SHA512_1024_A: &str =
+    "bO7Eq5ubilg55mUGSAieJjtmRdS+PhkSv4Z8Dj4XT5dqOfVEbEvR1X2DfWMZsSMQP+L+4vWQOAqD/k0O2YCZ7w==";
+const MD5_1024_A: &str = "1HsSe8LeLWh93ILaw1TEFQ==";
+const XXHASH3_1024_A: &str = "TTWtCOnXfA0=";
+const XXHASH64_1024_A: &str = "Np5GGlTsOCc=";
+const XXHASH128_1024_A: &str = "kZHSD0DXTkZNNa0I6dd8DQ==";
+
+/// Checks a known digest over the wire, including read opt-in and failed overwrite behavior.
+async fn check_object_checksum(algorithm: &str, expected: &str) -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ck");
+    create_bucket(&client, &bucket).await?;
+    let path = format!("/{bucket}/myobj");
+    let name = format!("x-amz-checksum-{}", algorithm.to_ascii_lowercase());
+    let put = |value| {
+        let headers = [
+            ("x-amz-sdk-checksum-algorithm", algorithm),
+            (name.as_str(), value),
+        ];
+        let server = &server;
+        let path = &path;
+        async move {
+            signed_request_with_headers(server, Method::PUT, path, vec![b'A'; 1024], &headers).await
+        }
+    };
+    let mismatch = signed_request_with_headers(
+        &server,
+        Method::PUT,
+        &path,
+        vec![b'A'; 1024],
+        &[
+            ("x-amz-sdk-checksum-algorithm", "SHA256"),
+            (name.as_str(), expected),
+        ],
+    )
+    .await?;
+    assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
+    assert!(mismatch.text().await?.contains("<Code>BadDigest</Code>"));
+    let response = put(expected).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[&name], expected);
+    let head = signed_request_with_headers(&server, Method::HEAD, &path, Vec::new(), &[]).await?;
+    assert!(!head.headers().contains_key(&name));
+    let error = put("bad").await?;
+    assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+    assert!(error.text().await?.contains("<Code>BadDigest</Code>"));
+    for method in [Method::HEAD, Method::GET] {
+        let read = signed_request_with_headers(
+            &server,
+            method,
+            &path,
+            Vec::new(),
+            &[("x-amz-checksum-mode", "ENABLED")],
+        )
+        .await?;
+        assert_eq!(read.status(), StatusCode::OK);
+        assert_eq!(read.headers()[&name], expected);
+    }
+    Ok(())
+}
+
+/// Checks Ceph's SHA512 PUT and HEAD checksum vector.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_object_checksum_sha512() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_object_checksum_sha512
+    check_object_checksum("SHA512", SHA512_1024_A).await
+}
+
+/// Checks Ceph's MD5 PUT and HEAD checksum vector.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_object_checksum_md5() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_object_checksum_md5
+    check_object_checksum("MD5", MD5_1024_A).await
+}
+
+/// Checks Ceph's XXHASH3 PUT and HEAD checksum vector.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_object_checksum_xxhash3() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_object_checksum_xxhash3
+    check_object_checksum("XXHASH3", XXHASH3_1024_A).await
+}
+
+/// Checks Ceph's XXHASH64 PUT and HEAD checksum vector.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_object_checksum_xxhash64() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_object_checksum_xxhash64
+    check_object_checksum("XXHASH64", XXHASH64_1024_A).await
+}
+
+/// Checks Ceph's XXHASH128 PUT and HEAD checksum vector.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_object_checksum_xxhash128() -> Result<()> {
+    // Mirrors s3tests/functional/test_s3.py::test_object_checksum_xxhash128
+    check_object_checksum("XXHASH128", XXHASH128_1024_A).await
+}
+
+/// Verifies part digests, composite completion, and full-object checksums inherited by COPY.
+#[tokio::test]
+#[serial(conformance)]
+async fn s3ite_composite_checksums_and_copy() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ck");
+    create_bucket(&client, &bucket).await?;
+    for (algorithm, digest, composite) in [
+        (
+            "SHA512",
+            SHA512_1024_A,
+            "57Q71yIuvYiVHQ39rpT3x/M//zWwH0c7LPG3s0I7Cz5aaGwFGcnLc+qB3dR+uH/wR5qiXXtbqzdNSYVpZfgvBQ==-1",
+        ),
+        ("MD5", MD5_1024_A, "dT948PU2Vu3WU4R8ayIeig==-1"),
+        ("XXHASH3", XXHASH3_1024_A, "0fi2lo/lnIA=-1"),
+        ("XXHASH64", XXHASH64_1024_A, "PA1EekC9AsQ=-1"),
+        ("XXHASH128", XXHASH128_1024_A, "q4aNok8yZn1qqNXR0rofXA==-1"),
+    ] {
+        let created = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(algorithm)
+            .checksum_algorithm(ChecksumAlgorithm::from(algorithm))
+            .send()
+            .await?;
+        let upload_id = created.upload_id().context("missing upload ID")?;
+        let path = format!("/{bucket}/{algorithm}");
+        let upload = format!("{path}?uploadId={upload_id}");
+        let header = format!("x-amz-checksum-{}", algorithm.to_ascii_lowercase());
+        let part = signed_request_with_headers(
+            &server,
+            Method::PUT,
+            &format!("{upload}&partNumber=1"),
+            vec![b'A'; 1024],
+            &[(header.as_str(), digest)],
+        )
+        .await?;
+        assert_eq!(part.status(), StatusCode::OK);
+        assert_eq!(part.headers()[&header], digest);
+        let etag = part.headers()["etag"].to_str()?;
+        let element = format!("Checksum{algorithm}");
+        let body = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag><{element}>{digest}</{element}></Part></CompleteMultipartUpload>"
+        );
+        let complete =
+            signed_request_with_headers(&server, Method::POST, &upload, body.into_bytes(), &[])
+                .await?;
+        assert_eq!(complete.status(), StatusCode::OK);
+        let xml = complete.text().await?;
+        assert!(
+            xml.contains(&format!("<{element}>{composite}</{element}>")),
+            "{xml}"
+        );
+
+        let copy = signed_request_with_headers(
+            &server,
+            Method::PUT,
+            &format!("{path}-copy"),
+            vec![],
+            &[("x-amz-copy-source", &path)],
+        )
+        .await?;
+        assert_eq!(copy.status(), StatusCode::OK);
+        let xml = copy.text().await?;
+        assert!(
+            xml.contains(&format!("<{element}>{digest}</{element}>")),
+            "{xml}"
+        );
+        for (key, expected) in [(&path, composite), (&format!("{path}-copy"), digest)] {
+            let head = signed_request_with_headers(
+                &server,
+                Method::HEAD,
+                key,
+                vec![],
+                &[("x-amz-checksum-mode", "ENABLED")],
+            )
+            .await?;
+            assert_eq!(head.headers()[&header], expected);
+        }
+    }
+    Ok(())
+}
+
+/// Rejects a checksum algorithm introduced after multipart initiation and an unsupported aggregation mode.
+#[tokio::test]
+#[serial(conformance)]
+async fn s3ite_multipart_requires_declared_composite_checksum() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-ck");
+    create_bucket(&client, &bucket).await?;
+    let create = || client.create_multipart_upload().bucket(&bucket).key("obj");
+    let error = create()
+        .checksum_algorithm(ChecksumAlgorithm::Sha512)
+        .checksum_type(ChecksumType::FullObject)
+        .send()
+        .await
+        .unwrap_err();
+    assert_error_contains(&error, "InvalidRequest");
+    let created = create().send().await?;
+    let upload_id = created.upload_id().context("missing upload ID")?;
+    let part = || {
+        client
+            .upload_part()
+            .bucket(&bucket)
+            .key("obj")
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from(vec![b'A'; 1024]))
+    };
+    let error = part()
+        .checksum_sha512(SHA512_1024_A)
+        .send()
+        .await
+        .unwrap_err();
+    assert_error_contains(&error, "InvalidRequest");
+    let saved = part().send().await?;
+    let part = CompletedPart::builder()
+        .part_number(1)
+        .e_tag(saved.e_tag().context("missing ETag")?)
+        .build();
+    let error = client
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key("obj")
+        .upload_id(upload_id)
+        .multipart_upload(CompletedMultipartUpload::builder().parts(part).build())
+        .checksum_sha512(SHA512_1024_A)
+        .send()
+        .await
+        .unwrap_err();
+    assert_error_contains(&error, "InvalidRequest");
+    Ok(())
+}
 
 /// Verifies explicit SHA256 object checksums are stored, exposed, and validated.
 #[tokio::test]
@@ -927,6 +1167,7 @@ async fn create_checksum_upload(
         .to_string())
 }
 
+/// Uploads three parts filled with A, B, and C using the supplied per-part checksums.
 async fn upload_checksum_abc_parts(
     client: &Client,
     bucket: &str,
@@ -936,7 +1177,7 @@ async fn upload_checksum_abc_parts(
     checksums: [&str; 3],
 ) -> Result<Vec<CompletedPart>> {
     let mut parts = Vec::with_capacity(3);
-    for (index, byte) in [b'A', b'B', b'C'].into_iter().enumerate() {
+    for (index, &byte) in b"ABC".iter().enumerate() {
         parts.push(
             upload_checksum_part(
                 client,

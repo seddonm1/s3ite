@@ -7,13 +7,14 @@ use anyhow::{Context, Result};
 use aws_credential_types::Credentials;
 use aws_sigv4::{
     http_request::{
-        PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest, SigningSettings,
-        UriPathNormalizationMode, sign,
+        PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest, SignatureLocation,
+        SigningInstructions, SigningSettings, UriPathNormalizationMode, sign,
     },
     sign::v4,
 };
 use bytes::Bytes;
 use futures::stream;
+use hyper::Request;
 use reqwest::{Client, Method, Response, StatusCode};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -289,6 +290,7 @@ fn signing_headers(
     signing_headers_with_body(server, method, url, SignableBody::Bytes(body), headers)
 }
 
+/// Signs a raw request, including any body representation used by the test.
 fn signing_headers_with_body(
     server: &TestServer,
     method: &Method,
@@ -301,6 +303,44 @@ fn signing_headers_with_body(
     signing_settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
     signing_settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
 
+    Ok(
+        sign_request(server, method, url, body, headers, signing_settings)?
+            .headers()
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect(),
+    )
+}
+
+/// Presigns an S3 operation for which the Rust SDK has no presigning builder.
+pub fn presigned_url(server: &TestServer, method: Method, path_and_query: &str) -> Result<String> {
+    let url = format!("{}{path_and_query}", server.endpoint());
+    let mut settings = SigningSettings::default();
+    settings.percent_encoding_mode = PercentEncodingMode::Single;
+    settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+    settings.signature_location = SignatureLocation::QueryParams;
+    settings.expires_in = Some(Duration::from_secs(60));
+    let instructions = sign_request(
+        server,
+        &method,
+        &url,
+        SignableBody::UnsignedPayload,
+        &[],
+        settings,
+    )?;
+    let mut request = Request::builder().method(method).uri(url).body(())?;
+    instructions.apply_to_request_http1x(&mut request);
+    Ok(request.uri().to_string())
+}
+
+/// Signs with the test owner's credentials and the selected header or query settings.
+fn sign_request(
+    server: &TestServer,
+    method: &Method,
+    url: &str,
+    body: SignableBody<'_>,
+    headers: &[(&str, &str)],
+    signing_settings: SigningSettings,
+) -> Result<SigningInstructions> {
     let credentials = Credentials::new(
         server.access_key(),
         server.secret_key(),
@@ -320,8 +360,5 @@ fn signing_headers_with_body(
     let signable_request =
         SignableRequest::new(method.as_str(), url, headers.iter().copied(), body)?;
     let (signing_instructions, _signature) = sign(signable_request, &signing_params)?.into_parts();
-    Ok(signing_instructions
-        .headers()
-        .map(|(name, value)| (name.to_owned(), value.to_owned()))
-        .collect())
+    Ok(signing_instructions)
 }

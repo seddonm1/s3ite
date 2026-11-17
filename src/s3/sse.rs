@@ -8,7 +8,7 @@ use aes_gcm::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures::StreamExt;
-use hyper::http::HeaderMap;
+use hyper::http::{HeaderMap, HeaderValue};
 use md5::{Digest, Md5};
 use s3s::{S3Error, S3ErrorCode, S3Result, dto::ServerSideEncryption};
 
@@ -193,11 +193,12 @@ pub(super) fn validate_no_sse_headers(headers: &HeaderMap) -> S3Result<()> {
     validate_no_unsupported_sse_headers(headers)
 }
 
-/// Rejects SSE variants this backend does not implement.
+/// Checks the raw headers because the S3 parser treats an empty algorithm as absent.
 pub(super) fn validate_no_unsupported_sse_headers(headers: &HeaderMap) -> S3Result<()> {
-    if UNSUPPORTED_SSE_HEADERS
-        .iter()
-        .any(|header| headers.contains_key(*header))
+    if headers.get(SSE_HEADER).is_some_and(HeaderValue::is_empty)
+        || UNSUPPORTED_SSE_HEADERS
+            .iter()
+            .any(|header| headers.contains_key(*header))
     {
         return Err(s3_error_with_message(
             S3ErrorCode::InvalidArgument,
@@ -526,8 +527,7 @@ mod tests {
     use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
     use bytes::Bytes;
-    use futures::{StreamExt as _, stream};
-    use hyper::http::HeaderValue;
+    use futures::stream;
     use s3s::S3Error;
     use tokio::sync::RwLock;
 
@@ -578,6 +578,29 @@ mod tests {
                 "error should explain unsupported SSE header {header}"
             );
         }
+    }
+
+    /// Rejects a wrapped key with an invalid plaintext length or a damaged authentication tag.
+    #[test]
+    fn rejects_malformed_wrapped_data_key() -> Result<(), String> {
+        let master_key = [0; MASTER_KEY_LEN];
+        let nonce = [0; NONCE_LEN];
+        let encrypted = encrypt_bytes(&master_key, &nonce, b"short")?;
+        let (ciphertext, tag) = split_ciphertext_tag(encrypted)?;
+        let mut stored = StoredSse {
+            nonce: nonce.to_vec(),
+            ciphertext,
+            tag,
+        };
+        assert_eq!(
+            active_sse_from_stored(&master_key, stored.clone())
+                .err()
+                .as_deref(),
+            Some("invalid SSE data key length: 5")
+        );
+        stored.tag[0] ^= 1;
+        assert!(active_sse_from_stored(&master_key, stored).is_err());
+        Ok(())
     }
 
     #[test]
@@ -750,7 +773,10 @@ mod tests {
             streaming_blob(&[b"abc"]),
             false,
             None,
-            ChecksumInput::value_fields(None, None, None, None, Some(sha256)),
+            ChecksumInput {
+                sha256: Some(sha256),
+                ..Default::default()
+            },
             3,
             &encryption,
         )
@@ -768,7 +794,10 @@ mod tests {
             streaming_blob(&[b"abc"]),
             false,
             None,
-            ChecksumInput::value_fields(None, None, None, None, Some("wrong".to_string())),
+            ChecksumInput {
+                sha256: Some("wrong".to_string()),
+                ..Default::default()
+            },
             3,
             &encryption,
         )
@@ -833,7 +862,10 @@ mod tests {
         let sha256 = checksum_test_support::checksum_value(ChecksumAlgorithmKind::Sha256, b"abc");
         let part = read_part_body_encrypted(
             streaming_blob(&[b"abc"]),
-            &ChecksumInput::value_fields(None, None, None, None, Some(sha256)),
+            &ChecksumInput {
+                sha256: Some(sha256),
+                ..Default::default()
+            },
             None,
             false,
             None,

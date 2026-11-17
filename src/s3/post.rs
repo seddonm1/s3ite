@@ -18,6 +18,7 @@ pub(super) async fn post_object(
     Ok(response.map_output(put_object_output_into_post_object_output))
 }
 
+/// Maps form fields to the shared object write path.
 fn post_object_input_into_put_object_input(input: PostObjectInput) -> PutObjectInput {
     let PostObjectInput {
         acl,
@@ -31,6 +32,11 @@ fn post_object_input_into_put_object_input(input: PostObjectInput) -> PutObjectI
         checksum_crc64nvme,
         checksum_sha1,
         checksum_sha256,
+        checksum_sha512,
+        checksum_md5,
+        checksum_xxhash3,
+        checksum_xxhash64,
+        checksum_xxhash128,
         content_disposition,
         content_encoding,
         content_language,
@@ -78,6 +84,11 @@ fn post_object_input_into_put_object_input(input: PostObjectInput) -> PutObjectI
         checksum_crc64nvme,
         checksum_sha1,
         checksum_sha256,
+        checksum_sha512,
+        checksum_md5,
+        checksum_xxhash3,
+        checksum_xxhash64,
+        checksum_xxhash128,
         content_disposition,
         content_encoding,
         content_language,
@@ -111,6 +122,7 @@ fn post_object_input_into_put_object_input(input: PostObjectInput) -> PutObjectI
     }
 }
 
+/// Maps the stored object identity and checksums to the form response.
 fn put_object_output_into_post_object_output(output: PutObjectOutput) -> PostObjectOutput {
     let PutObjectOutput {
         bucket_key_enabled,
@@ -119,6 +131,11 @@ fn put_object_output_into_post_object_output(output: PutObjectOutput) -> PostObj
         checksum_crc64nvme,
         checksum_sha1,
         checksum_sha256,
+        checksum_sha512,
+        checksum_md5,
+        checksum_xxhash3,
+        checksum_xxhash64,
+        checksum_xxhash128,
         checksum_type,
         e_tag,
         expiration,
@@ -139,6 +156,11 @@ fn put_object_output_into_post_object_output(output: PutObjectOutput) -> PostObj
         checksum_crc64nvme,
         checksum_sha1,
         checksum_sha256,
+        checksum_sha512,
+        checksum_md5,
+        checksum_xxhash3,
+        checksum_xxhash64,
+        checksum_xxhash128,
         checksum_type,
         e_tag,
         expiration,

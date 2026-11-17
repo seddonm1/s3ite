@@ -288,6 +288,7 @@ mod tests {
     use s3s::dto::{ETag, ETagCondition};
     use time::Duration;
 
+    /// Builds object metadata for conditional deletion tests.
     fn metadata(md5: Option<&str>, last_modified: OffsetDateTime, size: i64) -> KeyMetadata {
         KeyMetadata {
             version_id: "version".to_string(),
@@ -295,6 +296,8 @@ mod tests {
             metadata: None,
             content_type: None,
             content_encoding: None,
+            content_disposition: None,
+            content_language: None,
             cache_control: None,
             expires: None,
             last_modified,
