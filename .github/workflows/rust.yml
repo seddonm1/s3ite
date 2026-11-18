@@ -15,35 +15,47 @@ jobs:
         # Disable full debug symbol generation to speed up CI build and keep memory down
         # "1" means line tables only, which is useful for panic tracebacks.
         RUSTFLAGS: "-C debuginfo=1"
+        CARGO_INCREMENTAL: "0"
+        CARGO_TARGET_DIR: target
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: true
-      - name: Cache Cargo
-        uses: actions/cache@v6
-        with:
-          path: /home/runner/.cargo
-          key: cargo-cache-
-      - name: Cache Rust dependencies
-        uses: actions/cache@v6
-        with:
-          path: /home/runner/target
-          key: target-cache-
       - name: Setup Rust toolchain
+        id: toolchain
         run: |
           rustup toolchain install ${{ matrix.rust }}
           rustup default ${{ matrix.rust }}
           rustup component add rustfmt
           rustup component add clippy
           rustup component add llvm-tools-preview
+          echo "version=$(rustc --version | cut -d ' ' -f 2)" >> "$GITHUB_OUTPUT"
+          echo "cargo_home=$CARGO_HOME" >> "$GITHUB_OUTPUT"
+      - name: Cache Cargo downloads
+        uses: actions/cache@v6
+        with:
+          path: |
+            ${{ steps.toolchain.outputs.cargo_home }}/registry/index
+            ${{ steps.toolchain.outputs.cargo_home }}/registry/cache
+            ${{ steps.toolchain.outputs.cargo_home }}/git/db
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+      - name: Cache Cargo build artifacts
+        uses: actions/cache@v6
+        with:
+          path: target
+          key: target-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+      - name: Run repository audits
+        run: |
+          python3 scripts/audit_transaction_boundaries.py
+          python3 scripts/audit_conformance_mirrors.py
       - name: Install coverage tool
         run: cargo install cargo-llvm-cov --version 0.9.1 --locked
       - name: Run tests with coverage limits
         run: >
-          cargo llvm-cov --all-targets --workspace
+          cargo llvm-cov --locked --all-targets --workspace
           --fail-under-lines 95
           --fail-under-file-lines 95
       - name: Run format
         run: cargo fmt --all -- --check
       - name: Run clippy
-        run: cargo clippy --all-targets --workspace -- -D warnings
+        run: cargo clippy --locked --all-targets --workspace -- -D warnings

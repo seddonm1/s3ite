@@ -28,12 +28,13 @@ RUN set -eux; \
         --profile release \
         --exclude-cpu-features crt-static,lor,pan,pmuv3,ras,spe,vh \
         --out-dir /app/dist \
-        -- --bin s3ite
+        -- --locked --bin s3ite
 
 RUN mkdir -p /scratch/data /scratch/tmp \
     && chmod 1777 /scratch/tmp
 
 FROM scratch
+COPY --from=build-env /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build-env /scratch/data /data
 COPY --from=build-env /scratch/tmp /tmp
 COPY --from=build-env /app/dist/s3ite /s3ite
