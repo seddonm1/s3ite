@@ -1,6 +1,4 @@
-//! S3 SSE-S3 envelope crypto, request handling, response mapping, and encrypted body encoding.
-
-use std::ops::Not;
+//! S3 envelope crypto, request handling, response mapping, and encrypted body encoding.
 
 use aes_gcm::{
     Aes256Gcm, Nonce,
@@ -13,10 +11,12 @@ use md5::{Digest, Md5};
 use s3s::{S3Error, S3ErrorCode, S3Result, dto::ServerSideEncryption};
 
 use crate::sqlite::{
-    ChecksumAccumulator, ChecksumTypeKind, EncodedBlobChunk, MultipartChecksumConfig, PartChecksum,
-    Sqlite, SqliteError, SqliteResult, StoredBlobChunk, StoredChecksum, StoredSse,
+    ChecksumAccumulator, ChecksumTypeKind, EncodedBlobChunk, EncryptionMode,
+    MultipartChecksumConfig, PartChecksum, Sqlite, SqliteError, SqliteResult, StoredBlobChunk,
+    StoredChecksum, StoredSse,
 };
 
+use super::kms;
 use super::{
     ChecksumInput, ChecksumPolicy, InternalError, StreamingBlob, finish_part_checksum,
     finish_payload_checksum, hex, part_checksum_accumulator, payload_checksum_accumulator,
@@ -29,10 +29,9 @@ const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 
 /// Encryption state for a new write or existing multipart upload.
-#[derive(Clone, Debug)]
 pub(crate) struct ActiveSse {
     pub(crate) stored: StoredSse,
-    data_key: [u8; DATA_KEY_LEN],
+    pub(super) data_key: [u8; DATA_KEY_LEN],
 }
 
 /// Encrypted chunk data plus the nonce/tag needed to decrypt it.
@@ -67,7 +66,7 @@ pub(crate) fn new_active_sse(master_key: &[u8; MASTER_KEY_LEN]) -> Result<Active
     let encrypted = encrypt_bytes(master_key, &nonce, &data_key)?;
     let (ciphertext, tag) = split_ciphertext_tag(encrypted)?;
     Ok(ActiveSse {
-        stored: StoredSse {
+        stored: StoredSse::Local {
             nonce: nonce.to_vec(),
             ciphertext,
             tag,
@@ -81,8 +80,16 @@ pub(crate) fn active_sse_from_stored(
     master_key: &[u8; MASTER_KEY_LEN],
     stored: StoredSse,
 ) -> Result<ActiveSse, String> {
-    let nonce = nonce_array(&stored.nonce)?;
-    let encrypted = join_ciphertext_tag(&stored.ciphertext, &stored.tag);
+    let StoredSse::Local {
+        nonce,
+        ciphertext,
+        tag,
+    } = &stored
+    else {
+        return Err("expected a locally wrapped data key".into());
+    };
+    let nonce = nonce_array(nonce)?;
+    let encrypted = join_ciphertext_tag(ciphertext, tag);
     let data_key = decrypt_bytes(master_key, &nonce, &encrypted)?;
     let data_key = data_key
         .try_into()
@@ -169,10 +176,10 @@ fn nonce_array(nonce: &[u8]) -> Result<[u8; NONCE_LEN], String> {
 }
 
 const SSE_HEADER: &str = "x-amz-server-side-encryption";
+const KMS_KEY_HEADER: &str = "x-amz-server-side-encryption-aws-kms-key-id";
+const KMS_CONTEXT_HEADER: &str = "x-amz-server-side-encryption-context";
 const SSE_S3_ALGORITHM: &str = "AES256";
 const UNSUPPORTED_SSE_HEADERS: &[&str] = &[
-    "x-amz-server-side-encryption-aws-kms-key-id",
-    "x-amz-server-side-encryption-context",
     "x-amz-server-side-encryption-bucket-key-enabled",
     "x-amz-server-side-encryption-customer-algorithm",
     "x-amz-server-side-encryption-customer-key",
@@ -184,7 +191,10 @@ const UNSUPPORTED_SSE_HEADERS: &[&str] = &[
 
 /// Rejects request-level SSE headers for operations where they do not apply.
 pub(super) fn validate_no_sse_headers(headers: &HeaderMap) -> S3Result<()> {
-    if headers.contains_key(SSE_HEADER) {
+    if [SSE_HEADER, KMS_KEY_HEADER, KMS_CONTEXT_HEADER]
+        .iter()
+        .any(|name| headers.contains_key(*name))
+    {
         return Err(s3_error_with_message(
             S3ErrorCode::InvalidArgument,
             "server-side encryption headers are not valid for this operation",
@@ -193,79 +203,154 @@ pub(super) fn validate_no_sse_headers(headers: &HeaderMap) -> S3Result<()> {
     validate_no_unsupported_sse_headers(headers)
 }
 
+/// Recognizes repeated KMS declarations on individual parts and completion.
+pub(super) fn multipart_kms_headers(headers: &HeaderMap) -> S3Result<bool> {
+    if headers
+        .get(SSE_HEADER)
+        .is_some_and(|algorithm| algorithm == "aws:kms")
+        && !headers.contains_key(KMS_CONTEXT_HEADER)
+    {
+        validate_no_unsupported_sse_headers(headers)?;
+        return Ok(true);
+    }
+    validate_no_sse_headers(headers)?;
+    Ok(false)
+}
+
+/// Keeps the key chosen at initiation authoritative throughout a multipart upload.
+pub(super) fn validate_multipart_mode(declares_kms: bool, upload_uses_kms: bool) -> S3Result<()> {
+    if declares_kms && !upload_uses_kms {
+        return Err(s3_error_with_message(
+            S3ErrorCode::InvalidArgument,
+            "KMS headers require an SSE-KMS upload",
+        ));
+    }
+    Ok(())
+}
+
 /// Checks the raw headers because the S3 parser treats an empty algorithm as absent.
 pub(super) fn validate_no_unsupported_sse_headers(headers: &HeaderMap) -> S3Result<()> {
-    if headers.get(SSE_HEADER).is_some_and(HeaderValue::is_empty)
+    if [SSE_HEADER, KMS_KEY_HEADER, KMS_CONTEXT_HEADER]
+        .iter()
+        .any(|name| headers.get(*name).is_some_and(HeaderValue::is_empty))
         || UNSUPPORTED_SSE_HEADERS
             .iter()
             .any(|header| headers.contains_key(*header))
     {
         return Err(s3_error_with_message(
             S3ErrorCode::InvalidArgument,
-            "only SSE-S3 with AES256 is supported",
+            "unsupported encryption headers",
         ));
     }
     Ok(())
 }
 
-/// Validates object-write SSE settings and returns whether AES256 was requested.
-pub(super) fn requested_sse_s3(
-    server_side_encryption: Option<&ServerSideEncryption>,
-    has_kms_settings: bool,
-    has_sse_customer_settings: bool,
-    has_bucket_key_setting: bool,
-) -> S3Result<bool> {
-    if has_sse_customer_settings || has_kms_settings || has_bucket_key_setting {
-        return Err(s3_error_with_message(
-            S3ErrorCode::InvalidArgument,
-            "only SSE-S3 with AES256 is supported",
-        ));
-    }
-
-    match server_side_encryption {
-        Some(algorithm) if algorithm.as_str() == SSE_S3_ALGORITHM => Ok(true),
-        Some(_) => Err(s3_error_with_message(
-            S3ErrorCode::InvalidArgument,
-            "server-side encryption must be AES256",
-        )),
-        None => Ok(false),
-    }
+/// Explicit encryption settings supplied with an object write.
+#[derive(Clone, Debug)]
+pub(super) struct WriteEncryption {
+    mode: EncryptionMode,
+    context: Option<String>,
 }
 
-/// Resolves explicit SSE-S3 and bucket default encryption for an object write.
+/// Validates the encryption algorithm and its companion headers before writing any data.
+pub(super) fn requested_encryption(
+    algorithm: Option<&ServerSideEncryption>,
+    key_id: Option<&str>,
+    context: Option<&str>,
+    customer_settings: bool,
+    bucket_key: bool,
+) -> S3Result<Option<WriteEncryption>> {
+    if !customer_settings && !bucket_key {
+        match (algorithm.map(ServerSideEncryption::as_str), key_id, context) {
+            (None, None, None) => return Ok(None),
+            (Some("AES256"), None, None) => {
+                return Ok(Some(WriteEncryption {
+                    mode: EncryptionMode::Aes256,
+                    context: None,
+                }));
+            }
+            (Some("aws:kms"), Some(id), _) if !id.is_empty() => {
+                return Ok(Some(WriteEncryption {
+                    mode: EncryptionMode::Kms(id.to_owned()),
+                    context: context.map(str::to_owned),
+                }));
+            }
+            _ => {}
+        }
+    }
+    Err(s3_error_with_message(
+        S3ErrorCode::InvalidArgument,
+        "invalid encryption settings or missing KMS key ID",
+    ))
+}
+
+/// Resolves the bucket default or explicit encryption and creates a fresh data key.
 pub(super) async fn resolve_write_encryption(
     sqlite: &Sqlite,
     bucket: &str,
-    explicit_sse_s3: bool,
+    key: &str,
+    explicit: Option<&WriteEncryption>,
 ) -> S3Result<Option<ActiveSse>> {
-    let use_sse_s3 = if explicit_sse_s3 {
-        true
+    let mode = if let Some(settings) = explicit {
+        Some(settings.mode.clone())
     } else {
-        let connection = sqlite
+        sqlite
             .get_connection(bucket)
             .await
-            .map_err(s3_error_from_sqlite)?;
-        connection
-            .read(Sqlite::get_bucket_default_sse_s3)
+            .map_err(s3_error_from_sqlite)?
+            .read(Sqlite::get_bucket_encryption)
             .await
             .map_err(s3_error_from_sqlite)?
     };
-
-    if use_sse_s3.not() {
-        return Ok(None);
+    match mode {
+        Some(EncryptionMode::Aes256) => new_active_sse(&require_sse_s3_master_key(sqlite)?)
+            .map(Some)
+            .map_err(|_| s3_error_with_message(InternalError, "SSE-S3 encryption failed")),
+        Some(EncryptionMode::Kms(id)) => kms::generate(
+            &sqlite.config,
+            bucket,
+            key,
+            &id,
+            explicit.and_then(|s| s.context.as_deref()),
+        )
+        .await
+        .map(Some),
+        None => Ok(None),
     }
-
-    let master_key = sqlite.config.sse_s3_master_key().ok_or_else(|| {
-        s3_error_with_message(S3ErrorCode::InvalidRequest, "SSE-S3 is not configured")
-    })?;
-    new_active_sse(&master_key)
-        .map(Some)
-        .map_err(|_| s3_error_with_message(InternalError, "SSE-S3 encryption failed"))
 }
 
-/// Returns the response enum for encrypted object outputs.
-pub(super) fn sse_s3_output(encrypted: bool) -> Option<ServerSideEncryption> {
-    encrypted.then(|| ServerSideEncryption::from_static(ServerSideEncryption::AES256))
+/// Reopens a persisted encryption envelope outside the storage transaction.
+pub(super) async fn open_encryption(sqlite: &Sqlite, stored: StoredSse) -> S3Result<ActiveSse> {
+    match &stored {
+        StoredSse::Local { .. } => {
+            active_sse_from_stored(&require_sse_s3_master_key(sqlite)?, stored)
+                .map_err(|_| s3_error_with_message(InternalError, "SSE-S3 decryption failed"))
+        }
+        StoredSse::Kms {
+            key_id,
+            ciphertext,
+            context,
+        } => {
+            let data_key = kms::decrypt(&sqlite.config, key_id, ciphertext, context).await?;
+            Ok(ActiveSse { stored, data_key })
+        }
+    }
+}
+
+/// Maps the stored encryption mode to response headers.
+pub(super) fn encryption_headers(
+    mode: Option<EncryptionMode>,
+) -> (Option<ServerSideEncryption>, Option<String>) {
+    match mode {
+        Some(EncryptionMode::Aes256) => (
+            Some(ServerSideEncryption::from_static(SSE_S3_ALGORITHM)),
+            None,
+        ),
+        Some(EncryptionMode::Kms(id)) => {
+            (Some(ServerSideEncryption::from_static("aws:kms")), Some(id))
+        }
+        None => (None, None),
+    }
 }
 
 /// Returns the configured SSE-S3 master key or a protocol error.
@@ -395,7 +480,7 @@ pub(super) fn encrypt_value_chunks(
     Ok(chunks)
 }
 
-/// Decrypts stored SSE-S3 chunks into plaintext bytes.
+/// Decrypts authenticated storage chunks into plaintext bytes.
 pub(super) fn decrypt_stored_chunks(
     encryption: &ActiveSse,
     chunks: Vec<StoredBlobChunk>,
@@ -498,7 +583,7 @@ fn push_encrypted_chunk(
     let chunk_number = i32::try_from(chunks.len() + 1).map_err(S3Error::internal_error)?;
     let size = i64::try_from(plaintext.len()).map_err(S3Error::internal_error)?;
     let encrypted = encrypt_chunk(encryption, plaintext)
-        .map_err(|_| S3Error::with_message(InternalError, "SSE-S3 encryption failed"))?;
+        .map_err(|_| S3Error::with_message(InternalError, "object chunk encryption failed"))?;
     chunks.push(EncodedBlobChunk {
         chunk_number,
         offset: *next_offset,
@@ -549,6 +634,7 @@ mod tests {
         }
     }
 
+    /// Checks the operations that reject write-time encryption headers.
     #[test]
     fn rejects_server_side_encryption_headers() {
         let mut headers = HeaderMap::new();
@@ -574,7 +660,7 @@ mod tests {
                 Some(&S3ErrorCode::InvalidArgument)
             ));
             assert!(
-                format!("{error:?}").contains("only SSE-S3 with AES256 is supported"),
+                format!("{error:?}").contains("unsupported encryption headers"),
                 "error should explain unsupported SSE header {header}"
             );
         }
@@ -587,7 +673,7 @@ mod tests {
         let nonce = [0; NONCE_LEN];
         let encrypted = encrypt_bytes(&master_key, &nonce, b"short")?;
         let (ciphertext, tag) = split_ciphertext_tag(encrypted)?;
-        let mut stored = StoredSse {
+        let mut stored = StoredSse::Local {
             nonce: nonce.to_vec(),
             ciphertext,
             tag,
@@ -598,7 +684,9 @@ mod tests {
                 .as_deref(),
             Some("invalid SSE data key length: 5")
         );
-        stored.tag[0] ^= 1;
+        if let StoredSse::Local { tag, .. } = &mut stored {
+            tag[0] ^= 1;
+        }
         assert!(active_sse_from_stored(&master_key, stored).is_err());
         Ok(())
     }
@@ -609,6 +697,7 @@ mod tests {
         assert!(parse_master_key("AQID").is_err());
     }
 
+    /// Checks missing local key configuration and SSE-S3 response headers.
     #[test]
     fn sse_master_key_helpers_reject_missing_config_and_map_output_header() {
         let sqlite = sqlite_with_config(Config::default());
@@ -620,63 +709,79 @@ mod tests {
             Some(&S3ErrorCode::InvalidRequest)
         ));
         assert_eq!(
-            sse_s3_output(true)
+            encryption_headers(Some(EncryptionMode::Aes256))
+                .0
                 .as_ref()
                 .map(ServerSideEncryption::as_str),
             Some(ServerSideEncryption::AES256)
         );
-        assert!(sse_s3_output(false).is_none());
+        assert!(encryption_headers(None).0.is_none());
     }
 
+    /// Rejects explicit local encryption when no master key is configured.
     #[tokio::test]
     async fn resolve_write_encryption_rejects_sse_without_master_key() {
         let sqlite = sqlite_with_config(Config::default());
         assert!(matches!(
-            resolve_write_encryption(&sqlite, "bucket", true)
-                .await
-                .err()
-                .as_ref()
-                .map(S3Error::code),
+            resolve_write_encryption(
+                &sqlite,
+                "bucket",
+                "key",
+                Some(&WriteEncryption {
+                    mode: EncryptionMode::Aes256,
+                    context: None
+                })
+            )
+            .await
+            .err()
+            .as_ref()
+            .map(S3Error::code),
             Some(&S3ErrorCode::InvalidRequest)
         ));
     }
 
+    /// Checks encryption algorithms and their required companion settings.
     #[test]
     fn rejects_unsupported_write_encryption_inputs() -> S3Result<()> {
         assert!(matches!(
-            requested_sse_s3(None, true, false, false)
+            requested_encryption(None, Some("key"), None, false, false)
                 .err()
                 .as_ref()
                 .map(S3Error::code),
             Some(&S3ErrorCode::InvalidArgument)
         ));
         assert!(matches!(
-            requested_sse_s3(None, false, true, false)
+            requested_encryption(None, None, None, true, false)
                 .err()
                 .as_ref()
                 .map(S3Error::code),
             Some(&S3ErrorCode::InvalidArgument)
         ));
         assert!(matches!(
-            requested_sse_s3(None, false, false, true)
+            requested_encryption(None, None, None, false, true)
                 .err()
                 .as_ref()
                 .map(S3Error::code),
             Some(&S3ErrorCode::InvalidArgument)
         ));
-        assert!(requested_sse_s3(
-            Some(&ServerSideEncryption::from_static(
-                ServerSideEncryption::AES256
-            )),
-            false,
-            false,
-            false,
-        )?);
-        assert!(!requested_sse_s3(None, false, false, false)?);
+        assert!(
+            requested_encryption(
+                Some(&ServerSideEncryption::from_static(
+                    ServerSideEncryption::AES256
+                )),
+                None,
+                None,
+                false,
+                false,
+            )?
+            .is_some()
+        );
+        assert!(requested_encryption(None, None, None, false, false)?.is_none());
 
         Ok(())
     }
 
+    /// Rejects malformed local envelopes and incomplete encrypted chunks.
     #[test]
     fn encrypt_and_decrypt_chunk_helpers_reject_inconsistent_input() -> S3Result<()> {
         let encryption =
@@ -687,7 +792,7 @@ mod tests {
         assert!(
             active_sse_from_stored(
                 &[0; 32],
-                StoredSse {
+                StoredSse::Local {
                     nonce: vec![0],
                     ciphertext: vec![0; 32],
                     tag: vec![0; 16],

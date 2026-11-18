@@ -40,6 +40,8 @@ The supported S3 surface is intentionally focused:
 - Lifecycle: bucket lifecycle configuration, current object expiration,
   noncurrent version expiration, expired delete-marker cleanup, prefix/tag/size
   filters, and incomplete multipart upload aborts.
+- Encryption: SSE-S3 and SSE-KMS for object writes, multipart uploads, copies,
+  and bucket defaults.
 - POST form uploads: browser-form `POST Object`, SigV4 POST policy validation,
   success status responses, and success redirects.
 - Auth compatibility: signed owner requests, presigned URLs, SigV2/SigV4 edge
@@ -47,7 +49,7 @@ The supported S3 surface is intentionally focused:
 
 Out of scope surfaces include IAM, STS, SNS, S3 Select, S3 Control, torrent,
 public or anonymous access, public ACL grants, bucket policies, lifecycle
-transitions and restore/tiering, SSE-KMS/SSE-C/DSSE-KMS encryption, S3 logging,
+transitions and restore/tiering, SSE-C/DSSE-KMS encryption, S3 logging,
 object ownership controls, public access block, and multi-owner behavior.
 
 ## Compatibility Matrix
@@ -184,8 +186,8 @@ s3ite. The matrix was last reconciled on 2026-06-12.
 | Encryption | SSE-S3 multipart upload | ✅ | ✅ | ✅ | Works with default bucket encryption and multipart writes. |
 | Encryption | SSE-S3 CopyObject | ✅ | ✅ | ✅ | Supports plaintext/encrypted source and destination permutations. |
 | Encryption | SSE-S3 UploadPartCopy | ✅ | ✅ | ✅ | Supports plaintext/encrypted source and destination permutations. |
-| Encryption | SSE-KMS object encryption | ✅ | ✅ | ❌ | s3ite rejects KMS headers as unsupported. |
-| Encryption | Bucket default SSE-KMS | ✅ | ✅ | ❌ | s3ite only supports bucket-default SSE-S3. |
+| Encryption | SSE-KMS object encryption | ✅ | ✅ | ✅ | PUT, signed browser POST, multipart, and copy support `aws:kms` with an explicit key ID. |
+| Encryption | Bucket default SSE-KMS | ✅ | ✅ | ✅ | Put/Get/DeleteBucketEncryption manage a default KMS key for new writes. |
 | Encryption | SSE-C object encryption | ✅ | ✅ | ❌ | s3ite rejects SSE-C headers as unsupported. |
 | Encryption | SSE-C multipart | ✅ | ✅ | ❌ | Out of scope for s3ite. |
 | Encryption | S3 Bucket Keys | ✅ | ❌ | ❌ | s3ite rejects bucket-key settings. |
@@ -220,11 +222,11 @@ s3ite. The matrix was last reconciled on 2026-06-12.
 | Notifications | Bucket notification configuration | ✅ | ✅ | ❌ | MinIO documents bucket notifications; s3ite does not implement them. |
 | Notifications | SNS-compatible notifications | ✅ | ✅ | ❌ | Out of scope for s3ite. |
 | Replication | Bucket replication configuration | ✅ | ✅ | ❌ | MinIO documents bucket replication; s3ite does not implement replication. |
-| Logging | S3 server access logging | ✅ | ❌ | ❌ | MinIO documents bucket logging APIs as unsupported; s3ite has application logs only. |
+| Logging | S3 server access logging | ✅ | ❌ | ❌ | MinIO documents bucket logging APIs as unsupported; s3ite exports audit events over OTLP. |
 | Website | Static website bucket configuration | ✅ | ❌ | ❌ | MinIO documents website APIs as unsupported. |
 | Inventory | Bucket inventory configuration | ✅ | ❌ | ❌ | MinIO documents inventory APIs as unsupported. |
 | Analytics | Bucket analytics configuration | ✅ | ❌ | ❌ | MinIO documents some analytics operations but still lists `GetBucketAnalyticsConfiguration` as unsupported, so full configuration parity is not present. |
-| Metrics | Bucket metrics configuration | ✅ | ❌ | ❌ | MinIO documents metrics APIs as unsupported. |
+| Metrics | Bucket metrics configuration | ✅ | ❌ | ❌ | s3ite exports operational metrics over OTLP. |
 | Accelerate | Bucket accelerate configuration | ✅ | ❌ | ❌ | MinIO documents accelerate APIs as unsupported. |
 | Storage class | STANDARD storage-class reporting | ✅ | ✅ | ✅ | s3ite reports `STANDARD` in list/object-attribute shapes. |
 | Storage class | REDUCED_REDUNDANCY PutObject validation | ✅ | ✅ | ✅ | s3ite accepts this request value but does not implement tiered placement. |
@@ -251,14 +253,14 @@ The largest compatibility gaps relative to AWS S3 and MinIO are:
 - Object-management APIs: lifecycle transitions, restore/tiering, PublicAccessBlock,
   notifications, logging, website hosting, inventory, analytics, metrics, and
   request payment.
-- Encryption variants: SSE-KMS, SSE-C, DSSE-KMS, and S3 Bucket Keys.
+- Encryption variants: SSE-C, DSSE-KMS, and S3 Bucket Keys.
 - AWS managed/control-plane features: S3 Control, access points,
   Multi-Region Access Points, S3 Express/directory buckets, S3 on Outposts,
   Object Lambda control APIs, S3 Tables, S3 Vectors, and S3 Files.
 
 s3ite's implemented surface is concentrated on the data path: bucket lifecycle,
 object CRUD, listings, versioning, multipart, checksums, owner-only auth/ACL
-compatibility, selected raw HTTP edge cases, and SSE-S3.
+compatibility, selected raw HTTP edge cases, SSE-S3, and SSE-KMS.
 
 ## Storage Model
 
@@ -273,21 +275,46 @@ schema versions before serving requests. To inspect an existing bucket, run
 Tables are `STRICT`, use normal rowid tables, and include foreign keys and
 indexes for the storage queries used by the S3 handlers.
 
-Object metadata and object bodies are split:
+Each bucket database stores object data and upload state in these tables.
 
 - `object_version` stores keys, version IDs, delete-marker state, latest markers,
   object metadata, size, ETag, checksums, and timestamps.
-- `object_body` stores the object BLOB by `object_version.sequence`.
-- `completed_object_part` stores completed multipart boundaries and per-part
-  checksum metadata.
-- `multipart_upload`, `multipart_upload_part`, and
-  `completed_multipart_upload` track in-progress uploads, uploaded parts, and
-  idempotent completion responses.
+- `object_part` records part numbers, sizes, and optional per-part checksums
+  for pending uploads and stored objects. For stored objects it also records
+  where each part starts.
+- `object_blob_chunk` stores the bytes of each part in bounded BLOB chunks,
+  linked to either a pending upload or an object version.
+- `multipart_upload` tracks in-progress uploads. `completed_multipart_upload`
+  records completion results so clients can safely retry.
 - `bucket_state` stores bucket-level state such as versioning as an integer enum.
 
 Writes are performed transactionally. Larger request work such as multipart
 normalization and checksum calculation is kept outside SQLite write transactions
 where practical, so the single writer is held for the database mutation itself.
+
+### SSE-KMS encryption
+
+Set `kms_region` in YAML or pass `--kms-region us-east-1` to enable SSE-KMS.
+s3ite uses the AWS SDK credential chain for its own KMS identity. Grant that
+identity `kms:GenerateDataKey` and `kms:Decrypt` on the keys clients may use.
+For an AWS KMS-compatible service, set `AWS_ENDPOINT_URL_KMS` on the server.
+
+For example, write an object with a symmetric KMS key in the configured region:
+
+```sh
+aws --endpoint-url http://localhost:8014 s3api put-object \
+  --bucket example --key report --body ./report \
+  --server-side-encryption aws:kms --ssekms-key-id alias/object-storage
+```
+
+Clients can also set `aws:kms` and a key ID as the bucket default. Each new
+object or multipart upload gets a fresh AES-256 data key. SQLite stores the
+encrypted chunks, wrapped data key, canonical KMS key ID, and encryption
+context. The context includes the destination object's S3 ARN and can include
+client-supplied string pairs. Reading an object requires access to its original
+KMS key, including after the bucket default changes or a database is restored.
+Copies use the destination encryption settings. Multipart uploads keep the key
+selected at initiation.
 
 ## Migrate from v0.6.0 over HTTP
 
@@ -330,7 +357,7 @@ a directory marker (an empty object with a key ending in `/`) can return
 When `access_key` and `secret_key` are configured, signed requests and valid
 presigned URLs from that identity act as the single owner. Unsigned requests are
 denied. When both values are omitted, authentication is disabled and every
-request behaves as that owner.
+request behaves as that owner. Startup fails if only one credential is set.
 
 SigV2 header authentication follows `s3s`. Send an RFC 1123 HTTP date in
 `Date` or a UTC timestamp such as `20261117T120000Z` in `x-amz-date`.
@@ -474,6 +501,69 @@ buckets:
       busy_timeout_milliseconds: 10000
 ```
 
+### Health probes
+
+Enable the dedicated HTTP listener with `--health-bind 127.0.0.1:8015` or
+`health_bind: 127.0.0.1:8015` in YAML. It is off by default. For a container
+probe, choose an address the orchestrator can reach. Both endpoints accept
+unauthenticated `GET` and `HEAD` requests and return an empty body.
+
+| Endpoint | During bucket initialization | Accepting S3 requests | Draining active requests |
+| --- | --- | --- | --- |
+| `/livez` | 200 | 200 | 200 |
+| `/readyz` | 503 | 200 | 503 |
+
+Readiness turns on after bucket initialization and S3 socket binding. It turns
+off when graceful shutdown begins. Probes report the server lifecycle without
+issuing SQLite queries or calling KMS.
+
+### OpenTelemetry
+
+Export is off by default. To send traces, metrics, and audit logs to one
+OTLP/HTTP collector, set `OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318`.
+The SDK appends the signal path. To enable individual signals, configure their
+full URLs in YAML or use the corresponding CLI flags.
+
+| Signal | YAML setting | CLI flag | Path |
+| --- | --- | --- | --- |
+| Traces | `otlp_traces_endpoint` | `--otlp-traces-endpoint` | `/v1/traces` |
+| Metrics | `otlp_metrics_endpoint` | `--otlp-metrics-endpoint` | `/v1/metrics` |
+| Audit logs | `otlp_logs_endpoint` | `--otlp-logs-endpoint` | `/v1/logs` |
+
+The SDK also accepts `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_ENDPOINT`.
+Explicit CLI and YAML endpoints take precedence. Set an individual selector
+such as `OTEL_LOGS_EXPORTER=none` to disable that signal or `otlp` to enable it.
+`OTEL_SDK_DISABLED=true` disables all three. The default protocol is
+HTTP/protobuf. Set `OTEL_EXPORTER_OTLP_PROTOCOL=http/json` for JSON or use the
+signal-specific protocol variable. `OTEL_SERVICE_NAME` defaults to `s3ite`.
+
+**Traces.** Each HTTP request creates a server span with S3 operation spans
+beneath it. s3ite propagates W3C `traceparent`, `tracestate`, and `baggage`.
+The default trace sampler follows the caller’s sampling decision. `RUST_LOG`
+controls console logging independently.
+
+**Audit logs.** The `s3.request` event records mutations and failed requests.
+Set `audit_reads: true` or `--audit-reads true` to include successful reads and
+listings. Records include the request ID, operation, HTTP status, and, once
+the request reaches an S3 handler, its available principal and target fields.
+Requests rejected before dispatch carry the URL path without its query.
+A governance bypass header is recorded as a request for bypass. Each committed
+bulk delete also emits `s3.delete_object.result` per item, including failures
+and quiet-mode successes. The item records share the request ID returned to the
+client. Audit records include trace context when available, independently of
+the caller's trace sampling decision. The exporter buffers records in memory
+and flushes on graceful shutdown. A process crash, a full queue, or an
+unavailable collector can cause gaps.
+
+**Metrics.** The `s3ite.request.duration` histogram measures seconds until
+response headers by S3 operation and HTTP status. Use its count for request
+and error rates. Requests that never reached a handler use `unrouted`.
+`s3ite.sqlite.writer.queue.duration` measures write transaction queue wait.
+`s3ite.kms.request.duration` measures KMS calls including SDK retries, by
+operation and success. On Unix, `s3ite.storage.available` reports available
+bytes on the filesystem containing the storage root. Metric labels omit
+bucket names, object keys, principals, and request IDs.
+
 ### CORS
 
 S3 bucket CORS APIs are supported and store rules in the bucket database.
@@ -505,7 +595,8 @@ for `cors.mode`.
 The Rust conformance suite includes scenarios ported from or inspired by
 Ceph's S3 tests. Ceph maintains its suite under
 `src/test/rgw/s3-tests` in `ceph/ceph`. Source paths in the Rust test comments
-are relative to that directory. The presigned expiry, Unicode metadata, and
+are relative to that directory. The SSE-KMS cases run against a local mock that
+serves signed AWS KMS requests. The presigned expiry, SSE-KMS, Unicode metadata, and
 POST policy expectations were checked against [Ceph revision 6ffb1fc](https://github.com/ceph/ceph/tree/6ffb1fc533b38a153f91b46eba6deb3ec3fa5788/src/test/rgw/s3-tests).
 
 Run all tests:
@@ -518,6 +609,7 @@ Useful focused runs:
 
 ```bash
 cargo test --test conformance_bucket
+cargo test --test conformance_kms
 cargo test --test storage_transactions
 cargo test --test logging
 ```

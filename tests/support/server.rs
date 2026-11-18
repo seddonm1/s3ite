@@ -34,6 +34,7 @@ pub struct TestServerOptions {
     pub domain_name: Option<String>,
     pub maintenance_interval_seconds: Option<u64>,
     pub rust_log: Option<String>,
+    pub env: Vec<(&'static str, String)>,
 }
 
 impl TestServer {
@@ -41,6 +42,7 @@ impl TestServer {
         Self::spawn_with(TestServerOptions::default()).await
     }
 
+    /// Starts a server with isolated storage and the supplied process settings.
     pub async fn spawn_with(options: TestServerOptions) -> Result<Self> {
         let root = TempDir::new().context("create temporary s3ite root")?;
         let data_root = root.path().join("data");
@@ -88,8 +90,28 @@ impl TestServer {
             command.arg("--cors").arg(cors);
         }
 
+        // Only export traces when the test supplies its own collector.
+        for name in [
+            "OTEL_SDK_DISABLED",
+            "OTEL_TRACES_EXPORTER",
+            "OTEL_LOGS_EXPORTER",
+            "OTEL_METRICS_EXPORTER",
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_PROTOCOL",
+            "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+            "OTEL_TRACES_SAMPLER",
+            "OTEL_SERVICE_NAME",
+        ] {
+            command.env_remove(name);
+        }
         let mut child = command
             .env("RUST_LOG", rust_log)
+            .envs(options.env)
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr))
             .spawn()
@@ -202,7 +224,8 @@ fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> io::Result<()> {
     }
 }
 
-fn s3ite_binary() -> Result<PathBuf> {
+/// Resolves the real server executable, including coverage-instrumented builds.
+pub fn s3ite_binary() -> Result<PathBuf> {
     if let Ok(binary) = std::env::var("S3ITE_TEST_BIN") {
         return Ok(PathBuf::from(binary));
     }

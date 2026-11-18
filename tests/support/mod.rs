@@ -4,6 +4,7 @@
 
 pub mod assertions;
 pub mod fixtures;
+pub mod kms;
 pub mod raw_http;
 pub mod sdk;
 pub mod server;

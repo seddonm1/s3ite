@@ -8,7 +8,7 @@ use crate::database::BlobReadRequest;
 
 use super::{
     KeyMetadata, ObjectBodyReference, Sqlite, SqliteError, SqliteResult, StoredBlobChunk,
-    optional_stored_checksum, optional_stored_object_lock, optional_stored_sse, row_bool, row_size,
+    optional_stored_checksum, optional_stored_object_lock, row_bool, row_size,
 };
 
 impl Sqlite {
@@ -227,10 +227,7 @@ impl Sqlite {
                 checksum_algorithm,
                 checksum_type,
                 checksum_value,
-                sse_algorithm,
-                sse_key_nonce,
-                sse_key_ciphertext,
-                sse_key_tag,
+                encryption,
                 object_lock_legal_hold,
                 object_lock_retention_mode,
                 object_lock_retain_until,
@@ -276,19 +273,14 @@ impl Sqlite {
                             row.get(13)?,
                             row.get(14)?,
                         )?,
-                        stored_sse: optional_stored_sse(
-                            row.get(15)?,
+                        stored_sse: row.get(15)?,
+                        object_lock: optional_stored_object_lock(
                             row.get(16)?,
                             row.get(17)?,
                             row.get(18)?,
                         )?,
-                        object_lock: optional_stored_object_lock(
-                            row.get(19)?,
-                            row.get(20)?,
-                            row.get(21)?,
-                        )?,
-                        is_latest: row_bool(row, 22)?,
-                        is_delete_marker: row_bool(row, 23)?,
+                        is_latest: row_bool(row, 19)?,
+                        is_delete_marker: row_bool(row, 20)?,
                     },
                 })
             })
@@ -344,10 +336,7 @@ impl Sqlite {
                 checksum_algorithm,
                 checksum_type,
                 checksum_value,
-                sse_algorithm,
-                sse_key_nonce,
-                sse_key_ciphertext,
-                sse_key_tag,
+                encryption,
                 object_lock_legal_hold,
                 object_lock_retention_mode,
                 object_lock_retain_until,
@@ -385,19 +374,14 @@ impl Sqlite {
                     last_modified: row.get(9)?,
                     md5: row.get(10)?,
                     checksum: optional_stored_checksum(row.get(11)?, row.get(12)?, row.get(13)?)?,
-                    stored_sse: optional_stored_sse(
-                        row.get(14)?,
+                    stored_sse: row.get(14)?,
+                    object_lock: optional_stored_object_lock(
                         row.get(15)?,
                         row.get(16)?,
                         row.get(17)?,
                     )?,
-                    object_lock: optional_stored_object_lock(
-                        row.get(18)?,
-                        row.get(19)?,
-                        row.get(20)?,
-                    )?,
-                    is_latest: row_bool(row, 21)?,
-                    is_delete_marker: row_bool(row, 22)?,
+                    is_latest: row_bool(row, 18)?,
+                    is_delete_marker: row_bool(row, 19)?,
                 })
             })
             .optional()?)
@@ -412,7 +396,7 @@ pub(crate) mod test_support {
 
     use super::super::{
         KeyMetadata, KeyValue, Sqlite, SqliteResult, optional_stored_checksum,
-        optional_stored_object_lock, optional_stored_sse, row_bool, row_size,
+        optional_stored_object_lock, row_bool, row_size,
     };
 
     /// Fetches the current visible object body and metadata by key.
@@ -449,10 +433,7 @@ pub(crate) mod test_support {
                 ov.checksum_algorithm,
                 ov.checksum_type,
                 ov.checksum_value,
-                ov.sse_algorithm,
-                ov.sse_key_nonce,
-                ov.sse_key_ciphertext,
-                ov.sse_key_tag,
+                ov.encryption,
                 ov.object_lock_legal_hold,
                 ov.object_lock_retention_mode,
                 ov.object_lock_retain_until,
@@ -499,19 +480,14 @@ pub(crate) mod test_support {
                                 row.get(14)?,
                                 row.get(15)?,
                             )?,
-                            stored_sse: optional_stored_sse(
-                                row.get(16)?,
+                            stored_sse: row.get(16)?,
+                            object_lock: optional_stored_object_lock(
                                 row.get(17)?,
                                 row.get(18)?,
                                 row.get(19)?,
                             )?,
-                            object_lock: optional_stored_object_lock(
-                                row.get(20)?,
-                                row.get(21)?,
-                                row.get(22)?,
-                            )?,
-                            is_latest: row_bool(row, 23)?,
-                            is_delete_marker: row_bool(row, 24)?,
+                            is_latest: row_bool(row, 20)?,
+                            is_delete_marker: row_bool(row, 21)?,
                         },
                     },
                 ))

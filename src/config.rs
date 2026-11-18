@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     time::Duration,
 };
@@ -60,6 +60,10 @@ struct ConfigArgs {
     #[arg(long, default_value_t = default_port())]
     port: u16,
 
+    /// Address for the optional HTTP liveness and readiness listener.
+    #[arg(long)]
+    health_bind: Option<SocketAddr>,
+
     /// Configures Cross-Origin Resource Sharing (`CORS`) handling.
     #[arg(
         long,
@@ -86,9 +90,29 @@ struct ConfigArgs {
     #[arg(long)]
     sse_s3_key: Option<String>,
 
+    /// Enable SSE-KMS in this AWS region using the AWS SDK credential chain.
+    #[arg(long)]
+    kms_region: Option<String>,
+
     /// The domain to use to allow parsing virtual-hosted-style requests.
     #[arg(long)]
     domain_name: Option<String>,
+
+    /// Full OTLP/HTTP traces endpoint, including its path.
+    #[arg(long)]
+    otlp_traces_endpoint: Option<String>,
+
+    /// Full OTLP/HTTP audit logs endpoint.
+    #[arg(long)]
+    otlp_logs_endpoint: Option<String>,
+
+    /// Full OTLP/HTTP operational metrics endpoint.
+    #[arg(long)]
+    otlp_metrics_endpoint: Option<String>,
+
+    /// Include successful reads in the audit log.
+    #[arg(long, action = ArgAction::Set)]
+    audit_reads: Option<bool>,
 
     /// Enforces a limit on the concurrent number of requests the underlying service can handle.
     /// This can be tuned depending on infrastructure as `SSD`/`HDD` will deal with resource contention very differently.
@@ -233,6 +257,9 @@ pub struct Config {
     #[serde(default = "default_port")]
     pub port: u16,
 
+    /// Address for the dedicated process health listener.
+    pub health_bind: Option<SocketAddr>,
+
     /// The access key ID that is used to authenticate for this service.
     pub access_key: Option<String>,
 
@@ -241,6 +268,13 @@ pub struct Config {
 
     /// Base64-encoded 32-byte master key used for SSE-S3 object encryption.
     pub sse_s3_key: Option<String>,
+
+    /// AWS region for the optional KMS client.
+    pub kms_region: Option<String>,
+
+    /// Shared client initialized at startup when SSE-KMS is configured.
+    #[serde(skip)]
+    pub(crate) kms_client: Option<aws_sdk_kms::Client>,
 
     /// Enforces a limit on the concurrent number of requests the underlying service can handle.
     /// This can be tuned depending on infrastructure as SSD/HDD will deal with resource contention very differently.
@@ -297,6 +331,16 @@ pub struct Config {
     /// The domain to use to allow parsing virtual-hosted-style requests.
     pub domain_name: Option<String>,
 
+    /// Full OTLP/HTTP traces endpoint, including its path.
+    pub otlp_traces_endpoint: Option<String>,
+    /// Full OTLP/HTTP audit logs endpoint.
+    pub otlp_logs_endpoint: Option<String>,
+    /// Full OTLP/HTTP operational metrics endpoint.
+    pub otlp_metrics_endpoint: Option<String>,
+    /// Includes successful read-only requests when audit export is enabled.
+    #[serde(default)]
+    pub audit_reads: bool,
+
     /// Whether this service should reject write operations by default.
     #[serde(default = "default_read_only")]
     pub read_only: bool,
@@ -311,14 +355,18 @@ pub struct Config {
 }
 
 impl Default for Config {
+    /// Loads service defaults with encryption providers disabled.
     fn default() -> Self {
         Self {
             root: default_root(),
             host: default_host(),
             port: default_port(),
+            health_bind: None,
             access_key: None,
             secret_key: None,
             sse_s3_key: None,
+            kms_region: None,
+            kms_client: None,
             concurrency_limit: default_concurrency_limit(),
             readers: default_readers(),
             blob_readers: default_blob_readers(),
@@ -331,6 +379,10 @@ impl Default for Config {
             permissive_cors: None,
             read_only: default_read_only(),
             domain_name: None,
+            otlp_traces_endpoint: None,
+            otlp_logs_endpoint: None,
+            otlp_metrics_endpoint: None,
+            audit_reads: false,
             sqlite: default_pragmas(),
             buckets: HashMap::default(),
         }
@@ -394,6 +446,7 @@ impl Config {
         if cli_supplied(matches, "host") {
             self.host = args.host;
         }
+        self.health_bind = args.health_bind.or(self.health_bind);
         if cli_supplied(matches, "port") {
             self.port = args.port;
         }
@@ -402,6 +455,9 @@ impl Config {
         }
         if cli_supplied(matches, "secret_key") {
             self.secret_key.clone_from(&args.secret_key);
+        }
+        if cli_supplied(matches, "kms_region") {
+            self.kms_region.clone_from(&args.kms_region);
         }
         if cli_supplied(matches, "sse_s3_key") {
             self.sse_s3_key.clone_from(&args.sse_s3_key);
@@ -420,6 +476,19 @@ impl Config {
                 CorsMode::Disabled
             };
             self.permissive_cors = None;
+        }
+        if let Some(endpoint) = &args.otlp_logs_endpoint {
+            self.otlp_logs_endpoint = Some(endpoint.clone());
+        }
+        if let Some(endpoint) = &args.otlp_metrics_endpoint {
+            self.otlp_metrics_endpoint = Some(endpoint.clone());
+        }
+        if let Some(enabled) = args.audit_reads {
+            self.audit_reads = enabled;
+        }
+        if cli_supplied(matches, "otlp_traces_endpoint") {
+            self.otlp_traces_endpoint
+                .clone_from(&args.otlp_traces_endpoint);
         }
         if cli_supplied(matches, "domain_name") {
             self.domain_name.clone_from(&args.domain_name);
@@ -487,8 +556,13 @@ impl Config {
         )
     }
 
-    /// Validates semantic configuration constraints.
+    /// Validates the merged configuration before the server opens any listeners.
     fn validate(&self) -> ConfigResult<()> {
+        if self.access_key.is_some() != self.secret_key.is_some() {
+            return Err(ConfigError::Configuration(
+                "access_key and secret_key must be set together or both omitted".into(),
+            ));
+        }
         self.cors_mode()
             .validate()
             .map_err(ConfigError::Configuration)?;
@@ -633,12 +707,18 @@ fn render_config_template(config: &Config) -> String {
 root: {root}
 host: {host}
 port: {port}
+# health_bind: 127.0.0.1:8015
 
-# Authentication is disabled until both access_key and secret_key are set.
+# Set both credentials to enable authentication, or omit both to disable it.
 # access_key: AKIAIOSFODNN7EXAMPLE
 # secret_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 # sse_s3_key: base64-encoded-32-byte-key
+# kms_region: us-east-1
 # domain_name: s3ite.local
+# otlp_traces_endpoint: http://localhost:4318/v1/traces
+# otlp_logs_endpoint: http://localhost:4318/v1/logs
+# otlp_metrics_endpoint: http://localhost:4318/v1/metrics
+audit_reads: false
 
 concurrency_limit: {concurrency_limit}
 read_only: {read_only}
@@ -1249,6 +1329,7 @@ mod tests {
         env::temp_dir,
         fs::{remove_file, write},
     };
+    use tempfile::tempdir;
     use uuid::Uuid;
     use yaml_serde::from_str;
 
@@ -1616,6 +1697,35 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// The command line can select a trace collector without a YAML file.
+    #[test]
+    fn cli_sets_otlp_signal_endpoints() -> TestResult {
+        let endpoint = "http://collector:4318/v1/traces";
+        let matches = ConfigArgs::command().try_get_matches_from([
+            "s3ite",
+            "--otlp-traces-endpoint",
+            endpoint,
+            "--otlp-metrics-endpoint",
+            "http://metrics/v1/metrics",
+            "--otlp-logs-endpoint",
+            "http://logs/v1/logs",
+            "--audit-reads",
+            "true",
+        ])?;
+        let config = Config::from_arg_matches(&matches)?;
+        assert_eq!(config.otlp_traces_endpoint.as_deref(), Some(endpoint));
+        assert_eq!(
+            config.otlp_metrics_endpoint.as_deref(),
+            Some("http://metrics/v1/metrics")
+        );
+        assert_eq!(
+            config.otlp_logs_endpoint.as_deref(),
+            Some("http://logs/v1/logs")
+        );
+        assert!(config.audit_reads);
+        Ok(())
+    }
+
     /// Verifies the generated template parses back to the built-in defaults.
     #[test]
     fn config_template_parses_as_default_config() -> TestResult {
@@ -1627,6 +1737,7 @@ mod tests {
         assert!(template.contains("# secret_key:"));
         assert!(template.contains("# sse_s3_key:"));
         assert!(template.contains("# domain_name:"));
+        assert!(template.contains("# otlp_traces_endpoint:"));
         assert!(template.contains("# buckets:"));
 
         assert_eq!(config.root, default.root);
@@ -1636,6 +1747,7 @@ mod tests {
         assert_eq!(config.secret_key, default.secret_key);
         assert_eq!(config.sse_s3_key, default.sse_s3_key);
         assert_eq!(config.domain_name, default.domain_name);
+        assert!(config.otlp_traces_endpoint.is_none());
         assert_eq!(config.concurrency_limit, default.concurrency_limit);
         assert_eq!(config.read_only, default.read_only);
         assert_eq!(config.readers, default.readers);
@@ -1675,6 +1787,35 @@ mod tests {
         );
         assert!(config.buckets.is_empty());
 
+        Ok(())
+    }
+
+    /// Startup accepts a complete or omitted YAML credential pair and rejects either missing half.
+    #[test]
+    fn yaml_requires_paired_owner_credentials() -> TestResult {
+        let directory = tempdir()?;
+        let path = directory.path().join("config.yaml");
+        let matches = ConfigArgs::command().try_get_matches_from([
+            "s3ite".as_ref(),
+            "--config".as_ref(),
+            path.as_os_str(),
+        ])?;
+
+        for yaml in ["access_key: example-id", "secret_key: example-secret"] {
+            write(&path, yaml)?;
+            assert!(matches!(
+                ConfigAction::from_arg_matches(&matches),
+                Err(ConfigError::Configuration(message))
+                    if message == "access_key and secret_key must be set together or both omitted"
+            ));
+        }
+        for yaml in ["{}", "access_key: example-id\nsecret_key: example-secret"] {
+            write(&path, yaml)?;
+            assert!(matches!(
+                ConfigAction::from_arg_matches(&matches)?,
+                ConfigAction::Run(_)
+            ));
+        }
         Ok(())
     }
 
@@ -1957,6 +2098,7 @@ mod tests {
             &path,
             "
             port: 9000
+            health_bind: 127.0.0.1:9100
             readers: 2
             blob_readers: 6
             blob_read_timeout_seconds: 90
@@ -1984,6 +2126,8 @@ mod tests {
             "127.0.0.1",
             "--port",
             "9001",
+            "--health-bind",
+            "127.0.0.1:9101",
             "--access-key",
             "access",
             "--secret-key",
@@ -2024,6 +2168,7 @@ mod tests {
         assert_eq!(config.root, root);
         assert_eq!(config.host, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(config.port, 9001);
+        assert_eq!(config.health_bind, Some("127.0.0.1:9101".parse()?));
         assert_eq!(config.access_key.as_deref(), Some("access"));
         assert_eq!(config.secret_key.as_deref(), Some("secret"));
         assert_eq!(config.cors_mode(), CorsMode::Disabled);

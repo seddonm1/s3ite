@@ -13,7 +13,7 @@ TEST_FN = re.compile(r"\b(?:async\s+)?fn\s+([A-Za-z0-9_]+)\s*\(")
 SOURCE_COMMENT = re.compile(
     r"(Mirrors|Adapted from) s3tests/functional/test_s3\.py::([^\s:]+)(?::\s*(.+))?"
 )
-SUPPORTED_COPY_ENCRYPTIONS = ("unencrypted", "sse-s3")
+SUPPORTED_COPY_ENCRYPTIONS = ("unencrypted", "sse-s3", "sse-kms")
 SUPPORTED_COPY_SIZES = (1, 1024, 1024 * 1024, 8 * 1024 * 1024)
 SUPPORTED_COPY_PART_SIZE = 8 * 1024 * 1024
 REQUIRED_SINGLE_TEST_PORTS = (

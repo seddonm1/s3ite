@@ -10,12 +10,15 @@ use std::{
     io::{Write, stdout},
     net::SocketAddr,
     sync::Arc,
+    time::Duration,
 };
 
+use aws_config::{BehaviorVersion, Region};
+use aws_sdk_kms::Client as KmsClient;
+use hyper::service::service_fn;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto,
-    service::TowerToHyperService,
 };
 use s3s::{
     auth::SimpleAuth,
@@ -23,16 +26,23 @@ use s3s::{
     host::MultiDomain,
     service::{S3Service, S3ServiceBuilder},
 };
-use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::signal::unix::{SignalKind, signal as unix_signal};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    signal,
+    time::sleep,
+};
 use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer};
-use tracing::info;
-use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
+use tracing::{info, warn};
 
 mod compat;
 mod config;
 mod database;
+mod health;
 mod s3;
 mod sqlite;
+mod telemetry;
 
 /// Routes Linux builds through jemalloc for steadier allocation behavior in the
 /// static container binary.
@@ -41,6 +51,8 @@ mod sqlite;
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use self::compat::S3CompatLayer;
+use self::health::Readiness;
+use self::telemetry::Observer;
 pub(crate) use self::{
     config::{Config, ConfigAction, ConfigError},
     sqlite::{Sqlite, SqliteError},
@@ -66,8 +78,6 @@ enum MainError {
 /// Parses the startup action and runs the configured S3 server.
 #[tokio::main]
 async fn main() -> MainResult<()> {
-    init_tracing();
-
     let config = match ConfigAction::from_args()? {
         ConfigAction::Run(config) => *config,
         ConfigAction::PrintConfigTemplate => {
@@ -77,20 +87,43 @@ async fn main() -> MainResult<()> {
             return Ok(());
         }
     };
+    let telemetry = telemetry::init(&config)?;
+    let readiness = Readiness::default();
+    if let Some(address) = config.health_bind {
+        let listener = TcpListener::bind(address).await?;
+        info!(
+            "health probes listening on http://{}",
+            listener.local_addr()?
+        );
+        let probes = readiness.clone();
+        tokio::spawn(async move { probes.serve(listener).await });
+    }
+    run_s3(config, telemetry.observer(), readiness).await
+}
+
+/// Opens bucket databases and binds the S3 socket before advertising readiness.
+async fn run_s3(mut config: Config, observer: Observer, readiness: Readiness) -> MainResult<()> {
+    if let Some(region) = &config.kms_region {
+        let settings = aws_config::defaults(BehaviorVersion::latest())
+            .region(Region::new(region.clone()))
+            .load()
+            .await;
+        config.kms_client = Some(KmsClient::new(&settings));
+    }
     let sqlite = Sqlite::new(&config).await?;
     let cors_layer = s3::BucketCorsLayer::new(sqlite.clone(), &config);
     let svc = build_s3_service(&config, sqlite)?;
     let listener = bind_listener(&config).await?;
 
-    serve(listener, svc, cors_layer, config.concurrency_limit).await
-}
-
-fn init_tracing() {
-    let env_filter = EnvFilter::from_default_env();
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_span_events(FmtSpan::CLOSE)
-        .init();
+    serve(
+        listener,
+        svc,
+        cors_layer,
+        config.concurrency_limit,
+        observer,
+        readiness,
+    )
+    .await
 }
 
 /// Builds the S3 service with the configured owner and addressing mode.
@@ -121,50 +154,73 @@ async fn bind_listener(config: &Config) -> MainResult<TcpListener> {
     Ok(TcpListener::bind(addr).await?)
 }
 
+/// Accepts the next connection, backing off if the listener runs out of resources.
+async fn accept_connection(listener: &TcpListener) -> (TcpStream, SocketAddr) {
+    loop {
+        match listener.accept().await {
+            Ok(connection) => return connection,
+            Err(error) => {
+                warn!(%error, "failed to accept connection");
+                sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+/// Waits for a console interrupt or a Unix termination signal before draining connections.
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate = unix_signal(SignalKind::terminate())?;
+        tokio::select! {
+            result = signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    signal::ctrl_c().await
+}
+
 /// Serves S3 connections until shutdown and gives active requests time to finish.
 async fn serve(
     listener: TcpListener,
     svc: S3Service,
     cors_layer: s3::BucketCorsLayer,
     concurrency_limit: u16,
+    observer: Observer,
+    readiness: Readiness,
 ) -> MainResult<()> {
     let local_addr = listener.local_addr()?;
     let http_server = auto::Builder::new(TokioExecutor::new());
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
-    let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
+    let mut shutdown = std::pin::pin!(shutdown_signal());
 
+    readiness.set(true);
     info!("server is running at http://{local_addr}");
 
     loop {
         let (stream, remote_addr) = tokio::select! {
-            res = listener.accept() => {
-                match res {
-                    Ok(conn) => conn,
-                    Err(err) => {
-                        tracing::error!("error accepting connection: {err}");
-                        continue;
-                    }
-                }
-            }
-            _ = ctrl_c.as_mut() => {
+            conn = accept_connection(&listener) => conn,
+            result = shutdown.as_mut() => {
+                readiness.set(false);
+                result?;
                 break;
             }
         };
 
         let io = TokioIo::new(stream);
+        let service = ServiceBuilder::new()
+            .map_request(move |mut request: hyper::Request<hyper::body::Incoming>| {
+                request.extensions_mut().insert(ClientAddress(remote_addr));
+                request
+            })
+            .layer(ConcurrencyLimitLayer::new(concurrency_limit.into()))
+            .layer(cors_layer.clone())
+            .layer(S3CompatLayer)
+            .service(svc.clone());
         let conn = http_server.serve_connection(
             io,
-            TowerToHyperService::new(
-                ServiceBuilder::new()
-                    .map_request(move |mut request: hyper::Request<hyper::body::Incoming>| {
-                        request.extensions_mut().insert(ClientAddress(remote_addr));
-                        request
-                    })
-                    .layer(ConcurrencyLimitLayer::new(concurrency_limit.into()))
-                    .layer(cors_layer.clone())
-                    .layer(S3CompatLayer)
-                    .service(svc.clone()),
-            ),
+            service_fn(move |req| observer.call(service.clone(), req, remote_addr.ip())),
         );
         let conn = graceful.watch(conn.into_owned());
         tokio::spawn(async move {
@@ -172,11 +228,12 @@ async fn serve(
         });
     }
 
+    drop(listener);
     tokio::select! {
         () = graceful.shutdown() => {
              info!("graceful shutdown completed");
         },
-        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+        () = sleep(Duration::from_secs(10)) => {
              tracing::warn!("graceful shutdown timed out; aborting open connections");
         }
     }

@@ -11,11 +11,11 @@ use super::{
     KeyMetadata, Multipart, MultipartChecksumConfig, MultipartCompletion,
     MultipartCompletionChecksum, MultipartCompletionPart, MultipartCompletionRequest,
     MultipartMetadata, MultipartPartWrite, MultipartUploadListEntry, MultipartUploadListPage,
-    MultipartUploadState, MultipartUploadSummary, PartChecksum, PreparedMultipartUpload,
-    SSE_S3_ALGORITHM_CODE, Sqlite, SqliteError, SqliteResult, StoredBlobChunk, StoredChecksum,
-    StoredSse, decode_base64, decode_multipart_md5_hex, encode_hex,
-    optional_multipart_checksum_config, optional_part_checksum, optional_stored_object_lock,
-    optional_stored_sse, required_stored_checksum, row_size, sql_limit, sql_size,
+    MultipartUploadState, MultipartUploadSummary, PartChecksum, PreparedMultipartUpload, Sqlite,
+    SqliteError, SqliteResult, StoredBlobChunk, StoredChecksum, StoredSse, decode_base64,
+    decode_multipart_md5_hex, encode_hex, optional_multipart_checksum_config,
+    optional_part_checksum, optional_stored_object_lock, required_stored_checksum, row_size,
+    sql_limit, sql_size,
 };
 
 const MULTIPART_UPLOAD_ENTRY_KIND: i64 = 0;
@@ -316,6 +316,7 @@ impl Sqlite {
         Self::put_completed_multipart_upload(
             transaction,
             CompletedMultipartUploadRecord {
+                encryption: prepared.stored_sse.as_ref().map(StoredSse::mode),
                 upload_id: request.upload_id,
                 bucket: &request.bucket,
                 key: &request.key,
@@ -331,7 +332,7 @@ impl Sqlite {
             md5: prepared.md5,
             returned_version_id: write_outcome.returned_version_id,
             checksum: prepared.checksum,
-            stored_sse: prepared.stored_sse,
+            encryption: prepared.stored_sse.as_ref().map(StoredSse::mode),
         })
     }
 
@@ -355,7 +356,7 @@ impl Sqlite {
             md5: completed.md5,
             returned_version_id: completed.returned_version_id,
             checksum: completed.checksum,
-            stored_sse: None,
+            encryption: completed.encryption,
         })
     }
 
@@ -705,15 +706,12 @@ impl Sqlite {
                 checksum_algorithm,
                 checksum_type,
                 checksum_value,
-                sse_algorithm,
-                sse_key_nonce,
-                sse_key_ciphertext,
-                sse_key_tag,
+                encryption,
                 object_lock_legal_hold,
                 object_lock_retention_mode,
                 object_lock_retain_until
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23);",
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20);",
         )?;
 
         let now = OffsetDateTime::now_utc();
@@ -738,19 +736,7 @@ impl Sqlite {
             state.checksum.map(|checksum| checksum.algorithm),
             state.checksum.map(|checksum| checksum.checksum_type),
             Option::<String>::None,
-            state.stored_sse.as_ref().map(|_| SSE_S3_ALGORITHM_CODE),
-            state
-                .stored_sse
-                .as_ref()
-                .map(|stored_sse| stored_sse.nonce.as_slice()),
-            state
-                .stored_sse
-                .as_ref()
-                .map(|stored_sse| stored_sse.ciphertext.as_slice()),
-            state
-                .stored_sse
-                .as_ref()
-                .map(|stored_sse| stored_sse.tag.as_slice()),
+            state.stored_sse.as_ref(),
             state.object_lock.legal_hold,
             state
                 .object_lock
@@ -786,10 +772,7 @@ impl Sqlite {
                 checksum_algorithm,
                 checksum_type,
                 checksum_value,
-                sse_algorithm,
-                sse_key_nonce,
-                sse_key_ciphertext,
-                sse_key_tag,
+                encryption,
                 object_lock_legal_hold,
                 object_lock_retention_mode,
                 object_lock_retain_until
@@ -823,16 +806,11 @@ impl Sqlite {
                         row.get(9)?,
                         row.get(10)?,
                     )?,
-                    stored_sse: optional_stored_sse(
-                        row.get(11)?,
+                    stored_sse: row.get(11)?,
+                    object_lock: optional_stored_object_lock(
                         row.get(12)?,
                         row.get(13)?,
                         row.get(14)?,
-                    )?,
-                    object_lock: optional_stored_object_lock(
-                        row.get(15)?,
-                        row.get(16)?,
-                        row.get(17)?,
                     )?,
                 })
             })
@@ -871,11 +849,12 @@ impl Sqlite {
                 checksum_algorithm,
                 checksum_type,
                 checksum_value,
+                encryption,
                 last_modified
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             ON CONFLICT(upload_id) DO UPDATE
-            SET bucket=excluded.bucket, key=excluded.key, access_key=excluded.access_key, md5=excluded.md5, version_id=excluded.version_id, returned_version_id=excluded.returned_version_id, checksum_algorithm=excluded.checksum_algorithm, checksum_type=excluded.checksum_type, checksum_value=excluded.checksum_value, last_modified=excluded.last_modified;",
+            SET encryption=excluded.encryption, bucket=excluded.bucket, key=excluded.key, access_key=excluded.access_key, md5=excluded.md5, version_id=excluded.version_id, returned_version_id=excluded.returned_version_id, checksum_algorithm=excluded.checksum_algorithm, checksum_type=excluded.checksum_type, checksum_value=excluded.checksum_value, last_modified=excluded.last_modified;",
         )?;
 
         Ok(stmt.execute((
@@ -889,6 +868,7 @@ impl Sqlite {
             record.checksum.algorithm(),
             record.checksum.checksum_type(),
             record.checksum.as_str(),
+            record.encryption,
             OffsetDateTime::now_utc(),
         ))?)
     }
@@ -908,7 +888,8 @@ impl Sqlite {
                 returned_version_id,
                 checksum_algorithm,
                 checksum_type,
-                checksum_value
+                checksum_value,
+                encryption
             FROM completed_multipart_upload
             WHERE upload_id = ?1 AND bucket = ?2 AND key = ?3;",
         )?;
@@ -916,6 +897,7 @@ impl Sqlite {
         Ok(stmt
             .query_row((upload_id, bucket, key), |row| {
                 Ok(CompletedMultipartUploadState {
+                    encryption: row.get(6)?,
                     access_key: row.get(0)?,
                     md5: row.get(1)?,
                     returned_version_id: row.get(2)?,
@@ -1598,6 +1580,7 @@ mod tests {
         Ok(())
     }
 
+    /// Retrieves the completed response even after the active upload has gone.
     #[test]
     fn completion_prepare_returns_existing_completed_upload() -> SqliteResult<()> {
         let mut connection = open_schema()?;
@@ -1607,6 +1590,7 @@ mod tests {
         Sqlite::put_completed_multipart_upload(
             &transaction,
             CompletedMultipartUploadRecord {
+                encryption: None,
                 upload_id,
                 bucket: "bucket",
                 key: "key",
@@ -1635,6 +1619,7 @@ mod tests {
         Ok(())
     }
 
+    /// Checks part metadata and both completion outcomes.
     #[test]
     fn multipart_helpers_cover_metadata_and_unexpected_completion_variants() {
         let upload_id = Uuid::new_v4();
@@ -1653,7 +1638,7 @@ mod tests {
             md5: "etag".to_string(),
             returned_version_id: None,
             checksum: StoredChecksum::Full(FullObjectChecksum::Crc64Nvme("crc".to_string())),
-            stored_sse: None,
+            encryption: None,
         };
         assert!(matches!(
             require_prepared(MultipartCompletion::AlreadyCompleted(completed)),
@@ -1702,7 +1687,7 @@ mod tests {
                     ChecksumAlgorithmKind::Sha256,
                     ChecksumTypeKind::Composite,
                 )),
-                stored_sse: Some(StoredSse {
+                stored_sse: Some(StoredSse::Local {
                     nonce: vec![1; 12],
                     ciphertext: vec![2; 32],
                     tag: vec![3; 16],
@@ -1730,7 +1715,7 @@ mod tests {
         );
         assert_eq!(
             state.stored_sse,
-            Some(StoredSse {
+            Some(StoredSse::Local {
                 nonce: vec![1; 12],
                 ciphertext: vec![2; 32],
                 tag: vec![3; 16],
@@ -2198,6 +2183,7 @@ mod tests {
         Ok(())
     }
 
+    /// Rejects changed encryption or part ownership between preparation and commit.
     #[test]
     fn completion_put_revalidates_sse_metadata_and_part_ownership() -> SqliteResult<()> {
         let mut connection = open_schema()?;
@@ -2211,7 +2197,7 @@ mod tests {
             "bucket",
             "key",
             MultipartUploadState {
-                stored_sse: Some(StoredSse {
+                stored_sse: Some(StoredSse::Local {
                     nonce: vec![1; 12],
                     ciphertext: vec![2; 32],
                     tag: vec![3; 16],
@@ -2235,10 +2221,7 @@ mod tests {
         transaction.execute(
             "
             UPDATE multipart_upload
-            SET sse_algorithm = NULL,
-                sse_key_nonce = NULL,
-                sse_key_ciphertext = NULL,
-                sse_key_tag = NULL
+            SET encryption = NULL
             WHERE upload_id = ?1;",
             [sse_upload],
         )?;

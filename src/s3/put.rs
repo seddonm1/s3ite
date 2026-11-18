@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::sqlite::{
-    ChecksumTypeKind, KeyMetadata, KeyValue, ObjectWriteConditions, StoredChecksum,
+    ChecksumTypeKind, EncryptionMode, KeyMetadata, KeyValue, ObjectWriteConditions, StoredChecksum,
     StoredObjectLock, StoredTag,
 };
 
@@ -13,13 +13,13 @@ use super::{
     CONTENT_MD5, ChecksumInput, ChecksumPolicy, Digest, ETag, LifecycleExpirationHeader, Md5, Not,
     ObjectAclRequest, OffsetDateTime, PutObjectInput, PutObjectOutput, S3Error, S3ErrorCode,
     S3Request, S3Response, S3Result, Sqlite, StorageClass, StreamingBlob, TryStreamExt,
-    checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_input, checksum_md5,
-    checksum_sha1, checksum_sha256, checksum_sha512, checksum_type_output, checksum_xxhash3,
-    checksum_xxhash64, checksum_xxhash128, copy_bytes, finish_payload_checksum, hex,
-    load_bucket_object_lock_config, normalize_content_encoding, normalize_metadata,
-    object_lock_for_new_version, object_lock_write_headers, object_write_conditions,
-    payload_checksum_accumulator, read_object_body_encrypted, requested_sse_s3,
-    resolve_write_encryption, s3_error, s3_error_from_sqlite, sse_s3_output,
+    WriteEncryption, checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_input,
+    checksum_md5, checksum_sha1, checksum_sha256, checksum_sha512, checksum_type_output,
+    checksum_xxhash3, checksum_xxhash64, checksum_xxhash128, copy_bytes, encryption_headers,
+    finish_payload_checksum, hex, load_bucket_object_lock_config, normalize_content_encoding,
+    normalize_metadata, object_lock_for_new_version, object_lock_write_headers,
+    object_write_conditions, payload_checksum_accumulator, read_object_body_encrypted,
+    requested_encryption, resolve_write_encryption, s3_error, s3_error_from_sqlite,
     stored_tags_from_header, validate_content_md5, validate_declared_object_write_length,
     validate_expected_bucket_owner, validate_no_unsupported_sse_headers, validate_object_acl,
 };
@@ -133,11 +133,12 @@ fn validate_put_object_acl_input(input: &PutObjectInput) -> S3Result<()> {
     })
 }
 
-/// Returns whether the request explicitly asks for SSE-S3 encryption.
-fn requested_put_object_sse_s3(input: &PutObjectInput) -> S3Result<bool> {
-    requested_sse_s3(
+/// Extracts explicit encryption settings from the object write.
+fn requested_put_object_encryption(input: &PutObjectInput) -> S3Result<Option<WriteEncryption>> {
+    requested_encryption(
         input.server_side_encryption.as_ref(),
-        input.ssekms_key_id.is_some() || input.ssekms_encryption_context.is_some(),
+        input.ssekms_key_id.as_deref(),
+        input.ssekms_encryption_context.as_deref(),
         input.sse_customer_algorithm.is_some()
             || input.sse_customer_key.is_some()
             || input.sse_customer_key_md5.is_some(),
@@ -151,12 +152,13 @@ fn put_object_output(
     checksum: &StoredChecksum,
     version_id: Option<String>,
     expiration: Option<LifecycleExpirationHeader>,
-    encrypted: bool,
+    encryption: Option<EncryptionMode>,
 ) -> S3Result<PutObjectOutput> {
     let checksum_type = checksum_type_output(checksum);
     let expiration = expiration
         .map(|expiration| expiration.to_header_value())
         .transpose()?;
+    let (server_side_encryption, ssekms_key_id) = encryption_headers(encryption);
     Ok(PutObjectOutput {
         e_tag: Some(ETag::Strong(md5)),
         version_id,
@@ -172,7 +174,8 @@ fn put_object_output(
         checksum_xxhash64: checksum_xxhash64(checksum),
         checksum_xxhash128: checksum_xxhash128(checksum),
         checksum_type,
-        server_side_encryption: sse_s3_output(encrypted),
+        server_side_encryption,
+        ssekms_key_id,
         ..Default::default()
     })
 }
@@ -268,7 +271,7 @@ async fn put_encrypted_object(
         &checksum,
         write_outcome.returned_version_id,
         expiration,
-        true,
+        Some(encryption.stored.mode()),
     )
 }
 
@@ -358,7 +361,7 @@ async fn put_plain_object(
         &checksum,
         write_outcome.returned_version_id,
         expiration,
-        false,
+        None,
     )
 }
 
@@ -369,10 +372,16 @@ async fn write_put_object(
     content_md5: ContentMd5Input<'_>,
     checksum_input: ChecksumInput,
     context: PutObjectWriteContext,
-    explicit_sse_s3: bool,
+    explicit_encryption: Option<WriteEncryption>,
 ) -> S3Result<PutObjectOutput> {
     let chunk_size = sqlite.blob_chunk_size();
-    let encryption = resolve_write_encryption(sqlite, &context.bucket, explicit_sse_s3).await?;
+    let encryption = resolve_write_encryption(
+        sqlite,
+        &context.bucket,
+        &context.key,
+        explicit_encryption.as_ref(),
+    )
+    .await?;
     if let Some(encryption) = encryption {
         put_encrypted_object(
             sqlite,
@@ -407,7 +416,7 @@ pub(super) async fn put_object(
     validate_no_unsupported_sse_headers(&headers)?;
     validate_put_object_bucket(sqlite, &input.bucket).await?;
     validate_put_object_acl_input(&input)?;
-    let explicit_sse_s3 = requested_put_object_sse_s3(&input)?;
+    let explicit_encryption = requested_put_object_encryption(&input)?;
 
     let checksum_input =
         checksum_input!(input, input.checksum_algorithm, None).with_sdk_algorithm(&headers)?;
@@ -429,6 +438,7 @@ pub(super) async fn put_object(
         object_lock_legal_hold_status,
         object_lock_mode,
         object_lock_retain_until_date,
+        ssekms_encryption_context,
         storage_class,
         tagging,
         ..
@@ -473,14 +483,15 @@ pub(super) async fn put_object(
         tags,
         object_lock,
     };
-    let output = write_put_object(
+    let mut output = write_put_object(
         sqlite,
         body,
         content_md5,
         checksum_input,
         context,
-        explicit_sse_s3,
+        explicit_encryption,
     )
     .await?;
+    output.ssekms_encryption_context = ssekms_encryption_context;
     Ok(S3Response::new(output))
 }

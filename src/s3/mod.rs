@@ -117,6 +117,7 @@ mod cors;
 mod delete;
 mod error;
 mod get;
+mod kms;
 mod lifecycle;
 mod list;
 mod metadata;
@@ -165,9 +166,9 @@ use self::{
         validate_expected_bucket_owner, validate_object_acl,
     },
     sse::{
-        ActiveSse, active_sse_from_stored, decrypt_stored_chunks, encrypt_value_chunks,
-        read_object_body_encrypted, read_part_body_encrypted, requested_sse_s3,
-        require_sse_s3_master_key, resolve_write_encryption, sse_s3_output,
+        ActiveSse, WriteEncryption, decrypt_stored_chunks, encrypt_value_chunks,
+        encryption_headers, open_encryption, read_object_body_encrypted, read_part_body_encrypted,
+        requested_encryption, require_sse_s3_master_key, resolve_write_encryption,
         validate_no_sse_headers, validate_no_unsupported_sse_headers,
     },
     tagging::{CopyTaggingDirective, copy_tagging_directive, stored_tags_from_header},

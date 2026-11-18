@@ -1,7 +1,8 @@
 use super::{
     CONTENT_TYPE, ETAG, ETag, HeaderValue, InternalError, S3Error, S3ErrorCode, S3Response,
-    S3Result, SqliteError, Uuid, X_AMZ_DELETE_MARKER, X_AMZ_REQUEST_ID,
+    S3Result, SqliteError, X_AMZ_DELETE_MARKER, X_AMZ_REQUEST_ID,
 };
+use crate::telemetry::request_id;
 
 /// Maps storage-layer failures into S3 protocol errors at the service boundary.
 pub(super) fn s3_error_from_sqlite(error: SqliteError) -> S3Error {
@@ -50,7 +51,7 @@ pub(super) fn s3_error_with_message(code: S3ErrorCode, message: &'static str) ->
 
 /// Adds a request ID to an error body and response headers.
 fn with_request_id(mut error: S3Error) -> S3Error {
-    let request_id = Uuid::new_v4().simple().to_string();
+    let request_id = request_id().simple().to_string();
     error.set_request_id(request_id.clone());
 
     let mut headers = error

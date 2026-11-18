@@ -7,8 +7,8 @@ use time::OffsetDateTime;
 
 use super::{
     BucketVersioningState, EncodedBlobChunk, KeyMetadata, KeyValue, NULL_VERSION_ID,
-    ObjectTagCondition, ObjectWriteConditions, ObjectWriteOutcome, SSE_S3_ALGORITHM_CODE, Sqlite,
-    SqliteError, SqliteResult, sql_size,
+    ObjectTagCondition, ObjectWriteConditions, ObjectWriteOutcome, Sqlite, SqliteError,
+    SqliteResult, sql_size,
 };
 
 const VERSION_ID_LEN: usize = 31;
@@ -163,15 +163,12 @@ impl Sqlite {
                 checksum_algorithm,
                 checksum_type,
                 checksum_value,
-                sse_algorithm,
-                sse_key_nonce,
-                sse_key_ciphertext,
-                sse_key_tag,
+                encryption,
                 object_lock_legal_hold,
                 object_lock_retention_mode,
                 object_lock_retain_until
             )
-            VALUES (?1, ?2, 1, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22);",
+            VALUES (?1, ?2, 1, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19);",
         )?;
 
         let size = sql_size(key_metadata.size)?;
@@ -201,10 +198,7 @@ impl Sqlite {
             checksum.algorithm(),
             checksum.checksum_type(),
             checksum.as_str(),
-            stored_sse.map(|_| SSE_S3_ALGORITHM_CODE),
-            stored_sse.map(|stored_sse| stored_sse.nonce.as_slice()),
-            stored_sse.map(|stored_sse| stored_sse.ciphertext.as_slice()),
-            stored_sse.map(|stored_sse| stored_sse.tag.as_slice()),
+            stored_sse,
             key_metadata.object_lock.legal_hold,
             retention.map(|retention| retention.mode.as_str()),
             retention.map(|retention| retention.retain_until),

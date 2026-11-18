@@ -28,6 +28,7 @@ use reqwest::{Response, StatusCode, Url, header};
 use serde_json::{Value, json};
 use serial_test::serial;
 use sha2::{Digest, Sha256};
+use support::kms::{ALGORITHM, KEY_ID, KmsServer, PRIMARY, set_default};
 use support::{
     assertions::{assert_error_contains, assert_status},
     fixtures::{bucket_name, create_bucket, get_object_bytes},
@@ -1661,4 +1662,52 @@ async fn s3ite_post_object_missing_file_fails_without_write() -> Result<()> {
     assert_object_absent(&client, &bucket, key).await?;
 
     Ok(())
+}
+
+/// Sends a signed browser form with explicit or bucket-default KMS encryption.
+async fn kms_post(default: bool) -> Result<()> {
+    let kms = KmsServer::start().await?;
+    let client = sdk::client(&kms.server);
+    let bucket = bucket_name("s3ite-kms-post");
+    create_bucket(&client, &bucket).await?;
+    let mut fields = vec![field("Content-Type", "text/plain"), field("acl", "private")];
+    if default {
+        set_default(&client, &bucket).await?;
+    } else {
+        fields.extend([field(ALGORITHM, "aws:kms"), field(KEY_ID, PRIMARY)]);
+    }
+    let options = PostFormOptions::new("foo.txt", b"bar")
+        .extra_fields(fields)
+        .content_length_range(0, 1024);
+    let response = send_signed_post(&kms.server, &bucket, options).await?;
+    assert_status(&response, StatusCode::NO_CONTENT);
+    let get = client
+        .get_object()
+        .bucket(&bucket)
+        .key("foo.txt")
+        .send()
+        .await?;
+    assert_eq!(
+        get.server_side_encryption(),
+        Some(&ServerSideEncryption::AwsKms)
+    );
+    assert_eq!(get.ssekms_key_id(), Some(PRIMARY));
+    assert_eq!(get.body.collect().await?.into_bytes().as_ref(), b"bar");
+    Ok(())
+}
+
+/// Verifies explicit KMS form fields reach object storage.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_sse_kms_post_object_authenticated_request() -> Result<()> {
+    // Adapted from s3tests/functional/test_s3.py::test_sse_kms_post_object_authenticated_request: uses the signed SigV4 form path
+    kms_post(false).await
+}
+
+/// Verifies a browser upload inherits the bucket KMS key.
+#[tokio::test]
+#[serial(conformance)]
+async fn test_sse_kms_default_post_object_authenticated_request() -> Result<()> {
+    // Adapted from s3tests/functional/test_s3.py::test_sse_kms_default_post_object_authenticated_request: uses the signed SigV4 form path
+    kms_post(true).await
 }

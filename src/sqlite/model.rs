@@ -10,13 +10,11 @@ use s3s::crypto::{
     Checksum as _, Crc32, Crc32c, Crc64Nvme, Md5, Sha1, Sha256, Sha512, XxHash3, XxHash64,
     XxHash128,
 };
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{SqliteError, SqliteResult};
-
-/// Compact database code for bucket default SSE-S3.
-pub(crate) const SSE_S3_ALGORITHM_CODE: i64 = 1;
 
 /// Normalized S3 bucket CORS rule persisted by storage.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -564,12 +562,68 @@ pub(crate) fn decode_base64(value: &str) -> Option<Vec<u8>> {
     Some(decoded)
 }
 
-/// Stored object/upload envelope encryption metadata.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StoredSse {
-    pub(crate) nonce: Vec<u8>,
-    pub(crate) ciphertext: Vec<u8>,
-    pub(crate) tag: Vec<u8>,
+/// Encryption mode exposed for a bucket default or written object.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub(crate) enum EncryptionMode {
+    Aes256,
+    Kms(String),
+}
+
+/// Key material persisted with one object version or multipart upload. Only wrapped keys are stored.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub(crate) enum StoredSse {
+    Local {
+        nonce: Vec<u8>,
+        ciphertext: Vec<u8>,
+        tag: Vec<u8>,
+    },
+    Kms {
+        key_id: String,
+        ciphertext: Vec<u8>,
+        context: HashMap<String, String>,
+    },
+}
+
+impl StoredSse {
+    /// Returns the mode and canonical key identity for S3 response headers.
+    pub(crate) fn mode(&self) -> EncryptionMode {
+        match self {
+            Self::Local { .. } => EncryptionMode::Aes256,
+            Self::Kms { key_id, .. } => EncryptionMode::Kms(key_id.clone()),
+        }
+    }
+}
+
+impl ToSql for EncryptionMode {
+    /// Encodes the tagged variant for storage in a strict TEXT column.
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        serde_json::to_string(self)
+            .map(ToSqlOutput::from)
+            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))
+    }
+}
+
+impl FromSql for EncryptionMode {
+    /// Restores the encryption variant and validates its required fields.
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        serde_json::from_str(value.as_str()?).map_err(|err| FromSqlError::Other(Box::new(err)))
+    }
+}
+
+impl ToSql for StoredSse {
+    /// Encodes the tagged variant for storage in a strict TEXT column.
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        serde_json::to_string(self)
+            .map(ToSqlOutput::from)
+            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))
+    }
+}
+
+impl FromSql for StoredSse {
+    /// Restores the encryption variant and validates its required fields.
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        serde_json::from_str(value.as_str()?).map_err(|err| FromSqlError::Other(Box::new(err)))
+    }
 }
 
 /// Normalized S3 bucket lifecycle rule persisted by storage.
@@ -970,6 +1024,7 @@ pub(crate) struct MultipartUploadListPage {
 #[derive(Debug)]
 pub(crate) struct CompletedMultipartUploadState {
     pub(crate) access_key: Option<String>,
+    pub(crate) encryption: Option<EncryptionMode>,
     pub(crate) md5: String,
     pub(crate) returned_version_id: Option<String>,
     pub(crate) checksum: StoredChecksum,
@@ -982,6 +1037,7 @@ pub(crate) struct CompletedMultipartUploadRecord<'a> {
     pub(crate) bucket: &'a str,
     pub(crate) key: &'a str,
     pub(crate) access_key: Option<String>,
+    pub(crate) encryption: Option<EncryptionMode>,
     pub(crate) md5: &'a str,
     pub(crate) version_id: &'a str,
     pub(crate) returned_version_id: Option<&'a str>,
@@ -991,10 +1047,10 @@ pub(crate) struct CompletedMultipartUploadRecord<'a> {
 /// Result of materializing multipart upload parts into an object version.
 #[derive(Debug)]
 pub(crate) struct CompletedMultipartUploadOutcome {
+    pub(crate) encryption: Option<EncryptionMode>,
     pub(crate) md5: String,
     pub(crate) returned_version_id: Option<String>,
     pub(crate) checksum: StoredChecksum,
-    pub(crate) stored_sse: Option<StoredSse>,
 }
 
 /// Read-side multipart completion state.

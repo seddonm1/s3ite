@@ -39,15 +39,15 @@ pub use self::error::{SqliteError, SqliteResult};
 pub(crate) use self::model::{
     BucketVersioningState, ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKind,
     CompletedMultipartUploadOutcome, CompletedMultipartUploadRecord, CompletedMultipartUploadState,
-    CompletedObjectPart, EncodedBlobChunk, KeyMetadata, KeyValue, Multipart,
+    CompletedObjectPart, EncodedBlobChunk, EncryptionMode, KeyMetadata, KeyValue, Multipart,
     MultipartChecksumConfig, MultipartCompletion, MultipartCompletionChecksum,
     MultipartCompletionPart, MultipartCompletionRequest, MultipartMetadata, MultipartPartWrite,
     MultipartUploadListEntry, MultipartUploadListPage, MultipartUploadState,
     MultipartUploadSummary, ObjectBodyReference, ObjectDeleteOutcome, ObjectLifecycleExpiration,
     ObjectSummary, ObjectTagCondition, ObjectTaggingTarget, ObjectVersionListEntry,
     ObjectVersionListPage, ObjectVersionTarget, ObjectWriteConditions, ObjectWriteOutcome,
-    PartChecksum, PreparedMultipartUpload, SSE_S3_ALGORITHM_CODE, StoredBlobChunk, StoredChecksum,
-    StoredCorsRule, StoredLifecycleAndFilter, StoredLifecycleExpiration, StoredLifecycleFilter,
+    PartChecksum, PreparedMultipartUpload, StoredBlobChunk, StoredChecksum, StoredCorsRule,
+    StoredLifecycleAndFilter, StoredLifecycleExpiration, StoredLifecycleFilter,
     StoredLifecycleRule, StoredNoncurrentVersionExpiration, StoredObjectLock,
     StoredObjectLockConfig, StoredObjectLockDefaultRetention, StoredObjectLockMode,
     StoredObjectRetention, StoredSse, StoredTag, current_expiration_time, decode_base64,
@@ -70,7 +70,7 @@ const BUCKET_SCHEMA_SQL: &str = "
 CREATE TABLE bucket_state (
     id INTEGER PRIMARY KEY CHECK(id = 1),
     versioning_state INTEGER NOT NULL CHECK(versioning_state IN (0, 1, 2)),
-    default_sse_algorithm INTEGER CHECK(default_sse_algorithm IN (1)),
+    default_encryption TEXT CHECK(default_encryption IS NULL OR json_valid(default_encryption)),
     object_lock_enabled INTEGER NOT NULL DEFAULT 0 CHECK(object_lock_enabled IN (0, 1)),
     object_lock_default_retention_mode TEXT CHECK(object_lock_default_retention_mode IN ('GOVERNANCE', 'COMPLIANCE')),
     object_lock_default_retention_days INTEGER CHECK(object_lock_default_retention_days IS NULL OR object_lock_default_retention_days > 0),
@@ -210,29 +210,11 @@ CREATE TABLE object_version (
     checksum_algorithm INTEGER CHECK(checksum_algorithm BETWEEN 1 AND 10),
     checksum_type INTEGER CHECK(checksum_type BETWEEN 1 AND 2),
     checksum_value TEXT,
-    sse_algorithm INTEGER CHECK(sse_algorithm IN (1)),
-    sse_key_nonce BLOB,
-    sse_key_ciphertext BLOB,
-    sse_key_tag BLOB,
+    encryption TEXT CHECK(encryption IS NULL OR json_valid(encryption)),
     object_lock_legal_hold INTEGER CHECK(object_lock_legal_hold IN (0, 1)),
     object_lock_retention_mode TEXT CHECK(object_lock_retention_mode IN ('GOVERNANCE', 'COMPLIANCE')),
     object_lock_retain_until TEXT,
     UNIQUE(key, version_id),
-    CHECK (
-        (
-            sse_algorithm IS NULL
-            AND sse_key_nonce IS NULL
-            AND sse_key_ciphertext IS NULL
-            AND sse_key_tag IS NULL
-        )
-        OR
-        (
-            sse_algorithm = 1
-            AND length(sse_key_nonce) = 12
-            AND length(sse_key_ciphertext) = 32
-            AND length(sse_key_tag) = 16
-        )
-    ),
     CHECK (
         (
             object_lock_retention_mode IS NULL
@@ -267,10 +249,7 @@ CREATE TABLE object_version (
             AND checksum_algorithm IS NULL
             AND checksum_type IS NULL
             AND checksum_value IS NULL
-            AND sse_algorithm IS NULL
-            AND sse_key_nonce IS NULL
-            AND sse_key_ciphertext IS NULL
-            AND sse_key_tag IS NULL
+            AND encryption IS NULL
             AND object_lock_legal_hold IS NULL
             AND object_lock_retention_mode IS NULL
             AND object_lock_retain_until IS NULL
@@ -314,29 +293,11 @@ CREATE TABLE multipart_upload (
     checksum_algorithm INTEGER CHECK(checksum_algorithm BETWEEN 1 AND 10),
     checksum_type INTEGER CHECK(checksum_type BETWEEN 1 AND 2),
     checksum_value TEXT,
-    sse_algorithm INTEGER CHECK(sse_algorithm IN (1)),
-    sse_key_nonce BLOB,
-    sse_key_ciphertext BLOB,
-    sse_key_tag BLOB,
+    encryption TEXT CHECK(encryption IS NULL OR json_valid(encryption)),
     object_lock_legal_hold INTEGER CHECK(object_lock_legal_hold IN (0, 1)),
     object_lock_retention_mode TEXT CHECK(object_lock_retention_mode IN ('GOVERNANCE', 'COMPLIANCE')),
     object_lock_retain_until TEXT,
     UNIQUE(upload_id, bucket, key),
-    CHECK (
-        (
-            sse_algorithm IS NULL
-            AND sse_key_nonce IS NULL
-            AND sse_key_ciphertext IS NULL
-            AND sse_key_tag IS NULL
-        )
-        OR
-        (
-            sse_algorithm = 1
-            AND length(sse_key_nonce) = 12
-            AND length(sse_key_ciphertext) = 32
-            AND length(sse_key_tag) = 16
-        )
-    ),
     CHECK (
         (
             object_lock_retention_mode IS NULL
@@ -510,6 +471,7 @@ CREATE TABLE completed_multipart_upload (
     md5 TEXT NOT NULL,
     version_id TEXT NOT NULL,
     returned_version_id TEXT,
+    encryption TEXT CHECK(encryption IS NULL OR json_valid(encryption)),
     checksum_algorithm INTEGER NOT NULL CHECK(checksum_algorithm BETWEEN 1 AND 10),
     checksum_type INTEGER NOT NULL CHECK(checksum_type BETWEEN 1 AND 2),
     checksum_value TEXT NOT NULL,
@@ -556,28 +518,6 @@ fn sql_limit(value: i64) -> rusqlite::Result<i64> {
 /// Reads an integer row column as a `SQLite` boolean.
 fn row_bool(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<bool> {
     Ok(row.get::<_, i32>(idx)? != 0)
-}
-
-/// Reads nullable SSE-S3 envelope metadata from contiguous row columns.
-fn optional_stored_sse(
-    algorithm: Option<i64>,
-    key_nonce: Option<Vec<u8>>,
-    key_ciphertext: Option<Vec<u8>>,
-    key_tag: Option<Vec<u8>>,
-) -> rusqlite::Result<Option<StoredSse>> {
-    match (algorithm, key_nonce, key_ciphertext, key_tag) {
-        (None, None, None, None) => Ok(None),
-        (Some(algorithm), Some(key_nonce), Some(key_ciphertext), Some(key_tag))
-            if algorithm == SSE_S3_ALGORITHM_CODE =>
-        {
-            Ok(Some(StoredSse {
-                nonce: key_nonce,
-                ciphertext: key_ciphertext,
-                tag: key_tag,
-            }))
-        }
-        _ => Err(rusqlite::Error::InvalidQuery),
-    }
 }
 
 /// Reads nullable Object Lock metadata from row columns.
@@ -2030,6 +1970,7 @@ mod maintenance_tests {
         Sqlite::put_completed_multipart_upload(
             &transaction,
             CompletedMultipartUploadRecord {
+                encryption: None,
                 upload_id: completed_upload_id,
                 bucket: "bucket",
                 key: "completed-key",

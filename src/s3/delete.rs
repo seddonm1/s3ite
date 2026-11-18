@@ -1,6 +1,7 @@
 //! S3 object delete request handling.
 
 use crate::sqlite::{KeyMetadata, ObjectDeleteOutcome};
+use crate::telemetry::audit_deletion;
 
 use super::{
     DeleteError, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput,
@@ -97,10 +98,11 @@ fn access_denied_delete_error(key: String, version_id: Option<String>) -> Delete
     }
 }
 
-fn precondition_failed_delete_error(key: String) -> DeleteError {
+/// Preserves the requested version on a failed conditional bulk delete.
+fn precondition_failed_delete_error(key: String, version_id: Option<String>) -> DeleteError {
     DeleteError {
         key: Some(key),
-        version_id: None,
+        version_id,
         code: Some("PreconditionFailed".to_string()),
         message: Some("At least one precondition failed".to_string()),
     }
@@ -179,6 +181,28 @@ pub(super) async fn delete_object(
     }))
 }
 
+/// Emits per-key outcomes only after the writer confirms the transaction committed.
+fn audit_bulk_results(deleted_entries: &[(String, ObjectDeleteOutcome)], errors: &[DeleteError]) {
+    for (key, outcome) in deleted_entries {
+        audit_deletion(
+            key,
+            outcome.version_id.as_deref(),
+            outcome.delete_marker_version_id.as_deref(),
+            None,
+        );
+    }
+    for error in errors {
+        if let Some(key) = &error.key {
+            audit_deletion(
+                key,
+                error.version_id.as_deref(),
+                None,
+                error.code.as_deref(),
+            );
+        }
+    }
+}
+
 /// Deletes a batch of objects and returns S3 multi-delete results.
 pub(super) async fn delete_objects(
     sqlite: &Sqlite,
@@ -249,7 +273,7 @@ pub(super) async fn delete_objects(
                         deleted_entries.push((key, outcome));
                     }
                     Err(SqliteError::PreconditionFailed) => {
-                        errors.push(precondition_failed_delete_error(key));
+                        errors.push(precondition_failed_delete_error(key, version_id));
                     }
                     Err(err) => return Err(err),
                 }
@@ -260,6 +284,7 @@ pub(super) async fn delete_objects(
         .await
         .map_err(s3_error_from_sqlite)?;
 
+    audit_bulk_results(&deleted_entries, &errors);
     let output = DeleteObjectsOutput {
         deleted: quiet.not().then(|| {
             deleted_entries

@@ -2,7 +2,10 @@
 
 use std::ops::Range as ByteRange;
 
-use crate::sqlite::{CompletedObjectPart, KeyMetadata, ObjectBodyReference, StoredChecksum};
+use crate::sqlite::{
+    CompletedObjectPart, KeyMetadata, ObjectBodyReference, StoredBlobChunk, StoredChecksum,
+    StoredSse,
+};
 
 use super::metadata::format_expires;
 use super::{
@@ -12,13 +15,13 @@ use super::{
     LifecycleExpirationHeader, Not, ObjectAttributes, ObjectPart, ObjectReadConditionFailure,
     ObjectReadConditions, S3Error, S3ErrorCode, S3Range, S3Request, S3Response, S3Result, Sqlite,
     SqliteError, SqliteResult, StorageClass, StreamExt, StreamingBlob, X_AMZ_TAGGING_COUNT,
-    active_sse_from_stored, checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_md5,
-    checksum_mode_enabled, checksum_sha1, checksum_sha256, checksum_sha512, checksum_struct,
-    checksum_type_output, checksum_xxhash3, checksum_xxhash64, checksum_xxhash128,
-    decrypt_stored_chunks, list_limit, not_found_delete_marker_error, not_modified_error,
+    checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_md5, checksum_mode_enabled,
+    checksum_sha1, checksum_sha256, checksum_sha512, checksum_struct, checksum_type_output,
+    checksum_xxhash3, checksum_xxhash64, checksum_xxhash128, decrypt_stored_chunks,
+    encryption_headers, list_limit, not_found_delete_marker_error, not_modified_error,
     object_checksum_for_part, object_lock_legal_hold_status, object_lock_mode,
-    object_lock_retain_until_date, requested_part_range, s3_error, s3_error_from_sqlite,
-    s3_error_with_message, sse_s3_output, stream, validate_expected_bucket_owner,
+    object_lock_retain_until_date, open_encryption, requested_part_range, s3_error,
+    s3_error_from_sqlite, s3_error_with_message, stream, validate_expected_bucket_owner,
     validate_no_sse_headers, validate_part_number, validate_read_conditions,
 };
 
@@ -91,16 +94,8 @@ enum ObjectBodyReadStart {
     /// The object exists and has an associated blob read request.
     Found {
         read: Box<ObjectBodyReadFound>,
-        decrypted_body: Option<Vec<u8>>,
+        chunks: Option<Vec<StoredBlobChunk>>,
     },
-    /// The object is encrypted but the server has no configured SSE-S3 key.
-    SseNotConfigured,
-}
-
-enum ObjectBodyDecryption {
-    Plain,
-    Bytes(Vec<u8>),
-    SseNotConfigured,
 }
 
 /// Object metadata selected for `HeadObject` and attribute responses.
@@ -298,34 +293,6 @@ fn load_object_body_read_found(
     })
 }
 
-/// Decrypts encrypted object chunks when a body read needs plaintext slicing.
-fn decrypt_object_body_if_needed(
-    transaction: &rusqlite::Transaction<'_>,
-    object: &ObjectBodyReference,
-    object_range: &ByteRange<u64>,
-    sse_s3_master_key: Option<[u8; 32]>,
-) -> SqliteResult<ObjectBodyDecryption> {
-    let Some(stored) = object.key_metadata.stored_sse.clone() else {
-        return Ok(ObjectBodyDecryption::Plain);
-    };
-    let Some(master_key) = sse_s3_master_key else {
-        return Ok(ObjectBodyDecryption::SseNotConfigured);
-    };
-
-    let active = active_sse_from_stored(&master_key, stored).map_err(SqliteError::Configuration)?;
-    let chunks =
-        Sqlite::get_object_blob_chunks(transaction, object.sequence, object.key_metadata.size)?;
-    let value = decrypt_stored_chunks(&active, chunks)?;
-    let start = usize::try_from(object_range.start).map_err(|_| SqliteError::InvalidObjectRange)?;
-    let end = usize::try_from(object_range.end).map_err(|_| SqliteError::InvalidObjectRange)?;
-    let bytes = value
-        .get(start..end)
-        .map(<[u8]>::to_vec)
-        .ok_or(SqliteError::InvalidObjectRange)?;
-
-    Ok(ObjectBodyDecryption::Bytes(bytes))
-}
-
 /// Resolves object metadata and body reads inside one storage transaction.
 fn resolve_get_object_read(
     transaction: &rusqlite::Transaction<'_>,
@@ -334,7 +301,6 @@ fn resolve_get_object_read(
     part_number: Option<i32>,
     range: Option<&S3Range>,
     conditions: &ObjectReadConditions,
-    sse_s3_master_key: Option<[u8; 32]>,
 ) -> SqliteResult<(ObjectBodyReadStart, Vec<BlobReadRequest>)> {
     let object = load_object_body_reference(transaction, key, version_id)?;
     let Some(object) = object else {
@@ -354,62 +320,69 @@ fn resolve_get_object_read(
     }
 
     let read = load_object_body_read_found(transaction, key, object, part_number, range)?;
-    let decrypted_body = match decrypt_object_body_if_needed(
-        transaction,
-        &read.object,
-        &read.object_range,
-        sse_s3_master_key,
-    )? {
-        ObjectBodyDecryption::Plain => None,
-        ObjectBodyDecryption::Bytes(bytes) => Some(bytes),
-        ObjectBodyDecryption::SseNotConfigured => {
-            return Ok((ObjectBodyReadStart::SseNotConfigured, Vec::new()));
-        }
-    };
-
-    let requests = if decrypted_body.is_some() {
-        Vec::new()
+    let (chunks, requests) = if read.object.key_metadata.stored_sse.is_some() {
+        (
+            Some(Sqlite::get_object_blob_chunks(
+                transaction,
+                read.object.sequence,
+                read.object.key_metadata.size,
+            )?),
+            Vec::new(),
+        )
     } else {
-        Sqlite::object_blob_read_requests(
-            transaction,
-            read.object.sequence,
-            read.object_range.clone(),
-        )?
+        (
+            None,
+            Sqlite::object_blob_read_requests(
+                transaction,
+                read.object.sequence,
+                read.object_range.clone(),
+            )?,
+        )
     };
 
     Ok((
         ObjectBodyReadStart::Found {
             read: Box::new(read),
-            decrypted_body,
+            chunks,
         },
         requests,
     ))
 }
 
 /// Builds the `GetObject` read state after storage metadata has been resolved.
-fn finish_get_object_read(
+async fn finish_get_object_read(
+    sqlite: &Sqlite,
     start: ObjectBodyReadStart,
     body: BlobReadReceiver,
 ) -> S3Result<ObjectBodyRead> {
     match start {
         ObjectBodyReadStart::Missing => Err(not_found_delete_marker_error(false)),
         ObjectBodyReadStart::DeleteMarker => Err(not_found_delete_marker_error(true)),
-        ObjectBodyReadStart::SseNotConfigured => Err(s3_error_with_message(
-            S3ErrorCode::InvalidRequest,
-            "SSE-S3 is not configured",
-        )),
         ObjectBodyReadStart::ConditionFailed { failure, md5 } => Err(match failure {
             ObjectReadConditionFailure::PreconditionFailed => {
                 s3_error(S3ErrorCode::PreconditionFailed)
             }
             ObjectReadConditionFailure::NotModified => not_modified_error(md5.as_deref())?,
         }),
-        ObjectBodyReadStart::Found {
-            read,
-            decrypted_body,
-        } => {
-            let body = if let Some(bytes) = decrypted_body {
-                ObjectBodyReadBody::Bytes(Bytes::from(bytes))
+        ObjectBodyReadStart::Found { read, chunks } => {
+            let body = if let Some(chunks) = chunks {
+                let stored = read
+                    .object
+                    .key_metadata
+                    .stored_sse
+                    .clone()
+                    .ok_or_else(|| s3_error(S3ErrorCode::InternalError))?;
+                let active = open_encryption(sqlite, stored).await?;
+                let bytes = decrypt_stored_chunks(&active, chunks).map_err(s3_error_from_sqlite)?;
+                let start =
+                    usize::try_from(read.object_range.start).map_err(S3Error::internal_error)?;
+                let end =
+                    usize::try_from(read.object_range.end).map_err(S3Error::internal_error)?;
+                let bytes = Bytes::from(bytes);
+                let slice = bytes
+                    .get(start..end)
+                    .ok_or_else(|| s3_error(S3ErrorCode::InvalidRange))?;
+                ObjectBodyReadBody::Bytes(bytes.slice_ref(slice))
             } else {
                 ObjectBodyReadBody::Blob(body)
             };
@@ -572,6 +545,8 @@ fn get_object_output(
     let object_lock_retain_until_date = object_lock_retain_until_date(&key_metadata.object_lock);
     let expiration = lifecycle_expiration_response_header(read.expiration)?;
 
+    let (server_side_encryption, ssekms_key_id) =
+        encryption_headers(key_metadata.stored_sse.as_ref().map(StoredSse::mode));
     Ok(GetObjectOutput {
         body: Some(body),
         accept_ranges: Some("bytes".to_string()),
@@ -607,7 +582,8 @@ fn get_object_output(
         object_lock_mode,
         object_lock_retain_until_date,
         parts_count: (read.completed_part_count > 0).then_some(read.completed_part_count),
-        server_side_encryption: sse_s3_output(key_metadata.stored_sse.is_some()),
+        server_side_encryption,
+        ssekms_key_id,
         version_id: Some(version_id),
         ..Default::default()
     })
@@ -647,6 +623,8 @@ fn head_object_output(
     let object_lock_retain_until_date = object_lock_retain_until_date(&object.object_lock);
     let expiration = lifecycle_expiration_response_header(read.expiration)?;
 
+    let (server_side_encryption, ssekms_key_id) =
+        encryption_headers(object.stored_sse.as_ref().map(StoredSse::mode));
     Ok(HeadObjectOutput {
         accept_ranges: Some("bytes".to_string()),
         cache_control: object.cache_control,
@@ -681,7 +659,8 @@ fn head_object_output(
         object_lock_mode,
         object_lock_retain_until_date,
         parts_count: (read.completed_part_count > 0).then_some(read.completed_part_count),
-        server_side_encryption: sse_s3_output(object.stored_sse.is_some()),
+        server_side_encryption,
+        ssekms_key_id,
         version_id: Some(object.version_id),
         ..Default::default()
     })
@@ -717,7 +696,6 @@ pub(super) async fn get_object(
         etag_none_matches: if_none_match,
         unmodified_since: if_unmodified_since.map(Into::into),
     };
-    let sse_s3_master_key = sqlite.config.sse_s3_master_key();
     let connection = sqlite
         .get_connection(&bucket)
         .await
@@ -731,12 +709,11 @@ pub(super) async fn get_object(
                 part_number,
                 range_for_read.as_ref(),
                 &conditions,
-                sse_s3_master_key,
             )
         })
         .await
         .map_err(s3_error_from_sqlite)?;
-    let read = finish_get_object_read(start, body)?;
+    let read = finish_get_object_read(sqlite, start, body).await?;
     let output = get_object_output(read, range.as_ref(), part_number, checksum_mode.as_ref())?;
     Ok(S3Response::new(output))
 }
@@ -789,6 +766,9 @@ pub(super) async fn head_object(
             unmodified_since: if_unmodified_since.map(Into::into),
         },
     )?;
+    if checksum_mode_enabled(checksum_mode.as_ref()) {
+        authorize_checksum(sqlite, read.metadata.stored_sse.as_ref()).await?;
+    }
     let tag_count = read.tag_count;
     let output = head_object_output(read, range.as_ref(), part_number, checksum_mode.as_ref())?;
     let mut response = S3Response::new(output);
@@ -799,6 +779,14 @@ pub(super) async fn head_object(
         );
     }
     Ok(response)
+}
+
+/// Checks KMS access before returning protected checksum metadata.
+async fn authorize_checksum(sqlite: &Sqlite, envelope: Option<&StoredSse>) -> S3Result<()> {
+    if let Some(stored @ StoredSse::Kms { .. }) = envelope {
+        open_encryption(sqlite, stored.clone()).await?;
+    }
+    Ok(())
 }
 
 /// Builds paginated object-part attributes for `GetObjectAttributes`.
@@ -930,6 +918,9 @@ pub(super) async fn get_object_attributes(
         return Err(not_found_delete_marker_error(true));
     }
 
+    if wants_checksum || wants_object_parts {
+        authorize_checksum(sqlite, object.stored_sse.as_ref()).await?;
+    }
     let object_parts = object_attributes_parts(
         wants_object_parts,
         total_parts_count,
@@ -961,12 +952,11 @@ mod tests {
     use super::*;
 
     use hyper::http::{Extensions, HeaderMap, Method, Uri};
-    use time::OffsetDateTime;
     use tokio::sync::RwLock;
 
     use crate::{
         Config,
-        sqlite::{FullObjectChecksum, PartChecksum, StoredSse},
+        sqlite::{FullObjectChecksum, PartChecksum},
     };
 
     fn assert_error_code<T>(result: S3Result<T>, code: &S3ErrorCode) {
@@ -1021,28 +1011,6 @@ mod tests {
 
     fn object_checksum() -> StoredChecksum {
         StoredChecksum::Full(FullObjectChecksum::Crc64Nvme("object-crc64".to_string()))
-    }
-
-    /// Builds metadata for read tests with optional stored encryption settings.
-    fn metadata(stored_sse: Option<StoredSse>) -> KeyMetadata {
-        KeyMetadata {
-            version_id: "version".to_string(),
-            size: 0,
-            metadata: None,
-            content_type: None,
-            content_encoding: None,
-            content_disposition: None,
-            content_language: None,
-            cache_control: None,
-            expires: None,
-            last_modified: OffsetDateTime::UNIX_EPOCH,
-            md5: Some("md5".to_string()),
-            checksum: Some(object_checksum()),
-            stored_sse,
-            object_lock: crate::sqlite::StoredObjectLock::default(),
-            is_latest: true,
-            is_delete_marker: false,
-        }
     }
 
     fn request<T: Default>() -> S3Request<T> {
@@ -1226,27 +1194,6 @@ mod tests {
             requested_object_range_sqlite(Some(1), None, Some(&invalid_part), 1, 10),
             Err(SqliteError::ObjectBodyInconsistent)
         ));
-    }
-
-    #[test]
-    fn encrypted_body_without_master_key_reports_sse_not_configured() -> SqliteResult<()> {
-        let mut connection = rusqlite::Connection::open_in_memory()?;
-        let transaction = connection.transaction()?;
-        let object = ObjectBodyReference {
-            version_id: "version".to_string(),
-            sequence: 1,
-            key_metadata: metadata(Some(StoredSse {
-                nonce: vec![0; 12],
-                ciphertext: vec![0; 32],
-                tag: vec![0; 16],
-            })),
-        };
-
-        assert!(matches!(
-            decrypt_object_body_if_needed(&transaction, &object, &(0..0), None)?,
-            ObjectBodyDecryption::SseNotConfigured
-        ));
-        Ok(())
     }
 
     #[test]

@@ -20,6 +20,7 @@ use tokio::{
 };
 use tracing::{debug, error};
 
+use crate::telemetry::writer_wait_timer;
 use crate::{
     Config,
     sqlite::{SqliteError, SqliteResult, reader_connection_pragmas, writer_connection_pragmas},
@@ -226,8 +227,10 @@ impl BucketConnection {
     {
         self.inner.reject_if_closed()?;
         let inner = self.inner.clone();
+        let dequeued = writer_wait_timer();
         self.inner
             .call(&self.inner.writer_sender, move |connection| {
+                dequeued();
                 inner.reject_if_closed()?;
                 let transaction = connection.transaction()?;
                 let result = function(&transaction)?;

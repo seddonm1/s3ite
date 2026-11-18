@@ -10,8 +10,7 @@ use rusqlite::Transaction;
 use tokio::fs;
 
 use super::{
-    BucketConnection, BucketVersioningState, SSE_S3_ALGORITHM_CODE, Sqlite, SqliteError,
-    SqliteResult,
+    BucketConnection, BucketVersioningState, EncryptionMode, Sqlite, SqliteError, SqliteResult,
 };
 
 impl Sqlite {
@@ -174,27 +173,24 @@ impl Sqlite {
         Ok(stmt.execute([state])?)
     }
 
-    /// Returns whether this bucket applies SSE-S3 by default to new objects.
-    pub(crate) fn get_bucket_default_sse_s3(transaction: &Transaction) -> SqliteResult<bool> {
+    /// Returns the encryption default applied to new objects in this bucket.
+    pub(crate) fn get_bucket_encryption(
+        transaction: &Transaction,
+    ) -> SqliteResult<Option<EncryptionMode>> {
         let mut stmt = transaction
-            .prepare_cached("SELECT default_sse_algorithm FROM bucket_state WHERE id = 1;")?;
-        let algorithm = stmt.query_row((), |row| row.get::<_, Option<i64>>(0))?;
-        Ok(algorithm == Some(SSE_S3_ALGORITHM_CODE))
+            .prepare_cached("SELECT default_encryption FROM bucket_state WHERE id = 1;")?;
+        Ok(stmt.query_row((), |row| row.get(0))?)
     }
 
-    /// Updates the bucket's default SSE-S3 setting.
-    pub(crate) fn put_bucket_default_sse_s3(
+    /// Replaces the default encryption mode atomically, or clears it on deletion.
+    pub(crate) fn put_bucket_encryption(
         transaction: &Transaction,
-        enabled: bool,
+        mode: Option<&EncryptionMode>,
     ) -> SqliteResult<usize> {
-        let algorithm = enabled.then_some(SSE_S3_ALGORITHM_CODE);
-        let mut stmt = transaction.prepare_cached(
-            "
-            UPDATE bucket_state
-            SET default_sse_algorithm = ?1
-            WHERE id = 1;",
-        )?;
-        Ok(stmt.execute([algorithm])?)
+        Ok(transaction.execute(
+            "UPDATE bucket_state SET default_encryption = ?1 WHERE id = 1;",
+            [mode],
+        )?)
     }
 }
 

@@ -1,6 +1,7 @@
 use hyper::StatusCode;
 
-use crate::sqlite::BucketVersioningState;
+use super::kms;
+use crate::sqlite::{BucketVersioningState, EncryptionMode};
 
 use super::{
     Bucket, BucketAclRequest, BucketVersioningStatus, CreateBucketInput, CreateBucketOutput,
@@ -194,7 +195,7 @@ pub(super) async fn get_bucket_versioning(
     }))
 }
 
-/// Deletes the bucket's default SSE-S3 configuration.
+/// Deletes the bucket's default encryption configuration.
 pub(super) async fn delete_bucket_encryption(
     sqlite: &Sqlite,
     req: S3Request<DeleteBucketEncryptionInput>,
@@ -214,7 +215,7 @@ pub(super) async fn delete_bucket_encryption(
         .map_err(s3_error_from_sqlite)?;
     connection
         .write(|transaction| {
-            Sqlite::put_bucket_default_sse_s3(transaction, false)?;
+            Sqlite::put_bucket_encryption(transaction, None)?;
             Ok(())
         })
         .await
@@ -223,7 +224,7 @@ pub(super) async fn delete_bucket_encryption(
     Ok(S3Response::new(DeleteBucketEncryptionOutput {}))
 }
 
-/// Returns the bucket's default SSE-S3 configuration.
+/// Returns the bucket's default encryption configuration.
 pub(super) async fn get_bucket_encryption(
     sqlite: &Sqlite,
     req: S3Request<GetBucketEncryptionInput>,
@@ -238,19 +239,19 @@ pub(super) async fn get_bucket_encryption(
         .get_connection(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
-    let enabled = connection
-        .read(Sqlite::get_bucket_default_sse_s3)
+    let mode = connection
+        .read(Sqlite::get_bucket_encryption)
         .await
         .map_err(s3_error_from_sqlite)?;
 
-    if enabled.not() {
+    let Some(mode) = mode else {
         let mut error = s3_error(S3ErrorCode::ServerSideEncryptionConfigurationNotFoundError);
         error.set_status_code(StatusCode::NOT_FOUND);
         return Err(error);
-    }
+    };
 
     Ok(S3Response::new(GetBucketEncryptionOutput {
-        server_side_encryption_configuration: Some(sse_s3_bucket_encryption_configuration()),
+        server_side_encryption_configuration: Some(bucket_encryption_configuration(mode)),
     }))
 }
 
@@ -270,16 +271,23 @@ pub(super) async fn put_bucket_encryption(
     sqlite
         .validate_mutable_bucket(&bucket)
         .map_err(s3_error_from_sqlite)?;
-    validate_sse_s3_bucket_encryption_configuration(&server_side_encryption_configuration)?;
-    require_sse_s3_master_key(sqlite)?;
+    let mode = validate_bucket_encryption_configuration(&server_side_encryption_configuration)?;
+    match &mode {
+        EncryptionMode::Aes256 => {
+            require_sse_s3_master_key(sqlite)?;
+        }
+        EncryptionMode::Kms(_) => {
+            kms::client(&sqlite.config)?;
+        }
+    }
 
     let connection = sqlite
         .get_connection(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
     connection
-        .write(|transaction| {
-            Sqlite::put_bucket_default_sse_s3(transaction, true)?;
+        .write(move |transaction| {
+            Sqlite::put_bucket_encryption(transaction, Some(&mode))?;
             Ok(())
         })
         .await
@@ -288,24 +296,28 @@ pub(super) async fn put_bucket_encryption(
     Ok(S3Response::new(PutBucketEncryptionOutput {}))
 }
 
-/// Builds the bucket encryption DTO for the supported SSE-S3 default.
-fn sse_s3_bucket_encryption_configuration() -> ServerSideEncryptionConfiguration {
+/// Builds the bucket encryption DTO from the stored default.
+fn bucket_encryption_configuration(mode: EncryptionMode) -> ServerSideEncryptionConfiguration {
+    let (algorithm, kms_master_key_id) = match mode {
+        EncryptionMode::Aes256 => (ServerSideEncryption::AES256, None),
+        EncryptionMode::Kms(id) => (ServerSideEncryption::AWS_KMS, Some(id)),
+    };
     ServerSideEncryptionConfiguration {
         rules: vec![ServerSideEncryptionRule {
             blocked_encryption_types: None,
             apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
-                kms_master_key_id: None,
-                sse_algorithm: ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+                kms_master_key_id,
+                sse_algorithm: ServerSideEncryption::from_static(algorithm),
             }),
             bucket_key_enabled: None,
         }],
     }
 }
 
-/// Validates that a bucket encryption request enables only SSE-S3 AES256.
-fn validate_sse_s3_bucket_encryption_configuration(
+/// Validates that a bucket encryption request specifies a supported encryption default.
+fn validate_bucket_encryption_configuration(
     configuration: &ServerSideEncryptionConfiguration,
-) -> S3Result<()> {
+) -> S3Result<EncryptionMode> {
     let [rule] = configuration.rules.as_slice() else {
         return Err(s3_error_with_message(
             S3ErrorCode::MalformedXML,
@@ -326,16 +338,19 @@ fn validate_sse_s3_bucket_encryption_configuration(
             "bucket encryption rule must specify an SSE algorithm",
         ));
     };
-    if default.kms_master_key_id.is_some()
-        || default.sse_algorithm.as_str() != ServerSideEncryption::AES256
-    {
-        return Err(s3_error_with_message(
+    match (
+        default.sse_algorithm.as_str(),
+        default.kms_master_key_id.as_deref(),
+    ) {
+        (ServerSideEncryption::AES256, None) => Ok(EncryptionMode::Aes256),
+        (ServerSideEncryption::AWS_KMS, Some(id)) if !id.is_empty() => {
+            Ok(EncryptionMode::Kms(id.to_owned()))
+        }
+        _ => Err(s3_error_with_message(
             S3ErrorCode::InvalidArgument,
-            "bucket default encryption must be AES256",
-        ));
+            "invalid bucket encryption algorithm or KMS key ID",
+        )),
     }
-
-    Ok(())
 }
 
 /// Updates the bucket versioning state.
@@ -547,13 +562,13 @@ mod tests {
     #[test]
     fn bucket_encryption_validation_rejects_unsupported_shapes() {
         assert!(
-            validate_sse_s3_bucket_encryption_configuration(&ServerSideEncryptionConfiguration {
+            validate_bucket_encryption_configuration(&ServerSideEncryptionConfiguration {
                 rules: Vec::new()
             })
             .is_err()
         );
         assert!(
-            validate_sse_s3_bucket_encryption_configuration(&ServerSideEncryptionConfiguration {
+            validate_bucket_encryption_configuration(&ServerSideEncryptionConfiguration {
                 rules: vec![ServerSideEncryptionRule {
                     blocked_encryption_types: None,
                     apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
@@ -568,7 +583,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            validate_sse_s3_bucket_encryption_configuration(&ServerSideEncryptionConfiguration {
+            validate_bucket_encryption_configuration(&ServerSideEncryptionConfiguration {
                 rules: vec![ServerSideEncryptionRule {
                     blocked_encryption_types: None,
                     apply_server_side_encryption_by_default: None,
@@ -578,7 +593,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            validate_sse_s3_bucket_encryption_configuration(&ServerSideEncryptionConfiguration {
+            validate_bucket_encryption_configuration(&ServerSideEncryptionConfiguration {
                 rules: vec![ServerSideEncryptionRule {
                     blocked_encryption_types: None,
                     apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
@@ -593,7 +608,7 @@ mod tests {
             .is_err()
         );
 
-        let configuration = sse_s3_bucket_encryption_configuration();
-        assert!(validate_sse_s3_bucket_encryption_configuration(&configuration).is_ok());
+        let configuration = bucket_encryption_configuration(EncryptionMode::Aes256);
+        assert!(validate_bucket_encryption_configuration(&configuration).is_ok());
     }
 }
