@@ -244,7 +244,7 @@ pub async fn aws_chunked_request(
     signing_settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
     signing_settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
     let signing = sign_request(
-        server,
+        (server.access_key(), server.secret_key()),
         &method,
         &url,
         SignableBody::Precomputed("STREAMING-UNSIGNED-PAYLOAD-TRAILER".to_string()),
@@ -451,24 +451,44 @@ fn signing_headers_with_body(
     signing_settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
     signing_settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
 
-    Ok(
-        sign_request(server, method, url, body, headers, signing_settings)?
-            .headers()
-            .map(|(name, value)| (name.to_owned(), value.to_owned()))
-            .collect(),
-    )
+    Ok(sign_request(
+        (server.access_key(), server.secret_key()),
+        method,
+        url,
+        body,
+        headers,
+        signing_settings,
+    )?
+    .headers()
+    .map(|(name, value)| (name.to_owned(), value.to_owned()))
+    .collect())
 }
 
 /// Presigns an S3 operation for which the Rust SDK has no presigning builder.
 pub fn presigned_url(server: &TestServer, method: Method, path_and_query: &str) -> Result<String> {
-    let url = format!("{}{path_and_query}", server.endpoint());
+    presigned_url_with_credentials(
+        server.endpoint(),
+        (server.access_key(), server.secret_key()),
+        method,
+        path_and_query,
+    )
+}
+
+/// Presigns a request for a server a test started itself, with that server's credentials.
+pub fn presigned_url_with_credentials(
+    endpoint: &str,
+    credentials: (&str, &str),
+    method: Method,
+    path_and_query: &str,
+) -> Result<String> {
+    let url = format!("{endpoint}{path_and_query}");
     let mut settings = SigningSettings::default();
     settings.percent_encoding_mode = PercentEncodingMode::Single;
     settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
     settings.signature_location = SignatureLocation::QueryParams;
     settings.expires_in = Some(Duration::from_secs(60));
     let instructions = sign_request(
-        server,
+        credentials,
         &method,
         &url,
         SignableBody::UnsignedPayload,
@@ -482,20 +502,14 @@ pub fn presigned_url(server: &TestServer, method: Method, path_and_query: &str) 
 
 /// Signs with the test owner's credentials and the selected header or query settings.
 fn sign_request(
-    server: &TestServer,
+    (access_key, secret_key): (&str, &str),
     method: &Method,
     url: &str,
     body: SignableBody<'_>,
     headers: &[(&str, &str)],
     signing_settings: SigningSettings,
 ) -> Result<SigningInstructions> {
-    let credentials = Credentials::new(
-        server.access_key(),
-        server.secret_key(),
-        None,
-        None,
-        "s3ite-test",
-    );
+    let credentials = Credentials::new(access_key, secret_key, None, None, "s3ite-test");
     let identity = credentials.into();
     let signing_params = v4::SigningParams::builder()
         .identity(&identity)

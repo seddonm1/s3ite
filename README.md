@@ -360,10 +360,11 @@ a directory marker (an empty object with a key ending in `/`) can return
 
 ## Auth Model
 
-When `access_key` and `secret_key` are configured, signed requests and valid
-presigned URLs from that identity act as the single owner. Unsigned requests are
-denied. When both values are omitted, authentication is disabled and every
-request behaves as that owner. Startup fails if only one credential is set.
+`access_key` and `secret_key` are required, and startup fails without both.
+As on AWS S3, every request must be signed: signed requests and valid presigned
+URLs from that identity act as the single owner, and unsigned requests are
+denied. `s3ite --print-config-template` prints a starter configuration with a
+freshly generated credential pair.
 
 SigV2 header authentication follows `s3s`. Send an RFC 1123 HTTP date in
 `Date` or a UTC timestamp such as `20261117T120000Z` in `x-amz-date`.
@@ -430,12 +431,16 @@ YAML additionally supports per-bucket overrides.
 Unknown YAML settings, including keys inside bucket overrides, cause startup
 to fail with an error naming the key.
 
+[`config.example.yaml`](config.example.yaml) lists every setting with its
+default. To start a real configuration, run `s3ite --print-config-template`,
+which prints the same file with a new random `access_key` and `secret_key`.
+
 Common service options:
 
 - `root`: directory containing bucket `.sqlite3` files. Default: `.`.
 - `host`: bind address. Default: `0.0.0.0`.
 - `port`: bind port. Default: `8014`.
-- `access_key` and `secret_key`: enable owner request authentication.
+- `access_key` and `secret_key`: required owner credentials.
 - `domain_name`: enables virtual-hosted-style bucket parsing for that domain.
 - `concurrency_limit`: max concurrent HTTP requests. Default: `16`.
 - `read_only`: rejects write operations by default. Default: `false`.
@@ -589,9 +594,11 @@ configuration and for non-bucket requests.
 
 `cors.mode` can be:
 
-- `disabled`: do not add CORS response headers.
+- `disabled`: do not add CORS response headers. This is the default and
+  matches AWS S3 for a bucket without a CORS configuration.
 - `permissive`: mirror request origins, methods, and headers and allow
-  credentials. This is the default compatibility mode.
+  credentials, including private network access. Use it only for trusted
+  networks; browsers on any site can then call the server.
 - `custom`: use explicit `allow_origins`, `allow_methods`, `allow_headers`,
   `expose_headers`, `allow_credentials`, `allow_private_network`, and
   `max_age_seconds`.

@@ -147,12 +147,16 @@ async fn disabling_export_skips_collector_setup() -> Result<()> {
     Ok(())
 }
 
+/// Credentials the server requires before it reaches telemetry setup.
+const TEST_CREDENTIALS: [&str; 4] = ["--access-key", "test-access", "--secret-key", "test-secret"];
+
 /// Checks startup errors for collector URLs supplied through either config or the environment.
 #[test]
 fn invalid_export_endpoint_fails_startup() -> Result<()> {
     for cli in [false, true] {
         let mut command = Command::new(env!("CARGO_BIN_EXE_s3ite"));
         command
+            .args(TEST_CREDENTIALS)
             .env_remove("OTEL_SDK_DISABLED")
             .env_remove("OTEL_TRACES_EXPORTER");
         if cli {
@@ -171,6 +175,7 @@ fn invalid_export_endpoint_fails_startup() -> Result<()> {
 #[test]
 fn unsupported_export_protocol_fails_startup() -> Result<()> {
     let result = Command::new(env!("CARGO_BIN_EXE_s3ite"))
+        .args(TEST_CREDENTIALS)
         .env_remove("OTEL_SDK_DISABLED")
         .env("OTEL_TRACES_EXPORTER", "otlp")
         .env("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")

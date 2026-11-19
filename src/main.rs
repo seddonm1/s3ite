@@ -83,7 +83,7 @@ async fn main() -> MainResult<()> {
         ConfigAction::PrintConfigTemplate => {
             stdout()
                 .lock()
-                .write_all(Config::config_template().as_bytes())?;
+                .write_all(Config::config_template()?.as_bytes())?;
             return Ok(());
         }
     };
@@ -126,11 +126,15 @@ fn build_s3_service(config: &Config, sqlite: Sqlite) -> MainResult<S3Service> {
     protocol.enable_sig_v2 = true;
     s3.set_config(Arc::new(StaticConfigProvider::new(protocol.into())));
 
-    if let (Some(access_key), Some(secret_key)) =
+    // Validation requires both credentials, so every request is authenticated.
+    let (Some(access_key), Some(secret_key)) =
         (config.access_key.clone(), config.secret_key.clone())
-    {
-        s3.set_auth(SimpleAuth::from_single(access_key, secret_key));
-    }
+    else {
+        return Err(MainError::Configuration(
+            "access_key and secret_key are required".into(),
+        ));
+    };
+    s3.set_auth(SimpleAuth::from_single(access_key, secret_key));
 
     if let Some(domain_name) = &config.domain_name {
         let domains = [domain_name.as_str()];

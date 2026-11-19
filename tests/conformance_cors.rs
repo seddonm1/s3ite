@@ -887,11 +887,39 @@ async fn s3ite_bucket_cors_is_per_bucket() -> Result<()> {
     Ok(())
 }
 
-/// s3ite-specific: buckets without CORS config still use server-level fallback.
+/// Verifies the default server rejects preflights for a bucket without CORS rules.
+///
+/// AWS S3 answers a preflight to a bucket with no CORS configuration with 403.
+#[tokio::test]
+#[serial(conformance)]
+async fn s3ite_default_server_rejects_preflight_without_bucket_cors() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-cors-default");
+    create_bucket(&client, &bucket).await?;
+
+    let response = preflight(
+        &server,
+        &bucket_path(&bucket),
+        "https://fallback.example.test",
+        "PUT",
+        Some("authorization"),
+    )
+    .await?;
+    assert_status(&response, StatusCode::FORBIDDEN);
+    assert_eq!(header(&response, "access-control-allow-origin"), None);
+    Ok(())
+}
+
+/// s3ite-specific: with `--cors permissive`, buckets without CORS rules use the server fallback.
 #[tokio::test]
 #[serial(conformance)]
 async fn s3ite_bucket_cors_falls_back_to_server_cors_when_unconfigured() -> Result<()> {
-    let server = TestServer::spawn().await?;
+    let server = TestServer::spawn_with(TestServerOptions {
+        cors: Some("permissive".to_owned()),
+        ..Default::default()
+    })
+    .await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cors-fallback");
 

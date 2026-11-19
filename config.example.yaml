@@ -1,0 +1,47 @@
+root: .
+host: 0.0.0.0
+port: 8014
+# health_bind: 127.0.0.1:8015
+
+# Required. Every request must be signed with this credential pair.
+access_key: REPLACE_WITH_ACCESS_KEY
+secret_key: REPLACE_WITH_SECRET_KEY
+# sse_s3_key: base64-encoded-32-byte-key
+# kms_region: us-east-1
+# domain_name: s3ite.local
+# otlp_traces_endpoint: http://localhost:4318/v1/traces
+# otlp_logs_endpoint: http://localhost:4318/v1/logs
+# otlp_metrics_endpoint: http://localhost:4318/v1/metrics
+audit_reads: false
+
+concurrency_limit: 16
+read_only: false
+
+readers: 4
+blob_readers: 16
+blob_read_timeout_seconds: 120
+# Caps the memory each in-flight upload buffers.
+blob_chunk_size_mib: 16
+
+maintenance_interval_seconds: 60
+maintenance_vacuum_pages: 100
+multipart_upload_ttl_seconds: 86400
+completed_multipart_upload_ttl_seconds: 86400
+
+journal_mode: wal
+synchronous: normal
+temp_store: memory
+cache_size: 65536
+busy_timeout_milliseconds: 5000
+journal_size_limit: 67108864
+
+cors:
+  mode: disabled
+
+# Bucket-specific overrides are optional.
+# buckets:
+#   example-bucket:
+#     read_only: false
+#     sqlite:
+#       cache_size: 131072
+#       synchronous: full

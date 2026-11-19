@@ -452,10 +452,22 @@ impl Config {
         Ok(config)
     }
 
-    /// Renders a starter YAML configuration using built-in defaults.
-    #[must_use]
-    pub(crate) fn config_template() -> String {
-        render_config_template(&Self::default())
+    /// Renders a starter YAML configuration with a fresh random credential pair.
+    ///
+    /// Every run generates new keys, so a template copied into place never
+    /// shares credentials with another deployment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operating system's random source fails.
+    pub(crate) fn config_template() -> ConfigResult<String> {
+        let access_key = random_credential(ACCESS_KEY_ALPHABET, ACCESS_KEY_LENGTH)?;
+        let secret_key = random_credential(SECRET_KEY_ALPHABET, SECRET_KEY_LENGTH)?;
+        Ok(render_config_template(
+            &Self::default(),
+            &access_key,
+            &secret_key,
+        ))
     }
 
     /// Applies explicit command-line values over the current configuration.
@@ -589,10 +601,14 @@ impl Config {
     }
 
     /// Validates the merged configuration before the server opens any listeners.
+    ///
+    /// Credentials are required: like AWS S3, every request is authenticated.
     fn validate(&self) -> ConfigResult<()> {
-        if self.access_key.is_some() != self.secret_key.is_some() {
+        if self.access_key.is_none() || self.secret_key.is_none() {
             return Err(ConfigError::Configuration(
-                "access_key and secret_key must be set together or both omitted".into(),
+                "access_key and secret_key are required; \
+                 `s3ite --print-config-template` generates a pair"
+                    .into(),
             ));
         }
         if self.concurrency_limit == 0 {
@@ -742,8 +758,40 @@ fn cli_supplied(matches: &ArgMatches, id: &str) -> bool {
     matches.value_source(id) == Some(ValueSource::CommandLine)
 }
 
-/// Renders a starter YAML configuration from a default config value.
-fn render_config_template(config: &Config) -> String {
+/// Characters used for generated access keys, matching AWS access key IDs.
+const ACCESS_KEY_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+/// Length of a generated access key, matching AWS access key IDs.
+const ACCESS_KEY_LENGTH: usize = 20;
+/// Characters used for generated secret keys, matching AWS secret access keys.
+const SECRET_KEY_ALPHABET: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+/// Length of a generated secret key, matching AWS secret access keys.
+const SECRET_KEY_LENGTH: usize = 40;
+
+/// Generates a random credential of `length` characters from `alphabet`.
+///
+/// Bytes that would bias the choice toward the start of the alphabet are
+/// discarded, so every character is equally likely.
+fn random_credential(alphabet: &[u8], length: usize) -> ConfigResult<String> {
+    let alphabet_len = u8::try_from(alphabet.len())
+        .map_err(|_| ConfigError::Configuration("credential alphabet is too large".into()))?;
+    let unbiased_limit = u8::MAX - u8::MAX % alphabet_len;
+    let mut credential = String::with_capacity(length);
+    let mut bytes = [0_u8; 64];
+    while credential.len() < length {
+        getrandom::fill(&mut bytes)
+            .map_err(|err| ConfigError::Configuration(format!("random source failed: {err}")))?;
+        for byte in bytes {
+            if byte < unbiased_limit && credential.len() < length {
+                credential.push(char::from(alphabet[usize::from(byte % alphabet_len)]));
+            }
+        }
+    }
+    Ok(credential)
+}
+
+/// Renders a starter YAML configuration from a default config value and credentials.
+fn render_config_template(config: &Config, access_key: &str, secret_key: &str) -> String {
     format!(
         "\
 root: {root}
@@ -751,9 +799,9 @@ host: {host}
 port: {port}
 # health_bind: 127.0.0.1:8015
 
-# Set both credentials to enable authentication, or omit both to disable it.
-# access_key: AKIAIOSFODNN7EXAMPLE
-# secret_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+# Required. Every request must be signed with this credential pair.
+access_key: {access_key}
+secret_key: {secret_key}
 # sse_s3_key: base64-encoded-32-byte-key
 # kms_region: us-east-1
 # domain_name: s3ite.local
@@ -871,10 +919,11 @@ fn value_enum_name<T: ValueEnum>(value: &T) -> String {
 /// Cross-Origin Resource Sharing behavior.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum CorsMode {
-    /// Do not add CORS response headers.
+    /// Do not add CORS response headers. This matches AWS S3 for a bucket
+    /// without a CORS configuration.
+    #[default]
     Disabled,
     /// Mirror request origins, methods, and headers and allow credentials.
-    #[default]
     Permissive,
     /// Apply explicit CORS rules from configuration.
     Custom(CorsConfig),
@@ -1254,6 +1303,7 @@ fn default_completed_upload_ttl_seconds() -> u64 {
     86_400
 }
 
+/// Returns the server-level `CORS` mode used when a bucket has no CORS rules.
 fn default_cors() -> CorsMode {
     CorsMode::default()
 }
@@ -1503,6 +1553,10 @@ mod tests {
 
         let matches = ConfigArgs::command().try_get_matches_from([
             "s3ite",
+            "--access-key",
+            "test-access",
+            "--secret-key",
+            "test-secret",
             "--journal-mode",
             "truncate",
             "--synchronous",
@@ -1603,7 +1657,7 @@ mod tests {
 
     #[test]
     fn cors_defaults_and_yaml_modes_are_parsed() -> TestResult {
-        assert_eq!(Config::default().cors_mode(), CorsMode::Permissive);
+        assert_eq!(Config::default().cors_mode(), CorsMode::Disabled);
 
         let config: Config = yaml_serde::from_str("permissive_cors: false\n")?;
         assert_eq!(config.cors_mode(), CorsMode::Disabled);
@@ -1811,6 +1865,10 @@ mod tests {
         let endpoint = "http://collector:4318/v1/traces";
         let matches = ConfigArgs::command().try_get_matches_from([
             "s3ite",
+            "--access-key",
+            "test-access",
+            "--secret-key",
+            "test-secret",
             "--otlp-traces-endpoint",
             endpoint,
             "--otlp-metrics-endpoint",
@@ -1834,15 +1892,49 @@ mod tests {
         Ok(())
     }
 
-    /// Verifies the generated template parses back to the built-in defaults.
+    /// Keeps `config.example.yaml` identical to the template with placeholder credentials.
+    ///
+    /// Regenerate it with `cargo test` after adding a setting, by copying the
+    /// rendered text this test prints on failure.
+    #[test]
+    fn example_config_matches_template() {
+        let expected = render_config_template(
+            &Config::default(),
+            "REPLACE_WITH_ACCESS_KEY",
+            "REPLACE_WITH_SECRET_KEY",
+        );
+        assert_eq!(
+            include_str!("../config.example.yaml"),
+            expected,
+            "config.example.yaml is out of date; replace it with:\n{expected}"
+        );
+    }
+
+    /// Verifies the generated template parses back to the defaults plus fresh credentials.
     #[test]
     fn config_template_parses_as_default_config() -> TestResult {
-        let template = Config::config_template();
+        let template = Config::config_template()?;
         let config: Config = from_str(&template)?;
         let default = Config::default();
 
-        assert!(template.contains("# access_key:"));
-        assert!(template.contains("# secret_key:"));
+        let access_key = config.access_key.clone().unwrap_or_default();
+        let secret_key = config.secret_key.clone().unwrap_or_default();
+        assert_eq!(access_key.len(), ACCESS_KEY_LENGTH);
+        assert!(
+            access_key
+                .bytes()
+                .all(|byte| ACCESS_KEY_ALPHABET.contains(&byte))
+        );
+        assert_eq!(secret_key.len(), SECRET_KEY_LENGTH);
+        assert!(
+            secret_key
+                .bytes()
+                .all(|byte| SECRET_KEY_ALPHABET.contains(&byte))
+        );
+        let again: Config = from_str(&Config::config_template()?)?;
+        assert_ne!(again.access_key, config.access_key);
+        assert_ne!(again.secret_key, config.secret_key);
+        assert!(config.validate().is_ok());
         assert!(template.contains("# sse_s3_key:"));
         assert!(template.contains("# domain_name:"));
         assert!(template.contains("# otlp_traces_endpoint:"));
@@ -1851,8 +1943,6 @@ mod tests {
         assert_eq!(config.root, default.root);
         assert_eq!(config.host, default.host);
         assert_eq!(config.port, default.port);
-        assert_eq!(config.access_key, default.access_key);
-        assert_eq!(config.secret_key, default.secret_key);
         assert_eq!(config.sse_s3_key, default.sse_s3_key);
         assert_eq!(config.domain_name, default.domain_name);
         assert!(config.otlp_traces_endpoint.is_none());
@@ -1899,9 +1989,9 @@ mod tests {
         Ok(())
     }
 
-    /// Startup accepts a complete or omitted YAML credential pair and rejects either missing half.
+    /// Startup requires both credentials and rejects a config missing either or both.
     #[test]
-    fn yaml_requires_paired_owner_credentials() -> TestResult {
+    fn yaml_requires_owner_credentials() -> TestResult {
         let directory = tempdir()?;
         let path = directory.path().join("config.yaml");
         let matches = ConfigArgs::command().try_get_matches_from([
@@ -1910,21 +2000,19 @@ mod tests {
             path.as_os_str(),
         ])?;
 
-        for yaml in ["access_key: example-id", "secret_key: example-secret"] {
+        for yaml in ["{}", "access_key: example-id", "secret_key: example-secret"] {
             write(&path, yaml)?;
             assert!(matches!(
                 ConfigAction::from_arg_matches(&matches),
                 Err(ConfigError::Configuration(message))
-                    if message == "access_key and secret_key must be set together or both omitted"
+                    if message.starts_with("access_key and secret_key are required")
             ));
         }
-        for yaml in ["{}", "access_key: example-id\nsecret_key: example-secret"] {
-            write(&path, yaml)?;
-            assert!(matches!(
-                ConfigAction::from_arg_matches(&matches)?,
-                ConfigAction::Run(_)
-            ));
-        }
+        write(&path, "access_key: example-id\nsecret_key: example-secret")?;
+        assert!(matches!(
+            ConfigAction::from_arg_matches(&matches)?,
+            ConfigAction::Run(_)
+        ));
         Ok(())
     }
 
@@ -1938,8 +2026,15 @@ mod tests {
                     if message == "concurrency_limit must be greater than zero"
             )
         };
-        let matches =
-            ConfigArgs::command().try_get_matches_from(["s3ite", "--concurrency-limit", "0"])?;
+        let matches = ConfigArgs::command().try_get_matches_from([
+            "s3ite",
+            "--access-key",
+            "test-access",
+            "--secret-key",
+            "test-secret",
+            "--concurrency-limit",
+            "0",
+        ])?;
         assert!(is_zero_limit_error(ConfigAction::from_arg_matches(
             &matches
         )));
@@ -1949,6 +2044,10 @@ mod tests {
         write(&path, "concurrency_limit: 0")?;
         let matches = ConfigArgs::command().try_get_matches_from([
             "s3ite".as_ref(),
+            "--access-key".as_ref(),
+            "test-access".as_ref(),
+            "--secret-key".as_ref(),
+            "test-secret".as_ref(),
             "--config".as_ref(),
             path.as_os_str(),
         ])?;
@@ -1961,15 +2060,29 @@ mod tests {
     /// Startup rejects a zero chunk size, which could never stage a byte.
     #[test]
     fn rejects_zero_blob_chunk_size() -> TestResult {
-        let matches =
-            ConfigArgs::command().try_get_matches_from(["s3ite", "--blob-chunk-size-mib", "0"])?;
+        let matches = ConfigArgs::command().try_get_matches_from([
+            "s3ite",
+            "--access-key",
+            "test-access",
+            "--secret-key",
+            "test-secret",
+            "--blob-chunk-size-mib",
+            "0",
+        ])?;
         assert!(matches!(
             ConfigAction::from_arg_matches(&matches),
             Err(ConfigError::Configuration(message))
                 if message == "blob_chunk_size_mib must be greater than zero"
         ));
-        let matches =
-            ConfigArgs::command().try_get_matches_from(["s3ite", "--blob-chunk-size-mib", "2"])?;
+        let matches = ConfigArgs::command().try_get_matches_from([
+            "s3ite",
+            "--access-key",
+            "test-access",
+            "--secret-key",
+            "test-secret",
+            "--blob-chunk-size-mib",
+            "2",
+        ])?;
         let ConfigAction::Run(config) = ConfigAction::from_arg_matches(&matches)? else {
             panic!("a valid chunk size should run");
         };
@@ -2009,8 +2122,15 @@ mod tests {
         )?;
 
         let path_arg = path.to_string_lossy().into_owned();
-        let matches =
-            ConfigArgs::command().try_get_matches_from(["s3ite", "--config", &path_arg])?;
+        let matches = ConfigArgs::command().try_get_matches_from([
+            "s3ite",
+            "--access-key",
+            "test-access",
+            "--secret-key",
+            "test-secret",
+            "--config",
+            &path_arg,
+        ])?;
         let config = Config::from_arg_matches(&matches)?;
 
         assert_eq!(config.root, PathBuf::from("/tmp/s3ite-yaml-root"));
@@ -2089,13 +2209,27 @@ mod tests {
 
     #[test]
     fn legacy_permissive_cors_aliases_override_explicit_mode() -> TestResult {
-        let matches =
-            ConfigArgs::command().try_get_matches_from(["s3ite", "--permissive-cors", "true"])?;
+        let matches = ConfigArgs::command().try_get_matches_from([
+            "s3ite",
+            "--access-key",
+            "test-access",
+            "--secret-key",
+            "test-secret",
+            "--permissive-cors",
+            "true",
+        ])?;
         let config = Config::from_arg_matches(&matches)?;
         assert_eq!(config.cors_mode(), CorsMode::Permissive);
 
-        let matches =
-            ConfigArgs::command().try_get_matches_from(["s3ite", "--permissive-cors", "false"])?;
+        let matches = ConfigArgs::command().try_get_matches_from([
+            "s3ite",
+            "--access-key",
+            "test-access",
+            "--secret-key",
+            "test-secret",
+            "--permissive-cors",
+            "false",
+        ])?;
         let config = Config::from_arg_matches(&matches)?;
         assert_eq!(config.cors_mode(), CorsMode::Disabled);
 

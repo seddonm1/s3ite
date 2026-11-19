@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::{Result, ensure};
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, Method, StatusCode};
 use rusqlite::Connection;
 use tempfile::tempdir;
 use tokio::{
@@ -19,7 +19,10 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-use support::server::s3ite_binary;
+use support::{raw_http::presigned_url_with_credentials, server::s3ite_binary};
+
+/// Credentials the test server is started with and its S3 requests are signed with.
+const CREDENTIALS: (&str, &str) = ("test-access", "test-secret");
 
 /// Reaps the spawned process even if a probe assertion fails.
 struct Server(Child);
@@ -78,6 +81,10 @@ async fn probes_follow_storage_startup_and_graceful_drain() -> Result<()> {
                 "0",
                 "--busy-timeout-milliseconds",
                 "10000",
+                "--access-key",
+                CREDENTIALS.0,
+                "--secret-key",
+                CREDENTIALS.1,
             ])
             .env("OTEL_SDK_DISABLED", "true")
             .spawn()?,
@@ -103,12 +110,20 @@ async fn probes_follow_storage_startup_and_graceful_drain() -> Result<()> {
             .status(),
         StatusCode::NOT_FOUND
     );
-    let listing = client.get(format!("http://{s3}/readyz")).send().await?;
+    let endpoint = format!("http://{s3}");
+    let listing_url =
+        presigned_url_with_credentials(&endpoint, CREDENTIALS, Method::GET, "/readyz")?;
+    let listing = client.get(listing_url).send().await?;
     assert!(listing.text().await?.contains("ListBucketResult"));
 
+    let upload_url =
+        presigned_url_with_credentials(&endpoint, CREDENTIALS, Method::PUT, "/readyz/draining")?;
+    let upload_path = upload_url
+        .strip_prefix(&endpoint)
+        .ok_or_else(|| anyhow::anyhow!("presigned URL should start with the endpoint"))?;
     let mut upload = BufReader::new(TcpStream::connect(s3).await?);
     let headers = format!(
-        "PUT /readyz/draining HTTP/1.1\r\nHost: {s3}\r\nContent-Length: 1\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n"
+        "PUT {upload_path} HTTP/1.1\r\nHost: {s3}\r\nContent-Length: 1\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n"
     );
     upload.get_mut().write_all(headers.as_bytes()).await?;
     let mut interim = String::new();
