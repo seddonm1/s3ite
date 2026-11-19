@@ -35,8 +35,11 @@ RUN mkdir -p /scratch/data /scratch/tmp \
 
 FROM scratch
 COPY --from=build-env /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=build-env /scratch/data /data
+COPY --from=build-env --chown=65532:65532 /scratch/data /data
 COPY --from=build-env /scratch/tmp /tmp
 COPY --from=build-env /app/dist/s3ite /s3ite
+# Run unprivileged (the distroless "nonroot" IDs) so Kubernetes runAsNonRoot
+# admits the image and a container escape does not land as host root.
+USER 65532:65532
 ENTRYPOINT ["/s3ite"]
 CMD ["--help"]

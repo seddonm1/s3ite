@@ -1,6 +1,9 @@
 name: Tests
 on: [push, pull_request]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Test Workspace on AMD64 Rust ${{ matrix.rust }}
@@ -18,7 +21,7 @@ jobs:
         CARGO_INCREMENTAL: "0"
         CARGO_TARGET_DIR: target
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
       - name: Setup Rust toolchain
@@ -32,7 +35,7 @@ jobs:
           echo "version=$(rustc --version | cut -d ' ' -f 2)" >> "$GITHUB_OUTPUT"
           echo "cargo_home=$CARGO_HOME" >> "$GITHUB_OUTPUT"
       - name: Cache Cargo downloads
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ${{ steps.toolchain.outputs.cargo_home }}/registry/index
@@ -40,7 +43,7 @@ jobs:
             ${{ steps.toolchain.outputs.cargo_home }}/git/db
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.version }}-${{ hashFiles('Cargo.lock') }}
       - name: Cache Cargo build artifacts
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
           key: target-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.version }}-${{ hashFiles('Cargo.lock') }}

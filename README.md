@@ -408,10 +408,14 @@ Build the Docker image:
 docker build -t s3ite:latest .
 ```
 
-Run the Docker image:
+Run the Docker image. It runs as the unprivileged user `65532:65532`, so a
+bind-mounted data directory must be writable by that user, or run the container
+as the directory's owner with `--user`:
 
 ```bash
+mkdir -p data
 docker run --rm \
+  --user "$(id -u):$(id -g)" \
   -e RUST_LOG=info \
   -v "$(pwd)/data:/data" \
   -p 8014:8014 \
