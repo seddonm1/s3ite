@@ -15,7 +15,10 @@ const SECRET_KEY: &str = "s3ite-secret-key-for-tests";
 const DEFAULT_RUST_LOG: &str = "s3ite=info,s3s=warn";
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const COVERAGE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest a coverage run waits for a graceful exit; above the server's 10 s drain.
+const COVERAGE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+/// Launches tried before giving up on finding a free port.
+const PORT_ATTEMPTS: u32 = 5;
 const COVERAGE_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Debug)]
@@ -49,75 +52,42 @@ impl TestServer {
         fs::create_dir_all(&data_root).context("create temporary bucket root")?;
 
         let log_path = root.path().join("s3ite.log");
-        let log = File::create(&log_path).context("create s3ite test log")?;
-        let stderr = log.try_clone().context("clone s3ite test log")?;
-
-        let port = allocate_port().context("allocate local s3ite port")?;
-        let endpoint = format!("http://127.0.0.1:{port}");
         let binary = s3ite_binary()?;
-        let rust_log = options.rust_log.unwrap_or_else(|| {
+        let rust_log = options.rust_log.clone().unwrap_or_else(|| {
             std::env::var("S3ITE_TEST_LOG").unwrap_or_else(|_| DEFAULT_RUST_LOG.to_string())
         });
+        let config_path = match &options.config {
+            Some(config) => {
+                let config_path = root.path().join("s3ite.yaml");
+                fs::write(&config_path, config).context("write s3ite test config")?;
+                Some(config_path)
+            }
+            None => None,
+        };
 
-        let mut command = Command::new(&binary);
-        if let Some(config) = options.config {
-            let config_path = root.path().join("s3ite.yaml");
-            fs::write(&config_path, config).context("write s3ite test config")?;
-            command.arg("--config").arg(config_path);
-        }
-        command
-            .arg("--root")
-            .arg(&data_root)
-            .arg("--host")
-            .arg("127.0.0.1")
-            .arg("--port")
-            .arg(port.to_string())
-            .arg("--access-key")
-            .arg(ACCESS_KEY)
-            .arg("--secret-key")
-            .arg(SECRET_KEY)
-            .arg("--maintenance-interval-seconds")
-            .arg(
-                options
-                    .maintenance_interval_seconds
-                    .unwrap_or(0)
-                    .to_string(),
-            );
-        if let Some(domain_name) = options.domain_name {
-            command.arg("--domain-name").arg(domain_name);
-        }
-        if let Some(cors) = options.cors {
-            command.arg("--cors").arg(cors);
-        }
-
-        // Only export traces when the test supplies its own collector.
-        for name in [
-            "OTEL_SDK_DISABLED",
-            "OTEL_TRACES_EXPORTER",
-            "OTEL_LOGS_EXPORTER",
-            "OTEL_METRICS_EXPORTER",
-            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
-            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
-            "OTEL_EXPORTER_OTLP_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_PROTOCOL",
-            "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
-            "OTEL_TRACES_SAMPLER",
-            "OTEL_SERVICE_NAME",
-        ] {
-            command.env_remove(name);
-        }
-        let mut child = command
-            .env("RUST_LOG", rust_log)
-            .envs(options.env)
-            .stdout(Stdio::from(log))
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .with_context(|| format!("spawn s3ite binary {}", binary.display()))?;
-
-        wait_for_ready(&mut child, port, &log_path).await?;
+        // The port is chosen by binding port 0 and releasing it, so another
+        // socket can take it before the child binds. The child then exits with
+        // "address in use", and the next attempt uses a fresh port.
+        let mut attempt = 1;
+        let (child, endpoint) = loop {
+            let port = allocate_port().context("allocate local s3ite port")?;
+            let log = File::create(&log_path).context("create s3ite test log")?;
+            let stderr = log.try_clone().context("clone s3ite test log")?;
+            let mut command =
+                server_command(&binary, &options, config_path.as_deref(), &data_root, port);
+            let mut child = command
+                .env("RUST_LOG", &rust_log)
+                .envs(options.env.iter().map(|(name, value)| (*name, value)))
+                .stdout(Stdio::from(log))
+                .stderr(Stdio::from(stderr))
+                .spawn()
+                .with_context(|| format!("spawn s3ite binary {}", binary.display()))?;
+            match wait_for_ready(&mut child, port, &log_path).await {
+                Ok(()) => break (child, format!("http://127.0.0.1:{port}")),
+                Err(_) if attempt < PORT_ATTEMPTS && lost_port_race(&log_path) => attempt += 1,
+                Err(error) => return Err(error),
+            }
+        };
 
         Ok(Self {
             child,
@@ -180,6 +150,70 @@ impl Drop for TestServer {
             let _ = root.keep();
         }
     }
+}
+
+/// Builds the server command line for one launch attempt on `port`.
+fn server_command(
+    binary: &Path,
+    options: &TestServerOptions,
+    config_path: Option<&Path>,
+    data_root: &Path,
+    port: u16,
+) -> Command {
+    let mut command = Command::new(binary);
+    if let Some(config_path) = config_path {
+        command.arg("--config").arg(config_path);
+    }
+    command
+        .arg("--root")
+        .arg(data_root)
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--access-key")
+        .arg(ACCESS_KEY)
+        .arg("--secret-key")
+        .arg(SECRET_KEY)
+        .arg("--maintenance-interval-seconds")
+        .arg(
+            options
+                .maintenance_interval_seconds
+                .unwrap_or(0)
+                .to_string(),
+        );
+    if let Some(domain_name) = &options.domain_name {
+        command.arg("--domain-name").arg(domain_name);
+    }
+    if let Some(cors) = &options.cors {
+        command.arg("--cors").arg(cors);
+    }
+
+    // Only export traces when the test supplies its own collector.
+    for name in [
+        "OTEL_SDK_DISABLED",
+        "OTEL_TRACES_EXPORTER",
+        "OTEL_LOGS_EXPORTER",
+        "OTEL_METRICS_EXPORTER",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+        "OTEL_TRACES_SAMPLER",
+        "OTEL_SERVICE_NAME",
+    ] {
+        command.env_remove(name);
+    }
+    command
+}
+
+/// Reports whether a failed launch exited because its port was already taken.
+fn lost_port_race(log_path: &Path) -> bool {
+    fs::read_to_string(log_path).is_ok_and(|log| log.contains("Address already in use"))
 }
 
 fn coverage_run() -> bool {
