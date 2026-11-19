@@ -1390,6 +1390,27 @@ mod tests {
             )),
             &S3ErrorCode::InvalidArgument,
         );
+
+        // A second checksum on a repeated header line is still a second checksum.
+        let mut repeated = trailer_headers("x-amz-checksum-crc32");
+        repeated.append(
+            "x-amz-trailer",
+            hyper::header::HeaderValue::from_static("x-amz-meta-a, x-amz-checksum-sha256"),
+        );
+        assert_error_code(
+            declared_checksum_trailer(&repeated),
+            &S3ErrorCode::InvalidArgument,
+        );
+        // Repeated lines without a second checksum still find the declared one.
+        let mut split = trailer_headers("x-amz-meta-a");
+        split.append(
+            "x-amz-trailer",
+            hyper::header::HeaderValue::from_static("x-amz-checksum-sha256"),
+        );
+        assert_eq!(
+            declared_checksum_trailer(&split).ok(),
+            Some(Some("x-amz-checksum-sha256".to_string()))
+        );
     }
 
     /// Checks that trailers which could never be verified are rejected before the body is read.
