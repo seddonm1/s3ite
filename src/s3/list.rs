@@ -384,13 +384,13 @@ pub(super) async fn list_objects(
                 })
                 .collect::<Vec<_>>()
         }),
-        delimiter,
+        delimiter: delimiter.map(|delimiter| encode_list_value(delimiter, encode_keys)),
         encoding_type,
         name: Some(bucket),
-        prefix,
+        prefix: prefix.map(|prefix| encode_list_value(prefix, encode_keys)),
         max_keys: Some(max_keys),
         is_truncated: Some(next_marker.is_some()),
-        marker: marker_output,
+        marker: marker_output.map(|marker| encode_list_value(marker, encode_keys)),
         next_marker,
         ..Default::default()
     };
@@ -489,15 +489,15 @@ pub(super) async fn list_object_versions(
     let output = ListObjectVersionsOutput {
         common_prefixes: delimiter.as_ref().map(|_| common_prefixes),
         delete_markers: Some(delete_markers),
-        delimiter,
+        delimiter: delimiter.map(|delimiter| encode_list_value(delimiter, encode_keys)),
         encoding_type,
         is_truncated: Some(listing.is_truncated),
-        key_marker: key_marker_clone,
+        key_marker: key_marker_clone.map(|marker| encode_list_value(marker, encode_keys)),
         max_keys: Some(max_keys),
         name: Some(bucket),
         next_key_marker,
         next_version_id_marker,
-        prefix,
+        prefix: prefix.map(|prefix| encode_list_value(prefix, encode_keys)),
         version_id_marker: version_id_marker_clone,
         versions: Some(versions),
         ..Default::default()
@@ -593,11 +593,11 @@ pub(super) async fn list_objects_v2(
                 })
                 .collect::<Vec<_>>()
         }),
-        delimiter,
+        delimiter: delimiter.map(|delimiter| encode_list_value(delimiter, encode_keys)),
         encoding_type,
         name: Some(bucket),
-        prefix,
-        start_after,
+        prefix: prefix.map(|prefix| encode_list_value(prefix, encode_keys)),
+        start_after: start_after.map(|start_after| encode_list_value(start_after, encode_keys)),
         next_continuation_token,
         ..Default::default()
     };

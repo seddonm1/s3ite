@@ -494,6 +494,87 @@ async fn test_bucket_listv2_delimiter_prefix_ends_with_delimiter() -> Result<()>
 }
 
 /// Verifies URL encoding applies to returned ListObjects v1 keys and prefixes.
+/// Verifies `encoding-type=url` also encodes the echoed request fields.
+///
+/// AWS encodes Prefix, Delimiter and the request markers (Marker, StartAfter,
+/// KeyMarker) in addition to keys, while filtering uses the raw values.
+#[tokio::test]
+#[serial(conformance)]
+async fn s3ite_list_encoding_echoes_request_fields() -> Result<()> {
+    let (_server, client, bucket) =
+        seeded_bucket(&["quux ab/a", "quux ab/b", "quux ab/c d/e"]).await?;
+    let prefix = "quux ab/";
+    let marker = "quux ab/a";
+
+    let v1 = client
+        .list_objects()
+        .bucket(&bucket)
+        .prefix(prefix)
+        .delimiter("/")
+        .marker(marker)
+        .encoding_type(EncodingType::Url)
+        .send()
+        .await?;
+    assert_eq!(v1.prefix(), Some("quux%20ab/"));
+    assert_eq!(v1.delimiter(), Some("/"));
+    assert_eq!(v1.marker(), Some("quux%20ab/a"));
+    assert_eq!(object_keys(v1.contents()), vec!["quux%20ab/b"]);
+    assert_eq!(prefixes(v1.common_prefixes()), vec!["quux%20ab/c%20d/"]);
+
+    let v2 = client
+        .list_objects_v2()
+        .bucket(&bucket)
+        .prefix(prefix)
+        .start_after(marker)
+        .encoding_type(EncodingType::Url)
+        .send()
+        .await?;
+    assert_eq!(v2.prefix(), Some("quux%20ab/"));
+    assert_eq!(v2.start_after(), Some("quux%20ab/a"));
+    assert_eq!(
+        object_keys(v2.contents()),
+        vec!["quux%20ab/b", "quux%20ab/c%20d/e"]
+    );
+
+    let versions = client
+        .list_object_versions()
+        .bucket(&bucket)
+        .prefix(prefix)
+        .key_marker(marker)
+        .encoding_type(EncodingType::Url)
+        .send()
+        .await?;
+    assert_eq!(versions.prefix(), Some("quux%20ab/"));
+    assert_eq!(versions.key_marker(), Some("quux%20ab/a"));
+    assert_eq!(versions.versions().len(), 2);
+
+    for key in ["quux ab/a", "quux ab/b"] {
+        client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await?;
+    }
+    let uploads = client
+        .list_multipart_uploads()
+        .bucket(&bucket)
+        .prefix(prefix)
+        .key_marker(marker)
+        .encoding_type(EncodingType::Url)
+        .send()
+        .await?;
+    assert_eq!(uploads.prefix(), Some("quux%20ab/"));
+    assert_eq!(uploads.key_marker(), Some("quux%20ab/a"));
+    let upload_keys = uploads
+        .uploads()
+        .iter()
+        .filter_map(|upload| upload.key())
+        .collect::<Vec<_>>();
+    assert_eq!(upload_keys, vec!["quux%20ab/b"]);
+    Ok(())
+}
+
 #[tokio::test]
 #[serial(conformance)]
 async fn test_bucket_list_encoding_basic() -> Result<()> {

@@ -245,16 +245,19 @@ fn parse_copy_object_request(input: CopyObjectInput) -> S3Result<CopyObjectReque
     })
 }
 
-/// Rejects invalid destination/source combinations before opening transactions.
+/// Rejects same-key copies of an implicit source version without metadata or encryption changes.
 fn validate_copy_target(request: &CopyObjectRequest) -> S3Result<()> {
     if request.source_bucket.as_str() == request.target_bucket.as_str()
         && request.source_key.as_str() == request.target_key.as_str()
+        && request.source_version_id.is_none()
         && request.explicit_encryption.is_none()
         && request.replace_metadata.not()
     {
         return Err(s3_error_with_message(
             S3ErrorCode::InvalidRequest,
-            "copy source must be different from target unless replacing metadata or encryption",
+            "This copy request is illegal because it is trying to copy an object to itself \
+             without changing the object's metadata, storage class, website redirect location \
+             or encryption attributes.",
         ));
     }
     Ok(())
@@ -842,6 +845,7 @@ mod tests {
         );
     }
 
+    /// Checks same-key copy validation with and without an explicit source version.
     #[test]
     fn validates_copy_target_collisions() {
         let mut request = match parse_copy_object_request(copy_input()) {
@@ -852,7 +856,12 @@ mod tests {
         assert!(validate_copy_target(&request).is_ok());
         request.source_bucket.clone_from(&request.target_bucket);
         request.source_key.clone_from(&request.target_key);
+        request.source_version_id = None;
         assert_error_code(validate_copy_target(&request), &S3ErrorCode::InvalidRequest);
+
+        request.source_version_id = Some("old-version".into());
+        assert!(validate_copy_target(&request).is_ok());
+        request.source_version_id = None;
 
         request.replace_metadata = true;
         assert!(validate_copy_target(&request).is_ok());

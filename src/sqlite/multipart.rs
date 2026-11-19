@@ -363,7 +363,7 @@ impl Sqlite {
         })
     }
 
-    /// Validates requested multipart parts and prepares final object metadata.
+    /// Prepares final object metadata from the requested ascending subset of uploaded parts.
     fn prepare_multipart_object(
         transaction: &Transaction,
         request: MultipartObjectPreparation<'_>,
@@ -377,21 +377,15 @@ impl Sqlite {
             default_checksum,
             precomputed_full_object_checksum,
         } = request;
-        let limit = i64::try_from(requested_parts.len())
-            .map_err(|_| SqliteError::MultipartObjectTooLarge)?
-            .checked_add(1)
-            .ok_or(SqliteError::MultipartObjectTooLarge)?;
-        let parts = Self::list_multipart(transaction, upload_id, 0, limit)?;
-        if parts.len() != requested_parts.len() {
-            return Err(SqliteError::InvalidMultipartPart);
-        }
+        let mut parts = Self::list_multipart(transaction, upload_id, 0, 10_000)?.into_iter();
 
         let checksum_config = MultipartChecksumConfig::for_completion(
             upload_checksum,
             requested_checksum,
             default_checksum,
         )?;
-        let mut completed_parts = Vec::with_capacity(parts.len());
+        let mut selected_parts = Vec::with_capacity(requested_parts.len());
+        let mut completed_parts = Vec::with_capacity(requested_parts.len());
         let mut md5_hash = Md5::new();
         let mut full_object_checksum = (checksum_config.checksum_type
             == ChecksumTypeKind::FullObject
@@ -401,13 +395,15 @@ impl Sqlite {
         let mut offset = 0;
         let algorithm = upload_checksum.map(|checksum| checksum.algorithm);
         let require_requested_part_checksums = requested_checksum.has_value();
-        for (index, (requested_part, part)) in requested_parts.iter().zip(parts.iter()).enumerate()
-        {
+        for (index, requested_part) in requested_parts.iter().enumerate() {
+            let part = parts
+                .find(|part| part.part_number >= requested_part.part_number)
+                .ok_or(SqliteError::InvalidMultipartPart)?;
             Self::validate_completion_part(
                 index,
                 final_part_number,
                 requested_part,
-                CompletionPartMetadata::from(part),
+                CompletionPartMetadata::from(&part),
                 algorithm,
                 require_requested_part_checksums,
             )?;
@@ -433,6 +429,7 @@ impl Sqlite {
                     full_object_checksum,
                 )?;
             }
+            selected_parts.push(part);
         }
 
         let md5 = format!(
@@ -440,7 +437,7 @@ impl Sqlite {
             encode_hex(md5_hash.finalize()),
             requested_parts.len()
         );
-        let size = Self::total_multipart_size(&parts)?;
+        let size = Self::total_multipart_size(&selected_parts)?;
         let checksum = Self::completed_multipart_checksum(
             checksum_config,
             requested_checksum,
@@ -458,32 +455,27 @@ impl Sqlite {
         })
     }
 
-    /// Revalidates multipart completion metadata inside the writer transaction.
+    /// Revalidates the requested ascending subset inside the writer transaction.
     fn validate_multipart_completion_metadata(
         transaction: &Transaction,
         request: &MultipartCompletionRequest,
         upload_checksum: Option<MultipartChecksumConfig>,
     ) -> SqliteResult<()> {
-        let limit = i64::try_from(request.requested_parts.len())
-            .map_err(|_| SqliteError::MultipartObjectTooLarge)?
-            .checked_add(1)
-            .ok_or(SqliteError::MultipartObjectTooLarge)?;
-        let parts = Self::list_multipart(transaction, request.upload_id, 0, limit)?;
-        if parts.len() != request.requested_parts.len() {
-            return Err(SqliteError::InvalidMultipartPart);
-        }
+        let mut parts =
+            Self::list_multipart(transaction, request.upload_id, 0, 10_000)?.into_iter();
 
         let final_part_number = request.requested_parts.len();
         let algorithm = upload_checksum.map(|checksum| checksum.algorithm);
         let require_requested_part_checksums = request.requested_checksum.has_value();
-        for (index, (requested_part, part)) in
-            request.requested_parts.iter().zip(parts.iter()).enumerate()
-        {
+        for (index, requested_part) in request.requested_parts.iter().enumerate() {
+            let part = parts
+                .find(|part| part.part_number >= requested_part.part_number)
+                .ok_or(SqliteError::InvalidMultipartPart)?;
             Self::validate_completion_part(
                 index,
                 final_part_number,
                 requested_part,
-                CompletionPartMetadata::from(part),
+                CompletionPartMetadata::from(&part),
                 algorithm,
                 require_requested_part_checksums,
             )?;

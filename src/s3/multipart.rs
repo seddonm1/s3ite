@@ -670,16 +670,16 @@ pub(super) async fn list_multipart_uploads(
     let output = ListMultipartUploadsOutput {
         bucket: Some(bucket),
         common_prefixes: delimiter.as_ref().map(|_| common_prefixes),
-        delimiter,
+        delimiter: delimiter.map(|delimiter| encode_list_value(delimiter, encode_keys)),
         encoding_type,
         is_truncated: Some(listing.is_truncated),
-        key_marker,
+        key_marker: key_marker.map(|marker| encode_list_value(marker, encode_keys)),
         max_uploads: Some(max_uploads),
         next_key_marker: listing
             .next_key_marker
             .map(|marker| encode_list_value(marker, encode_keys)),
         next_upload_id_marker: listing.next_upload_id_marker,
-        prefix,
+        prefix: prefix.map(|prefix| encode_list_value(prefix, encode_keys)),
         upload_id_marker,
         uploads: Some(uploads),
         ..Default::default()
@@ -1277,17 +1277,14 @@ async fn precompute_multipart_completion_checksum(
     }
     connection
         .read(move |transaction| {
-            let limit = i64::try_from(requested_parts.len())
-                .map_err(|_| SqliteError::MultipartObjectTooLarge)?
-                .checked_add(1)
-                .ok_or(SqliteError::MultipartObjectTooLarge)?;
-            let parts = Sqlite::list_multipart(transaction, upload_id, 0, limit)?;
-            if parts.len() != requested_parts.len() {
-                return Ok(None);
-            }
+            // The request may list any ascending subset of the uploaded parts.
+            let mut parts = Sqlite::list_multipart(transaction, upload_id, 0, 10_000)?.into_iter();
 
             let mut accumulator = ChecksumAccumulator::new(checksum_config.algorithm);
-            for ((number, etag), part) in requested_parts.iter().zip(&parts) {
+            for (number, etag) in &requested_parts {
+                let part = parts
+                    .find(|part| part.part_number >= *number)
+                    .ok_or(SqliteError::InvalidMultipartPart)?;
                 if *number != part.part_number || part.md5.as_ref() != Some(etag) {
                     return Err(SqliteError::InvalidMultipartPart);
                 }

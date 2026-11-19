@@ -167,6 +167,54 @@ async fn test_object_copy_to_itself() -> Result<()> {
     Ok(())
 }
 
+/// Verifies copying a previous version onto its own key restores it.
+///
+/// AWS documents this as the way to restore a previous version:
+/// <https://docs.aws.amazon.com/AmazonS3/latest/userguide/RestoringPreviousVersions.html>.
+#[tokio::test]
+#[serial(conformance)]
+async fn s3ite_copy_restores_previous_version_onto_same_key() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-copy");
+
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    let old = client
+        .put_object()
+        .bucket(&bucket)
+        .key("doc")
+        .body(ByteStream::from_static(b"old"))
+        .send()
+        .await?;
+    let old_version = old
+        .version_id()
+        .ok_or_else(|| anyhow::anyhow!("versioned put missing version ID"))?;
+    put_object(&client, &bucket, "doc", b"new").await?;
+
+    let restored = client
+        .copy_object()
+        .bucket(&bucket)
+        .key("doc")
+        .copy_source(format!("{bucket}/doc?versionId={old_version}"))
+        .send()
+        .await?;
+    ensure!(
+        restored.version_id().is_some_and(|id| id != old_version),
+        "restore must create a new version"
+    );
+    assert_eq!(get_object_bytes(&client, &bucket, "doc").await?, b"old");
+    let versions = client
+        .list_object_versions()
+        .bucket(&bucket)
+        .prefix("doc")
+        .send()
+        .await?;
+    assert_eq!(versions.versions().len(), 3);
+
+    Ok(())
+}
+
 /// Verifies self-copy with replacement metadata updates object metadata.
 #[tokio::test]
 #[serial(conformance)]

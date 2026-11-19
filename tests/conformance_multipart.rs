@@ -452,6 +452,70 @@ async fn test_multipart_upload_missing_part() -> Result<()> {
     Ok(())
 }
 
+/// Verifies completion may list an ascending subset of uploaded parts, as AWS allows.
+///
+/// Unlisted parts are discarded, the 5 MiB minimum applies to every listed part
+/// but the last, and the encrypted upload exercises the SSE checksum precompute.
+#[tokio::test]
+#[serial(conformance)]
+async fn s3ite_multipart_completion_with_part_subset() -> Result<()> {
+    let server = support::sse::spawn_sse_server().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-mpu");
+    create_bucket(&client, &bucket).await?;
+    let first = vec![b'a'; 5 * MIB];
+    let second = vec![b'b'; 5 * MIB];
+    let third = vec![b'c'; MIB];
+
+    for (key, encrypted) in [("plain", false), ("encrypted", true)] {
+        let mut create = client.create_multipart_upload().bucket(&bucket).key(key);
+        if encrypted {
+            create = create.server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::Aes256);
+        }
+        let upload_id = create
+            .send()
+            .await?
+            .upload_id()
+            .ok_or_else(|| anyhow::anyhow!("create multipart response missing upload ID"))?
+            .to_string();
+        let one = upload_part(&client, &bucket, key, &upload_id, 1, first.clone()).await?;
+        upload_part(&client, &bucket, key, &upload_id, 2, second.clone()).await?;
+        let three = upload_part(&client, &bucket, key, &upload_id, 3, third.clone()).await?;
+
+        let completed =
+            complete_upload(&client, &bucket, key, &upload_id, vec![one, three]).await?;
+        assert!(
+            completed.e_tag().is_some_and(|etag| etag.ends_with("-2\"")),
+            "{key}: ETag must count the listed parts: {:?}",
+            completed.e_tag()
+        );
+        let body = get_object_bytes(&client, &bucket, key).await?;
+        assert_eq!(body.len(), first.len() + third.len(), "{key}");
+        assert!(
+            body[..first.len()].iter().all(|byte| *byte == b'a'),
+            "{key}"
+        );
+        assert!(
+            body[first.len()..].iter().all(|byte| *byte == b'c'),
+            "{key}"
+        );
+    }
+
+    // A small listed part that is not the last listed part is still too small.
+    let key = "small-middle";
+    let upload_id = create_upload(&client, &bucket, key).await?;
+    let one = upload_part(&client, &bucket, key, &upload_id, 1, vec![b'x'; MIB]).await?;
+    upload_part(&client, &bucket, key, &upload_id, 2, vec![b'y'; MIB]).await?;
+    let three = upload_part(&client, &bucket, key, &upload_id, 3, vec![b'z'; MIB]).await?;
+    let error = match complete_upload(&client, &bucket, key, &upload_id, vec![one, three]).await {
+        Ok(_) => bail!("a small non-final listed part should be rejected"),
+        Err(error) => error,
+    };
+    assert_error_contains(&error, "EntityTooSmall");
+
+    Ok(())
+}
+
 /// Verifies completing with the wrong part ETag fails with InvalidPart.
 #[tokio::test]
 #[serial(conformance)]
