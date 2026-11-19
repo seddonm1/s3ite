@@ -421,6 +421,8 @@ docker run --rm \
 Configuration can come from defaults, a YAML file passed with `--config`, and
 command-line overrides. Command-line values override YAML service-level values.
 YAML additionally supports per-bucket overrides.
+Unknown YAML settings, including keys inside bucket overrides, cause startup
+to fail with an error naming the key.
 
 Common service options:
 

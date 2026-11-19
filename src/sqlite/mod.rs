@@ -96,7 +96,10 @@ pub(super) enum BucketOpen {
     ///
     /// A concurrent `CreateBucket` may already have published this database
     /// and started staging uploads, so staged bodies are left to maintenance.
-    Create,
+    Create {
+        /// Whether the initial bucket state enables Object Lock and versioning.
+        object_lock: bool,
+    },
 }
 
 /// On-disk schema for the 0.7.0 release. Bump when the storage layout changes.
@@ -730,21 +733,22 @@ impl Sqlite {
         Ok(())
     }
 
-    /// Initializes an empty writable database and stamps its version in the same transaction.
-    pub(crate) fn create_tables(transaction: &Transaction) -> SqliteResult<()> {
+    /// Initializes and stamps an empty schema, returning whether it was newly initialized.
+    pub(crate) fn create_tables(transaction: &Transaction) -> SqliteResult<bool> {
         let version = Self::schema_version(transaction)?;
         if version == 0 && Self::user_table_count(transaction)? == 0 {
             transaction.execute_batch(BUCKET_SCHEMA_SQL)?;
             transaction.pragma_update(None, "user_version", BUCKET_SCHEMA_VERSION)?;
-            return Ok(());
+            return Ok(true);
         }
-        Self::check_schema_version(version)
+        Self::check_schema_version(version)?;
+        Ok(false)
     }
 
     /// Validates the schema before starting bucket workers. Writable buckets also run startup maintenance.
     ///
-    /// `open` decides whether staged upload bodies may be swept unconditionally;
-    /// see [`BucketOpen`].
+    /// `open` decides whether staged upload bodies may be swept unconditionally
+    /// and whether a newly initialized schema enables Object Lock; see [`BucketOpen`].
     pub(super) async fn prepare_bucket_file(
         path: PathBuf,
         config: &crate::Config,
@@ -817,9 +821,8 @@ impl Sqlite {
 
     /// Prepares an already opened writable bucket connection.
     ///
-    /// Creates the schema, then runs startup cleanup in one transaction:
-    /// staged bodies (only for [`BucketOpen::Startup`]), expired multipart
-    /// uploads, and due lifecycle rules.
+    /// Initializes the schema and requested Object Lock in the same transaction
+    /// as cleanup for expired uploads, lifecycle rules, and startup-only staged bodies.
     fn prepare_writable_bucket_connection(
         connection: &mut rusqlite::Connection,
         config: &crate::Config,
@@ -833,7 +836,10 @@ impl Sqlite {
         connection.execute_batch(&writer_connection_pragmas(config, Some(bucket)))?;
 
         let transaction = connection.transaction()?;
-        Self::create_tables(&transaction)?;
+        let initialized = Self::create_tables(&transaction)?;
+        if initialized && matches!(open, BucketOpen::Create { object_lock: true }) {
+            Self::enable_bucket_object_lock(&transaction)?;
+        }
         if open == BucketOpen::Startup {
             // No request from a previous process can still claim its staged body.
             Self::delete_all_staged_bodies(&transaction)?;
@@ -1542,7 +1548,7 @@ mod tests {
             path.clone(),
             &Config::default(),
             "bucket",
-            BucketOpen::Create,
+            BucketOpen::Create { object_lock: false },
         )
         .await?;
         let connection = Connection::open(&path)?;
@@ -1556,7 +1562,7 @@ mod tests {
             path.clone(),
             &Config::default(),
             "bucket",
-            BucketOpen::Create,
+            BucketOpen::Create { object_lock: false },
         )
         .await?;
         assert_eq!(staged_count(&path)?, 1);

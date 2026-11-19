@@ -8,8 +8,8 @@ use super::{
 };
 
 impl Sqlite {
-    /// Enables Object Lock for a newly created bucket and turns versioning on.
-    pub(crate) fn enable_bucket_object_lock(transaction: &Transaction) -> SqliteResult<usize> {
+    /// Enables Object Lock and versioning in the bucket initialization transaction.
+    pub(super) fn enable_bucket_object_lock(transaction: &Transaction) -> SqliteResult<usize> {
         let mut stmt = transaction.prepare_cached(
             "
             UPDATE bucket_state

@@ -75,7 +75,14 @@ impl Sqlite {
     }
 
     /// Creates or opens a bucket database and registers its connection.
-    pub(crate) async fn create_bucket(&self, bucket: &str) -> SqliteResult<bool> {
+    ///
+    /// A newly initialized database enables `object_lock` in its schema
+    /// transaction, before any worker can serve the bucket.
+    pub(crate) async fn create_bucket(
+        &self,
+        bucket: &str,
+        object_lock: bool,
+    ) -> SqliteResult<bool> {
         self.validate_mutable_bucket(bucket)?;
 
         if self.buckets.read().await.contains_key(bucket) {
@@ -84,7 +91,13 @@ impl Sqlite {
 
         let file_path = self.get_bucket_path(bucket)?;
         let config = self.config.clone();
-        Self::prepare_bucket_file(file_path.clone(), &config, bucket, BucketOpen::Create).await?;
+        Self::prepare_bucket_file(
+            file_path.clone(),
+            &config,
+            bucket,
+            BucketOpen::Create { object_lock },
+        )
+        .await?;
 
         let connection = BucketConnection::open(file_path, &config, bucket).await?;
         let bucket = bucket.to_string();
@@ -290,12 +303,13 @@ mod tests {
         Ok(())
     }
 
+    /// Ensures deleting an empty bucket removes its file and registry entry.
     #[tokio::test]
     async fn delete_bucket_removes_empty_bucket_file_and_connection() -> SqliteResult<()> {
         let root = temp_root("delete-empty-bucket")?;
         let sqlite = sqlite_with_root(root.clone());
 
-        assert!(sqlite.create_bucket("bucket").await?);
+        assert!(sqlite.create_bucket("bucket", false).await?);
         let path = sqlite.get_bucket_path("bucket")?;
         assert!(path.exists());
 
@@ -308,12 +322,13 @@ mod tests {
         Ok(())
     }
 
+    /// Ensures deleting a nonempty bucket preserves its file and registry entry.
     #[tokio::test]
     async fn delete_bucket_refuses_nonempty_bucket() -> SqliteResult<()> {
         let root = temp_root("delete-nonempty-bucket")?;
         let sqlite = sqlite_with_root(root.clone());
 
-        assert!(sqlite.create_bucket("bucket").await?);
+        assert!(sqlite.create_bucket("bucket", false).await?);
         let path = sqlite.get_bucket_path("bucket")?;
         let connection = sqlite.get_connection("bucket").await?;
         connection

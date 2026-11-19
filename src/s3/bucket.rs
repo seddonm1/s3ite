@@ -54,7 +54,11 @@ fn looks_like_ipv4_address(bucket: &str) -> bool {
     })
 }
 
-/// Creates a bucket database if it does not already exist.
+/// Creates a bucket, committing any requested Object Lock with its schema.
+///
+/// AWS enables Object Lock (and versioning) only as part of creating the
+/// bucket, so a bucket must never become visible without it. A retry against
+/// an existing bucket keeps that bucket's committed settings.
 pub(super) async fn create_bucket(
     sqlite: &Sqlite,
     req: S3Request<CreateBucketInput>,
@@ -89,23 +93,10 @@ pub(super) async fn create_bucket(
         .count(),
     })?;
 
-    let created = sqlite
-        .create_bucket(&bucket)
+    sqlite
+        .create_bucket(&bucket, object_lock_enabled_for_bucket.unwrap_or(false))
         .await
         .map_err(s3_error_from_sqlite)?;
-    if created && object_lock_enabled_for_bucket.unwrap_or(false) {
-        let connection = sqlite
-            .get_connection(&bucket)
-            .await
-            .map_err(s3_error_from_sqlite)?;
-        connection
-            .write(|transaction| {
-                Sqlite::enable_bucket_object_lock(transaction)?;
-                Ok(())
-            })
-            .await
-            .map_err(s3_error_from_sqlite)?;
-    }
 
     let output = CreateBucketOutput {
         bucket_arn: None,
@@ -533,6 +524,54 @@ pub(super) async fn list_buckets(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bucket recovered after a worker startup failure already has Object Lock and versioning.
+    #[tokio::test]
+    async fn create_bucket_persists_object_lock_before_opening_workers() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let config = crate::Config {
+            root: root.path().to_owned(),
+            maintenance_interval_seconds: 0,
+            ..Default::default()
+        };
+        let mut sqlite = Sqlite::new(&config).await?;
+        sqlite.config.readers = 0;
+        let request = S3Request {
+            input: CreateBucketInput::builder()
+                .bucket("locked-bucket".to_owned())
+                .object_lock_enabled_for_bucket(Some(true))
+                .build()?,
+            method: hyper::Method::PUT,
+            uri: hyper::Uri::from_static("/locked-bucket"),
+            headers: hyper::HeaderMap::new(),
+            extensions: hyper::http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let Err(error) = create_bucket(&sqlite, request).await else {
+            panic!("worker setup should fail");
+        };
+        assert_eq!(error.code(), &S3ErrorCode::InternalError);
+        assert_eq!(error.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        drop(sqlite);
+
+        let recovered = Sqlite::new(&config).await?;
+        let connection = recovered.get_connection("locked-bucket").await?;
+        let (locked, versioning) = connection
+            .read(|transaction| {
+                Ok((
+                    Sqlite::get_bucket_object_lock_config(transaction)?.enabled,
+                    Sqlite::get_bucket_versioning_state(transaction)?,
+                ))
+            })
+            .await?;
+        assert!(locked, "recovered bucket must already be locked");
+        assert_eq!(versioning, BucketVersioningState::Enabled);
+        Ok(())
+    }
 
     #[test]
     fn validates_dns_bucket_names() {

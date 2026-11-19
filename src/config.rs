@@ -1108,6 +1108,7 @@ impl Default for Pragmas {
 
 /// Bucket-specific configuration overrides.
 #[derive(Clone, Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct Bucket {
     /// Whether this bucket should reject write operations.
     pub read_only: Option<bool>,
@@ -1118,6 +1119,7 @@ pub struct Bucket {
 
 /// Optional `SQLite` PRAGMA overrides for one bucket.
 #[derive(Clone, Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct BucketPragmas {
     /// Controls the `SQLite` `journal_mode` flag pragma.
     pub journal_mode: Option<JournalMode>,
@@ -1412,6 +1414,58 @@ mod tests {
         assert_eq!(config.cache_size(Some("bucket")), 512);
         assert_eq!(config.busy_timeout_milliseconds(Some("bucket")), 250);
         assert_eq!(config.journal_size_limit(Some("bucket")), 4096);
+    }
+
+    /// Reports an unknown setting while loading bucket overrides for startup.
+    #[test]
+    fn yaml_rejects_unknown_bucket_keys() -> TestResult {
+        let directory = tempdir()?;
+        let path = directory.path().join("config.yaml");
+        write(&path, "buckets:\n  example:\n    read_onyl: true\n")?;
+        let matches = ConfigArgs::command().try_get_matches_from([
+            std::ffi::OsStr::new("s3ite"),
+            std::ffi::OsStr::new("--config"),
+            path.as_os_str(),
+        ])?;
+
+        let Err(error) = Config::from_arg_matches(&matches) else {
+            panic!("startup accepted an unknown bucket setting");
+        };
+        assert!(error.to_string().contains("unknown field `read_onyl`"));
+        Ok(())
+    }
+
+    /// Reports typos in bucket-level SQLite pragmas.
+    #[test]
+    fn yaml_rejects_unknown_bucket_sqlite_keys() {
+        let Err(error) =
+            from_str::<Config>("buckets:\n  example:\n    sqlite:\n      cache_szie: 512\n")
+        else {
+            panic!("startup accepted an unknown bucket pragma");
+        };
+        assert!(error.to_string().contains("unknown field `cache_szie`"));
+    }
+
+    /// Reports typos in service settings, flattened SQLite pragmas, and CORS.
+    #[test]
+    fn yaml_rejects_unknown_service_keys() {
+        for (yaml, key) in [
+            ("read_onyl: true\n", "read_onyl"),
+            ("cache_szie: 512\n", "cache_szie"),
+            (
+                "cors:\n  mode: disabled\n  allow_orgins: []\n",
+                "allow_orgins",
+            ),
+        ] {
+            let Err(error) = from_str::<Config>(yaml) else {
+                panic!("startup accepted an unknown service setting {key}");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unknown field `{key}`"))
+            );
+        }
     }
 
     #[test]
