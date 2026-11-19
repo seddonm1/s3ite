@@ -478,6 +478,7 @@ mod tests {
             buckets: Arc::new(RwLock::new(HashMap::new())),
             bucket_lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             blob_chunk_size: DEFAULT_OBJECT_BLOB_CHUNK_SIZE,
+            requests: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 

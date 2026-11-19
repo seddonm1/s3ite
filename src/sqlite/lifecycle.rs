@@ -6,6 +6,8 @@ use rusqlite::{Error::ToSqlConversionFailure, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::database::BucketConnection;
+
 use super::{
     NULL_VERSION_ID, ObjectLifecycleExpiration, Sqlite, SqliteResult, StoredLifecycleAndFilter,
     StoredLifecycleExpiration, StoredLifecycleFilter, StoredLifecycleRule,
@@ -13,6 +15,9 @@ use super::{
     lifecycle_rule_matches_object, noncurrent_expiration_time, object_lifecycle_expiration,
     object_lock_allows_lifecycle_delete, optional_stored_object_lock, row_size,
 };
+
+/// Maximum number of object keys or multipart uploads in a maintenance transaction.
+pub(super) const LIFECYCLE_BATCH_SIZE: i64 = 1_000;
 
 #[derive(Debug)]
 struct LifecycleObjectCandidate {
@@ -176,11 +181,92 @@ impl Sqlite {
             return Ok(());
         }
 
-        Self::abort_lifecycle_multipart_uploads(transaction, &rules, now)?;
-        Self::expire_lifecycle_current_objects(transaction, &rules, now)?;
-        Self::expire_lifecycle_noncurrent_objects(transaction, &rules, now)?;
-        Self::expire_lifecycle_delete_markers(transaction, &rules, now)?;
+        let uploads = Self::lifecycle_multipart_candidates(transaction, ("", Uuid::nil()), -1)?;
+        Self::abort_lifecycle_multipart_uploads(transaction, &rules, now, &uploads)?;
+        let (first, last): (Option<String>, Option<String>) = transaction.query_row(
+            "SELECT (SELECT MIN(key) FROM object_version), (SELECT MAX(key) FROM object_version);",
+            (),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if let Some(bounds) = first.as_deref().zip(last.as_deref()) {
+            Self::expire_lifecycle_object_keys(transaction, &rules, now, bounds)?;
+        }
         Ok(())
+    }
+
+    /// Runs lifecycle in writer transactions that yield between upload or whole-key pages.
+    ///
+    /// Each batch reads the current rules and uses the pass's fixed expiration time.
+    pub(super) async fn maintain_lifecycle(
+        connection: &BucketConnection,
+        now: OffsetDateTime,
+    ) -> SqliteResult<()> {
+        // S3 keys are never empty, so an empty key sorts before every row.
+        let mut after = Some((String::new(), Uuid::nil()));
+        while let Some(cursor) = after {
+            after = connection
+                .write(move |transaction| {
+                    let rules = Self::get_bucket_lifecycle_rules(transaction)?;
+                    if rules.is_empty() {
+                        return Ok(None);
+                    }
+                    let uploads = Self::lifecycle_multipart_candidates(
+                        transaction,
+                        (&cursor.0, cursor.1),
+                        LIFECYCLE_BATCH_SIZE,
+                    )?;
+                    Self::abort_lifecycle_multipart_uploads(transaction, &rules, now, &uploads)?;
+                    Ok(uploads
+                        .last()
+                        .map(|upload| (upload.key.clone(), upload.upload_id)))
+                })
+                .await?;
+        }
+
+        let mut after = Some(String::new());
+        while let Some(cursor) = after {
+            after = connection
+                .write(move |transaction| {
+                    let rules = Self::get_bucket_lifecycle_rules(transaction)?;
+                    if rules.is_empty() {
+                        return Ok(None);
+                    }
+                    // Returns the first and last key of the next page of up to
+                    // LIFECYCLE_BATCH_SIZE distinct keys after the cursor, or NULLs
+                    // when no keys remain. Pages cover whole keys, so every version
+                    // of a key is evaluated in the same transaction.
+                    let (first, last): (Option<String>, Option<String>) = transaction.query_row(
+                        "SELECT MIN(key), MAX(key)
+                         FROM (
+                             SELECT DISTINCT key
+                             FROM object_version
+                             WHERE key > ?1
+                             ORDER BY key
+                             LIMIT ?2
+                         );",
+                        (cursor, LIFECYCLE_BATCH_SIZE),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?;
+                    if let Some(bounds) = first.as_deref().zip(last.as_deref()) {
+                        Self::expire_lifecycle_object_keys(transaction, &rules, now, bounds)?;
+                    }
+                    Ok(last)
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Expires current versions, noncurrent versions, then lone markers in an inclusive key range.
+    fn expire_lifecycle_object_keys(
+        transaction: &Transaction,
+        rules: &[StoredLifecycleRule],
+        now: OffsetDateTime,
+        bounds: (&str, &str),
+    ) -> SqliteResult<()> {
+        Self::expire_lifecycle_current_objects(transaction, rules, now, bounds)?;
+        Self::expire_lifecycle_noncurrent_objects(transaction, rules, now, bounds)?;
+        Self::expire_lifecycle_delete_markers(transaction, rules, now, bounds)
     }
 
     /// Computes an object's lifecycle expiration, when a current expiration rule applies.
@@ -378,12 +464,13 @@ impl Sqlite {
         Ok(())
     }
 
+    /// Aborts the supplied uploads whose enabled lifecycle rules are due.
     fn abort_lifecycle_multipart_uploads(
         transaction: &Transaction,
         rules: &[StoredLifecycleRule],
         now: OffsetDateTime,
+        uploads: &[LifecycleMultipartCandidate],
     ) -> SqliteResult<()> {
-        let uploads = Self::lifecycle_multipart_candidates(transaction)?;
         for upload in uploads {
             let tags = Self::get_multipart_upload_tags(transaction, upload.upload_id)?;
             let should_abort = rules.iter().any(|rule| {
@@ -409,9 +496,10 @@ impl Sqlite {
         transaction: &Transaction,
         rules: &[StoredLifecycleRule],
         now: OffsetDateTime,
+        bounds: (&str, &str),
     ) -> SqliteResult<()> {
         let versioning_state = Self::get_bucket_versioning_state(transaction)?;
-        let objects = Self::lifecycle_current_object_candidates(transaction)?;
+        let objects = Self::lifecycle_current_object_candidates(transaction, bounds)?;
         for object in objects {
             let tags = Self::get_object_tags(transaction, object.sequence)?;
             let should_expire = rules.iter().any(|rule| {
@@ -470,12 +558,14 @@ impl Sqlite {
         Ok(())
     }
 
+    /// Expires noncurrent versions after ranking the version candidates for each key.
     fn expire_lifecycle_noncurrent_objects(
         transaction: &Transaction,
         rules: &[StoredLifecycleRule],
         now: OffsetDateTime,
+        bounds: (&str, &str),
     ) -> SqliteResult<()> {
-        let objects = Self::lifecycle_noncurrent_object_candidates(transaction)?;
+        let objects = Self::lifecycle_noncurrent_object_candidates(transaction, bounds)?;
         let mut noncurrent_rank_by_key = HashMap::<String, i32>::new();
         for object in objects {
             let rank = noncurrent_rank_by_key
@@ -508,12 +598,14 @@ impl Sqlite {
         Ok(())
     }
 
+    /// Expires current delete markers only when they are the key's last version.
     fn expire_lifecycle_delete_markers(
         transaction: &Transaction,
         rules: &[StoredLifecycleRule],
         now: OffsetDateTime,
+        bounds: (&str, &str),
     ) -> SqliteResult<()> {
-        let markers = Self::lifecycle_delete_marker_candidates(transaction)?;
+        let markers = Self::lifecycle_delete_marker_candidates(transaction, bounds)?;
         for marker in markers {
             if Self::object_version_count(transaction, &marker.key)? != 1 {
                 continue;
@@ -534,8 +626,10 @@ impl Sqlite {
         Ok(())
     }
 
+    /// Loads current data versions in an inclusive key range, ordered by key.
     fn lifecycle_current_object_candidates(
         transaction: &Transaction,
+        bounds: (&str, &str),
     ) -> SqliteResult<Vec<LifecycleObjectCandidate>> {
         Self::lifecycle_object_candidates(
             transaction,
@@ -551,13 +645,18 @@ impl Sqlite {
                 object_lock_retention_mode,
                 object_lock_retain_until
             FROM object_version
-            WHERE is_latest = 1 AND is_delete_marker = 0
+            WHERE key BETWEEN ?1 AND ?2 AND is_latest = 1 AND is_delete_marker = 0
             ORDER BY key;",
+            bounds,
         )
     }
 
+    /// Loads noncurrent data versions in an inclusive key range.
+    ///
+    /// Newest sequence first within each key preserves noncurrent version ranks.
     fn lifecycle_noncurrent_object_candidates(
         transaction: &Transaction,
+        bounds: (&str, &str),
     ) -> SqliteResult<Vec<LifecycleObjectCandidate>> {
         Self::lifecycle_object_candidates(
             transaction,
@@ -573,18 +672,21 @@ impl Sqlite {
                 object_lock_retention_mode,
                 object_lock_retain_until
             FROM object_version
-            WHERE is_latest = 0 AND is_delete_marker = 0
+            WHERE key BETWEEN ?1 AND ?2 AND is_latest = 0 AND is_delete_marker = 0
             ORDER BY key, sequence DESC;",
+            bounds,
         )
     }
 
+    /// Maps candidate rows for an inclusive key range into storage types.
     fn lifecycle_object_candidates(
         transaction: &Transaction,
         sql: &str,
+        bounds: (&str, &str),
     ) -> SqliteResult<Vec<LifecycleObjectCandidate>> {
         let mut stmt = transaction.prepare_cached(sql)?;
         Ok(stmt
-            .query_map((), |row| {
+            .query_map(bounds, |row| {
                 Ok(LifecycleObjectCandidate {
                     sequence: row.get(0)?,
                     key: row.get(1)?,
@@ -602,18 +704,20 @@ impl Sqlite {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Loads latest delete markers in an inclusive key range, ordered by key.
     fn lifecycle_delete_marker_candidates(
         transaction: &Transaction,
+        bounds: (&str, &str),
     ) -> SqliteResult<Vec<LifecycleDeleteMarkerCandidate>> {
         let mut stmt = transaction.prepare_cached(
             "
             SELECT key, version_id, last_modified
             FROM object_version
-            WHERE is_latest = 1 AND is_delete_marker = 1
+            WHERE key BETWEEN ?1 AND ?2 AND is_latest = 1 AND is_delete_marker = 1
             ORDER BY key;",
         )?;
         Ok(stmt
-            .query_map((), |row| {
+            .query_map(bounds, |row| {
                 Ok(LifecycleDeleteMarkerCandidate {
                     key: row.get(0)?,
                     version_id: row.get(1)?,
@@ -623,17 +727,25 @@ impl Sqlite {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Loads uploads after an exclusive `(key, upload_id)` marker in that order.
+    ///
+    /// Pass `("", Uuid::nil())` for the first page; a negative limit reads every
+    /// remaining upload, which startup uses inside its single transaction.
     fn lifecycle_multipart_candidates(
         transaction: &Transaction,
+        after: (&str, Uuid),
+        limit: i64,
     ) -> SqliteResult<Vec<LifecycleMultipartCandidate>> {
         let mut stmt = transaction.prepare_cached(
             "
             SELECT upload_id, key, initiated
             FROM multipart_upload
-            ORDER BY key, upload_id;",
+            WHERE (key, upload_id) > (?1, ?2)
+            ORDER BY key, upload_id
+            LIMIT ?3;",
         )?;
         Ok(stmt
-            .query_map((), |row| {
+            .query_map((after.0, after.1, limit), |row| {
                 Ok(LifecycleMultipartCandidate {
                     upload_id: row.get(0)?,
                     key: row.get(1)?,

@@ -168,6 +168,7 @@ struct ConfigArgs {
     maintenance_interval_seconds: u64,
 
     /// Number of free pages to reclaim during each maintenance pass. Set to `0` to disable.
+    /// The vacuum waits for a pass with no requests in flight, for at most 10 passes.
     #[arg(long, default_value_t = default_maintenance_vacuum_pages())]
     maintenance_vacuum_pages: u32,
 
@@ -318,6 +319,10 @@ pub struct Config {
     /// Number of free pages to reclaim during each maintenance pass.
     ///
     /// Set to `0` to skip `PRAGMA incremental_vacuum(N)`.
+    ///
+    /// The WAL checkpoint and vacuum run only on a pass when no S3 request is
+    /// in flight, so clients never wait behind them. After 10 deferred passes
+    /// they run anyway, so a server that is never idle still reclaims space.
     #[serde(default = "default_maintenance_vacuum_pages")]
     pub maintenance_vacuum_pages: u32,
 

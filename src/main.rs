@@ -111,19 +111,12 @@ async fn run_s3(mut config: Config, observer: Observer, readiness: Readiness) ->
         config.kms_client = Some(KmsClient::new(&settings));
     }
     let sqlite = Sqlite::new(&config).await?;
+    let requests = sqlite.requests.clone();
     let cors_layer = s3::BucketCorsLayer::new(sqlite.clone(), &config);
     let svc = build_s3_service(&config, sqlite)?;
     let listener = bind_listener(&config).await?;
 
-    serve(
-        listener,
-        svc,
-        cors_layer,
-        config.concurrency_limit,
-        observer,
-        readiness,
-    )
-    .await
+    serve(listener, svc, cors_layer, requests, observer, readiness).await
 }
 
 /// Builds the S3 service with the configured owner and addressing mode.
@@ -183,14 +176,16 @@ async fn shutdown_signal() -> std::io::Result<()> {
 
 /// Serves S3 connections until shutdown and gives active requests time to finish.
 ///
-/// `concurrency_limit` caps in-flight S3 requests across every connection: one
-/// semaphore is shared by all accepted connections, so HTTP/1 keep-alive
-/// clients cannot bypass the limit by opening more connections.
+/// `requests` caps in-flight S3 requests across every connection: one
+/// semaphore, sized by `concurrency_limit`, is shared by all accepted
+/// connections, so HTTP/1 keep-alive clients cannot bypass the limit by opening
+/// more connections. Storage maintenance reads the same semaphore to detect an
+/// idle server.
 async fn serve(
     listener: TcpListener,
     svc: S3Service,
     cors_layer: s3::BucketCorsLayer,
-    concurrency_limit: u16,
+    requests: Arc<tokio::sync::Semaphore>,
     observer: Observer,
     readiness: Readiness,
 ) -> MainResult<()> {
@@ -198,7 +193,7 @@ async fn serve(
     let http_server = auto::Builder::new(TokioExecutor::new());
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
     let mut shutdown = std::pin::pin!(shutdown_signal());
-    let request_limit = GlobalConcurrencyLimitLayer::new(concurrency_limit.into());
+    let request_limit = GlobalConcurrencyLimitLayer::with_semaphore(requests);
 
     readiness.set(true);
     info!("server is running at http://{local_addr}");

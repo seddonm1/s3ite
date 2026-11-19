@@ -71,6 +71,8 @@ pub(crate) const NULL_VERSION_ID: &str = "null";
 /// last appended chunk. A live request can never own a row this old, because
 /// staging gives up after [`STAGED_BODY_MAX_LIFETIME`].
 const ABANDONED_STAGED_BODY_AGE: Duration = Duration::days(1);
+/// Maintenance passes that may defer WAL checkpoint and vacuum on a busy server.
+const MAX_DEFERRED_COMPACTIONS: u32 = 10;
 
 /// Longest a request may spend staging one body before it is rejected.
 ///
@@ -609,11 +611,14 @@ fn expiration_threshold(ttl_seconds: u64) -> Option<OffsetDateTime> {
 
 /// Renders the `SQLite` PRAGMA statements for a writable bucket connection.
 ///
+/// Sets auto-vacuum before journal mode initializes a new database header.
+///
 /// `SQLite` interprets negative `cache_size` values as kibibytes, so the
 /// configured positive KiB value is emitted as `PRAGMA cache_size=-N`.
 pub(crate) fn writer_connection_pragmas(config: &crate::Config, bucket: Option<&str>) -> String {
     format!(
         "
+        PRAGMA auto_vacuum=INCREMENTAL;
         PRAGMA journal_mode={};
         PRAGMA synchronous={};
         PRAGMA temp_store={};
@@ -623,7 +628,6 @@ pub(crate) fn writer_connection_pragmas(config: &crate::Config, bucket: Option<&
         PRAGMA query_only={};
         PRAGMA foreign_keys=true;
         PRAGMA trusted_schema=false;
-        PRAGMA auto_vacuum=INCREMENTAL;
         ",
         pragma_value(&config.journal_mode(bucket)),
         pragma_value(&config.synchronous(bucket)),
@@ -663,6 +667,18 @@ fn pragma_value<T: ValueEnum>(value: &T) -> String {
     possible.get_name().to_string()
 }
 
+/// Decides whether a maintenance pass compacts, returning the new deferral count.
+///
+/// An idle server always compacts. A busy one defers until
+/// [`MAX_DEFERRED_COMPACTIONS`] passes have been skipped, then compacts anyway.
+fn next_compaction(idle: bool, deferred: u32) -> (bool, u32) {
+    if idle || deferred >= MAX_DEFERRED_COMPACTIONS {
+        (true, 0)
+    } else {
+        (false, deferred + 1)
+    }
+}
+
 /// SQLite-backed storage state and open bucket connections.
 #[derive(Clone, Debug)]
 pub struct Sqlite {
@@ -672,6 +688,10 @@ pub struct Sqlite {
     /// Serializes bucket creation and deletion, including database file changes.
     pub(crate) bucket_lifecycle: Arc<Mutex<()>>,
     pub(crate) blob_chunk_size: usize,
+    /// Permits held by in-flight S3 requests, shared with the request limit.
+    ///
+    /// Maintenance treats every permit being free as an idle server.
+    pub(crate) requests: Arc<tokio::sync::Semaphore>,
 }
 
 impl Sqlite {
@@ -811,7 +831,8 @@ impl Sqlite {
         }
 
         let buckets = Arc::new(RwLock::new(buckets));
-        Self::spawn_maintenance_task(buckets.clone(), config.clone());
+        let requests = Arc::new(tokio::sync::Semaphore::new(config.concurrency_limit.into()));
+        Self::spawn_maintenance_task(buckets.clone(), config.clone(), requests.clone());
 
         Ok(Self {
             root,
@@ -819,6 +840,7 @@ impl Sqlite {
             buckets,
             bucket_lifecycle: Arc::new(Mutex::new(())),
             blob_chunk_size,
+            requests,
         })
     }
 
@@ -859,9 +881,16 @@ impl Sqlite {
     }
 
     /// Starts periodic database maintenance for writable bucket connections.
+    ///
+    /// Cleanup and lifecycle run on every pass. The WAL checkpoint and
+    /// incremental vacuum run only when `requests` shows no request in flight,
+    /// so clients never wait behind them, or after
+    /// [`MAX_DEFERRED_COMPACTIONS`] deferred passes so a server that is never
+    /// idle still reclaims space.
     pub(super) fn spawn_maintenance_task(
         buckets: Arc<RwLock<HashMap<String, Arc<BucketConnection>>>>,
         config: crate::Config,
+        requests: Arc<tokio::sync::Semaphore>,
     ) {
         if config.maintenance_interval_seconds == 0 {
             return;
@@ -870,8 +899,16 @@ impl Sqlite {
         let maintenance_interval =
             std::time::Duration::from_secs(config.maintenance_interval_seconds);
         tokio::spawn(async move {
+            let mut deferred = 0;
             loop {
                 tokio::time::sleep(maintenance_interval).await;
+
+                let idle = requests.available_permits() == usize::from(config.concurrency_limit);
+                let compact;
+                (compact, deferred) = next_compaction(idle, deferred);
+                if compact && !idle {
+                    tracing::warn!("Compacting bucket databases while requests are in flight");
+                }
 
                 let multipart_expire_before =
                     expiration_threshold(config.multipart_upload_ttl_seconds);
@@ -882,50 +919,70 @@ impl Sqlite {
                     .await
                     .iter()
                     .filter(|(bucket, _)| config.read_only(Some(bucket)).not())
-                    .map(|(_, connection)| connection.clone())
+                    .map(|(bucket, connection)| (bucket.clone(), connection.clone()))
                     .collect::<Vec<_>>();
 
-                for connection in connections {
-                    Self::maintain_connection(
+                for (bucket, connection) in connections {
+                    if let Err(error) = Self::maintain_connection(
                         &connection,
                         multipart_expire_before,
                         completed_multipart_expire_before,
                         config.maintenance_vacuum_pages,
+                        compact,
                     )
                     .await
-                    .ok();
+                    {
+                        tracing::warn!(%bucket, %error, "Bucket maintenance failed");
+                    }
                 }
             }
         });
     }
 
     /// Runs one maintenance pass for a writable bucket connection.
+    ///
+    /// Cleanup and lifecycle each commit in their own writes so client writes
+    /// can run between them. When `compact` is set, the WAL checkpoint,
+    /// incremental vacuum and `optimize` run last, after the deletes have
+    /// filled the freelist.
     pub(super) async fn maintain_connection(
         connection: &BucketConnection,
         multipart_expire_before: Option<OffsetDateTime>,
         completed_multipart_expire_before: Option<OffsetDateTime>,
         vacuum_pages: u32,
+        compact: bool,
     ) -> SqliteResult<()> {
+        let now = OffsetDateTime::now_utc();
         connection
-            .write_raw_connection(move |connection| {
-                let transaction = connection.transaction()?;
-                let now = OffsetDateTime::now_utc();
-                Self::delete_abandoned_staged_bodies(
-                    &transaction,
-                    now - ABANDONED_STAGED_BODY_AGE,
-                )?;
+            .write(move |transaction| {
+                Self::delete_abandoned_staged_bodies(transaction, now - ABANDONED_STAGED_BODY_AGE)?;
+                Ok(())
+            })
+            .await?;
+        connection
+            .write(move |transaction| {
                 Self::delete_expired_multipart_uploads(
-                    &transaction,
+                    transaction,
                     multipart_expire_before,
                     completed_multipart_expire_before,
-                )?;
-                Self::apply_lifecycle_rules(&transaction, now)?;
-                transaction.commit()?;
+                )
+            })
+            .await?;
+        Self::maintain_lifecycle(connection, now).await?;
+        if !compact {
+            return Ok(());
+        }
 
-                connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        connection
+            .write_raw_connection(move |connection| {
+                // PASSIVE checkpoints without waiting for readers. The configured
+                // journal_size_limit still applies when SQLite resets the WAL.
+                connection.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
                 if vacuum_pages > 0 {
-                    connection
-                        .execute_batch(&format!("PRAGMA incremental_vacuum({vacuum_pages});"))?;
+                    let sql = format!("PRAGMA incremental_vacuum({vacuum_pages});");
+                    let mut stmt = connection.prepare(&sql)?;
+                    let mut rows = stmt.query(())?;
+                    while rows.next()?.is_some() {}
                 }
                 connection.execute_batch("PRAGMA optimize;")?;
 
@@ -1619,8 +1676,8 @@ mod tests {
             })
             .await?;
 
-        Sqlite::maintain_connection(&connection, None, None, 0).await?;
-        Sqlite::maintain_connection(&connection, None, None, 1).await?;
+        Sqlite::maintain_connection(&connection, None, None, 0, true).await?;
+        Sqlite::maintain_connection(&connection, None, None, 1, true).await?;
 
         connection.close().await?;
         remove_root(&root);
@@ -1990,6 +2047,7 @@ mod tests {
                 completed_multipart_upload_ttl_seconds: 0,
                 ..Default::default()
             },
+            Arc::new(tokio::sync::Semaphore::new(1)),
         );
         tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
 
@@ -2004,6 +2062,200 @@ mod tests {
             .await?;
         assert_eq!(remaining, 0);
 
+        connection.close().await?;
+        remove_root(&root);
+        Ok(())
+    }
+
+    /// Checks that a new bucket enables incremental vacuum and drains its freelist in one pass.
+    #[tokio::test]
+    async fn maintenance_drains_new_bucket_freelist() -> SqliteResult<()> {
+        let root = temp_root("maintenance-vacuum")?;
+        let path = root.join("bucket.sqlite3");
+        let connection = BucketConnection::open(&path, &Config::default(), "bucket").await?;
+        let (auto_vacuum, before): (i64, i64) = connection
+            .write_raw_connection(|connection| {
+                Sqlite::prepare_writable_bucket_connection(
+                    connection,
+                    &Config::default(),
+                    "bucket",
+                    super::BucketOpen::Create { object_lock: false },
+                )?;
+                let auto_vacuum =
+                    connection.query_row("PRAGMA auto_vacuum;", (), |row| row.get(0))?;
+                connection.execute_batch(
+                    "CREATE TABLE vacuum_fixture (body BLOB);
+                     INSERT INTO vacuum_fixture VALUES (zeroblob(2097152));
+                     DROP TABLE vacuum_fixture;",
+                )?;
+                let freelist =
+                    connection.query_row("PRAGMA freelist_count;", (), |row| row.get(0))?;
+                Ok((auto_vacuum, freelist))
+            })
+            .await?;
+        assert_eq!(auto_vacuum, 2);
+        assert!(before > 1);
+
+        Sqlite::maintain_connection(&connection, None, None, 10_000, true).await?;
+
+        let after: i64 = connection
+            .read(|connection| {
+                Ok(connection.query_row("PRAGMA freelist_count;", (), |row| row.get(0))?)
+            })
+            .await?;
+        assert_eq!(after, 0);
+        connection.close().await?;
+        remove_root(&root);
+        Ok(())
+    }
+
+    /// Checks that a busy server defers compaction for a bounded number of passes.
+    #[test]
+    fn compaction_waits_for_idle_with_a_bounded_deferral() {
+        assert_eq!(super::next_compaction(true, 0), (true, 0));
+        assert_eq!(super::next_compaction(true, 3), (true, 0));
+        let mut deferred = 0;
+        for _ in 0..super::MAX_DEFERRED_COMPACTIONS {
+            let compact;
+            (compact, deferred) = super::next_compaction(false, deferred);
+            assert!(!compact);
+        }
+        assert_eq!(super::next_compaction(false, deferred), (true, 0));
+    }
+
+    /// Checks that a pass without compaction leaves the freelist for a later pass.
+    #[tokio::test]
+    async fn maintenance_without_compaction_skips_vacuum() -> SqliteResult<()> {
+        let root = temp_root("maintenance-no-compact")?;
+        let path = root.join("bucket.sqlite3");
+        let connection = BucketConnection::open(&path, &Config::default(), "bucket").await?;
+        let before: i64 = connection
+            .write(|transaction| {
+                Sqlite::create_tables(transaction)?;
+                transaction.execute_batch(
+                    "CREATE TABLE vacuum_fixture (body BLOB);
+                     INSERT INTO vacuum_fixture VALUES (zeroblob(2097152));
+                     DROP TABLE vacuum_fixture;",
+                )?;
+                Ok(transaction.query_row("PRAGMA freelist_count;", (), |row| row.get(0))?)
+            })
+            .await?;
+        assert!(before > 1);
+
+        Sqlite::maintain_connection(&connection, None, None, 10_000, false).await?;
+        let after: i64 = connection
+            .read(|transaction| {
+                Ok(transaction.query_row("PRAGMA freelist_count;", (), |row| row.get(0))?)
+            })
+            .await?;
+        assert_eq!(after, before);
+        connection.close().await?;
+        remove_root(&root);
+        Ok(())
+    }
+
+    /// Checks that a lifecycle SQL failure reaches the maintenance caller.
+    #[tokio::test]
+    async fn maintenance_returns_lifecycle_errors() -> SqliteResult<()> {
+        let root = temp_root("maintenance-error")?;
+        let path = root.join("bucket.sqlite3");
+        let connection = BucketConnection::open(&path, &Config::default(), "bucket").await?;
+        connection
+            .write(|transaction| {
+                Sqlite::create_tables(transaction)?;
+                transaction.execute("DROP TABLE bucket_lifecycle_rule;", ())?;
+                Ok(())
+            })
+            .await?;
+
+        assert!(
+            Sqlite::maintain_connection(&connection, None, None, 0, true)
+                .await
+                .is_err()
+        );
+        connection.close().await?;
+        remove_root(&root);
+        Ok(())
+    }
+
+    /// Checks that one maintenance pass expires due objects across multiple key batches.
+    #[tokio::test]
+    async fn maintenance_expires_objects_across_lifecycle_batches() -> SqliteResult<()> {
+        let root = temp_root("maintenance-lifecycle-batches")?;
+        let path = root.join("bucket.sqlite3");
+        let connection = BucketConnection::open(&path, &Config::default(), "bucket").await?;
+        let fresh_index = super::lifecycle::LIFECYCLE_BATCH_SIZE + 1;
+        connection
+            .write(move |transaction| {
+                Sqlite::create_tables(transaction)?;
+                Sqlite::replace_bucket_lifecycle_rules(
+                    transaction,
+                    &[super::StoredLifecycleRule {
+                        id: None,
+                        enabled: true,
+                        filter: super::StoredLifecycleFilter::Empty,
+                        expiration: Some(super::StoredLifecycleExpiration {
+                            days: Some(1),
+                            date: None,
+                            expired_object_delete_marker: false,
+                        }),
+                        noncurrent_expiration: None,
+                        abort_incomplete_multipart_days: None,
+                    }],
+                )?;
+                let now = OffsetDateTime::now_utc();
+                for index in 0..=fresh_index {
+                    let last_modified = if index == fresh_index {
+                        now
+                    } else {
+                        OffsetDateTime::UNIX_EPOCH
+                    };
+                    super::put::test_support::put_object(
+                        transaction,
+                        super::KeyValue {
+                            key: format!("logs/{index:04}"),
+                            value: Some(b"value".to_vec()),
+                            key_metadata: super::KeyMetadata {
+                                version_id: String::new(),
+                                size: 5,
+                                metadata: None,
+                                content_type: None,
+                                content_encoding: None,
+                                content_disposition: None,
+                                content_language: None,
+                                cache_control: None,
+                                expires: None,
+                                last_modified,
+                                md5: Some("md5".to_string()),
+                                checksum: Some(super::StoredChecksum::Full(
+                                    super::FullObjectChecksum::Crc64Nvme("crc".to_string()),
+                                )),
+                                stored_sse: None,
+                                object_lock: StoredObjectLock::default(),
+                                is_latest: true,
+                                is_delete_marker: false,
+                            },
+                        },
+                    )?;
+                }
+                Ok(())
+            })
+            .await?;
+
+        Sqlite::maintain_connection(&connection, None, None, 0, true).await?;
+
+        connection
+            .read(move |transaction| {
+                let remaining: i64 =
+                    transaction
+                        .query_row("SELECT COUNT(*) FROM object_version;", (), |row| row.get(0))?;
+                assert_eq!(remaining, 1);
+                assert!(
+                    Sqlite::get_metadata(transaction, &format!("logs/{fresh_index:04}"))?.is_some()
+                );
+                Ok(())
+            })
+            .await?;
         connection.close().await?;
         remove_root(&root);
         Ok(())
