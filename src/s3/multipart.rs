@@ -1,9 +1,10 @@
-use super::sse::{WriteEncryption, multipart_kms_headers, validate_multipart_mode};
+use super::sse::{WriteEncryption, decrypt_chunk, multipart_kms_headers, validate_multipart_mode};
+use super::stage::{stage_streaming_body, with_client_idle_timeout};
 use crate::sqlite::{
     ChecksumAccumulator, ChecksumTypeKind, CompletedMultipartUploadOutcome, CompletedObjectPart,
-    EncodedBlobChunk, EncryptionMode, KeyValue, Multipart, MultipartChecksumConfig,
-    MultipartCompletion, MultipartCompletionPart, MultipartCompletionRequest, MultipartPartWrite,
-    MultipartUploadListEntry, MultipartUploadState, PartChecksum, StoredChecksum, StoredSse,
+    EncryptionMode, MultipartChecksumConfig, MultipartCompletion, MultipartCompletionPart,
+    MultipartCompletionRequest, MultipartPartWrite, MultipartUploadListEntry, MultipartUploadState,
+    PartChecksum, StoredChecksum, StoredSse,
 };
 
 use super::copy::load_copy_source_object;
@@ -16,17 +17,16 @@ use super::{
     ListMultipartUploadsOutput, ListPartsInput, ListPartsOutput, Md5, MultipartUpload, Not,
     ObjectAclRequest, ObjectReadConditions, OffsetDateTime, Owner, Part,
     S3_SINGLE_REQUEST_BODY_MAX, S3Error, S3ErrorCode, S3Range, S3Request, S3Response, S3Result,
-    Sqlite, SqliteError, SqliteResult, StorageClass, StreamingBlob, TryStreamExt,
-    UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput, Uuid,
-    checksum_algorithm_output, checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_input,
-    checksum_md5, checksum_sha1, checksum_sha256, checksum_sha512, checksum_type_output,
-    checksum_xxhash3, checksum_xxhash64, checksum_xxhash128, configured_part_checksum, copy_bytes,
-    decode_list_input_value, decrypt_stored_chunks, default_crc64nvme_full_object_checksum,
-    encode_list_value, encrypt_value_chunks, encryption_headers, finish_part_checksum, hex,
-    is_url_encoding, load_bucket_object_lock_config, multipart_checksum_config,
-    normalize_content_encoding, normalize_metadata, object_lock_for_new_version,
-    object_lock_write_headers, object_write_conditions, open_encryption, output_delimiter, owner,
-    part_checksum_accumulator, read_part_body_encrypted, requested_encryption,
+    Sqlite, SqliteError, SqliteResult, StorageClass, StreamingBlob, UploadPartCopyInput,
+    UploadPartCopyOutput, UploadPartInput, UploadPartOutput, Uuid, checksum_algorithm_output,
+    checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_input, checksum_md5,
+    checksum_sha1, checksum_sha256, checksum_sha512, checksum_type_output, checksum_xxhash3,
+    checksum_xxhash64, checksum_xxhash128, decode_list_input_value,
+    default_crc64nvme_full_object_checksum, encode_list_value, encryption_headers,
+    finish_part_checksum, hex, is_url_encoding, load_bucket_object_lock_config,
+    multipart_checksum_config, normalize_content_encoding, normalize_metadata,
+    object_lock_for_new_version, object_lock_write_headers, object_write_conditions,
+    open_encryption, output_delimiter, owner, part_checksum_accumulator, requested_encryption,
     resolve_write_encryption, s3_error, s3_error_from_sqlite, s3_error_with_message,
     stored_tags_from_header, validate_content_md5, validate_declared_object_write_length,
     validate_expected_bucket_owner, validate_no_sse_headers, validate_no_unsupported_sse_headers,
@@ -153,63 +153,6 @@ fn validate_upload_part_copy_size(range: ByteRange<u64>) -> SqliteResult<i64> {
     Ok(size)
 }
 
-/// Returns an object byte slice for upload-copy storage.
-pub(super) fn copied_part_bytes(
-    object: &KeyValue,
-    range: ByteRange<u64>,
-) -> Result<Vec<u8>, SqliteError> {
-    let value = match object.value.as_ref() {
-        Some(value) => value,
-        None if object.key_metadata.size == 0 => return Ok(Vec::new()),
-        None => {
-            return Err(SqliteError::Configuration(
-                "object metadata has nonzero size but no value".to_string(),
-            ));
-        }
-    };
-
-    let start = usize::try_from(range.start).map_err(|_| SqliteError::InvalidObjectRange)?;
-    let end = usize::try_from(range.end).map_err(|_| SqliteError::InvalidObjectRange)?;
-    value
-        .get(start..end)
-        .map(<[u8]>::to_vec)
-        .ok_or(SqliteError::InvalidObjectRange)
-}
-
-/// Computes the MD5 `ETag` for part bytes.
-pub(super) fn part_md5(value: &[u8]) -> String {
-    let mut md5_hash = Md5::new();
-    md5_hash.update(value);
-    hex(md5_hash.finalize())
-}
-
-/// Buffers an uploaded part body while validating MD5 and explicit checksums.
-async fn read_upload_part_body(
-    body: StreamingBlob,
-    checksum_input: &ChecksumInput,
-    content_md5_present: bool,
-    content_md5: Option<&str>,
-) -> S3Result<(Vec<u8>, i64, String, Option<PartChecksum>)> {
-    let mut checksum_accumulator = part_checksum_accumulator(checksum_input)?;
-    let mut md5_hash = Md5::new();
-    let stream = body.inspect_ok(|bytes| {
-        let bytes = bytes.as_ref();
-        md5_hash.update(bytes);
-        if let Some(checksum_accumulator) = &mut checksum_accumulator {
-            checksum_accumulator.update(bytes);
-        }
-    });
-    let mut value = Vec::new();
-    copy_bytes(stream, &mut value).await?;
-    let md5_bytes = md5_hash.finalize();
-    let md5 = hex(md5_bytes);
-    let size = i64::try_from(value.len()).map_err(S3Error::internal_error)?;
-
-    validate_content_md5(content_md5_present, content_md5, md5_bytes.as_ref())?;
-    let explicit_checksum = finish_part_checksum(checksum_input, checksum_accumulator)?;
-    Ok((value, size, md5, explicit_checksum))
-}
-
 /// Loads active upload state after validating upload ownership.
 fn load_multipart_upload_state(
     transaction: &rusqlite::Transaction<'_>,
@@ -268,6 +211,8 @@ struct UploadPartWriteContext {
     checksum_config: Option<MultipartChecksumConfig>,
     expected_encryption: Option<StoredSse>,
     chunk_size: usize,
+    /// Body length the request declared; the staged part must match it exactly.
+    declared_size: i64,
 }
 
 /// Converts a stored completed part boundary into an object byte range.
@@ -296,7 +241,6 @@ pub(super) fn requested_part_range(
 
 #[derive(Debug)]
 pub(super) struct CopiedPart {
-    value: Vec<u8>,
     size: i64,
     md5: String,
 }
@@ -306,9 +250,8 @@ struct UploadPartCopyWrite<'a> {
     copied_part: CopiedPart,
     checksum_config: Option<MultipartChecksumConfig>,
     expected_stored_sse: Option<&'a StoredSse>,
-    encoded_chunks: Option<Vec<EncodedBlobChunk>>,
+    staging_id: Uuid,
     checksum: Option<PartChecksum>,
-    chunk_size: usize,
 }
 
 #[derive(Clone)]
@@ -399,17 +342,6 @@ fn parse_upload_part_copy_request(
     })
 }
 
-/// Loads, condition-checks, and slices the source object for `UploadPartCopy`.
-fn slice_copy_part(object: &KeyValue, request: &UploadPartCopyRequest) -> SqliteResult<CopiedPart> {
-    let object_size =
-        u64::try_from(object.key_metadata.size).map_err(|_| SqliteError::InvalidObjectRange)?;
-    let byte_range = checked_copy_source_range(request.copy_source_range, object_size)?;
-    let size = validate_upload_part_copy_size(byte_range.clone())?;
-    let value = copied_part_bytes(object, byte_range)?;
-    let md5 = part_md5(&value);
-    Ok(CopiedPart { value, size, md5 })
-}
-
 /// Stores a copied multipart part after revalidating upload state.
 fn store_upload_part_copy(
     transaction: &rusqlite::Transaction<'_>,
@@ -420,9 +352,8 @@ fn store_upload_part_copy(
         copied_part,
         checksum_config,
         expected_stored_sse,
-        encoded_chunks,
+        staging_id,
         checksum,
-        chunk_size,
     } = write;
     let upload_state = Sqlite::get_multipart_upload_state(
         transaction,
@@ -455,31 +386,18 @@ fn store_upload_part_copy(
     let checksum_xxhash64 = checksum_xxhash64(&checksum);
     let checksum_xxhash128 = checksum_xxhash128(&checksum);
     Sqlite::touch_multipart_upload(transaction, request.upload_id)?;
-    if let Some(chunks) = encoded_chunks {
-        Sqlite::put_multipart_with_encoded_chunks(
-            transaction,
-            &MultipartPartWrite {
-                upload_id: request.upload_id,
-                part_number: request.part_number,
-                last_modified: now,
-                size: copied_part.size,
-                md5: Some(md5.clone()),
-                checksum,
-            },
-            chunks,
-        )?;
-    } else {
-        let multipart = Multipart {
+    Sqlite::put_multipart_with_staged_chunks(
+        transaction,
+        &MultipartPartWrite {
             upload_id: request.upload_id,
             part_number: request.part_number,
             last_modified: now,
-            value: copied_part.value,
             size: copied_part.size,
             md5: Some(md5.clone()),
             checksum,
-        };
-        Sqlite::put_multipart_with_chunk_size(transaction, &multipart, chunk_size)?;
-    }
+        },
+        staging_id,
+    )?;
 
     Ok(CopyPartResult {
         checksum_crc32,
@@ -523,7 +441,11 @@ fn upload_part_output(
     }
 }
 
-/// Reads the source snapshot and revalidates the destination upload in its write transaction.
+/// Streams a source byte range into a staged upload part, then stores it.
+///
+/// The range is validated against the source size before any body bytes are
+/// read. MD5 and the upload's configured checksum are computed while the range
+/// streams, and the upload's state is revalidated in the claiming transaction.
 async fn copy_part_data(
     sqlite: &Sqlite,
     request: UploadPartCopyRequest,
@@ -535,18 +457,30 @@ async fn copy_part_data(
         &request.source_key,
         request.source_version_id.clone(),
         request.source_conditions.clone(),
+        request.copy_source_range,
     )
     .await?;
-    let copied_part = slice_copy_part(&source.object, &request).map_err(s3_error_from_sqlite)?;
+    let object_size = u64::try_from(source.key_metadata.size)
+        .map_err(|_| s3_error_from_sqlite(SqliteError::InvalidObjectRange))?;
+    // UploadPartCopy permits ranges only for sources larger than 5 MiB.
+    // The API gives no specific error code for a source below that threshold.
+    if request.copy_source_range.is_some() && object_size <= 5 * 1024 * 1024 {
+        return Err(s3_error_with_message(
+            S3ErrorCode::InvalidRequest,
+            "A copy source range requires an object larger than 5 MiB",
+        ));
+    }
+    let size =
+        validate_upload_part_copy_size(source.range.clone()).map_err(s3_error_from_sqlite)?;
+    let connection = sqlite
+        .get_connection(&request.bucket)
+        .await
+        .map_err(s3_error_from_sqlite)?;
     let upload_state = {
         let upload_id = request.upload_id;
         let bucket = request.bucket.clone();
         let key = request.key.clone();
         let access_key = request.access_key.clone();
-        let connection = sqlite
-            .get_connection(&request.bucket)
-            .await
-            .map_err(s3_error_from_sqlite)?;
         connection
             .read(move |transaction| {
                 load_multipart_upload_state(
@@ -564,17 +498,30 @@ async fn copy_part_data(
     let expected_encryption = upload_state.stored_sse.clone();
     let encryption = active_upload_encryption(sqlite, upload_state.stored_sse).await?;
     let encrypted = encryption.as_ref().map(|active| active.stored.mode());
-    let checksum = configured_part_checksum(checksum_config, &copied_part.value);
-    let encoded_chunks = encryption
-        .as_ref()
-        .map(|encryption| encrypt_value_chunks(&copied_part.value, chunk_size, encryption))
-        .transpose()?;
 
-    let connection = sqlite
-        .get_connection(&request.bucket)
-        .await
-        .map_err(s3_error_from_sqlite)?;
-    connection
+    let mut md5_hash = Md5::new();
+    let mut accumulator = checksum_config.map(|config| ChecksumAccumulator::new(config.algorithm));
+    let staged = stage_streaming_body(
+        connection.clone(),
+        source.body(),
+        chunk_size,
+        size,
+        encryption.as_ref(),
+        |bytes| {
+            md5_hash.update(bytes);
+            if let Some(accumulator) = &mut accumulator {
+                accumulator.update(bytes);
+            }
+        },
+    )
+    .await?;
+    let copied_part = CopiedPart {
+        size,
+        md5: hex(md5_hash.finalize()),
+    };
+    let checksum = accumulator.map(ChecksumAccumulator::finish_part);
+    let staging_id = staged.staging_id();
+    let written = connection
         .write(move |transaction| {
             let copy_part_result = store_upload_part_copy(
                 transaction,
@@ -583,15 +530,24 @@ async fn copy_part_data(
                     copied_part,
                     checksum_config,
                     expected_stored_sse: expected_encryption.as_ref(),
-                    encoded_chunks,
+                    staging_id,
                     checksum,
-                    chunk_size,
                 },
             )?;
             Ok((copy_part_result, encrypted))
         })
         .await
-        .map_err(s3_error_from_sqlite)
+        .map_err(s3_error_from_sqlite);
+    match written {
+        Ok(written) => {
+            staged.claimed();
+            Ok(written)
+        }
+        Err(err) => {
+            staged.discard();
+            Err(err)
+        }
+    }
 }
 
 /// Maps one storage multipart upload summary into the S3 listing DTO.
@@ -860,47 +816,89 @@ pub(super) async fn create_multipart_upload(
     Ok(S3Response::new(output))
 }
 
-/// Reads, encrypts, and stores one multipart upload part as encoded chunks.
-async fn upload_encrypted_part(
+/// Streams one multipart upload part into staged chunks, validates it, then commits it.
+///
+/// The body is encrypted chunk-by-chunk when the upload uses SSE. MD5 and the
+/// explicit or upload-configured checksum are computed while streaming and
+/// validated after the body ends; a mismatch discards the staged chunks. The
+/// upload's state is revalidated in the transaction that claims them.
+async fn upload_streamed_part(
     sqlite: &Sqlite,
     context: UploadPartWriteContext,
     body: StreamingBlob,
     checksum_input: &ChecksumInput,
     content_md5_present: bool,
     content_md5: Option<String>,
-    encryption: ActiveSse,
+    encryption: Option<ActiveSse>,
 ) -> S3Result<S3Response<UploadPartOutput>> {
-    let encrypted_body = read_part_body_encrypted(
-        body,
-        checksum_input,
-        context.checksum_config,
-        content_md5_present,
-        content_md5.as_deref(),
+    let connection = sqlite
+        .get_connection(&context.bucket)
+        .await
+        .map_err(s3_error_from_sqlite)?;
+    let mut explicit_accumulator = part_checksum_accumulator(checksum_input)?;
+    let mut configured_accumulator = explicit_accumulator
+        .is_none()
+        .then(|| {
+            context
+                .checksum_config
+                .map(|checksum| ChecksumAccumulator::new(checksum.algorithm))
+        })
+        .flatten();
+    let mut md5_hash = Md5::new();
+    let staged = stage_streaming_body(
+        connection.clone(),
+        with_client_idle_timeout(body),
         context.chunk_size,
-        &encryption,
+        context.declared_size,
+        encryption.as_ref(),
+        |bytes| {
+            md5_hash.update(bytes);
+            if let Some(accumulator) = &mut explicit_accumulator {
+                accumulator.update(bytes);
+            }
+            if let Some(accumulator) = &mut configured_accumulator {
+                accumulator.update(bytes);
+            }
+        },
     )
     .await?;
-    let size = encrypted_body.size;
-    let md5 = encrypted_body.md5;
-    let checksum = encrypted_body.checksum;
-    let md5_clone = md5.clone();
-    let checksum_write = checksum.clone();
-    let chunks = encrypted_body.chunks;
+    let md5_bytes = md5_hash.finalize();
+    let validated = validate_content_md5(
+        content_md5_present,
+        content_md5.as_deref(),
+        md5_bytes.as_ref(),
+    )
+    .and_then(|()| finish_part_checksum(checksum_input, explicit_accumulator));
+    let checksum = match validated {
+        Ok(explicit) => {
+            explicit.or_else(|| configured_accumulator.map(ChecksumAccumulator::finish_part))
+        }
+        Err(err) => {
+            staged.discard();
+            return Err(err);
+        }
+    };
+
+    let md5 = hex(md5_bytes);
+    let part = MultipartPartWrite {
+        upload_id: context.upload_id,
+        part_number: context.part_number,
+        last_modified: OffsetDateTime::now_utc(),
+        size: staged.size,
+        md5: Some(md5.clone()),
+        checksum: checksum.clone(),
+    };
+    let staging_id = staged.staging_id();
     let UploadPartWriteContext {
         bucket,
         key,
         upload_id,
-        part_number,
         access_key,
         checksum_config,
         expected_encryption,
         ..
     } = context;
-    let connection = sqlite
-        .get_connection(&bucket)
-        .await
-        .map_err(s3_error_from_sqlite)?;
-    connection
+    let written = connection
         .write(move |transaction| {
             validate_upload_part_write_state(
                 transaction,
@@ -911,93 +909,23 @@ async fn upload_encrypted_part(
                 checksum_config,
                 expected_encryption.as_ref(),
             )?;
-            let part = MultipartPartWrite {
-                upload_id,
-                part_number,
-                last_modified: OffsetDateTime::now_utc(),
-                size,
-                md5: Some(md5_clone),
-                checksum: checksum_write,
-            };
-            Sqlite::put_multipart_with_encoded_chunks(transaction, &part, chunks)?;
-
+            Sqlite::put_multipart_with_staged_chunks(transaction, &part, staging_id)?;
             Ok(())
         })
         .await
-        .map_err(s3_error_from_sqlite)?;
+        .map_err(s3_error_from_sqlite);
+    match written {
+        Ok(()) => staged.claimed(),
+        Err(err) => {
+            staged.discard();
+            return Err(err);
+        }
+    }
 
     Ok(S3Response::new(upload_part_output(
         md5,
         checksum.as_ref(),
-        Some(encryption.stored.mode()),
-    )))
-}
-
-/// Reads and stores one plain multipart upload part.
-async fn upload_plain_part(
-    sqlite: &Sqlite,
-    context: UploadPartWriteContext,
-    body: StreamingBlob,
-    checksum_input: &ChecksumInput,
-    content_md5_present: bool,
-    content_md5: Option<String>,
-) -> S3Result<S3Response<UploadPartOutput>> {
-    let (value, size, md5, explicit_checksum) = read_upload_part_body(
-        body,
-        checksum_input,
-        content_md5_present,
-        content_md5.as_deref(),
-    )
-    .await?;
-    let checksum =
-        explicit_checksum.or_else(|| configured_part_checksum(context.checksum_config, &value));
-    let md5_clone = md5.clone();
-    let checksum_write = checksum.clone();
-    let UploadPartWriteContext {
-        bucket,
-        key,
-        upload_id,
-        part_number,
-        access_key,
-        checksum_config,
-        expected_encryption,
-        chunk_size,
-    } = context;
-    let connection = sqlite
-        .get_connection(&bucket)
-        .await
-        .map_err(s3_error_from_sqlite)?;
-    connection
-        .write(move |transaction| {
-            validate_upload_part_write_state(
-                transaction,
-                upload_id,
-                &bucket,
-                &key,
-                access_key.as_deref(),
-                checksum_config,
-                expected_encryption.as_ref(),
-            )?;
-            let multipart = Multipart {
-                upload_id,
-                part_number,
-                last_modified: OffsetDateTime::now_utc(),
-                value,
-                size,
-                md5: Some(md5_clone),
-                checksum: checksum_write,
-            };
-            Sqlite::put_multipart_with_chunk_size(transaction, &multipart, chunk_size)?;
-
-            Ok(())
-        })
-        .await
-        .map_err(s3_error_from_sqlite)?;
-
-    Ok(S3Response::new(upload_part_output(
-        md5,
-        checksum.as_ref(),
-        None,
+        encryption.map(|encryption| encryption.stored.mode()),
     )))
 }
 
@@ -1039,13 +967,15 @@ pub(super) async fn upload_part(
         input,
         headers,
         credentials,
+        trailing_headers,
         ..
     } = req;
     validate_expected_bucket_owner(input.expected_bucket_owner.as_deref())?;
     let declares_kms = multipart_kms_headers(&headers)?;
     let access_key = credentials.map(|credentials| credentials.access_key);
-    let checksum_input =
-        checksum_input!(input, input.checksum_algorithm, None).with_sdk_algorithm(&headers)?;
+    let checksum_input = checksum_input!(input, input.checksum_algorithm, None)
+        .with_sdk_algorithm(&headers)?
+        .with_trailer(&headers, trailing_headers)?;
     let UploadPartInput {
         body,
         bucket,
@@ -1076,7 +1006,7 @@ pub(super) async fn upload_part(
 
     let upload_id = parse_upload_id(&upload_id)?;
     validate_part_number(part_number)?;
-    validate_declared_object_write_length(&headers, content_length)?;
+    let declared_size = validate_declared_object_write_length(&headers, content_length)?;
     let body = body.ok_or_else(|| s3_error(S3ErrorCode::IncompleteBody))?;
 
     let content_md5_present = headers.contains_key(CONTENT_MD5);
@@ -1100,30 +1030,19 @@ pub(super) async fn upload_part(
         checksum_config,
         expected_encryption,
         chunk_size,
+        declared_size,
     };
 
-    if let Some(encryption) = encryption {
-        upload_encrypted_part(
-            sqlite,
-            context,
-            body,
-            &checksum_input,
-            content_md5_present,
-            content_md5,
-            encryption,
-        )
-        .await
-    } else {
-        upload_plain_part(
-            sqlite,
-            context,
-            body,
-            &checksum_input,
-            content_md5_present,
-            content_md5,
-        )
-        .await
-    }
+    upload_streamed_part(
+        sqlite,
+        context,
+        body,
+        &checksum_input,
+        content_md5_present,
+        content_md5,
+        encryption,
+    )
+    .await
 }
 
 /// Copies an existing object byte range into a multipart upload part.
@@ -1372,14 +1291,24 @@ async fn precompute_multipart_completion_checksum(
                 if *number != part.part_number || part.md5.as_ref() != Some(etag) {
                     return Err(SqliteError::InvalidMultipartPart);
                 }
-                let chunks = Sqlite::get_upload_part_blob_chunks(
+                Sqlite::for_each_upload_part_chunk(
                     transaction,
                     upload_id,
                     part.part_number,
                     part.size,
+                    |chunk| {
+                        let (Some(nonce), Some(tag)) = (chunk.sse_nonce, chunk.sse_tag) else {
+                            return Err(SqliteError::ObjectBodyInconsistent);
+                        };
+                        let plaintext = decrypt_chunk(&active, &nonce, &tag, &chunk.body)
+                            .map_err(SqliteError::Configuration)?;
+                        if i64::try_from(plaintext.len()).ok() != Some(chunk.size) {
+                            return Err(SqliteError::ObjectBodyInconsistent);
+                        }
+                        accumulator.update(&plaintext);
+                        Ok(())
+                    },
                 )?;
-                let plaintext = decrypt_stored_chunks(&active, chunks)?;
-                accumulator.update(&plaintext);
             }
 
             accumulator
@@ -1427,7 +1356,7 @@ fn normalize_multipart_completion_request(
         requested_checksum: checksum_input.into_completion_checksum()?,
         default_checksum: default_crc64nvme_full_object_checksum(),
         access_key,
-        write_conditions: object_write_conditions(if_match, if_none_match),
+        write_conditions: object_write_conditions(if_match, if_none_match, false)?,
         precomputed_full_object_checksum: None,
     })
 }
@@ -1542,7 +1471,7 @@ pub(super) async fn complete_multipart_upload(
 mod tests {
     use super::*;
 
-    use crate::sqlite::{KeyMetadata, PartChecksum, StoredObjectLock};
+    use crate::sqlite::PartChecksum;
 
     fn assert_error_code<T>(result: S3Result<T>, code: &S3ErrorCode) {
         let err = result.err();
@@ -1557,32 +1486,6 @@ mod tests {
             part_number,
             e_tag,
             ..CompletedPart::default()
-        }
-    }
-
-    /// Builds a source object for multipart range and body checks.
-    fn key_value(value: Option<Vec<u8>>, size: i64) -> KeyValue {
-        KeyValue {
-            key: "key".to_string(),
-            value,
-            key_metadata: KeyMetadata {
-                version_id: "version".to_string(),
-                size,
-                metadata: None,
-                content_type: None,
-                content_encoding: None,
-                content_disposition: None,
-                content_language: None,
-                cache_control: None,
-                expires: None,
-                last_modified: OffsetDateTime::UNIX_EPOCH,
-                md5: Some("md5".to_string()),
-                checksum: None,
-                stored_sse: None,
-                object_lock: StoredObjectLock::default(),
-                is_latest: true,
-                is_delete_marker: false,
-            },
         }
     }
 
@@ -1770,26 +1673,6 @@ mod tests {
             &S3ErrorCode::NotImplemented,
         );
         Ok(())
-    }
-
-    #[test]
-    fn copies_part_byte_slices() {
-        let object = key_value(Some(b"abcdef".to_vec()), 6);
-        assert_sqlite_ok(copied_part_bytes(&object, 0..6), &b"abcdef".to_vec());
-        assert_sqlite_ok(copied_part_bytes(&object, 2..5), &b"cde".to_vec());
-        assert!(matches!(
-            copied_part_bytes(&object, 5..7),
-            Err(SqliteError::InvalidObjectRange)
-        ));
-
-        let empty = key_value(None, 0);
-        assert_sqlite_ok(copied_part_bytes(&empty, 0..0), &Vec::new());
-
-        let inconsistent = key_value(None, 1);
-        assert!(matches!(
-            copied_part_bytes(&inconsistent, 0..1),
-            Err(SqliteError::Configuration(_))
-        ));
     }
 
     #[test]

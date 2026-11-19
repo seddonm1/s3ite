@@ -7,7 +7,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{
-    ObjectLifecycleExpiration, Sqlite, SqliteResult, StoredLifecycleAndFilter,
+    NULL_VERSION_ID, ObjectLifecycleExpiration, Sqlite, SqliteResult, StoredLifecycleAndFilter,
     StoredLifecycleExpiration, StoredLifecycleFilter, StoredLifecycleRule,
     StoredNoncurrentVersionExpiration, StoredObjectLock, StoredTag, current_expiration_time,
     lifecycle_rule_matches_object, noncurrent_expiration_time, object_lifecycle_expiration,
@@ -400,6 +400,11 @@ impl Sqlite {
         Ok(())
     }
 
+    /// Expires current object versions whose enabled rule expiration is due at `now`.
+    ///
+    /// Candidates and the bucket versioning state are read once, then each due
+    /// object is expired through [`Self::expire_lifecycle_current_object`],
+    /// which applies the versioning-specific delete and object-lock checks.
     fn expire_lifecycle_current_objects(
         transaction: &Transaction,
         rules: &[StoredLifecycleRule],
@@ -408,7 +413,6 @@ impl Sqlite {
         let versioning_state = Self::get_bucket_versioning_state(transaction)?;
         let objects = Self::lifecycle_current_object_candidates(transaction)?;
         for object in objects {
-            let version_id = object.version_id.clone();
             let tags = Self::get_object_tags(transaction, object.sequence)?;
             let should_expire = rules.iter().any(|rule| {
                 rule.enabled
@@ -419,11 +423,47 @@ impl Sqlite {
                     })
             });
             if should_expire {
-                if versioning_state == super::BucketVersioningState::Enabled {
+                Self::expire_lifecycle_current_object(transaction, versioning_state, &object, now)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies a current-version expiration action according to the bucket's versioning state.
+    ///
+    /// - Enabled: inserts a delete marker; no version data is removed.
+    /// - Suspended: removes the `null` version, if any, and inserts a `null`
+    ///   delete marker, matching an unversioned `DeleteObject`. Older numbered
+    ///   versions stay noncurrent and are never promoted back to current.
+    /// - Never configured: permanently removes the only (`null`) version.
+    ///
+    /// Object Lock only blocks the actions that destroy a locked `null` version.
+    fn expire_lifecycle_current_object(
+        transaction: &Transaction,
+        versioning_state: super::BucketVersioningState,
+        object: &LifecycleObjectCandidate,
+        now: OffsetDateTime,
+    ) -> SqliteResult<()> {
+        match versioning_state {
+            super::BucketVersioningState::Enabled => {
+                Self::delete_object(transaction, &object.key, None)?;
+            }
+            super::BucketVersioningState::Suspended => {
+                let null_version_lock = if object.version_id == NULL_VERSION_ID {
+                    Some(object.object_lock.clone())
+                } else {
+                    Self::get_version_metadata(transaction, &object.key, NULL_VERSION_ID)?
+                        .map(|metadata| metadata.object_lock)
+                };
+                if null_version_lock
+                    .is_none_or(|lock| object_lock_allows_lifecycle_delete(&lock, now))
+                {
                     Self::delete_object(transaction, &object.key, None)?;
-                } else if object_lock_allows_lifecycle_delete(&object.object_lock, now) {
-                    Self::delete_version_row(transaction, &object.key, &version_id)?;
-                    Self::promote_latest_version(transaction, &object.key)?;
+                }
+            }
+            super::BucketVersioningState::NeverConfigured => {
+                if object_lock_allows_lifecycle_delete(&object.object_lock, now) {
+                    Self::delete_version_row(transaction, &object.key, &object.version_id)?;
                 }
             }
         }
@@ -642,10 +682,10 @@ mod tests {
     use uuid::Uuid;
 
     use crate::sqlite::{
-        FullObjectChecksum, KeyMetadata, KeyValue, MultipartUploadState, NULL_VERSION_ID, Sqlite,
-        SqliteResult, StoredChecksum, StoredLifecycleExpiration, StoredLifecycleFilter,
-        StoredLifecycleRule, StoredNoncurrentVersionExpiration, StoredObjectLock, StoredTag,
-        put::test_support as put_test_support,
+        BucketVersioningState, FullObjectChecksum, KeyMetadata, KeyValue, MultipartUploadState,
+        NULL_VERSION_ID, Sqlite, SqliteResult, StoredChecksum, StoredLifecycleExpiration,
+        StoredLifecycleFilter, StoredLifecycleRule, StoredNoncurrentVersionExpiration,
+        StoredObjectLock, StoredTag, put::test_support as put_test_support,
     };
 
     fn open_schema() -> SqliteResult<Connection> {
@@ -752,6 +792,135 @@ mod tests {
 
         assert!(Sqlite::get_metadata(&transaction, "logs/old")?.is_none());
         assert!(Sqlite::get_metadata(&transaction, "other/old")?.is_some());
+        Ok(())
+    }
+
+    /// Current and noncurrent days become eligible at the same midnight UTC boundary.
+    #[test]
+    fn lifecycle_day_rules_wait_until_midnight_utc() -> SqliteResult<()> {
+        let mut connection = open_schema()?;
+        let transaction = connection.transaction()?;
+        let created = OffsetDateTime::UNIX_EPOCH + time::Duration::hours(10);
+        let midnight = OffsetDateTime::UNIX_EPOCH + time::Duration::days(2);
+        let mut rule = expiration_rule(1);
+        rule.noncurrent_expiration = Some(StoredNoncurrentVersionExpiration {
+            noncurrent_days: 1,
+            newer_noncurrent_versions: None,
+        });
+        Sqlite::replace_bucket_lifecycle_rules(&transaction, &[rule])?;
+        Sqlite::put_bucket_versioning_state(&transaction, BucketVersioningState::Enabled)?;
+        let old = put_test_support::put_object(
+            &transaction,
+            key_value("logs/version", b"old", OffsetDateTime::UNIX_EPOCH),
+        )?;
+        put_test_support::put_object(
+            &transaction,
+            key_value("logs/version", b"successor", created),
+        )?;
+        put_test_support::put_object(&transaction, key_value("logs/current", b"current", created))?;
+
+        transaction.execute(
+            "UPDATE object_version SET noncurrent_since = ?1 WHERE key = 'logs/version' AND version_id = ?2;",
+            (created, &old.version_id),
+        )?;
+
+        Sqlite::apply_lifecycle_rules(&transaction, midnight - time::Duration::nanoseconds(1))?;
+        let version_presence = || -> SqliteResult<[bool; 2]> {
+            Ok([
+                Sqlite::get_metadata(&transaction, "logs/current")?.is_some(),
+                Sqlite::get_version_metadata(&transaction, "logs/version", &old.version_id)?
+                    .is_some(),
+            ])
+        };
+        assert_eq!(version_presence()?, [true, true]);
+
+        Sqlite::apply_lifecycle_rules(&transaction, midnight)?;
+        assert_eq!(version_presence()?, [false, false]);
+        Ok(())
+    }
+
+    /// Writes an expired `logs/a` version while versioning is enabled, then suspends versioning.
+    fn suspended_bucket_with_numbered_version(
+        transaction: &rusqlite::Transaction,
+    ) -> SqliteResult<String> {
+        Sqlite::replace_bucket_lifecycle_rules(transaction, &[expiration_rule(1)])?;
+        Sqlite::put_bucket_versioning_state(transaction, BucketVersioningState::Enabled)?;
+        let numbered = put_test_support::put_object(
+            transaction,
+            key_value("logs/a", b"numbered", OffsetDateTime::UNIX_EPOCH),
+        )?;
+        Sqlite::put_bucket_versioning_state(transaction, BucketVersioningState::Suspended)?;
+        Ok(numbered.version_id)
+    }
+
+    /// Asserts that `logs/a` is a `null` delete marker and the numbered version stays noncurrent.
+    fn assert_null_marker_over(
+        transaction: &rusqlite::Transaction,
+        numbered: &str,
+    ) -> SqliteResult<()> {
+        let current = Sqlite::get_current_metadata(transaction, "logs/a")?;
+        assert!(current.as_ref().is_some_and(
+            |current| current.is_delete_marker && current.version_id == NULL_VERSION_ID
+        ));
+        let preserved = Sqlite::get_version_metadata(transaction, "logs/a", numbered)?;
+        assert!(preserved.is_some_and(|preserved| !preserved.is_latest));
+        assert!(Sqlite::get_metadata(transaction, "logs/a")?.is_none());
+        Ok(())
+    }
+
+    /// Expiring a suspended bucket's `null` version must not resurrect an older version.
+    #[test]
+    fn lifecycle_suspended_expiration_replaces_null_version_with_marker() -> SqliteResult<()> {
+        let mut connection = open_schema()?;
+        let transaction = connection.transaction()?;
+        let numbered = suspended_bucket_with_numbered_version(&transaction)?;
+        put_test_support::put_object(
+            &transaction,
+            key_value("logs/a", b"null", OffsetDateTime::UNIX_EPOCH),
+        )?;
+
+        Sqlite::apply_lifecycle_rules(
+            &transaction,
+            OffsetDateTime::UNIX_EPOCH + time::Duration::days(10),
+        )?;
+
+        assert_null_marker_over(&transaction, &numbered)
+    }
+
+    /// Expiring a numbered current version in a suspended bucket keeps it as noncurrent.
+    #[test]
+    fn lifecycle_suspended_expiration_preserves_numbered_current_version() -> SqliteResult<()> {
+        let mut connection = open_schema()?;
+        let transaction = connection.transaction()?;
+        let numbered = suspended_bucket_with_numbered_version(&transaction)?;
+
+        Sqlite::apply_lifecycle_rules(
+            &transaction,
+            OffsetDateTime::UNIX_EPOCH + time::Duration::days(10),
+        )?;
+
+        assert_null_marker_over(&transaction, &numbered)
+    }
+
+    /// A legal hold on the suspended bucket's `null` version blocks lifecycle expiration.
+    #[test]
+    fn lifecycle_suspended_expiration_respects_null_version_legal_hold() -> SqliteResult<()> {
+        let mut connection = open_schema()?;
+        let transaction = connection.transaction()?;
+        let numbered = suspended_bucket_with_numbered_version(&transaction)?;
+        let mut held = key_value("logs/a", b"held", OffsetDateTime::UNIX_EPOCH);
+        held.key_metadata.object_lock.legal_hold = Some(true);
+        put_test_support::put_object(&transaction, held)?;
+
+        Sqlite::apply_lifecycle_rules(
+            &transaction,
+            OffsetDateTime::UNIX_EPOCH + time::Duration::days(10),
+        )?;
+
+        let current = Sqlite::get_metadata(&transaction, "logs/a")?;
+        assert!(current.is_some_and(|current| current.version_id == NULL_VERSION_ID));
+        let preserved = Sqlite::get_version_metadata(&transaction, "logs/a", &numbered)?;
+        assert!(preserved.is_some_and(|preserved| !preserved.is_latest));
         Ok(())
     }
 

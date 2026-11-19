@@ -7,7 +7,12 @@ use crate::telemetry::request_id;
 /// Maps storage-layer failures into S3 protocol errors at the service boundary.
 pub(super) fn s3_error_from_sqlite(error: SqliteError) -> S3Error {
     with_request_id(match error {
-        SqliteError::BucketNotFound => S3Error::new(S3ErrorCode::NoSuchBucket),
+        // Only DeleteBucket closes a writer while requests are served (the
+        // process exits without closing them), so a write that finds its queue
+        // closed lost a race with that delete.
+        SqliteError::BucketNotFound | SqliteError::DatabaseQueueClosed => {
+            S3Error::new(S3ErrorCode::NoSuchBucket)
+        }
         SqliteError::BucketNotEmpty => S3Error::new(S3ErrorCode::BucketNotEmpty),
         SqliteError::BucketReadOnly => S3Error::with_message(
             S3ErrorCode::MethodNotAllowed,
@@ -141,6 +146,7 @@ mod tests {
     #[test]
     fn maps_storage_errors_to_s3_error_codes() {
         assert_maps(SqliteError::BucketNotFound, &S3ErrorCode::NoSuchBucket);
+        assert_maps(SqliteError::DatabaseQueueClosed, &S3ErrorCode::NoSuchBucket);
         assert_maps(SqliteError::BucketNotEmpty, &S3ErrorCode::BucketNotEmpty);
         assert_maps(SqliteError::ObjectNotFound, &S3ErrorCode::NoSuchKey);
         assert_maps(
@@ -180,7 +186,6 @@ mod tests {
             SqliteError::MultipartObjectTooLarge,
             SqliteError::Configuration("bad config".to_string()),
             SqliteError::DatabaseQueueFull,
-            SqliteError::DatabaseQueueClosed,
             SqliteError::UnsupportedSchemaVersion {
                 found: 1,
                 expected: 5,

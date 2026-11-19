@@ -654,7 +654,7 @@ async fn test_multipart_upload_overwrite_existing_object() -> Result<()> {
     Ok(())
 }
 
-/// Verifies multipart copy can copy a one-byte source object.
+/// Verifies multipart copy can copy small ranges from a source larger than 5 MiB.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_multipart_copy_small() -> Result<()> {
@@ -668,7 +668,9 @@ async fn test_multipart_copy_small() -> Result<()> {
 
     create_bucket(&client, &source_bucket).await?;
     create_bucket(&client, &target_bucket).await?;
-    put_object(&client, &source_bucket, source_key, b"x").await?;
+    let mut source = vec![b'x'; 5 * MIB + 1];
+    source[1] = b'y';
+    put_bytes(&client, &source_bucket, source_key, source).await?;
 
     let (upload_id, parts) = multipart_copy(
         &client,
@@ -775,6 +777,19 @@ async fn test_multipart_copy_without_range() -> Result<()> {
     create_bucket(&client, &target_bucket).await?;
     put_object(&client, &source_bucket, source_key, b"0123456789").await?;
     let upload_id = create_upload(&client, &target_bucket, target_key).await?;
+    // AWS UploadPartCopy allows range headers only above 5 MiB.
+    let error = upload_part_copy(
+        &client,
+        &target_bucket,
+        target_key,
+        &upload_id,
+        1,
+        &copy_source(CopySourceRef::new(&source_bucket, source_key, None)),
+        Some("bytes=2-5".to_string()),
+    )
+    .await
+    .expect_err("small source range must fail");
+    assert_error_contains(&error, "InvalidRequest");
     let part = upload_part_copy(
         &client,
         &target_bucket,
@@ -805,7 +820,9 @@ async fn s3ite_upload_part_copy_conditions_and_missing_upload() -> Result<()> {
 
     create_bucket(&client, &source_bucket).await?;
     create_bucket(&client, &target_bucket).await?;
-    put_object(&client, &source_bucket, "source", b"0123456789abcdef").await?;
+    let mut source = b"0123456789abcdef".to_vec();
+    source.resize(5 * MIB + 1, b'x');
+    put_bytes(&client, &source_bucket, "source", source).await?;
     let source_etag = client
         .head_object()
         .bucket(&source_bucket)
@@ -900,7 +917,7 @@ async fn test_multipart_copy_special_names() -> Result<()> {
     create_bucket(&client, &source_bucket).await?;
     create_bucket(&client, &target_bucket).await?;
     for (index, source_key) in [" ", "_", "__", "?versionId"].into_iter().enumerate() {
-        let body = vec![b'a' + u8::try_from(index)?];
+        let body = vec![b'a' + u8::try_from(index)?; 5 * MIB + 1];
         put_bytes_raw(&server, &source_bucket, source_key, body.clone()).await?;
         let (upload_id, parts) = multipart_copy(
             &client,
@@ -1709,5 +1726,62 @@ async fn abort_upload(client: &Client, bucket: &str, key: &str, upload_id: &str)
         .upload_id(upload_id)
         .send()
         .await?;
+    Ok(())
+}
+
+/// Checks HTTP and AWS-framed UploadPart errors without replacing the previous part.
+#[tokio::test]
+#[serial(conformance)]
+async fn s3ite_upload_part_rejects_invalid_framing() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-mpu");
+    let key = "framing";
+    create_bucket(&client, &bucket).await?;
+    let upload = create_upload(&client, &bucket, key).await?;
+    let part = upload_part(&client, &bucket, key, &upload, 1, b"old part".to_vec()).await?;
+    let path = format!("/{bucket}/{key}?partNumber=1&uploadId={upload}");
+    let plain =
+        raw_http::signed_chunked_request(&server, Method::PUT, &path, b"abc".to_vec()).await?;
+    let plain = (plain.status(), plain.text().await?);
+    let mut outcomes = Vec::new();
+    let trailer = "x-amz-checksum-crc32";
+    for declared in [2, 4] {
+        let framed = raw_http::aws_chunked_request(
+            &server,
+            Method::PUT,
+            &path,
+            raw_http::AwsChunkedRequest {
+                chunks: &[b"abc"],
+                decoded_length: declared,
+                declared_trailer: trailer,
+                trailers: &[(trailer, "NSRBwg==")],
+                extra_headers: &[],
+                http_chunked: false,
+            },
+        )
+        .await?;
+        outcomes.push((framed.status(), framed.text().await?));
+    }
+    assert_eq!(
+        (
+            plain.0,
+            plain.1.contains("<Code>NotImplemented</Code>"),
+            plain.1.contains("<Header>Transfer-Encoding</Header>"),
+            outcomes
+                .iter()
+                .map(|(status, xml)| (*status, xml.contains("<Code>IncompleteBody</Code>")))
+                .collect::<Vec<_>>()
+        ),
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            true,
+            true,
+            vec![(StatusCode::BAD_REQUEST, true); 2]
+        ),
+        "{plain:?} {outcomes:?}",
+    );
+    complete_upload(&client, &bucket, key, &upload, vec![part]).await?;
+    assert_eq!(get_object_bytes(&client, &bucket, key).await?, b"old part");
     Ok(())
 }

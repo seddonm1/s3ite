@@ -5,17 +5,19 @@ use rusqlite::{Error::ToSqlConversionFailure, OptionalExtension, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+#[cfg(test)]
+use super::Multipart;
 use super::{
     ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKind, CompletedMultipartUploadOutcome,
     CompletedMultipartUploadRecord, CompletedMultipartUploadState, CompletedObjectPart,
-    KeyMetadata, Multipart, MultipartChecksumConfig, MultipartCompletion,
-    MultipartCompletionChecksum, MultipartCompletionPart, MultipartCompletionRequest,
-    MultipartMetadata, MultipartPartWrite, MultipartUploadListEntry, MultipartUploadListPage,
-    MultipartUploadState, MultipartUploadSummary, PartChecksum, PreparedMultipartUpload, Sqlite,
-    SqliteError, SqliteResult, StoredBlobChunk, StoredChecksum, StoredSse, decode_base64,
+    KeyMetadata, MultipartChecksumConfig, MultipartCompletion, MultipartCompletionChecksum,
+    MultipartCompletionPart, MultipartCompletionRequest, MultipartMetadata, MultipartPartWrite,
+    MultipartUploadListEntry, MultipartUploadListPage, MultipartUploadState,
+    MultipartUploadSummary, PartChecksum, PreparedMultipartUpload, Sqlite, SqliteError,
+    SqliteResult, StoredBlobChunk, StoredChecksum, StoredSse, decode_base64,
     decode_multipart_md5_hex, encode_hex, optional_multipart_checksum_config,
     optional_part_checksum, optional_stored_object_lock, required_stored_checksum, row_size,
-    sql_limit, sql_size,
+    sql_limit, sql_size, staging::StagedChunkOwner,
 };
 
 const MULTIPART_UPLOAD_ENTRY_KIND: i64 = 0;
@@ -29,6 +31,7 @@ struct CompletionPartMetadata<'a> {
     checksum: Option<&'a PartChecksum>,
 }
 
+#[cfg(test)]
 impl<'a> From<&'a Multipart> for CompletionPartMetadata<'a> {
     /// Builds completion validation metadata from a stored multipart part.
     fn from(part: &'a Multipart) -> Self {
@@ -525,6 +528,7 @@ impl Sqlite {
         Ok(())
     }
 
+    #[cfg(test)]
     /// Reads stored upload-part chunks without decrypting them.
     pub(crate) fn get_upload_part_blob_chunks(
         transaction: &Transaction,
@@ -532,8 +536,36 @@ impl Sqlite {
         part_number: i32,
         expected_size: i64,
     ) -> SqliteResult<Vec<StoredBlobChunk>> {
-        let expected_size =
-            usize::try_from(expected_size).map_err(|_| SqliteError::ObjectBodyInconsistent)?;
+        let mut chunks = Vec::new();
+        Self::for_each_upload_part_chunk(
+            transaction,
+            upload_id,
+            part_number,
+            expected_size,
+            |chunk| {
+                chunks.push(chunk);
+                Ok(())
+            },
+        )?;
+        Ok(chunks)
+    }
+
+    /// Visits one upload part's stored chunks in order, one chunk in memory at a time.
+    ///
+    /// Chunk numbers must start at 1 and offsets must be contiguous from 0,
+    /// and the sizes must add up to `expected_size`; otherwise the part is
+    /// `ObjectBodyInconsistent`. `visit` runs inside the caller's transaction,
+    /// so every chunk comes from the same snapshot.
+    pub(crate) fn for_each_upload_part_chunk(
+        transaction: &Transaction,
+        upload_id: Uuid,
+        part_number: i32,
+        expected_size: i64,
+        mut visit: impl FnMut(StoredBlobChunk) -> SqliteResult<()>,
+    ) -> SqliteResult<()> {
+        if expected_size < 0 {
+            return Err(SqliteError::ObjectBodyInconsistent);
+        }
         let mut stmt = transaction.prepare_cached(
             "
             SELECT chunk_number, offset, size, body, sse_nonce, sse_tag
@@ -542,33 +574,27 @@ impl Sqlite {
             ORDER BY chunk_number;",
         )?;
         let mut rows = stmt.query((upload_id, part_number))?;
-        let mut chunks = Vec::new();
         let mut expected_chunk_number = 1;
-        let mut expected_offset = 0usize;
+        let mut expected_offset = 0_i64;
 
         while let Some(row) = rows.next()? {
             let chunk_number = row.get::<_, i32>(0)?;
-            let offset = usize::try_from(row_size(row, 1)?)
-                .map_err(|_| SqliteError::ObjectBodyInconsistent)?;
-            let size = usize::try_from(row_size(row, 2)?)
-                .map_err(|_| SqliteError::ObjectBodyInconsistent)?;
+            let offset = row_size(row, 1)?;
+            let size = row_size(row, 2)?;
             let body = row.get::<_, Vec<u8>>(3)?;
-            let sse_nonce = row.get::<_, Option<Vec<u8>>>(4)?;
-            let sse_tag = row.get::<_, Option<Vec<u8>>>(5)?;
-
-            if chunk_number != expected_chunk_number || offset != expected_offset {
+            if chunk_number != expected_chunk_number
+                || offset != expected_offset
+                || i64::try_from(body.len()).ok() != Some(size)
+            {
                 return Err(SqliteError::ObjectBodyInconsistent);
             }
-            if body.len() != size {
-                return Err(SqliteError::ObjectBodyInconsistent);
-            }
-            chunks.push(StoredBlobChunk {
-                offset: i64::try_from(offset).map_err(|_| SqliteError::ObjectBodyInconsistent)?,
-                size: i64::try_from(size).map_err(|_| SqliteError::ObjectBodyInconsistent)?,
+            visit(StoredBlobChunk {
+                offset,
+                size,
                 body,
-                sse_nonce,
-                sse_tag,
-            });
+                sse_nonce: row.get(4)?,
+                sse_tag: row.get(5)?,
+            })?;
             expected_chunk_number = expected_chunk_number
                 .checked_add(1)
                 .ok_or(SqliteError::ObjectBodyInconsistent)?;
@@ -580,7 +606,7 @@ impl Sqlite {
         if expected_offset != expected_size {
             return Err(SqliteError::ObjectBodyInconsistent);
         }
-        Ok(chunks)
+        Ok(())
     }
 
     /// Validates one requested completion part against the stored part row.
@@ -907,6 +933,7 @@ impl Sqlite {
             .optional()?)
     }
 
+    #[cfg(test)]
     /// Inserts or replaces a multipart upload part using the requested chunk size.
     pub(crate) fn put_multipart_with_chunk_size(
         transaction: &Transaction,
@@ -918,52 +945,17 @@ impl Sqlite {
         if value_size != multipart.size {
             return Err(SqliteError::ObjectBodyInconsistent);
         }
-        let mut delete_chunks = transaction.prepare_cached(
-            "
-            DELETE FROM object_blob_chunk
-            WHERE upload_id = ?1 AND part_number = ?2;",
+        let inserted = Self::replace_multipart_part_row(
+            transaction,
+            &MultipartPartWrite {
+                upload_id: multipart.upload_id,
+                part_number: multipart.part_number,
+                last_modified: multipart.last_modified,
+                size: multipart.size,
+                md5: multipart.md5.clone(),
+                checksum: multipart.checksum.clone(),
+            },
         )?;
-        delete_chunks.execute((multipart.upload_id, multipart.part_number))?;
-        drop(delete_chunks);
-
-        let mut delete_part = transaction.prepare_cached(
-            "
-            DELETE FROM object_part
-            WHERE upload_id = ?1 AND part_number = ?2;",
-        )?;
-        delete_part.execute((multipart.upload_id, multipart.part_number))?;
-        drop(delete_part);
-
-        let mut stmt = transaction.prepare_cached(
-            "
-            INSERT INTO object_part (
-                object_sequence,
-                upload_id,
-                is_multipart_part,
-                last_modified,
-                part_number,
-                start,
-                size,
-                md5,
-                checksum_algorithm,
-                checksum_type,
-                checksum_value
-            )
-            VALUES (NULL, ?1, 1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8);",
-        )?;
-
-        let size = sql_size(multipart.size)?;
-        let inserted = stmt.execute((
-            multipart.upload_id,
-            multipart.last_modified,
-            multipart.part_number,
-            size,
-            multipart.md5.as_deref(),
-            multipart.checksum.as_ref().map(PartChecksum::algorithm),
-            Option::<ChecksumTypeKind>::None,
-            multipart.checksum.as_ref().map(PartChecksum::as_str),
-        ))?;
-        drop(stmt);
 
         Self::put_object_blob_chunks(
             transaction,
@@ -978,6 +970,7 @@ impl Sqlite {
         Ok(inserted)
     }
 
+    #[cfg(test)]
     /// Inserts or replaces a multipart upload part whose chunks were encoded before the transaction.
     pub(crate) fn put_multipart_with_encoded_chunks<I>(
         transaction: &Transaction,
@@ -987,6 +980,53 @@ impl Sqlite {
     where
         I: IntoIterator<Item = super::EncodedBlobChunk>,
     {
+        let inserted = Self::replace_multipart_part_row(transaction, part)?;
+        let written_size = Self::put_encoded_object_blob_chunks(
+            transaction,
+            None,
+            Some(part.upload_id),
+            part.part_number,
+            0,
+            chunks,
+        )?;
+        if written_size != part.size {
+            return Err(SqliteError::ObjectBodyInconsistent);
+        }
+
+        Ok(inserted)
+    }
+
+    /// Inserts or replaces a multipart upload part whose body was streamed into a staged body.
+    ///
+    /// The replaced part's chunks are deleted and the staged chunks are claimed
+    /// in the same transaction, so a concurrent reader sees either the old part
+    /// or the new one, never a mix.
+    pub(crate) fn put_multipart_with_staged_chunks(
+        transaction: &Transaction,
+        part: &MultipartPartWrite,
+        staging_id: Uuid,
+    ) -> SqliteResult<usize> {
+        let inserted = Self::replace_multipart_part_row(transaction, part)?;
+        Self::claim_staged_chunks(
+            transaction,
+            staging_id,
+            StagedChunkOwner::UploadPart {
+                upload_id: part.upload_id,
+                part_number: part.part_number,
+            },
+            part.size,
+        )?;
+        Ok(inserted)
+    }
+
+    /// Deletes a multipart part's existing chunks and part row, then inserts the new part row.
+    ///
+    /// Callers must add the new part's chunks in the same transaction; the
+    /// deferred chunk foreign keys require the part row to exist at commit.
+    fn replace_multipart_part_row(
+        transaction: &Transaction,
+        part: &MultipartPartWrite,
+    ) -> SqliteResult<usize> {
         let mut delete_chunks = transaction.prepare_cached(
             "
             DELETE FROM object_blob_chunk
@@ -1020,8 +1060,7 @@ impl Sqlite {
             )
             VALUES (NULL, ?1, 1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8);",
         )?;
-
-        let inserted = stmt.execute((
+        Ok(stmt.execute((
             part.upload_id,
             part.last_modified,
             part.part_number,
@@ -1030,22 +1069,7 @@ impl Sqlite {
             part.checksum.as_ref().map(PartChecksum::algorithm),
             Option::<ChecksumTypeKind>::None,
             part.checksum.as_ref().map(PartChecksum::as_str),
-        ))?;
-        drop(stmt);
-
-        let written_size = Self::put_encoded_object_blob_chunks(
-            transaction,
-            None,
-            Some(part.upload_id),
-            part.part_number,
-            0,
-            chunks,
-        )?;
-        if written_size != part.size {
-            return Err(SqliteError::ObjectBodyInconsistent);
-        }
-
-        Ok(inserted)
+        ))?)
     }
 
     /// Lists multipart upload part metadata ordered by part number.

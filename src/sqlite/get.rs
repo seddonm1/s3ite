@@ -7,8 +7,9 @@ use rusqlite::{OptionalExtension, Transaction};
 use crate::database::BlobReadRequest;
 
 use super::{
-    KeyMetadata, ObjectBodyReference, Sqlite, SqliteError, SqliteResult, StoredBlobChunk,
-    optional_stored_checksum, optional_stored_object_lock, row_bool, row_size,
+    EncryptedChunkRead, KeyMetadata, ObjectBodyReference, ObjectChunkLocation, Sqlite, SqliteError,
+    SqliteResult, StoredBlobChunk, optional_stored_checksum, optional_stored_object_lock, row_bool,
+    row_size,
 };
 
 impl Sqlite {
@@ -36,6 +37,7 @@ impl Sqlite {
         Ok(stmt.query_row((), |row| row.get(0))?)
     }
 
+    #[cfg(test)]
     /// Reassembles object bytes from stored chunks for copy-style operations.
     pub(crate) fn get_object_bytes(
         transaction: &Transaction,
@@ -58,6 +60,7 @@ impl Sqlite {
         Ok(value)
     }
 
+    #[cfg(test)]
     /// Reads stored object chunks without decrypting them.
     pub(crate) fn get_object_blob_chunks(
         transaction: &Transaction,
@@ -183,6 +186,183 @@ impl Sqlite {
         }
 
         Ok(requests)
+    }
+
+    /// Lists the chunks of an object version that overlap `range`, in offset order.
+    ///
+    /// The returned chunks must cover `range` contiguously, with no gaps or
+    /// overlaps, otherwise the body is `ObjectBodyInconsistent`. Callers fetch each chunk separately with
+    /// [`Self::get_object_blob_chunk_at`], so at most one chunk is in memory.
+    pub(crate) fn object_chunk_locations(
+        transaction: &Transaction,
+        object_sequence: i64,
+        range: ByteRange<u64>,
+    ) -> SqliteResult<Vec<ObjectChunkLocation>> {
+        Self::plan_object_chunks(transaction, object_sequence, range, false)
+    }
+
+    /// Plans a whole-body read, including any inconsistent chunks outside the declared size.
+    pub(crate) fn whole_object_chunk_locations(
+        transaction: &Transaction,
+        object_sequence: i64,
+        size: u64,
+    ) -> SqliteResult<Vec<ObjectChunkLocation>> {
+        Self::plan_object_chunks(transaction, object_sequence, 0..size, true)
+    }
+
+    /// Requires contiguous coverage, allowing edge clipping only for a range.
+    fn plan_object_chunks(
+        transaction: &Transaction,
+        object_sequence: i64,
+        range: ByteRange<u64>,
+        whole: bool,
+    ) -> SqliteResult<Vec<ObjectChunkLocation>> {
+        if range.is_empty() && !whole {
+            return Ok(Vec::new());
+        }
+        let start = i64::try_from(range.start).map_err(|_| SqliteError::ObjectBodyInconsistent)?;
+        let end = i64::try_from(range.end).map_err(|_| SqliteError::ObjectBodyInconsistent)?;
+        // Both plans return chunk metadata ordered by offset. The range plan
+        // uses the offset bound for overlap and may clip the first and last chunk.
+        let mut stmt = transaction.prepare_cached(if whole {
+            "SELECT chunk_id, offset, size
+            FROM object_blob_chunk
+            WHERE object_sequence = ?1
+            ORDER BY offset;"
+        } else {
+            "SELECT chunk_id, offset, size
+            FROM object_blob_chunk
+            WHERE object_sequence = ?1 AND offset < ?3 AND offset + size > ?2
+            ORDER BY offset;"
+        })?;
+        let mut rows = if whole {
+            stmt.query((object_sequence,))?
+        } else {
+            stmt.query((object_sequence, start, end))?
+        };
+        let mut locations = Vec::new();
+        let mut next = start;
+        while let Some(row) = rows.next()? {
+            let chunk_id = row.get(0)?;
+            let offset = row_size(row, 1)?;
+            let size = row_size(row, 2)?;
+            let chunk_end = offset
+                .checked_add(size)
+                .ok_or(SqliteError::ObjectBodyInconsistent)?;
+            // The first chunk may start before `range`; every later chunk must
+            // start exactly where the previous one ended. Readers trim each
+            // whole chunk to `range`, so an overlap would repeat bytes.
+            let misplaced = if locations.is_empty() && !whole {
+                offset > next
+            } else {
+                offset != next
+            };
+            if misplaced || chunk_end <= next {
+                return Err(SqliteError::ObjectBodyInconsistent);
+            }
+            locations.push(ObjectChunkLocation {
+                chunk_id,
+                offset,
+                size,
+            });
+            next = chunk_end;
+        }
+        if next < end || (whole && next != end) {
+            return Err(SqliteError::ObjectBodyInconsistent);
+        }
+        Ok(locations)
+    }
+
+    /// Plans a snapshot read of every encrypted chunk overlapping `range`.
+    ///
+    /// Encrypted chunks can only be authenticated whole, so each overlapping
+    /// chunk's full ciphertext is requested, in offset order, alongside its
+    /// nonce and tag. Running this inside the BLOB reader transaction keeps the
+    /// whole response on one snapshot, like an unencrypted read.
+    pub(crate) fn encrypted_object_read_plan(
+        transaction: &Transaction,
+        object_sequence: i64,
+        range: ByteRange<u64>,
+    ) -> SqliteResult<(Vec<EncryptedChunkRead>, Vec<BlobReadRequest>)> {
+        let locations = Self::object_chunk_locations(transaction, object_sequence, range)?;
+        let mut stmt = transaction.prepare_cached(
+            "
+            SELECT sse_nonce, sse_tag
+            FROM object_blob_chunk
+            WHERE chunk_id = ?1 AND object_sequence = ?2;",
+        )?;
+        let mut chunks = Vec::with_capacity(locations.len());
+        let mut requests = Vec::with_capacity(locations.len());
+        for location in locations {
+            let (nonce, tag) = stmt.query_row((location.chunk_id, object_sequence), |row| {
+                Ok((
+                    row.get::<_, Option<Vec<u8>>>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                ))
+            })?;
+            let (Some(sse_nonce), Some(sse_tag)) = (nonce, tag) else {
+                return Err(SqliteError::ObjectBodyInconsistent);
+            };
+            let size =
+                u64::try_from(location.size).map_err(|_| SqliteError::ObjectBodyInconsistent)?;
+            requests.push(BlobReadRequest::new(
+                "object_blob_chunk",
+                "body",
+                location.chunk_id,
+                0,
+                size,
+                size,
+            ));
+            chunks.push(EncryptedChunkRead {
+                offset: location.offset,
+                size: location.size,
+                sse_nonce,
+                sse_tag,
+            });
+        }
+        Ok((chunks, requests))
+    }
+
+    /// Loads one previously listed chunk of an object version.
+    ///
+    /// The chunk must still have the listed rowid, owner, offset, and size.
+    /// Committed versions never change their chunks and object sequences are
+    /// never reused, so the only way the chunk can be missing is that the
+    /// version was deleted after listing; that is `ObjectNotFound`. A rowid
+    /// reused by another object can never match because its owner differs.
+    pub(crate) fn get_object_blob_chunk_at(
+        transaction: &Transaction,
+        object_sequence: i64,
+        location: ObjectChunkLocation,
+    ) -> SqliteResult<StoredBlobChunk> {
+        let mut stmt = transaction.prepare_cached(
+            "
+            SELECT offset, size, body, sse_nonce, sse_tag
+            FROM object_blob_chunk
+            WHERE chunk_id = ?1
+                AND object_sequence = ?2
+                AND offset = ?3
+                AND size = ?4;",
+        )?;
+        stmt.query_row(
+            (
+                location.chunk_id,
+                object_sequence,
+                location.offset,
+                location.size,
+            ),
+            |row| {
+                Ok(StoredBlobChunk {
+                    offset: row.get(0)?,
+                    size: row.get(1)?,
+                    body: row.get(2)?,
+                    sse_nonce: row.get(3)?,
+                    sse_tag: row.get(4)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or(SqliteError::ObjectNotFound)
     }
 
     /// Fetches the current object metadata and body rowid by key.
@@ -517,9 +697,107 @@ mod tests {
     use rusqlite::Connection;
     use time::OffsetDateTime;
 
-    use crate::sqlite::{FullObjectChecksum, Sqlite, SqliteError, SqliteResult, StoredChecksum};
+    use crate::sqlite::{
+        FullObjectChecksum, KeyMetadata, KeyValue, Sqlite, SqliteError, SqliteResult,
+        StoredChecksum, StoredObjectLock,
+    };
 
     use super::test_support;
+
+    /// Writes `key` as an unversioned object stored in `chunk_size` chunks.
+    fn put_chunked(
+        transaction: &rusqlite::Transaction,
+        key: &str,
+        body: &[u8],
+        chunk_size: usize,
+    ) -> SqliteResult<i64> {
+        let size = i64::try_from(body.len()).map_err(|_| SqliteError::ObjectBodyInconsistent)?;
+        let outcome = Sqlite::put_object_with_chunk_size(
+            transaction,
+            KeyValue {
+                key: key.to_string(),
+                value: Some(body.to_vec()),
+                key_metadata: KeyMetadata {
+                    version_id: String::new(),
+                    size,
+                    metadata: None,
+                    content_type: None,
+                    content_encoding: None,
+                    content_disposition: None,
+                    content_language: None,
+                    cache_control: None,
+                    expires: None,
+                    last_modified: OffsetDateTime::UNIX_EPOCH,
+                    md5: Some("md5".to_string()),
+                    checksum: Some(StoredChecksum::Full(FullObjectChecksum::Crc64Nvme(
+                        "crc".to_string(),
+                    ))),
+                    stored_sse: None,
+                    object_lock: StoredObjectLock::default(),
+                    is_latest: true,
+                    is_delete_marker: false,
+                },
+            },
+            chunk_size,
+        )?;
+        Ok(outcome.sequence)
+    }
+
+    /// A chunk listed for one version can never be read back from a different version,
+    /// even after an overwrite makes `SQLite` reuse the deleted chunk rowids.
+    #[test]
+    fn listed_chunks_never_resolve_to_a_replacement_object() -> SqliteResult<()> {
+        let mut connection = open_schema()?;
+        let transaction = connection.transaction()?;
+        let original = put_chunked(&transaction, "key", b"oldold", 3)?;
+        let locations = Sqlite::object_chunk_locations(&transaction, original, 1..5)?;
+        assert_eq!(
+            locations
+                .iter()
+                .map(|l| (l.offset, l.size))
+                .collect::<Vec<_>>(),
+            [(0, 3), (3, 3)]
+        );
+        let first = Sqlite::get_object_blob_chunk_at(&transaction, original, locations[0])?;
+        assert_eq!(first.body, b"old");
+
+        let replacement = put_chunked(&transaction, "key", b"newnew", 3)?;
+        assert_ne!(replacement, original);
+        let reused = Sqlite::object_chunk_locations(&transaction, replacement, 0..6)?;
+        assert_eq!(reused[0].chunk_id, locations[0].chunk_id);
+        for location in locations {
+            assert!(matches!(
+                Sqlite::get_object_blob_chunk_at(&transaction, original, location),
+                Err(SqliteError::ObjectNotFound)
+            ));
+        }
+        assert!(matches!(
+            Sqlite::object_chunk_locations(&transaction, replacement, 0..7),
+            Err(SqliteError::ObjectBodyInconsistent)
+        ));
+        Ok(())
+    }
+
+    /// Chunks that overlap must be rejected, because readers trim whole chunks to the range.
+    #[test]
+    fn chunk_locations_reject_overlapping_chunks() -> SqliteResult<()> {
+        let mut connection = open_schema()?;
+        let transaction = connection.transaction()?;
+        let sequence = put_chunked(&transaction, "key", b"abcdefghi", 3)?;
+        assert_eq!(
+            Sqlite::object_chunk_locations(&transaction, sequence, 4..9)?.len(),
+            2
+        );
+        transaction.execute(
+            "UPDATE object_blob_chunk SET offset = 2, size = 4, body = X'63646566' WHERE object_sequence = ?1 AND offset = 3;",
+            (sequence,),
+        )?;
+        assert!(matches!(
+            Sqlite::object_chunk_locations(&transaction, sequence, 0..9),
+            Err(SqliteError::ObjectBodyInconsistent)
+        ));
+        Ok(())
+    }
 
     fn open_schema() -> SqliteResult<Connection> {
         let mut connection = Connection::open_in_memory()?;

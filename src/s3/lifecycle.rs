@@ -609,6 +609,7 @@ mod tests {
         assert!(lifecycle_rule_matches_object(&rule, "logs/one", 10, &tags,));
     }
 
+    /// Checks that a day-based rule projects an expiration at midnight UTC.
     #[test]
     fn lifecycle_expiration_header_selects_earliest_matching_rule() -> S3Result<()> {
         let now = OffsetDateTime::UNIX_EPOCH;
@@ -621,7 +622,7 @@ mod tests {
         let expiration = object_lifecycle_expiration(&rules, "logs/one", 10, now, &[])
             .ok_or(s3_error(S3ErrorCode::InternalError))?;
         let header = LifecycleExpirationHeader::from(expiration);
-        assert_eq!(header.expires_at, now + time::Duration::days(2));
+        assert_eq!(header.expires_at, now + time::Duration::days(3));
         let header_value = header.to_header_value()?;
         assert!(header_value.contains("rule-id=\"rule%20id\""));
         Ok(())

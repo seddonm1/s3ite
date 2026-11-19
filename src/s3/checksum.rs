@@ -3,16 +3,18 @@
 //! `SQLite` owns the persisted checksum metadata. This module keeps the S3 wire
 //! parsing, checksum policy, and response header mapping.
 
+use std::borrow::Cow;
+
 use hyper::HeaderMap;
 use s3s::{
-    S3ErrorCode, S3Result,
+    S3ErrorCode, S3Result, TrailingHeaders,
     dto::{Checksum as S3Checksum, ChecksumAlgorithm, ChecksumMode, ChecksumType},
     header::X_AMZ_SDK_CHECKSUM_ALGORITHM,
 };
 
 use crate::sqlite::{
-    ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKind, CompletedObjectPart, KeyValue,
-    MultipartChecksumConfig, MultipartCompletionChecksum, PartChecksum, SqliteError, SqliteResult,
+    ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKind, CompletedObjectPart,
+    MultipartChecksumConfig, MultipartCompletionChecksum, PartChecksum, SqliteError,
     StoredChecksum, decode_base64,
 };
 
@@ -174,6 +176,17 @@ pub(super) struct ChecksumInput {
     pub(super) xxhash64: Option<String>,
     /// Request-provided `XXHASH128` checksum.
     pub(super) xxhash128: Option<String>,
+    /// Trailer handle, populated by the decoder after the body.
+    pub(super) trailer: Option<ChecksumTrailer>,
+}
+
+/// A checksum value that arrives in the `aws-chunked` trailer instead of a header.
+#[derive(Clone, Debug)]
+pub(super) struct ChecksumTrailer {
+    /// The declared checksum field and algorithm, when a checksum was declared.
+    declared: Option<(String, ChecksumAlgorithmKind)>,
+    /// s3s handle that is filled once the body stream has been fully consumed.
+    headers: TrailingHeaders,
 }
 
 /// Extracts the common digest fields from the generated S3 request DTOs.
@@ -192,6 +205,7 @@ macro_rules! checksum_input {
             xxhash3: $source.checksum_xxhash3,
             xxhash64: $source.checksum_xxhash64,
             xxhash128: $source.checksum_xxhash128,
+            trailer: None,
         }
     };
 }
@@ -214,6 +228,83 @@ impl ChecksumInput {
             self.algorithm = Some(ChecksumAlgorithm::from(name.to_owned()));
         }
         Ok(self)
+    }
+
+    /// Keeps the decoder's trailer handle even when no checksum was declared.
+    pub(super) fn with_trailer(
+        mut self,
+        headers: &HeaderMap,
+        trailing_headers: Option<TrailingHeaders>,
+    ) -> S3Result<Self> {
+        let name = declared_checksum_trailer(headers)?;
+        let declared = name
+            .map(|name| self.bind_trailer_algorithm(name))
+            .transpose()?;
+        if declared.is_some() && trailing_headers.is_none() {
+            return Err(s3_error_with_message(
+                S3ErrorCode::InvalidRequest,
+                "x-amz-trailer requires an aws-chunked request body",
+            ));
+        }
+        self.trailer = trailing_headers.map(|headers| ChecksumTrailer { declared, headers });
+        Ok(self)
+    }
+
+    /// Selects the checksum that must be computed while reading the body.
+    fn bind_trailer_algorithm(
+        &mut self,
+        name: String,
+    ) -> S3Result<(String, ChecksumAlgorithmKind)> {
+        let kind = checksum_algorithm_kind(&ChecksumAlgorithm::from(
+            name.trim_start_matches(CHECKSUM_HEADER_PREFIX)
+                .to_ascii_uppercase(),
+        ))
+        .ok_or_else(|| {
+            s3_error_with_message(
+                S3ErrorCode::InvalidArgument,
+                "unsupported checksum trailer algorithm",
+            )
+        })?;
+        match &self.algorithm {
+            Some(algorithm) if checksum_algorithm_kind(algorithm) != Some(kind) => {
+                return Err(s3_error_with_message(
+                    S3ErrorCode::InvalidRequest,
+                    "x-amz-checksum-algorithm does not match the declared checksum trailer",
+                ));
+            }
+            Some(_) => {}
+            None => self.algorithm = Some(checksum_algorithm_dto(kind)),
+        }
+        Ok((name, kind))
+    }
+
+    /// Validates and merges the checksum trailer after the body is consumed.
+    fn resolve_trailer(&self) -> S3Result<Cow<'_, Self>> {
+        let Some(trailer) = &self.trailer else {
+            return Ok(Cow::Borrowed(self));
+        };
+        let value = trailer
+            .headers
+            .read(|headers| trailer.checksum_value(headers))
+            .transpose()?
+            .flatten();
+        let Some((_, kind)) = trailer.declared else {
+            return Ok(Cow::Borrowed(self));
+        };
+        let value = value.ok_or_else(|| {
+            s3_error_with_message(
+                S3ErrorCode::InvalidRequest,
+                "declared checksum trailer must be sent exactly once",
+            )
+        })?;
+
+        let mut resolved = self.clone();
+        let slot = resolved.requested_slot(kind);
+        if slot.as_ref().is_some_and(|existing| *existing != value) {
+            return Err(s3_error(S3ErrorCode::BadDigest));
+        }
+        *slot = Some(value);
+        Ok(Cow::Owned(resolved))
     }
 
     /// Returns the explicitly requested algorithm or infers it from one value field.
@@ -254,6 +345,22 @@ impl ChecksumInput {
             return Err(s3_error(S3ErrorCode::BadDigest));
         }
         Ok(explicit.or(first))
+    }
+
+    /// Returns the mutable request field that carries the checksum for `kind`.
+    fn requested_slot(&mut self, kind: ChecksumAlgorithmKind) -> &mut Option<String> {
+        match kind {
+            ChecksumAlgorithmKind::Crc32 => &mut self.crc32,
+            ChecksumAlgorithmKind::Crc32c => &mut self.crc32c,
+            ChecksumAlgorithmKind::Crc64Nvme => &mut self.crc64nvme,
+            ChecksumAlgorithmKind::Sha1 => &mut self.sha1,
+            ChecksumAlgorithmKind::Sha256 => &mut self.sha256,
+            ChecksumAlgorithmKind::Sha512 => &mut self.sha512,
+            ChecksumAlgorithmKind::Md5 => &mut self.md5,
+            ChecksumAlgorithmKind::XxHash3 => &mut self.xxhash3,
+            ChecksumAlgorithmKind::XxHash64 => &mut self.xxhash64,
+            ChecksumAlgorithmKind::XxHash128 => &mut self.xxhash128,
+        }
     }
 
     /// Returns the request-provided checksum value for the selected algorithm.
@@ -335,6 +442,93 @@ pub(super) fn checksum_algorithm_from_request(
         )
     })?;
     Ok(Some(kind))
+}
+
+/// Prefix shared by every `x-amz-checksum-*` header and trailer field.
+const CHECKSUM_HEADER_PREFIX: &str = "x-amz-checksum-";
+
+/// Returns the single lowercase `x-amz-checksum-*` field named by `x-amz-trailer`.
+///
+/// Non-checksum trailer fields are ignored. Declaring more than one checksum
+/// trailer is `InvalidArgument`, matching the s3s algorithm parser. Every
+/// `x-amz-trailer` field line counts, so a second checksum cannot hide in a
+/// repeated header.
+fn declared_checksum_trailer(headers: &HeaderMap) -> S3Result<Option<String>> {
+    let mut lines = Vec::new();
+    for value in headers.get_all("x-amz-trailer") {
+        lines.push(
+            value
+                .to_str()
+                .map_err(|_| s3_error(S3ErrorCode::InvalidArgument))?,
+        );
+    }
+    let mut names = lines
+        .into_iter()
+        .flat_map(|line| line.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| name.starts_with(CHECKSUM_HEADER_PREFIX));
+    let name = names.next();
+    if names.next().is_some() {
+        return Err(s3_error_with_message(
+            S3ErrorCode::InvalidArgument,
+            "x-amz-trailer declares more than one checksum",
+        ));
+    }
+    Ok(name)
+}
+
+impl ChecksumInput {
+    /// Returns whether the request carries a checksum s3ite will verify.
+    ///
+    /// That is a recognized `x-amz-checksum-*` value, a declared checksum
+    /// trailer, or an SDK checksum algorithm whose value the body computes.
+    pub(super) fn supplies_checksum(&self) -> bool {
+        self.algorithm.is_some()
+            || self
+                .trailer
+                .as_ref()
+                .is_some_and(|trailer| trailer.declared.is_some())
+            || [
+                &self.crc32,
+                &self.crc32c,
+                &self.crc64nvme,
+                &self.sha1,
+                &self.sha256,
+                &self.sha512,
+                &self.md5,
+                &self.xxhash3,
+                &self.xxhash64,
+                &self.xxhash128,
+            ]
+            .iter()
+            .any(|value| value.is_some())
+    }
+}
+
+impl ChecksumTrailer {
+    /// Rejects malformed trailer declarations before returning the checksum value.
+    fn checksum_value(&self, headers: &HeaderMap) -> S3Result<Option<String>> {
+        let declared = self.declared.as_ref().map(|(name, _)| name.as_str());
+        // AWS requires the checksum trailer name to match x-amz-trailer
+        // (Checking object integrity for data uploads). InvalidRequest describes
+        // a malformed trailer declaration; BadDigest describes a digest mismatch.
+        if headers.keys().any(|name| {
+            name.as_str().starts_with(CHECKSUM_HEADER_PREFIX) && Some(name.as_str()) != declared
+        }) {
+            return Err(s3_error_with_message(
+                S3ErrorCode::InvalidRequest,
+                "checksum trailer was not declared in x-amz-trailer",
+            ));
+        }
+        let Some(name) = declared else {
+            return Ok(None);
+        };
+        let mut values = headers.get_all(name).iter();
+        Ok(match (values.next(), values.next()) {
+            (Some(value), None) => value.to_str().ok().map(str::to_owned),
+            _ => None,
+        })
+    }
 }
 
 /// Converts an S3 checksum algorithm name into its storage kind.
@@ -499,7 +693,7 @@ pub(super) fn finish_payload_checksum(
         .finish_stored(checksum_type)
         .ok_or(SqliteError::ChecksumMismatch)
         .map_err(s3_error_from_sqlite)?;
-    validate_stored_checksum(input, checksum)
+    validate_stored_checksum(&*input.resolve_trailer()?, checksum)
 }
 
 /// Creates an accumulator for an explicitly requested part checksum.
@@ -512,11 +706,12 @@ pub(super) fn part_checksum_accumulator(
     Ok(Some(ChecksumAccumulator::new(kind)))
 }
 
-/// Finalizes and validates an explicitly requested part checksum accumulator.
+/// Verifies trailer declarations and finalizes any explicitly requested part checksum.
 pub(super) fn finish_part_checksum(
     input: &ChecksumInput,
     accumulator: Option<ChecksumAccumulator>,
 ) -> S3Result<Option<PartChecksum>> {
+    let input = input.resolve_trailer()?;
     let Some(accumulator) = accumulator else {
         return Ok(None);
     };
@@ -551,33 +746,6 @@ pub(super) fn default_crc64nvme_full_object_checksum() -> MultipartChecksumConfi
         ChecksumAlgorithmKind::Crc64Nvme,
         ChecksumTypeKind::FullObject,
     )
-}
-
-/// Computes full-object checksum metadata for an object write.
-pub(super) fn object_write_checksum_from_value(
-    kind: ChecksumAlgorithmKind,
-    object: &KeyValue,
-) -> SqliteResult<StoredChecksum> {
-    let value = object.value.as_deref().ok_or_else(|| {
-        SqliteError::Configuration("object metadata has no stored value".to_string())
-    })?;
-    let mut accumulator = ChecksumAccumulator::new(kind);
-    accumulator.update(value);
-    accumulator
-        .finish_stored(ChecksumTypeKind::FullObject)
-        .ok_or(SqliteError::ChecksumMismatch)
-}
-
-/// Computes per-part checksum metadata for `UploadPartCopy`.
-pub(super) fn configured_part_checksum(
-    upload_checksum: Option<MultipartChecksumConfig>,
-    value: &[u8],
-) -> Option<PartChecksum> {
-    upload_checksum.map(|checksum| {
-        let mut accumulator = ChecksumAccumulator::new(checksum.algorithm);
-        accumulator.update(value);
-        accumulator.finish_part()
-    })
 }
 
 /// Converts stored checksum algorithm metadata into an S3 response DTO.
@@ -1047,7 +1215,7 @@ mod tests {
         dto::{ChecksumAlgorithm, ChecksumType},
     };
 
-    use crate::sqlite::{CompletedObjectPart, KeyMetadata, KeyValue};
+    use crate::sqlite::CompletedObjectPart;
 
     use super::{
         ChecksumAlgorithmKind, ChecksumInput, ChecksumPolicy, ChecksumTypeKind, FullObjectChecksum,
@@ -1055,11 +1223,12 @@ mod tests {
         checksum_algorithm_dto, checksum_algorithm_from_request, checksum_algorithm_kind,
         checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_mode_enabled,
         checksum_struct, checksum_type_dto, checksum_type_kind, checksum_type_name,
-        configured_part_checksum, default_crc64nvme_full_object_checksum, finish_part_checksum,
+        declared_checksum_trailer, default_crc64nvme_full_object_checksum, finish_part_checksum,
         finish_payload_checksum, multipart_checksum_config, multipart_checksum_type,
-        object_checksum_for_part, object_write_checksum_from_value, part_checksum_accumulator,
-        payload_checksum_accumulator, validate_content_md5,
+        object_checksum_for_part, part_checksum_accumulator, payload_checksum_accumulator,
+        validate_content_md5,
     };
+    use hyper::HeaderMap;
 
     fn assert_error_code<T>(result: s3s::S3Result<T>, code: &S3ErrorCode) {
         let err = result.err();
@@ -1185,6 +1354,62 @@ mod tests {
                 None,
                 Some(ChecksumType::from_static(ChecksumType::FULL_OBJECT)),
             ),
+            &S3ErrorCode::InvalidArgument,
+        );
+    }
+
+    /// Builds request headers containing a single `x-amz-trailer` value.
+    fn trailer_headers(value: &'static str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amz-trailer",
+            hyper::header::HeaderValue::from_static(value),
+        );
+        headers
+    }
+
+    /// Checks that only `x-amz-checksum-*` names in `x-amz-trailer` declare a checksum trailer.
+    #[test]
+    fn parses_declared_checksum_trailer() {
+        assert_eq!(
+            declared_checksum_trailer(&HeaderMap::new()).ok(),
+            Some(None)
+        );
+        assert_eq!(
+            declared_checksum_trailer(&trailer_headers("x-amz-meta-foo")).ok(),
+            Some(None)
+        );
+        assert_eq!(
+            declared_checksum_trailer(&trailer_headers(" X-Amz-Checksum-CRC32 , x-amz-meta-a"))
+                .ok(),
+            Some(Some("x-amz-checksum-crc32".to_string()))
+        );
+        assert_error_code(
+            declared_checksum_trailer(&trailer_headers(
+                "x-amz-checksum-crc32,x-amz-checksum-sha256",
+            )),
+            &S3ErrorCode::InvalidArgument,
+        );
+    }
+
+    /// Checks that trailers which could never be verified are rejected before the body is read.
+    #[test]
+    fn rejects_unverifiable_checksum_trailers() {
+        let input = ChecksumInput::default();
+        assert!(
+            input
+                .clone()
+                .with_trailer(&HeaderMap::new(), None)
+                .is_ok_and(|input| input.trailer.is_none())
+        );
+        assert_error_code(
+            input
+                .clone()
+                .with_trailer(&trailer_headers("x-amz-checksum-crc32"), None),
+            &S3ErrorCode::InvalidRequest,
+        );
+        assert_error_code(
+            input.with_trailer(&trailer_headers("x-amz-checksum-bogus"), None),
             &S3ErrorCode::InvalidArgument,
         );
     }
@@ -1392,55 +1617,6 @@ mod tests {
                 "9I3YU4IIYIFsddVND1hNyGMyenw=".to_string()
             ))
         );
-    }
-
-    #[test]
-    fn computes_configured_part_checksum_when_upload_requested_one() {
-        let config = multipart_checksum_config(
-            Some(ChecksumAlgorithm::from_static(ChecksumAlgorithm::SHA256)),
-            None,
-        )
-        .ok()
-        .flatten();
-        let checksum = configured_part_checksum(config, b"test data");
-        assert_eq!(
-            checksum,
-            Some(PartChecksum::Sha256(
-                "kW8AJ6V1B0znKjMXd8NHjWUT94alkb2JLaGld78jNfk=".to_string()
-            ))
-        );
-    }
-
-    /// Checks that computing a checksum requires the object body.
-    #[test]
-    fn object_write_checksum_requires_loaded_value() {
-        let object = KeyValue {
-            key: "key".to_string(),
-            value: None,
-            key_metadata: KeyMetadata {
-                version_id: "version".to_string(),
-                size: 4,
-                metadata: None,
-                content_type: None,
-                content_encoding: None,
-                content_disposition: None,
-                content_language: None,
-                cache_control: None,
-                expires: None,
-                last_modified: time::OffsetDateTime::UNIX_EPOCH,
-                md5: Some("md5".to_string()),
-                checksum: None,
-                stored_sse: None,
-                object_lock: crate::sqlite::StoredObjectLock::default(),
-                is_latest: true,
-                is_delete_marker: false,
-            },
-        };
-
-        assert!(matches!(
-            object_write_checksum_from_value(ChecksumAlgorithmKind::Crc64Nvme, &object),
-            Err(crate::sqlite::SqliteError::Configuration(_))
-        ));
     }
 
     #[test]

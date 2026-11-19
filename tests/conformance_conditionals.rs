@@ -380,34 +380,41 @@ async fn test_put_object_ifmatch_failed() -> Result<()> {
     Ok(())
 }
 
-/// Verifies PutObject succeeds when If-None-Match does not match.
+/// Verifies a concrete ETag is invalid for a conditional PutObject.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_put_object_ifnonmatch_good() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_put_object_ifnonmatch_good
+    // Ceph compares this ETag. AWS PutObject and Conditional writes require "*".
     let (_server, client, bucket, _state) = seeded_object().await?;
-
-    client
+    let error = client
         .put_object()
         .bucket(&bucket)
         .key(KEY)
         .if_none_match("\"ABCORZ\"")
-        .body(ByteStream::from_static(b"zar"))
+        .body(ByteStream::from_static(b"blocked"))
         .send()
-        .await?;
-    assert_eq!(get_object_bytes(&client, &bucket, KEY).await?, b"zar");
-
+        .await
+        .expect_err("write If-None-Match must be a wildcard");
+    assert_eq!(
+        error
+            .raw_response()
+            .context("missing HTTP response")?
+            .status()
+            .as_u16(),
+        400
+    );
+    assert_error_contains(&error, "InvalidRequest");
+    assert_eq!(get_object_bytes(&client, &bucket, KEY).await?, b"bar");
     Ok(())
 }
 
-/// Verifies PutObject fails when If-None-Match matches the current ETag.
+/// Verifies a concrete ETag is invalid for a conditional PutObject.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_put_object_ifnonmatch_failed() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_put_object_ifnonmatch_failed
+    // Ceph compares this ETag. AWS PutObject and Conditional writes require "*".
     let (_server, client, bucket, state) = seeded_object().await?;
-
-    let error = match client
+    let error = client
         .put_object()
         .bucket(&bucket)
         .key(KEY)
@@ -415,13 +422,17 @@ async fn test_put_object_ifnonmatch_failed() -> Result<()> {
         .body(ByteStream::from_static(b"blocked"))
         .send()
         .await
-    {
-        Ok(_) => bail!("matching If-None-Match should reject overwrite"),
-        Err(error) => error,
-    };
-    assert_error_contains(&error, "PreconditionFailed");
+        .expect_err("write If-None-Match must be a wildcard");
+    assert_eq!(
+        error
+            .raw_response()
+            .context("missing HTTP response")?
+            .status()
+            .as_u16(),
+        400
+    );
+    assert_error_contains(&error, "InvalidRequest");
     assert_eq!(get_object_bytes(&client, &bucket, KEY).await?, b"bar");
-
     Ok(())
 }
 
@@ -524,7 +535,7 @@ async fn test_put_object_ifnonmatch_overwrite_existed_failed() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_put_object_if_match() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_put_object_if_match
+    // Adapted from Ceph. AWS Conditional writes accepts only "*" for If-None-Match.
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cond");
@@ -543,7 +554,10 @@ async fn test_put_object_if_match() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("PutObject response missing ETag"))?
         .to_string();
 
-    for if_none_match in ["*", first_etag.as_str()] {
+    for (if_none_match, code) in [
+        ("*", "PreconditionFailed"),
+        (first_etag.as_str(), "InvalidRequest"),
+    ] {
         let error = match client
             .put_object()
             .bucket(&bucket)
@@ -556,14 +570,14 @@ async fn test_put_object_if_match() -> Result<()> {
             Ok(_) => bail!("If-None-Match should reject a matching current object"),
             Err(error) => error,
         };
-        assert_error_contains(&error, "PreconditionFailed");
+        assert_error_contains(&error, code);
     }
 
     let second = client
         .put_object()
         .bucket(&bucket)
         .key(KEY)
-        .if_none_match("badetag")
+        .if_match(&first_etag)
         .body(ByteStream::from_static(b"two"))
         .send()
         .await?;
@@ -620,7 +634,7 @@ async fn test_put_object_if_match() -> Result<()> {
         .put_object()
         .bucket(&bucket)
         .key(KEY)
-        .if_none_match(&second_etag)
+        .if_none_match("*")
         .body(ByteStream::from_static(b"four"))
         .send()
         .await?;
@@ -666,7 +680,7 @@ async fn test_put_object_if_match() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_put_current_object_if_none_match() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_put_current_object_if_none_match
+    // Adapted from Ceph. AWS Conditional writes accepts only "*" for If-None-Match.
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cond");
@@ -710,34 +724,18 @@ async fn test_put_current_object_if_none_match() -> Result<()> {
         Err(error) => error,
     };
     assert_error_contains(&error, "PreconditionFailed");
-    let error = match client
-        .put_object()
-        .bucket(&bucket)
-        .key(key)
-        .if_none_match(latest_etag)
-        .send()
-        .await
-    {
-        Ok(_) => bail!("If-None-Match should reject the current ETag"),
-        Err(error) => error,
-    };
-    assert_error_contains(&error, "PreconditionFailed");
-
-    client
-        .put_object()
-        .bucket(&bucket)
-        .key(key)
-        .if_none_match(etag)
-        .send()
-        .await?;
-    client
-        .put_object()
-        .bucket(&bucket)
-        .key(key)
-        .if_none_match("badetag")
-        .send()
-        .await?;
-
+    for tag in [latest_etag.as_str(), etag.as_str(), "badetag"] {
+        let error = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .if_none_match(tag)
+            .send()
+            .await
+            .expect_err("AWS requires a wildcard");
+        assert_error_contains(&error, "InvalidRequest");
+    }
+    assert_eq!(get_object_bytes(&client, &bucket, key).await?, b"data2");
     Ok(())
 }
 
@@ -745,7 +743,7 @@ async fn test_put_current_object_if_none_match() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_put_current_object_if_match() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_put_current_object_if_match
+    // Adapted from Ceph. AWS Conditional writes requires "*" for the initial create.
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cond");
@@ -782,7 +780,7 @@ async fn test_put_current_object_if_match() -> Result<()> {
         .put_object()
         .bucket(&bucket)
         .key(key)
-        .if_none_match("deadbeef")
+        .if_none_match("*")
         .body(ByteStream::from_static(b"data1"))
         .send()
         .await?;
@@ -843,7 +841,7 @@ async fn test_put_current_object_if_match() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_put_object_current_if_match() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_put_object_current_if_match
+    // Adapted from Ceph. AWS Conditional writes accepts only "*" for If-None-Match.
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cond");
@@ -886,7 +884,7 @@ async fn test_put_object_current_if_match() -> Result<()> {
         Ok(_) => bail!("If-None-Match should reject the current ETag"),
         Err(error) => error,
     };
-    assert_error_contains(&error, "PreconditionFailed");
+    assert_error_contains(&error, "InvalidRequest");
 
     client
         .put_object()
@@ -933,7 +931,7 @@ async fn test_put_object_current_if_match() -> Result<()> {
         .put_object()
         .bucket(&bucket)
         .key(key)
-        .if_none_match(etag)
+        .if_none_match("*")
         .send()
         .await?;
 
@@ -1114,7 +1112,7 @@ async fn s3ite_concurrent_copy_if_none_match() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_copy_object_dest_if_none_match() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_copy_object_dest_if_none_match
+    // Adapted from Ceph. AWS Conditional writes accepts only "*" for destination If-None-Match.
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     for versioned in [false, true] {
@@ -1132,15 +1130,13 @@ async fn test_copy_object_dest_if_none_match() -> Result<()> {
             };
             copy("*").send().await?;
             assert_eq!(get_object_bytes(&client, &bucket, "dst").await?, body);
-            for condition in ["*", &src_etag] {
-                assert_copy_error(copy(condition), 412, "PreconditionFailed").await?;
-            }
+            assert_copy_error(copy("*"), 412, "PreconditionFailed").await?;
+            assert_copy_error(copy(&src_etag), 400, "InvalidRequest").await?;
             put_object(&client, &bucket, "dst", b"old").await?;
             let dst_etag = head_state(&client, &bucket, "dst").await?.etag;
-            assert_copy_error(copy(&dst_etag), 412, "PreconditionFailed").await?;
+            assert_copy_error(copy(&dst_etag), 400, "InvalidRequest").await?;
             assert_copy_preserved_destination(&client, &bucket, versioned, 2).await?;
-            copy(&src_etag).send().await?;
-            assert_eq!(get_object_bytes(&client, &bucket, "dst").await?, body);
+            assert_eq!(get_object_bytes(&client, &bucket, "dst").await?, b"old");
 
             let deleted = client
                 .delete_object()
@@ -1407,7 +1403,7 @@ async fn test_multipart_put_object_suspended_if_none_match() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_multipart_put_object_if_match() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_multipart_put_object_if_match
+    // Adapted from Ceph. AWS Conditional writes accepts only "*" for If-None-Match.
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cond");
@@ -1417,7 +1413,7 @@ async fn test_multipart_put_object_if_match() -> Result<()> {
     let response =
         successful_conditional_multipart_upload(&client, &bucket, key, b"abc", None, Some("*"))
             .await?;
-    let mut etag = response
+    let etag = response
         .e_tag()
         .ok_or_else(|| anyhow::anyhow!("multipart completion missing ETag"))?
         .to_string();
@@ -1439,30 +1435,24 @@ async fn test_multipart_put_object_if_match() -> Result<()> {
         b"abc",
         None,
         Some(&etag),
-        "PreconditionFailed",
+        "InvalidRequest",
     )
     .await?;
 
-    let response = successful_conditional_multipart_upload(
+    failing_conditional_multipart_upload(
         &client,
         &bucket,
         key,
         b"abc",
         None,
         Some("badetag"),
+        "InvalidRequest",
     )
     .await?;
-    etag = response
-        .e_tag()
-        .ok_or_else(|| anyhow::anyhow!("multipart completion missing ETag"))?
-        .to_string();
     let response =
         successful_conditional_multipart_upload(&client, &bucket, key, b"abc", Some(&etag), None)
             .await?;
-    etag = response
-        .e_tag()
-        .ok_or_else(|| anyhow::anyhow!("multipart completion missing ETag"))?
-        .to_string();
+    assert_eq!(response.e_tag(), Some(etag.as_str()));
 
     client
         .delete_object()
@@ -1493,9 +1483,9 @@ async fn test_multipart_put_object_if_match() -> Result<()> {
     .await?;
 
     let response =
-        successful_conditional_multipart_upload(&client, &bucket, key, b"abc", None, Some(&etag))
+        successful_conditional_multipart_upload(&client, &bucket, key, b"abc", None, Some("*"))
             .await?;
-    etag = response
+    let etag = response
         .e_tag()
         .ok_or_else(|| anyhow::anyhow!("multipart completion missing ETag"))?
         .to_string();
@@ -1520,7 +1510,7 @@ async fn test_multipart_put_object_if_match() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_multipart_put_current_object_if_none_match() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_multipart_put_current_object_if_none_match
+    // Adapted from Ceph. AWS Conditional writes accepts only "*" for If-None-Match.
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cond");
@@ -1553,21 +1543,19 @@ async fn test_multipart_put_current_object_if_none_match() -> Result<()> {
         "PreconditionFailed",
     )
     .await?;
-    failing_conditional_multipart_upload(
-        &client,
-        &bucket,
-        key,
-        b"abc",
-        None,
-        Some(&latest_etag),
-        "PreconditionFailed",
-    )
-    .await?;
-
-    successful_conditional_multipart_upload(&client, &bucket, key, b"abc", None, Some(&etag))
+    for tag in [latest_etag.as_str(), etag.as_str(), "badetag"] {
+        failing_conditional_multipart_upload(
+            &client,
+            &bucket,
+            key,
+            b"abc",
+            None,
+            Some(tag),
+            "InvalidRequest",
+        )
         .await?;
-    successful_conditional_multipart_upload(&client, &bucket, key, b"abc", None, Some("badetag"))
-        .await?;
+    }
+    assert_eq!(get_object_bytes(&client, &bucket, key).await?, b"data2");
 
     client
         .delete_object()
@@ -1583,7 +1571,7 @@ async fn test_multipart_put_current_object_if_none_match() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_multipart_put_current_object_if_match() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_multipart_put_current_object_if_match
+    // Adapted from Ceph. AWS Conditional writes accepts only "*" for If-None-Match.
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cond");
@@ -1612,15 +1600,9 @@ async fn test_multipart_put_current_object_if_match() -> Result<()> {
     )
     .await?;
 
-    let response = successful_conditional_multipart_upload(
-        &client,
-        &bucket,
-        key,
-        b"data1",
-        None,
-        Some("deadbeef"),
-    )
-    .await?;
+    let response =
+        successful_conditional_multipart_upload(&client, &bucket, key, b"data1", None, Some("*"))
+            .await?;
     let etag = response
         .e_tag()
         .ok_or_else(|| anyhow::anyhow!("multipart completion missing ETag"))?
@@ -1699,87 +1681,81 @@ async fn test_delete_object_if_match() -> Result<()> {
     Ok(())
 }
 
-/// Verifies DeleteObject enforces If-Match-Size before deletion.
+/// Rejects the directory-only condition on a general-purpose bucket.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_object_if_match_size() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_delete_object_if_match_size
+    // Ceph evaluates this condition. AWS DeleteObject supports it for directory buckets only.
     let (_server, client, bucket, _state) = seeded_object_with_body(b"delete-me").await?;
-
-    let error = match client
-        .delete_object()
-        .bucket(&bucket)
-        .key(KEY)
-        .if_match_size(999)
-        .send()
-        .await
-    {
-        Ok(_) => bail!("mismatched delete size should fail"),
-        Err(error) => error,
-    };
-    assert_error_contains(&error, "PreconditionFailed");
-
-    client
+    let error = client
         .delete_object()
         .bucket(&bucket)
         .key(KEY)
         .if_match_size(9)
         .send()
-        .await?;
-    assert_deleted(&client, &bucket, KEY).await?;
-
+        .await
+        .expect_err("directory-only delete condition");
+    assert_eq!(
+        error
+            .raw_response()
+            .context("missing HTTP response")?
+            .status()
+            .as_u16(),
+        400
+    );
+    assert_error_contains(&error, "InvalidRequest");
+    assert_eq!(get_object_bytes(&client, &bucket, KEY).await?, b"delete-me");
     Ok(())
 }
 
-/// Verifies DeleteObject enforces If-Match-Last-Modified-Time before deletion.
+/// Rejects the directory-only condition on a general-purpose bucket.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_object_if_match_last_modified_time() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_delete_object_if_match_last_modified_time
+    // Ceph evaluates this condition. AWS DeleteObject supports it for directory buckets only.
     let (_server, client, bucket, state) = seeded_object_with_body(b"delete-me").await?;
-
-    let error = match client
-        .delete_object()
-        .bucket(&bucket)
-        .key(KEY)
-        .if_match_last_modified_time(state.before)
-        .send()
-        .await
-    {
-        Ok(_) => bail!("mismatched delete Last-Modified should fail"),
-        Err(error) => error,
-    };
-    assert_error_contains(&error, "PreconditionFailed");
-
-    client
+    let error = client
         .delete_object()
         .bucket(&bucket)
         .key(KEY)
         .if_match_last_modified_time(state.last_modified)
         .send()
-        .await?;
-    assert_deleted(&client, &bucket, KEY).await?;
-
+        .await
+        .expect_err("directory-only delete condition");
+    assert_eq!(
+        error
+            .raw_response()
+            .context("missing HTTP response")?
+            .status()
+            .as_u16(),
+        400
+    );
+    assert_error_contains(&error, "InvalidRequest");
+    assert_eq!(get_object_bytes(&client, &bucket, KEY).await?, b"delete-me");
     Ok(())
 }
 
-/// Verifies DeleteObject conditionals on missing objects remain idempotent.
+/// Checks missing-key handling for a concrete value and an existence condition.
 #[tokio::test]
 #[serial(conformance)]
-async fn s3ite_delete_object_if_match_missing_is_noop() -> Result<()> {
+async fn s3ite_delete_object_conditions_on_missing_key() -> Result<()> {
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cond");
 
     create_bucket(&client, &bucket).await?;
-    client
-        .delete_object()
-        .bucket(&bucket)
-        .key("missing")
-        .if_match("\"ABCORZ\"")
-        .send()
-        .await?;
-
+    // AWS conditional deletes: a missing key fails either precondition with Not Found.
+    for condition in ["\"ABCORZ\"", "*"] {
+        let rejected = client
+            .delete_object()
+            .bucket(&bucket)
+            .key("missing")
+            .if_match(condition)
+            .send()
+            .await
+            .expect_err("a delete precondition requires an existing key");
+        assert_error_contains(&rejected, "NoSuchKey");
+    }
     Ok(())
 }
 
@@ -1787,7 +1763,9 @@ async fn s3ite_delete_object_if_match_missing_is_noop() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_object_current_if_match() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_delete_object_current_if_match
+    // Ceph treats a conditional delete of a missing key as a no-op and allows
+    // a wildcard over a delete marker. AWS conditional deletes returns Not Found
+    // for the missing key and 412 for the delete marker.
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cond");
@@ -1795,20 +1773,15 @@ async fn test_delete_object_current_if_match() -> Result<()> {
 
     create_bucket(&client, &bucket).await?;
     put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
-    client
-        .delete_object()
-        .bucket(&bucket)
-        .key(key)
-        .if_match("*")
-        .send()
-        .await?;
-    client
+    let missing = client
         .delete_object()
         .bucket(&bucket)
         .key(key)
         .if_match("badetag")
         .send()
-        .await?;
+        .await
+        .expect_err("a conditional delete of a missing key fails");
+    assert_error_contains(&missing, "NoSuchKey");
 
     let response = client.put_object().bucket(&bucket).key(key).send().await?;
     let version = response
@@ -1842,13 +1815,15 @@ async fn test_delete_object_current_if_match() -> Result<()> {
         .await?;
     assert_eq!(response.delete_marker(), Some(true));
 
-    client
+    let rejected = client
         .delete_object()
         .bucket(&bucket)
         .key(key)
         .if_match("*")
         .send()
-        .await?;
+        .await
+        .expect_err("a delete marker fails the wildcard");
+    assert_error_contains(&rejected, "PreconditionFailed");
     let error = match client
         .delete_object()
         .bucket(&bucket)
@@ -1869,119 +1844,72 @@ async fn test_delete_object_current_if_match() -> Result<()> {
         .version_id(version)
         .send()
         .await?;
-    client
+    let rejected = client
         .delete_object()
         .bucket(&bucket)
         .key(key)
         .if_match("*")
         .send()
-        .await?;
+        .await
+        .expect_err("the delete marker remains current");
+    assert_error_contains(&rejected, "PreconditionFailed");
 
     Ok(())
 }
 
-/// Verifies DeleteObject Last-Modified conditions evaluate current delete markers.
+/// Rejects the directory-only condition on a general-purpose bucket.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_object_current_if_match_last_modified_time() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_delete_object_current_if_match_last_modified_time
-    let server = TestServer::spawn().await?;
-    let client = sdk::client(&server);
-    let bucket = bucket_name("s3ite-cond");
-    let key = "obj";
-
-    create_bucket(&client, &bucket).await?;
-    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
-    client.put_object().bucket(&bucket).key(key).send().await?;
-    let state = head_state(&client, &bucket, key).await?;
-
-    let error = match client
+    // Ceph evaluates this condition. AWS DeleteObject supports it for directory buckets only.
+    let (_server, client, bucket, _version, state) =
+        seeded_versioned_object_with_body(b"delete-me").await?;
+    let error = client
         .delete_object()
         .bucket(&bucket)
-        .key(key)
-        .if_match_last_modified_time(state.before)
-        .send()
-        .await
-    {
-        Ok(_) => bail!("mismatched current Last-Modified should fail"),
-        Err(error) => error,
-    };
-    assert_error_contains(&error, "PreconditionFailed");
-
-    let response = client
-        .delete_object()
-        .bucket(&bucket)
-        .key(key)
+        .key(KEY)
         .if_match_last_modified_time(state.last_modified)
         .send()
-        .await?;
-    assert_eq!(response.delete_marker(), Some(true));
-
-    let error = match client
-        .delete_object()
-        .bucket(&bucket)
-        .key(key)
-        .if_match_last_modified_time(state.before)
-        .send()
         .await
-    {
-        Ok(_) => bail!("current delete marker should still fail a mismatched Last-Modified"),
-        Err(error) => error,
-    };
-    assert_error_contains(&error, "PreconditionFailed");
-
+        .expect_err("directory-only delete condition");
+    assert_eq!(
+        error
+            .raw_response()
+            .context("missing HTTP response")?
+            .status()
+            .as_u16(),
+        400
+    );
+    assert_error_contains(&error, "InvalidRequest");
+    assert_eq!(get_object_bytes(&client, &bucket, KEY).await?, b"delete-me");
     Ok(())
 }
 
-/// Verifies DeleteObject size conditions evaluate current delete markers.
+/// Rejects the directory-only condition on a general-purpose bucket.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_object_current_if_match_size() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_delete_object_current_if_match_size
-    let server = TestServer::spawn().await?;
-    let client = sdk::client(&server);
-    let bucket = bucket_name("s3ite-cond");
-    let key = "obj";
-
-    create_bucket(&client, &bucket).await?;
-    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
-    client.put_object().bucket(&bucket).key(key).send().await?;
-
-    let error = match client
+    // Ceph evaluates this condition. AWS DeleteObject supports it for directory buckets only.
+    let (_server, client, bucket, _version, _state) =
+        seeded_versioned_object_with_body(b"delete-me").await?;
+    let error = client
         .delete_object()
         .bucket(&bucket)
-        .key(key)
-        .if_match_size(9999)
+        .key(KEY)
+        .if_match_size(9)
         .send()
         .await
-    {
-        Ok(_) => bail!("mismatched current size should fail"),
-        Err(error) => error,
-    };
-    assert_error_contains(&error, "PreconditionFailed");
-
-    let response = client
-        .delete_object()
-        .bucket(&bucket)
-        .key(key)
-        .if_match_size(0)
-        .send()
-        .await?;
-    assert_eq!(response.delete_marker(), Some(true));
-
-    let error = match client
-        .delete_object()
-        .bucket(&bucket)
-        .key(key)
-        .if_match_size(9999)
-        .send()
-        .await
-    {
-        Ok(_) => bail!("current delete marker should still fail a mismatched size"),
-        Err(error) => error,
-    };
-    assert_error_contains(&error, "PreconditionFailed");
-
+        .expect_err("directory-only delete condition");
+    assert_eq!(
+        error
+            .raw_response()
+            .context("missing HTTP response")?
+            .status()
+            .as_u16(),
+        400
+    );
+    assert_error_contains(&error, "InvalidRequest");
+    assert_eq!(get_object_bytes(&client, &bucket, KEY).await?, b"delete-me");
     Ok(())
 }
 
@@ -2046,89 +1974,61 @@ async fn test_delete_object_version_if_match() -> Result<()> {
     Ok(())
 }
 
-/// Verifies DeleteObject enforces If-Match-Last-Modified-Time for an exact version.
+/// Rejects the directory-only condition on a general-purpose bucket.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_object_version_if_match_last_modified_time() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_delete_object_version_if_match_last_modified_time
-    let (_server, client, bucket, version, state) = seeded_versioned_object().await?;
-
-    let error = match client
+    // Ceph evaluates this condition. AWS DeleteObject supports it for directory buckets only.
+    let (_server, client, bucket, version, state) =
+        seeded_versioned_object_with_body(b"delete-me").await?;
+    let error = client
         .delete_object()
         .bucket(&bucket)
         .key(KEY)
-        .version_id(&version)
-        .if_match_last_modified_time(state.before)
-        .send()
-        .await
-    {
-        Ok(_) => bail!("mismatched version delete Last-Modified should fail"),
-        Err(error) => error,
-    };
-    assert_error_contains(&error, "PreconditionFailed");
-
-    let response = client
-        .delete_object()
-        .bucket(&bucket)
-        .key(KEY)
-        .version_id(&version)
+        .version_id(version)
         .if_match_last_modified_time(state.last_modified)
         .send()
-        .await?;
-    assert_eq!(response.delete_marker(), None);
-
-    client
-        .delete_object()
-        .bucket(&bucket)
-        .key(KEY)
-        .version_id(&version)
-        .if_match_last_modified_time(state.before)
-        .send()
-        .await?;
-
+        .await
+        .expect_err("directory-only delete condition");
+    assert_eq!(
+        error
+            .raw_response()
+            .context("missing HTTP response")?
+            .status()
+            .as_u16(),
+        400
+    );
+    assert_error_contains(&error, "InvalidRequest");
+    assert_eq!(get_object_bytes(&client, &bucket, KEY).await?, b"delete-me");
     Ok(())
 }
 
-/// Verifies DeleteObject enforces If-Match-Size for an exact version.
+/// Rejects the directory-only condition on a general-purpose bucket.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_object_version_if_match_size() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_delete_object_version_if_match_size
-    let (_server, client, bucket, version, _state) = seeded_versioned_object_with_body(b"").await?;
-
-    let error = match client
+    // Ceph evaluates this condition. AWS DeleteObject supports it for directory buckets only.
+    let (_server, client, bucket, version, _state) =
+        seeded_versioned_object_with_body(b"delete-me").await?;
+    let error = client
         .delete_object()
         .bucket(&bucket)
         .key(KEY)
-        .version_id(&version)
-        .if_match_size(9999)
+        .version_id(version)
+        .if_match_size(9)
         .send()
         .await
-    {
-        Ok(_) => bail!("mismatched version delete size should fail"),
-        Err(error) => error,
-    };
-    assert_error_contains(&error, "PreconditionFailed");
-
-    let response = client
-        .delete_object()
-        .bucket(&bucket)
-        .key(KEY)
-        .version_id(&version)
-        .if_match_size(0)
-        .send()
-        .await?;
-    assert_eq!(response.delete_marker(), None);
-
-    client
-        .delete_object()
-        .bucket(&bucket)
-        .key(KEY)
-        .version_id(&version)
-        .if_match_size(9999)
-        .send()
-        .await?;
-
+        .expect_err("directory-only delete condition");
+    assert_eq!(
+        error
+            .raw_response()
+            .context("missing HTTP response")?
+            .status()
+            .as_u16(),
+        400
+    );
+    assert_error_contains(&error, "InvalidRequest");
+    assert_eq!(get_object_bytes(&client, &bucket, KEY).await?, b"delete-me");
     Ok(())
 }
 
@@ -2144,7 +2044,7 @@ async fn test_delete_objects_if_match() -> Result<()> {
     put_object(&client, &bucket, "keep", b"keep").await?;
     put_object(&client, &bucket, "delete", b"delete").await?;
 
-    let delete_etag = head_state(&client, &bucket, "delete").await?.etag;
+    // AWS Conditional deletes allows a bare wildcard in the XML ETag field.
     let delete = Delete::builder()
         .objects(
             ObjectIdentifier::builder()
@@ -2155,7 +2055,13 @@ async fn test_delete_objects_if_match() -> Result<()> {
         .objects(
             ObjectIdentifier::builder()
                 .key("delete")
-                .e_tag(delete_etag)
+                .e_tag("*")
+                .build()?,
+        )
+        .objects(
+            ObjectIdentifier::builder()
+                .key("missing")
+                .e_tag("*")
                 .build()?,
         )
         .build()?;
@@ -2167,94 +2073,77 @@ async fn test_delete_objects_if_match() -> Result<()> {
         .send()
         .await?;
     assert_eq!(output.deleted().len(), 1);
-    assert_eq!(output.errors().len(), 1);
+    assert_eq!(output.errors().len(), 2);
     assert_eq!(output.errors()[0].code(), Some("PreconditionFailed"));
+    assert_eq!(output.errors()[1].code(), Some("NoSuchKey"));
     assert_eq!(get_object_bytes(&client, &bucket, "keep").await?, b"keep");
     assert_deleted(&client, &bucket, "delete").await?;
 
     Ok(())
 }
 
-/// Verifies DeleteObjects reports Last-Modified precondition failures.
+/// Rejects the directory-only condition on a general-purpose bucket.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_objects_if_match_last_modified_time() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_delete_objects_if_match_last_modified_time
-    let (_server, client, bucket, state) = seeded_object_with_body(b"").await?;
-
-    let failed = ObjectIdentifier::builder()
-        .key(KEY)
-        .last_modified_time(state.before)
-        .build()?;
-    let response = client
+    // Ceph evaluates this condition. AWS ObjectIdentifier supports it for directory buckets only.
+    let (_server, client, bucket, state) = seeded_object_with_body(b"delete-me").await?;
+    let error = client
         .delete_objects()
         .bucket(&bucket)
-        .delete(Delete::builder().objects(failed).build()?)
+        .delete(
+            Delete::builder()
+                .objects(
+                    ObjectIdentifier::builder()
+                        .key(KEY)
+                        .last_modified_time(state.last_modified)
+                        .build()?,
+                )
+                .build()?,
+        )
         .send()
-        .await?;
-    assert_eq!(response.errors()[0].code(), Some("PreconditionFailed"));
-
-    let matched = ObjectIdentifier::builder()
-        .key(KEY)
-        .last_modified_time(state.last_modified)
-        .build()?;
-    let response = client
-        .delete_objects()
-        .bucket(&bucket)
-        .delete(Delete::builder().objects(matched).build()?)
-        .send()
-        .await?;
-    assert_eq!(response.deleted()[0].key(), Some(KEY));
-
-    let missing = ObjectIdentifier::builder()
-        .key(KEY)
-        .last_modified_time(state.before)
-        .build()?;
-    let response = client
-        .delete_objects()
-        .bucket(&bucket)
-        .delete(Delete::builder().objects(missing).build()?)
-        .send()
-        .await?;
-    assert!(response.errors().is_empty());
-
+        .await
+        .expect_err("directory-only delete condition");
+    assert_eq!(
+        error
+            .raw_response()
+            .context("missing HTTP response")?
+            .status()
+            .as_u16(),
+        400
+    );
+    assert_error_contains(&error, "InvalidRequest");
+    assert_eq!(get_object_bytes(&client, &bucket, KEY).await?, b"delete-me");
     Ok(())
 }
 
-/// Verifies DeleteObjects reports size precondition failures.
+/// Rejects the directory-only condition on a general-purpose bucket.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_objects_if_match_size() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_delete_objects_if_match_size
-    let (_server, client, bucket, _state) = seeded_object_with_body(b"").await?;
-
-    let failed = ObjectIdentifier::builder().key(KEY).size(9999).build()?;
-    let response = client
+    // Ceph evaluates this condition. AWS ObjectIdentifier supports it for directory buckets only.
+    let (_server, client, bucket, _state) = seeded_object_with_body(b"delete-me").await?;
+    let error = client
         .delete_objects()
         .bucket(&bucket)
-        .delete(Delete::builder().objects(failed).build()?)
+        .delete(
+            Delete::builder()
+                .objects(ObjectIdentifier::builder().key(KEY).size(9).build()?)
+                .build()?,
+        )
         .send()
-        .await?;
-    assert_eq!(response.errors()[0].code(), Some("PreconditionFailed"));
-
-    let matched = ObjectIdentifier::builder().key(KEY).size(0).build()?;
-    let response = client
-        .delete_objects()
-        .bucket(&bucket)
-        .delete(Delete::builder().objects(matched).build()?)
-        .send()
-        .await?;
-    assert_eq!(response.deleted()[0].key(), Some(KEY));
-
-    let missing = ObjectIdentifier::builder().key(KEY).size(9999).build()?;
-    let response = client
-        .delete_objects()
-        .bucket(&bucket)
-        .delete(Delete::builder().objects(missing).build()?)
-        .send()
-        .await?;
-    assert!(response.errors().is_empty());
-
+        .await
+        .expect_err("directory-only delete condition");
+    assert_eq!(
+        error
+            .raw_response()
+            .context("missing HTTP response")?
+            .status()
+            .as_u16(),
+        400
+    );
+    assert_error_contains(&error, "InvalidRequest");
+    assert_eq!(get_object_bytes(&client, &bucket, KEY).await?, b"delete-me");
     Ok(())
 }
 
@@ -2313,103 +2202,70 @@ async fn test_delete_objects_current_if_match() -> Result<()> {
     Ok(())
 }
 
-/// Verifies DeleteObjects Last-Modified conditions evaluate current delete markers.
+/// Rejects the directory-only condition on a general-purpose bucket.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_objects_current_if_match_last_modified_time() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_delete_objects_current_if_match_last_modified_time
-    let server = TestServer::spawn().await?;
-    let client = sdk::client(&server);
-    let bucket = bucket_name("s3ite-cond");
-    let key = "obj";
-
-    create_bucket(&client, &bucket).await?;
-    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
-    client.put_object().bucket(&bucket).key(key).send().await?;
-    let state = head_state(&client, &bucket, key).await?;
-
-    let failed = ObjectIdentifier::builder()
-        .key(key)
-        .last_modified_time(state.before)
-        .build()?;
-    let response = client
+    // Ceph evaluates this condition. AWS ObjectIdentifier supports it for directory buckets only.
+    let (_server, client, bucket, _version, state) =
+        seeded_versioned_object_with_body(b"delete-me").await?;
+    let error = client
         .delete_objects()
         .bucket(&bucket)
-        .delete(Delete::builder().objects(failed).build()?)
+        .delete(
+            Delete::builder()
+                .objects(
+                    ObjectIdentifier::builder()
+                        .key(KEY)
+                        .last_modified_time(state.last_modified)
+                        .build()?,
+                )
+                .build()?,
+        )
         .send()
-        .await?;
-    assert_eq!(response.errors()[0].code(), Some("PreconditionFailed"));
-
-    let matched = ObjectIdentifier::builder()
-        .key(key)
-        .last_modified_time(state.last_modified)
-        .build()?;
-    let response = client
-        .delete_objects()
-        .bucket(&bucket)
-        .delete(Delete::builder().objects(matched).build()?)
-        .send()
-        .await?;
-    assert_eq!(response.deleted()[0].key(), Some(key));
-    assert_eq!(response.deleted()[0].delete_marker(), Some(true));
-
-    let failed = ObjectIdentifier::builder()
-        .key(key)
-        .last_modified_time(state.before)
-        .build()?;
-    let response = client
-        .delete_objects()
-        .bucket(&bucket)
-        .delete(Delete::builder().objects(failed).build()?)
-        .send()
-        .await?;
-    assert_eq!(response.errors()[0].code(), Some("PreconditionFailed"));
-
+        .await
+        .expect_err("directory-only delete condition");
+    assert_eq!(
+        error
+            .raw_response()
+            .context("missing HTTP response")?
+            .status()
+            .as_u16(),
+        400
+    );
+    assert_error_contains(&error, "InvalidRequest");
+    assert_eq!(get_object_bytes(&client, &bucket, KEY).await?, b"delete-me");
     Ok(())
 }
 
-/// Verifies DeleteObjects size conditions evaluate current delete markers.
+/// Rejects the directory-only condition on a general-purpose bucket.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_objects_current_if_match_size() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_delete_objects_current_if_match_size
-    let server = TestServer::spawn().await?;
-    let client = sdk::client(&server);
-    let bucket = bucket_name("s3ite-cond");
-    let key = "obj";
-
-    create_bucket(&client, &bucket).await?;
-    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
-    client.put_object().bucket(&bucket).key(key).send().await?;
-
-    let failed = ObjectIdentifier::builder().key(key).size(9999).build()?;
-    let response = client
+    // Ceph evaluates this condition. AWS ObjectIdentifier supports it for directory buckets only.
+    let (_server, client, bucket, _version, _state) =
+        seeded_versioned_object_with_body(b"delete-me").await?;
+    let error = client
         .delete_objects()
         .bucket(&bucket)
-        .delete(Delete::builder().objects(failed).build()?)
+        .delete(
+            Delete::builder()
+                .objects(ObjectIdentifier::builder().key(KEY).size(9).build()?)
+                .build()?,
+        )
         .send()
-        .await?;
-    assert_eq!(response.errors()[0].code(), Some("PreconditionFailed"));
-
-    let matched = ObjectIdentifier::builder().key(key).size(0).build()?;
-    let response = client
-        .delete_objects()
-        .bucket(&bucket)
-        .delete(Delete::builder().objects(matched).build()?)
-        .send()
-        .await?;
-    assert_eq!(response.deleted()[0].key(), Some(key));
-    assert_eq!(response.deleted()[0].delete_marker(), Some(true));
-
-    let failed = ObjectIdentifier::builder().key(key).size(9999).build()?;
-    let response = client
-        .delete_objects()
-        .bucket(&bucket)
-        .delete(Delete::builder().objects(failed).build()?)
-        .send()
-        .await?;
-    assert_eq!(response.errors()[0].code(), Some("PreconditionFailed"));
-
+        .await
+        .expect_err("directory-only delete condition");
+    assert_eq!(
+        error
+            .raw_response()
+            .context("missing HTTP response")?
+            .status()
+            .as_u16(),
+        400
+    );
+    assert_error_contains(&error, "InvalidRequest");
+    assert_eq!(get_object_bytes(&client, &bucket, KEY).await?, b"delete-me");
     Ok(())
 }
 
@@ -2457,88 +2313,77 @@ async fn test_delete_objects_version_if_match() -> Result<()> {
     Ok(())
 }
 
-/// Verifies DeleteObjects reports Last-Modified precondition failures for exact versions.
+/// Rejects the directory-only condition on a general-purpose bucket.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_objects_version_if_match_last_modified_time() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_delete_objects_version_if_match_last_modified_time
-    let (_server, client, bucket, version, state) = seeded_versioned_object().await?;
-    put_versioned_object(&client, &bucket, KEY).await?;
-
-    let failed = delete_objects_for_version(KEY, &version)
-        .last_modified_time(state.before)
-        .build()?;
-    let response = client
+    // Ceph evaluates this condition. AWS ObjectIdentifier supports it for directory buckets only.
+    let (_server, client, bucket, version, state) =
+        seeded_versioned_object_with_body(b"delete-me").await?;
+    let error = client
         .delete_objects()
         .bucket(&bucket)
-        .delete(Delete::builder().objects(failed).build()?)
+        .delete(
+            Delete::builder()
+                .objects(
+                    ObjectIdentifier::builder()
+                        .key(KEY)
+                        .version_id(version)
+                        .last_modified_time(state.last_modified)
+                        .build()?,
+                )
+                .build()?,
+        )
         .send()
-        .await?;
-    assert_eq!(response.errors()[0].code(), Some("PreconditionFailed"));
-
-    let matched = delete_objects_for_version(KEY, &version)
-        .last_modified_time(state.last_modified)
-        .build()?;
-    let response = client
-        .delete_objects()
-        .bucket(&bucket)
-        .delete(Delete::builder().objects(matched).build()?)
-        .send()
-        .await?;
-    assert_eq!(response.deleted()[0].key(), Some(KEY));
-
-    let missing = delete_objects_for_version(KEY, &version)
-        .last_modified_time(state.before)
-        .build()?;
-    let response = client
-        .delete_objects()
-        .bucket(&bucket)
-        .delete(Delete::builder().objects(missing).build()?)
-        .send()
-        .await?;
-    assert!(response.errors().is_empty());
-
+        .await
+        .expect_err("directory-only delete condition");
+    assert_eq!(
+        error
+            .raw_response()
+            .context("missing HTTP response")?
+            .status()
+            .as_u16(),
+        400
+    );
+    assert_error_contains(&error, "InvalidRequest");
+    assert_eq!(get_object_bytes(&client, &bucket, KEY).await?, b"delete-me");
     Ok(())
 }
 
-/// Verifies DeleteObjects reports size precondition failures for exact versions.
+/// Rejects the directory-only condition on a general-purpose bucket.
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_objects_version_if_match_size() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_delete_objects_version_if_match_size
-    let (_server, client, bucket, version, _state) = seeded_versioned_object_with_body(b"").await?;
-
-    let failed = delete_objects_for_version(KEY, &version)
-        .size(9999)
-        .build()?;
-    let response = client
+    // Ceph evaluates this condition. AWS ObjectIdentifier supports it for directory buckets only.
+    let (_server, client, bucket, version, _state) =
+        seeded_versioned_object_with_body(b"delete-me").await?;
+    let error = client
         .delete_objects()
         .bucket(&bucket)
-        .delete(Delete::builder().objects(failed).build()?)
+        .delete(
+            Delete::builder()
+                .objects(
+                    ObjectIdentifier::builder()
+                        .key(KEY)
+                        .version_id(version)
+                        .size(9)
+                        .build()?,
+                )
+                .build()?,
+        )
         .send()
-        .await?;
-    assert_eq!(response.errors()[0].code(), Some("PreconditionFailed"));
-
-    let matched = delete_objects_for_version(KEY, &version).size(0).build()?;
-    let response = client
-        .delete_objects()
-        .bucket(&bucket)
-        .delete(Delete::builder().objects(matched).build()?)
-        .send()
-        .await?;
-    assert_eq!(response.deleted()[0].key(), Some(KEY));
-
-    let missing = delete_objects_for_version(KEY, &version)
-        .size(9999)
-        .build()?;
-    let response = client
-        .delete_objects()
-        .bucket(&bucket)
-        .delete(Delete::builder().objects(missing).build()?)
-        .send()
-        .await?;
-    assert!(response.errors().is_empty());
-
+        .await
+        .expect_err("directory-only delete condition");
+    assert_eq!(
+        error
+            .raw_response()
+            .context("missing HTTP response")?
+            .status()
+            .as_u16(),
+        400
+    );
+    assert_error_contains(&error, "InvalidRequest");
+    assert_eq!(get_object_bytes(&client, &bucket, KEY).await?, b"delete-me");
     Ok(())
 }
 
@@ -2765,5 +2610,24 @@ async fn assert_deleted(client: &Client, bucket: &str, key: &str) -> Result<()> 
         Err(error) => error,
     };
     assert_error_contains(&error, "NoSuchKey");
+    Ok(())
+}
+
+/// Rejects a concrete destination ETag when completing a multipart upload.
+#[tokio::test]
+#[serial(conformance)]
+async fn s3ite_complete_rejects_concrete_if_none_match() -> Result<()> {
+    let (_server, client, bucket, _state) = seeded_object().await?;
+    failing_conditional_multipart_upload(
+        &client,
+        &bucket,
+        KEY,
+        b"new",
+        None,
+        Some("\"different\""),
+        "InvalidRequest",
+    )
+    .await?;
+    assert_eq!(get_object_bytes(&client, &bucket, KEY).await?, b"bar");
     Ok(())
 }

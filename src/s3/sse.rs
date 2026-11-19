@@ -5,23 +5,15 @@ use aes_gcm::{
     aead::{Aead, KeyInit, consts::U12},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use futures::StreamExt;
 use hyper::http::{HeaderMap, HeaderValue};
-use md5::{Digest, Md5};
 use s3s::{S3Error, S3ErrorCode, S3Result, dto::ServerSideEncryption};
 
-use crate::sqlite::{
-    ChecksumAccumulator, ChecksumTypeKind, EncodedBlobChunk, EncryptionMode,
-    MultipartChecksumConfig, PartChecksum, Sqlite, SqliteError, SqliteResult, StoredBlobChunk,
-    StoredChecksum, StoredSse,
-};
+use crate::sqlite::{EncodedBlobChunk, EncryptionMode, Sqlite, StoredSse};
+#[cfg(test)]
+use crate::sqlite::{SqliteError, SqliteResult, StoredBlobChunk};
 
 use super::kms;
-use super::{
-    ChecksumInput, ChecksumPolicy, InternalError, StreamingBlob, finish_part_checksum,
-    finish_payload_checksum, hex, part_checksum_accumulator, payload_checksum_accumulator,
-    s3_error_from_sqlite, s3_error_with_message, validate_content_md5,
-};
+use super::{InternalError, s3_error_from_sqlite, s3_error_with_message};
 
 const MASTER_KEY_LEN: usize = 32;
 const DATA_KEY_LEN: usize = 32;
@@ -360,106 +352,7 @@ pub(super) fn require_sse_s3_master_key(sqlite: &Sqlite) -> S3Result<[u8; 32]> {
     })
 }
 
-/// Encrypted object body chunks plus checksums needed for `PutObject`.
-#[derive(Debug)]
-pub(super) struct EncryptedObjectBody {
-    pub(super) chunks: Vec<EncodedBlobChunk>,
-    pub(super) size: i64,
-    pub(super) md5: String,
-    pub(super) checksum: StoredChecksum,
-}
-
-/// Encrypted multipart part chunks plus checksums needed for `UploadPart`.
-#[derive(Debug)]
-pub(super) struct EncryptedPartBody {
-    pub(super) chunks: Vec<EncodedBlobChunk>,
-    pub(super) size: i64,
-    pub(super) md5: String,
-    pub(super) checksum: Option<PartChecksum>,
-}
-
-struct EncryptedChunks {
-    chunks: Vec<EncodedBlobChunk>,
-    size: i64,
-}
-
-/// Reads a `PutObject` body into encrypted storage chunks without retaining plaintext.
-pub(super) async fn read_object_body_encrypted(
-    body: StreamingBlob,
-    content_md5_present: bool,
-    content_md5: Option<&str>,
-    checksum_input: ChecksumInput,
-    chunk_size: usize,
-    encryption: &ActiveSse,
-) -> S3Result<EncryptedObjectBody> {
-    let mut md5_hash = Md5::new();
-    let mut checksum_accumulator =
-        payload_checksum_accumulator(&checksum_input, ChecksumPolicy::DefaultCrc64NvmeFullObject)?;
-    let encrypted = encrypt_streaming_body(body, chunk_size, encryption, |bytes| {
-        md5_hash.update(bytes);
-        checksum_accumulator.update(bytes);
-    })
-    .await?;
-    let md5_bytes = md5_hash.finalize();
-    let md5 = hex(md5_bytes);
-
-    validate_content_md5(content_md5_present, content_md5, md5_bytes.as_ref())?;
-    let checksum = finish_payload_checksum(
-        &checksum_input,
-        checksum_accumulator,
-        ChecksumTypeKind::FullObject,
-    )?;
-
-    Ok(EncryptedObjectBody {
-        chunks: encrypted.chunks,
-        size: encrypted.size,
-        md5,
-        checksum,
-    })
-}
-
-/// Reads an `UploadPart` body into encrypted storage chunks without retaining plaintext.
-pub(super) async fn read_part_body_encrypted(
-    body: StreamingBlob,
-    checksum_input: &ChecksumInput,
-    upload_checksum: Option<MultipartChecksumConfig>,
-    content_md5_present: bool,
-    content_md5: Option<&str>,
-    chunk_size: usize,
-    encryption: &ActiveSse,
-) -> S3Result<EncryptedPartBody> {
-    let mut explicit_accumulator = part_checksum_accumulator(checksum_input)?;
-    let mut configured_accumulator = explicit_accumulator
-        .is_none()
-        .then(|| upload_checksum.map(|checksum| ChecksumAccumulator::new(checksum.algorithm)))
-        .flatten();
-    let mut md5_hash = Md5::new();
-    let encrypted = encrypt_streaming_body(body, chunk_size, encryption, |bytes| {
-        md5_hash.update(bytes);
-        if let Some(accumulator) = &mut explicit_accumulator {
-            accumulator.update(bytes);
-        }
-        if let Some(accumulator) = &mut configured_accumulator {
-            accumulator.update(bytes);
-        }
-    })
-    .await?;
-    let md5_bytes = md5_hash.finalize();
-    let md5 = hex(md5_bytes);
-
-    validate_content_md5(content_md5_present, content_md5, md5_bytes.as_ref())?;
-    let explicit_checksum = finish_part_checksum(checksum_input, explicit_accumulator)?;
-    let checksum =
-        explicit_checksum.or_else(|| configured_accumulator.map(ChecksumAccumulator::finish_part));
-
-    Ok(EncryptedPartBody {
-        chunks: encrypted.chunks,
-        size: encrypted.size,
-        md5,
-        checksum,
-    })
-}
-
+#[cfg(test)]
 /// Encrypts a plaintext value into storage chunks.
 pub(super) fn encrypt_value_chunks(
     value: &[u8],
@@ -480,6 +373,7 @@ pub(super) fn encrypt_value_chunks(
     Ok(chunks)
 }
 
+#[cfg(test)]
 /// Decrypts authenticated storage chunks into plaintext bytes.
 pub(super) fn decrypt_stored_chunks(
     encryption: &ActiveSse,
@@ -510,70 +404,8 @@ pub(super) fn decrypt_stored_chunks(
     Ok(value)
 }
 
-/// Encrypts a streaming request body into ordered storage chunks.
-async fn encrypt_streaming_body(
-    mut body: StreamingBlob,
-    chunk_size: usize,
-    encryption: &ActiveSse,
-    mut observe_plaintext: impl FnMut(&[u8]),
-) -> S3Result<EncryptedChunks> {
-    if chunk_size == 0 {
-        return Err(S3Error::with_message(
-            InternalError,
-            "object blob chunk size must be greater than zero",
-        ));
-    }
-
-    let mut chunks = Vec::new();
-    let mut buffer = Vec::new();
-    let mut total_size = 0_i64;
-    let mut next_offset = 0_i64;
-
-    while let Some(result) = body.next().await {
-        let bytes = result.map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
-        observe_plaintext(bytes.as_ref());
-        total_size = add_body_len(total_size, bytes.len())?;
-
-        let mut remaining = bytes.as_ref();
-        while !remaining.is_empty() {
-            if buffer.is_empty() && remaining.len() >= chunk_size {
-                let (chunk, rest) = remaining.split_at(chunk_size);
-                push_encrypted_chunk(&mut chunks, &mut next_offset, chunk, encryption)?;
-                remaining = rest;
-                continue;
-            }
-
-            let available = chunk_size
-                .checked_sub(buffer.len())
-                .ok_or_else(|| S3Error::with_message(InternalError, "upload chunk overflow"))?;
-            let take = available.min(remaining.len());
-            buffer.extend_from_slice(&remaining[..take]);
-            remaining = &remaining[take..];
-
-            if buffer.len() == chunk_size {
-                push_encrypted_chunk(&mut chunks, &mut next_offset, &buffer, encryption)?;
-                buffer.clear();
-            }
-        }
-    }
-
-    if !buffer.is_empty() {
-        push_encrypted_chunk(&mut chunks, &mut next_offset, &buffer, encryption)?;
-    }
-    if next_offset != total_size {
-        return Err(S3Error::with_message(
-            InternalError,
-            "encrypted upload size mismatch",
-        ));
-    }
-
-    Ok(EncryptedChunks {
-        chunks,
-        size: total_size,
-    })
-}
-
-/// Encrypts and records one plaintext storage chunk at the next object offset.
+#[cfg(test)]
+/// Encrypts one plaintext chunk and appends it with the next chunk number and offset.
 fn push_encrypted_chunk(
     chunks: &mut Vec<EncodedBlobChunk>,
     next_offset: &mut i64,
@@ -581,49 +413,62 @@ fn push_encrypted_chunk(
     encryption: &ActiveSse,
 ) -> S3Result<()> {
     let chunk_number = i32::try_from(chunks.len() + 1).map_err(S3Error::internal_error)?;
-    let size = i64::try_from(plaintext.len()).map_err(S3Error::internal_error)?;
-    let encrypted = encrypt_chunk(encryption, plaintext)
-        .map_err(|_| S3Error::with_message(InternalError, "object chunk encryption failed"))?;
-    chunks.push(EncodedBlobChunk {
+    let chunk = encode_chunk(
+        Some(encryption),
         chunk_number,
-        offset: *next_offset,
-        size,
-        body: encrypted.ciphertext,
-        sse_nonce: Some(encrypted.nonce),
-        sse_tag: Some(encrypted.tag),
-    });
+        *next_offset,
+        plaintext.to_vec(),
+    )?;
     *next_offset = next_offset
-        .checked_add(size)
+        .checked_add(chunk.size)
         .ok_or_else(|| S3Error::with_message(InternalError, "upload chunk offset overflow"))?;
+    chunks.push(chunk);
 
     Ok(())
 }
 
-/// Adds a streamed body fragment length to the plaintext object size.
-fn add_body_len(total_size: i64, len: usize) -> S3Result<i64> {
-    let len = i64::try_from(len).map_err(S3Error::internal_error)?;
-    total_size
-        .checked_add(len)
-        .ok_or_else(|| S3Error::with_message(InternalError, "upload body size overflow"))
+/// Encodes one plaintext storage chunk, encrypting it when `encryption` is set.
+///
+/// The stored `size` is always the plaintext length; AES-GCM ciphertext has the
+/// same length, with the nonce and tag kept in their own columns.
+pub(super) fn encode_chunk(
+    encryption: Option<&ActiveSse>,
+    chunk_number: i32,
+    offset: i64,
+    plaintext: Vec<u8>,
+) -> S3Result<EncodedBlobChunk> {
+    let size = i64::try_from(plaintext.len()).map_err(S3Error::internal_error)?;
+    let Some(encryption) = encryption else {
+        return Ok(EncodedBlobChunk {
+            chunk_number,
+            offset,
+            size,
+            body: plaintext,
+            sse_nonce: None,
+            sse_tag: None,
+        });
+    };
+    let encrypted = encrypt_chunk(encryption, &plaintext)
+        .map_err(|_| S3Error::with_message(InternalError, "object chunk encryption failed"))?;
+    Ok(EncodedBlobChunk {
+        chunk_number,
+        offset,
+        size,
+        body: encrypted.ciphertext,
+        sse_nonce: Some(encrypted.nonce),
+        sse_tag: Some(encrypted.tag),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
-    use bytes::Bytes;
-    use futures::stream;
     use s3s::S3Error;
     use tokio::sync::RwLock;
 
     use super::*;
-    use crate::{
-        Config,
-        sqlite::{
-            ChecksumAlgorithmKind, ChecksumTypeKind, DEFAULT_OBJECT_BLOB_CHUNK_SIZE,
-            checksum_test_support,
-        },
-    };
+    use crate::{Config, sqlite::DEFAULT_OBJECT_BLOB_CHUNK_SIZE};
 
     fn sqlite_with_config(config: Config) -> Sqlite {
         Sqlite {
@@ -800,7 +645,6 @@ mod tests {
             )
             .is_err()
         );
-        assert!(add_body_len(i64::MAX, 1).is_err());
         let mut chunks = Vec::new();
         let mut next_offset = i64::MAX;
         assert!(push_encrypted_chunk(&mut chunks, &mut next_offset, b"x", &encryption).is_err());
@@ -837,178 +681,5 @@ mod tests {
         ));
 
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn object_body_encrypts_chunks_that_decrypt() -> S3Result<()> {
-        let encryption =
-            new_active_sse(&[7; 32]).map_err(|err| S3Error::with_message(InternalError, err))?;
-        let object = read_object_body_encrypted(
-            streaming_blob(&[b"ab", b"cdef", b"ghi"]),
-            false,
-            None,
-            ChecksumInput::default(),
-            3,
-            &encryption,
-        )
-        .await?;
-
-        assert_eq!(object.size, 9);
-        assert_eq!(object.chunks.len(), 3);
-        let plaintext = decrypt_stored_chunks(
-            &encryption,
-            object
-                .chunks
-                .into_iter()
-                .map(StoredBlobChunk::from)
-                .collect(),
-        )
-        .map_err(S3Error::internal_error)?;
-        assert_eq!(plaintext, b"abcdefghi");
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn object_body_encrypts_with_explicit_checksum() -> S3Result<()> {
-        let encryption =
-            new_active_sse(&[11; 32]).map_err(|err| S3Error::with_message(InternalError, err))?;
-        let sha256 = checksum_test_support::checksum_value(ChecksumAlgorithmKind::Sha256, b"abc");
-        let object = read_object_body_encrypted(
-            streaming_blob(&[b"abc"]),
-            false,
-            None,
-            ChecksumInput {
-                sha256: Some(sha256),
-                ..Default::default()
-            },
-            3,
-            &encryption,
-        )
-        .await?;
-        assert_eq!(object.checksum.algorithm(), ChecksumAlgorithmKind::Sha256);
-        Ok(())
-    }
-
-    /// Verifies encrypted object writes return the checksum validation error.
-    #[tokio::test]
-    async fn object_body_rejects_mismatched_explicit_checksum() -> S3Result<()> {
-        let encryption =
-            new_active_sse(&[12; 32]).map_err(|err| S3Error::with_message(InternalError, err))?;
-        let result = read_object_body_encrypted(
-            streaming_blob(&[b"abc"]),
-            false,
-            None,
-            ChecksumInput {
-                sha256: Some("wrong".to_string()),
-                ..Default::default()
-            },
-            3,
-            &encryption,
-        )
-        .await;
-
-        assert!(matches!(
-            result.err().as_ref().map(S3Error::code),
-            Some(&S3ErrorCode::BadDigest)
-        ));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn part_body_encrypts_and_computes_configured_checksum() -> S3Result<()> {
-        let encryption =
-            new_active_sse(&[8; 32]).map_err(|err| S3Error::with_message(InternalError, err))?;
-        let part = read_part_body_encrypted(
-            streaming_blob(&[b"hello", b" ", b"world"]),
-            &ChecksumInput::default(),
-            Some(MultipartChecksumConfig::new(
-                ChecksumAlgorithmKind::Sha256,
-                ChecksumTypeKind::Composite,
-            )),
-            false,
-            None,
-            4,
-            &encryption,
-        )
-        .await?;
-
-        let checksum = part.checksum.ok_or(S3Error::with_message(
-            InternalError,
-            "configured part checksum is missing",
-        ))?;
-        assert_eq!(checksum.algorithm(), ChecksumAlgorithmKind::Sha256);
-        assert_eq!(part.size, 11);
-        assert_eq!(part.chunks.len(), 3);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn encrypted_body_helpers_reject_zero_chunk_size_and_accept_explicit_part_checksum()
-    -> S3Result<()> {
-        let encryption =
-            new_active_sse(&[10; 32]).map_err(|err| S3Error::with_message(InternalError, err))?;
-
-        assert!(
-            read_object_body_encrypted(
-                streaming_blob(&[b"abc"]),
-                false,
-                None,
-                ChecksumInput::default(),
-                0,
-                &encryption,
-            )
-            .await
-            .is_err()
-        );
-
-        let sha256 = checksum_test_support::checksum_value(ChecksumAlgorithmKind::Sha256, b"abc");
-        let part = read_part_body_encrypted(
-            streaming_blob(&[b"abc"]),
-            &ChecksumInput {
-                sha256: Some(sha256),
-                ..Default::default()
-            },
-            None,
-            false,
-            None,
-            3,
-            &encryption,
-        )
-        .await?;
-        assert_eq!(
-            part.checksum.as_ref().map(PartChecksum::algorithm),
-            Some(ChecksumAlgorithmKind::Sha256)
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn object_body_rejects_bad_content_md5() -> S3Result<()> {
-        let encryption =
-            new_active_sse(&[9; 32]).map_err(|err| S3Error::with_message(InternalError, err))?;
-        let result = read_object_body_encrypted(
-            streaming_blob(&[b"abc"]),
-            true,
-            Some("AAAAAAAAAAAAAAAAAAAAAA=="),
-            ChecksumInput::default(),
-            3,
-            &encryption,
-        )
-        .await;
-
-        assert!(result.is_err());
-        Ok(())
-    }
-
-    fn streaming_blob(chunks: &[&'static [u8]]) -> StreamingBlob {
-        let chunks = chunks
-            .iter()
-            .map(|chunk| Ok::<_, S3Error>(Bytes::from_static(chunk)))
-            .collect::<Vec<_>>();
-        StreamingBlob::wrap::<_, S3Error>(stream::iter(chunks).fuse())
     }
 }

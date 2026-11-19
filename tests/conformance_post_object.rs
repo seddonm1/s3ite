@@ -1711,3 +1711,36 @@ async fn test_sse_kms_default_post_object_authenticated_request() -> Result<()> 
     // Adapted from s3tests/functional/test_s3.py::test_sse_kms_default_post_object_authenticated_request: uses the signed SigV4 form path
     kms_post(true).await
 }
+
+/// Rejects a chunked browser form before issuing 100 Continue or polling the body.
+#[tokio::test]
+#[serial(conformance)]
+async fn s3ite_post_form_requires_content_length_before_reading_body() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-post");
+    create_bucket(&client, &bucket).await?;
+
+    // The real S3 accelerate response in postiz-app#1659 is 411 for this POST.
+    let response = support::raw_http::signed_expect_continue_request(
+        &server,
+        reqwest::Method::POST,
+        &format!("/{bucket}"),
+        &[
+            (
+                "Content-Type",
+                "multipart/form-data; boundary=test-boundary",
+            ),
+            ("Transfer-Encoding", "chunked"),
+        ],
+    )
+    .await?;
+    assert_eq!(response.status, reqwest::StatusCode::LENGTH_REQUIRED);
+    assert!(response.body.contains("<Code>MissingContentLength</Code>"));
+    assert!(
+        response
+            .body
+            .contains("<Message>You must provide the Content-Length HTTP header.</Message>")
+    );
+    Ok(())
+}

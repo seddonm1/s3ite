@@ -159,6 +159,10 @@ struct ConfigArgs {
     #[arg(long, default_value_t = default_blob_read_timeout_seconds())]
     blob_read_timeout_seconds: u64,
 
+    /// Size, in MiB, of each stored object chunk. Each upload buffers at most one chunk in memory.
+    #[arg(long, default_value_t = default_blob_chunk_size_mib())]
+    blob_chunk_size_mib: usize,
+
     /// Interval, in seconds, for background database maintenance. Set to `0` to disable.
     #[arg(long, default_value_t = default_maintenance_interval_seconds())]
     maintenance_interval_seconds: u64,
@@ -295,6 +299,16 @@ pub struct Config {
     #[serde(default = "default_blob_read_timeout_seconds")]
     pub blob_read_timeout_seconds: u64,
 
+    /// Size, in MiB, of each stored object chunk.
+    ///
+    /// Uploads are staged one chunk at a time, so this caps the memory each
+    /// in-flight upload holds: at most `concurrency_limit` times this size
+    /// across the server (twice that while encrypting). A copy also holds one
+    /// chunk of its source. Existing objects keep their stored chunk sizes when
+    /// it changes, so that chunk can be larger than this setting.
+    #[serde(default = "default_blob_chunk_size_mib")]
+    pub blob_chunk_size_mib: usize,
+
     /// Interval, in seconds, for background database maintenance.
     ///
     /// Set to `0` to disable periodic maintenance. Startup cleanup still runs.
@@ -371,6 +385,7 @@ impl Default for Config {
             readers: default_readers(),
             blob_readers: default_blob_readers(),
             blob_read_timeout_seconds: default_blob_read_timeout_seconds(),
+            blob_chunk_size_mib: default_blob_chunk_size_mib(),
             maintenance_interval_seconds: default_maintenance_interval_seconds(),
             maintenance_vacuum_pages: default_maintenance_vacuum_pages(),
             multipart_upload_ttl_seconds: default_multipart_upload_ttl_seconds(),
@@ -505,6 +520,9 @@ impl Config {
         if cli_supplied(matches, "blob_read_timeout_seconds") {
             self.blob_read_timeout_seconds = args.blob_read_timeout_seconds;
         }
+        if cli_supplied(matches, "blob_chunk_size_mib") {
+            self.blob_chunk_size_mib = args.blob_chunk_size_mib;
+        }
         if cli_supplied(matches, "maintenance_interval_seconds") {
             self.maintenance_interval_seconds = args.maintenance_interval_seconds;
         }
@@ -521,26 +539,35 @@ impl Config {
         if cli_supplied(matches, "read_only") {
             self.read_only = args.read_only;
         }
+        self.sqlite.apply_args(args, matches);
+    }
+}
+
+impl Pragmas {
+    /// Applies explicit command-line `SQLite` pragma values over the configured ones.
+    fn apply_args(&mut self, args: &ConfigArgs, matches: &ArgMatches) {
         if cli_supplied(matches, "journal_mode") {
-            self.sqlite.journal_mode = args.journal_mode;
+            self.journal_mode = args.journal_mode;
         }
         if cli_supplied(matches, "synchronous") {
-            self.sqlite.synchronous = args.synchronous;
+            self.synchronous = args.synchronous;
         }
         if cli_supplied(matches, "temp_store") {
-            self.sqlite.temp_store = args.temp_store;
+            self.temp_store = args.temp_store;
         }
         if cli_supplied(matches, "cache_size") {
-            self.sqlite.cache_size = args.cache_size;
+            self.cache_size = args.cache_size;
         }
         if cli_supplied(matches, "busy_timeout_milliseconds") {
-            self.sqlite.busy_timeout_milliseconds = args.busy_timeout_milliseconds;
+            self.busy_timeout_milliseconds = args.busy_timeout_milliseconds;
         }
         if cli_supplied(matches, "journal_size_limit") {
-            self.sqlite.journal_size_limit = args.journal_size_limit;
+            self.journal_size_limit = args.journal_size_limit;
         }
     }
+}
 
+impl Config {
     /// Returns the effective `CORS` mode, including deprecated aliases.
     #[must_use]
     pub(crate) fn cors_mode(&self) -> CorsMode {
@@ -561,6 +588,16 @@ impl Config {
         if self.access_key.is_some() != self.secret_key.is_some() {
             return Err(ConfigError::Configuration(
                 "access_key and secret_key must be set together or both omitted".into(),
+            ));
+        }
+        if self.concurrency_limit == 0 {
+            return Err(ConfigError::Configuration(
+                "concurrency_limit must be greater than zero".into(),
+            ));
+        }
+        if self.blob_chunk_size_mib == 0 {
+            return Err(ConfigError::Configuration(
+                "blob_chunk_size_mib must be greater than zero".into(),
             ));
         }
         self.cors_mode()
@@ -726,6 +763,8 @@ read_only: {read_only}
 readers: {readers}
 blob_readers: {blob_readers}
 blob_read_timeout_seconds: {blob_read_timeout_seconds}
+# Caps the memory each in-flight upload buffers.
+blob_chunk_size_mib: {blob_chunk_size_mib}
 
 maintenance_interval_seconds: {maintenance_interval_seconds}
 maintenance_vacuum_pages: {maintenance_vacuum_pages}
@@ -758,6 +797,7 @@ cors:
         readers = config.readers,
         blob_readers = config.blob_readers,
         blob_read_timeout_seconds = config.blob_read_timeout_seconds,
+        blob_chunk_size_mib = config.blob_chunk_size_mib,
         maintenance_interval_seconds = config.maintenance_interval_seconds,
         maintenance_vacuum_pages = config.maintenance_vacuum_pages,
         multipart_upload_ttl_seconds = config.multipart_upload_ttl_seconds,
@@ -1186,6 +1226,11 @@ fn default_blob_read_timeout_seconds() -> u64 {
     120
 }
 
+/// Default stored chunk size, in MiB, which also caps each upload's buffered bytes.
+fn default_blob_chunk_size_mib() -> usize {
+    16
+}
+
 fn default_maintenance_interval_seconds() -> u64 {
     60
 }
@@ -1425,6 +1470,7 @@ mod tests {
         assert_eq!(Config::default().readers, 4);
         assert_eq!(Config::default().blob_readers, 16);
         assert_eq!(Config::default().blob_read_timeout_seconds, 120);
+        assert_eq!(Config::default().blob_chunk_size_mib, 16);
 
         let config: Config = yaml_serde::from_str(
             "
@@ -1566,6 +1612,7 @@ mod tests {
             format!("[default: {}]", default_readers()),
             format!("[default: {}]", default_blob_readers()),
             format!("[default: {}]", default_blob_read_timeout_seconds()),
+            format!("[default: {}]", default_blob_chunk_size_mib()),
             format!("[default: {}]", default_maintenance_interval_seconds()),
             format!("[default: {}]", default_maintenance_vacuum_pages()),
             format!("[default: {}]", default_multipart_upload_ttl_seconds()),
@@ -1603,6 +1650,7 @@ mod tests {
             "readers",
             "blob_readers",
             "blob_read_timeout_seconds",
+            "blob_chunk_size_mib",
             "maintenance_interval_seconds",
             "maintenance_vacuum_pages",
             "multipart_upload_ttl_seconds",
@@ -1650,6 +1698,7 @@ mod tests {
             args.blob_read_timeout_seconds,
             default_blob_read_timeout_seconds()
         );
+        assert_eq!(args.blob_chunk_size_mib, default_blob_chunk_size_mib());
         assert_eq!(
             args.maintenance_interval_seconds,
             default_maintenance_interval_seconds()
@@ -1756,6 +1805,7 @@ mod tests {
             config.blob_read_timeout_seconds,
             default.blob_read_timeout_seconds
         );
+        assert_eq!(config.blob_chunk_size_mib, default.blob_chunk_size_mib);
         assert_eq!(
             config.maintenance_interval_seconds,
             default.maintenance_interval_seconds
@@ -1819,6 +1869,55 @@ mod tests {
         Ok(())
     }
 
+    /// Startup rejects a zero request limit from the CLI or YAML, which would hang every request.
+    #[test]
+    fn rejects_zero_concurrency_limit() -> TestResult {
+        let is_zero_limit_error = |result: ConfigResult<ConfigAction>| {
+            matches!(
+                result,
+                Err(ConfigError::Configuration(message))
+                    if message == "concurrency_limit must be greater than zero"
+            )
+        };
+        let matches =
+            ConfigArgs::command().try_get_matches_from(["s3ite", "--concurrency-limit", "0"])?;
+        assert!(is_zero_limit_error(ConfigAction::from_arg_matches(
+            &matches
+        )));
+
+        let directory = tempdir()?;
+        let path = directory.path().join("config.yaml");
+        write(&path, "concurrency_limit: 0")?;
+        let matches = ConfigArgs::command().try_get_matches_from([
+            "s3ite".as_ref(),
+            "--config".as_ref(),
+            path.as_os_str(),
+        ])?;
+        assert!(is_zero_limit_error(ConfigAction::from_arg_matches(
+            &matches
+        )));
+        Ok(())
+    }
+
+    /// Startup rejects a zero chunk size, which could never stage a byte.
+    #[test]
+    fn rejects_zero_blob_chunk_size() -> TestResult {
+        let matches =
+            ConfigArgs::command().try_get_matches_from(["s3ite", "--blob-chunk-size-mib", "0"])?;
+        assert!(matches!(
+            ConfigAction::from_arg_matches(&matches),
+            Err(ConfigError::Configuration(message))
+                if message == "blob_chunk_size_mib must be greater than zero"
+        ));
+        let matches =
+            ConfigArgs::command().try_get_matches_from(["s3ite", "--blob-chunk-size-mib", "2"])?;
+        let ConfigAction::Run(config) = ConfigAction::from_arg_matches(&matches)? else {
+            panic!("a valid chunk size should run");
+        };
+        assert_eq!(config.blob_chunk_size_mib, 2);
+        Ok(())
+    }
+
     /// Verifies Clap defaults do not replace values loaded from a YAML file.
     #[test]
     fn clap_defaults_do_not_override_yaml_config() -> TestResult {
@@ -1834,6 +1933,7 @@ mod tests {
             readers: 2
             blob_readers: 6
             blob_read_timeout_seconds: 90
+            blob_chunk_size_mib: 4
             maintenance_interval_seconds: 30
             maintenance_vacuum_pages: 5
             multipart_upload_ttl_seconds: 100
@@ -1862,6 +1962,7 @@ mod tests {
         assert_eq!(config.readers, 2);
         assert_eq!(config.blob_readers, 6);
         assert_eq!(config.blob_read_timeout_seconds, 90);
+        assert_eq!(config.blob_chunk_size_mib, 4);
         assert_eq!(config.maintenance_interval_seconds, 30);
         assert_eq!(config.maintenance_vacuum_pages, 5);
         assert_eq!(config.multipart_upload_ttl_seconds, 100);

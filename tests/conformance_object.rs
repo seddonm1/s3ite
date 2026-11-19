@@ -654,7 +654,8 @@ async fn test_get_object_torrent() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn s3ite_object_write_with_chunked_transfer_encoding() -> Result<()> {
-    // Ceph s3-tests accepts this, but s3ite requires AWS-declared object size before reading bytes.
+    // Ceph s3-tests test_s3.py::test_object_write_with_chunked_transfer_encoding
+    // expects 200. Real S3 rejects plain chunked PUT with 501 (co-cddo/gds-idea-app-drop#9).
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-obj");
@@ -667,8 +668,13 @@ async fn s3ite_object_write_with_chunked_transfer_encoding() -> Result<()> {
         b"bar".to_vec(),
     )
     .await?;
-    assert_status(&response, StatusCode::LENGTH_REQUIRED);
-    assert!(response.text().await?.contains("MissingContentLength"));
+    assert_status(&response, StatusCode::NOT_IMPLEMENTED);
+    let xml = response.text().await?;
+    assert!(xml.contains("<Code>NotImplemented</Code>"));
+    assert!(xml.contains(
+        "<Message>A header you provided implies functionality that is not implemented</Message>"
+    ));
+    assert!(xml.contains("<Header>Transfer-Encoding</Header>"));
 
     let error = match client.get_object().bucket(&bucket).key("foo").send().await {
         Ok(_) => bail!("ordinary chunked PutObject should not store plaintext"),
@@ -679,10 +685,12 @@ async fn s3ite_object_write_with_chunked_transfer_encoding() -> Result<()> {
     Ok(())
 }
 
-/// Verifies PutObject rejects missing `Content-Length` without reading a body.
+/// Verifies the plain chunked PUT rejection also applies to an empty transfer.
 #[tokio::test]
 #[serial(conformance)]
-async fn s3ite_object_write_missing_content_length() -> Result<()> {
+async fn s3ite_object_write_with_empty_chunked_transfer() -> Result<()> {
+    // Without Content-Length this helper still sends Transfer-Encoding: chunked.
+    // The plain chunked PUT rejection observed on AWS applies even with no data.
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-obj");
@@ -695,8 +703,13 @@ async fn s3ite_object_write_missing_content_length() -> Result<()> {
         Vec::new(),
     )
     .await?;
-    assert_status(&response, StatusCode::LENGTH_REQUIRED);
-    assert!(response.text().await?.contains("MissingContentLength"));
+    assert_status(&response, StatusCode::NOT_IMPLEMENTED);
+    let xml = response.text().await?;
+    assert!(xml.contains("<Code>NotImplemented</Code>"));
+    assert!(xml.contains(
+        "<Message>A header you provided implies functionality that is not implemented</Message>"
+    ));
+    assert!(xml.contains("<Header>Transfer-Encoding</Header>"));
 
     Ok(())
 }

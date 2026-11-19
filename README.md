@@ -434,6 +434,12 @@ Common service options:
 - `readers`: short metadata/query SQLite reader connections. Default: `4`.
 - `blob_readers`: long-lived `GetObject` BLOB reader connections. Default: `16`.
 - `blob_read_timeout_seconds`: timeout for blocked BLOB readers. Default: `120`.
+- `blob_chunk_size_mib`: size of each stored object chunk, in MiB. Each
+  in-flight upload buffers at most one chunk (two while encrypting), so peak
+  upload memory is about `concurrency_limit` times this value. A copy also holds
+  one chunk of its source, which can be larger if the source was stored with a
+  bigger setting: existing objects keep their chunk sizes when it changes.
+  Default: `16`.
 - `maintenance_interval_seconds`: background maintenance interval. Default: `60`.
 - `maintenance_vacuum_pages`: incremental vacuum pages per pass. Default: `100`.
 - `multipart_upload_ttl_seconds`: inactive incomplete upload TTL. Default: `86400`.

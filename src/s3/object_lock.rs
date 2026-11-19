@@ -70,22 +70,6 @@ pub(super) fn object_lock_for_new_version(
     })
 }
 
-/// Resolves Object Lock metadata for a copied object version.
-pub(super) fn object_lock_for_copied_version(
-    source: &StoredObjectLock,
-    config: &StoredObjectLockConfig,
-    headers: ObjectLockWriteHeaders,
-    now: OffsetDateTime,
-) -> S3Result<StoredObjectLock> {
-    if headers.has_any() {
-        object_lock_for_new_version(config, headers, now)
-    } else if source.legal_hold.is_some() || source.retention.is_some() {
-        Ok(source.clone())
-    } else {
-        object_lock_for_new_version(config, headers, now)
-    }
-}
-
 /// Returns the S3 legal-hold response header value for stored metadata.
 #[must_use]
 pub(super) fn object_lock_legal_hold_status(
@@ -806,44 +790,6 @@ mod tests {
         });
         assert!(validate_object_lock_delete(&metadata, false, OffsetDateTime::UNIX_EPOCH).is_err());
         assert!(validate_object_lock_delete(&metadata, true, OffsetDateTime::UNIX_EPOCH).is_ok());
-    }
-
-    #[test]
-    fn copied_versions_preserve_source_lock_or_apply_explicit_headers() -> S3Result<()> {
-        let now = OffsetDateTime::UNIX_EPOCH;
-        let config = StoredObjectLockConfig {
-            enabled: true,
-            default_retention: None,
-        };
-        let source = StoredObjectLock {
-            legal_hold: Some(false),
-            retention: Some(StoredObjectRetention {
-                mode: StoredObjectLockMode::Compliance,
-                retain_until: now + Duration::days(3),
-            }),
-        };
-
-        assert_eq!(
-            object_lock_for_copied_version(
-                &source,
-                &config,
-                ObjectLockWriteHeaders::default(),
-                now
-            )?,
-            source
-        );
-
-        let copied = object_lock_for_copied_version(
-            &StoredObjectLock::default(),
-            &config,
-            ObjectLockWriteHeaders {
-                legal_hold: Some(true),
-                retention: None,
-            },
-            now,
-        )?;
-        assert_eq!(copied.legal_hold, Some(true));
-        Ok(())
     }
 
     #[test]

@@ -3,14 +3,13 @@ use std::{
     ops::{Not, Range as ByteRange},
 };
 
-use bytes::Bytes;
-use futures::{Stream, StreamExt, TryStreamExt, stream};
+use futures::{StreamExt, stream};
 use hyper::http::{HeaderMap, HeaderValue};
 use md5::{Digest, Md5};
 use s3s::{
     S3, S3Error, S3ErrorCode,
     S3ErrorCode::InternalError,
-    S3Request, S3Response, S3Result, StdError,
+    S3Request, S3Response, S3Result,
     dto::{
         AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketCannedACL,
         BucketVersioningStatus, ChecksumMode, CommonPrefix, CompleteMultipartUploadInput,
@@ -61,10 +60,7 @@ use s3s::{
     },
 };
 use time::OffsetDateTime;
-use tokio::{
-    fs,
-    io::{AsyncWrite, AsyncWriteExt},
-};
+use tokio::fs;
 use uuid::Uuid;
 
 use crate::ClientAddress;
@@ -126,7 +122,9 @@ mod object_lock;
 mod owner;
 mod post;
 mod put;
+mod source;
 mod sse;
+mod stage;
 mod tagging;
 
 pub(crate) use self::{
@@ -140,10 +138,9 @@ use self::{
         checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_input, checksum_md5,
         checksum_mode_enabled, checksum_sha1, checksum_sha256, checksum_sha512, checksum_struct,
         checksum_type_output, checksum_xxhash3, checksum_xxhash64, checksum_xxhash128,
-        configured_part_checksum, default_crc64nvme_full_object_checksum, finish_part_checksum,
-        finish_payload_checksum, hex, multipart_checksum_config, object_checksum_for_part,
-        object_write_checksum_from_value, part_checksum_accumulator, payload_checksum_accumulator,
-        validate_content_md5,
+        default_crc64nvme_full_object_checksum, finish_part_checksum, finish_payload_checksum, hex,
+        multipart_checksum_config, object_checksum_for_part, part_checksum_accumulator,
+        payload_checksum_accumulator, validate_content_md5,
     },
     error::{
         not_found_delete_marker_error, not_modified_error, s3_error, s3_error_from_sqlite,
@@ -157,19 +154,17 @@ use self::{
     multipart::{requested_part_range, validate_part_number},
     object_lock::{
         ObjectLockWriteHeaders, delete_requires_object_lock_check, load_bucket_object_lock_config,
-        object_lock_for_copied_version, object_lock_for_new_version, object_lock_legal_hold_status,
-        object_lock_mode, object_lock_retain_until_date, object_lock_write_headers,
-        validate_object_lock_delete,
+        object_lock_for_new_version, object_lock_legal_hold_status, object_lock_mode,
+        object_lock_retain_until_date, object_lock_write_headers, validate_object_lock_delete,
     },
     owner::{
         BucketAclRequest, ObjectAclRequest, owner, validate_bucket_acl,
         validate_expected_bucket_owner, validate_object_acl,
     },
     sse::{
-        ActiveSse, WriteEncryption, decrypt_stored_chunks, encrypt_value_chunks,
-        encryption_headers, open_encryption, read_object_body_encrypted, read_part_body_encrypted,
-        requested_encryption, require_sse_s3_master_key, resolve_write_encryption,
-        validate_no_sse_headers, validate_no_unsupported_sse_headers,
+        ActiveSse, WriteEncryption, encryption_headers, open_encryption, requested_encryption,
+        require_sse_s3_master_key, resolve_write_encryption, validate_no_sse_headers,
+        validate_no_unsupported_sse_headers,
     },
     tagging::{CopyTaggingDirective, copy_tagging_directive, stored_tags_from_header},
 };
@@ -236,16 +231,33 @@ enum ObjectReadConditionFailure {
     PreconditionFailed,
 }
 
-/// Converts S3 write condition headers into storage-neutral object conditions.
-#[must_use]
+/// Validates S3 write conditions and converts them to storage-neutral conditions.
+///
+/// The browser form adapter retains its existing concrete `ETag` behavior.
 fn object_write_conditions(
     if_match: Option<ETagCondition>,
     if_none_match: Option<ETagCondition>,
-) -> ObjectWriteConditions {
-    ObjectWriteConditions {
+    browser_form: bool,
+) -> S3Result<ObjectWriteConditions> {
+    let if_none_match = match if_none_match {
+        None => None,
+        Some(ETagCondition::Any) => Some(ObjectTagCondition::Any),
+        Some(ETagCondition::ETag(etag)) if browser_form => {
+            Some(ObjectTagCondition::Md5(etag.into_value()))
+        }
+        Some(ETagCondition::ETag(_)) => {
+            // AWS PutObject and Conditional writes specify only "*" here.
+            // InvalidRequest identifies an unsupported write condition value.
+            return Err(s3_error_with_message(
+                S3ErrorCode::InvalidRequest,
+                "If-None-Match must be * for object writes",
+            ));
+        }
+    };
+    Ok(ObjectWriteConditions {
         if_match: if_match.map(strong_object_tag_condition),
-        if_none_match: if_none_match.map(weak_object_tag_condition),
-    }
+        if_none_match,
+    })
 }
 
 /// Converts an `If-Match` value into a strong storage tag condition.
@@ -255,15 +267,6 @@ fn strong_object_tag_condition(condition: ETagCondition) -> ObjectTagCondition {
         ETagCondition::Any => ObjectTagCondition::Any,
         ETagCondition::ETag(ETag::Strong(md5)) => ObjectTagCondition::Md5(md5),
         ETagCondition::ETag(ETag::Weak(_)) => ObjectTagCondition::Never,
-    }
-}
-
-/// Converts an `If-None-Match` value into a weak storage tag condition.
-#[must_use]
-fn weak_object_tag_condition(condition: ETagCondition) -> ObjectTagCondition {
-    match condition {
-        ETagCondition::Any => ObjectTagCondition::Any,
-        ETagCondition::ETag(etag) => ObjectTagCondition::Md5(etag.into_value()),
     }
 }
 
@@ -325,25 +328,6 @@ fn validate_read_conditions(
     }
 
     Ok(())
-}
-
-/// Copies a streaming S3 request body into an async writer.
-async fn copy_bytes<S, W>(mut stream: S, writer: &mut W) -> S3Result<u64>
-where
-    S: Stream<Item = std::result::Result<Bytes, StdError>> + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut nwritten: u64 = 0;
-    while let Some(result) = stream.next().await {
-        let bytes = result.map_err(|err| S3Error::with_message(InternalError, err.to_string()))?;
-        writer
-            .write_all(&bytes)
-            .await
-            .map_err(S3Error::internal_error)?;
-        nwritten += bytes.len() as u64;
-    }
-    writer.flush().await.map_err(S3Error::internal_error)?;
-    Ok(nwritten)
 }
 
 #[async_trait::async_trait]
@@ -1251,25 +1235,34 @@ mod tests {
         assert!(!weak_etag_condition_matches(&ETagCondition::Any, None));
     }
 
+    /// Covers storage translation and rejects concrete write-side `If-None-Match` `ETags`.
     #[test]
-    fn maps_write_conditions_to_storage_conditions() {
+    fn maps_write_conditions_to_storage_conditions() -> S3Result<()> {
+        let invalid = object_write_conditions(
+            None,
+            Some(ETagCondition::ETag(ETag::Weak("none".to_string()))),
+            false,
+        );
+        assert_eq!(
+            invalid.err().as_ref().map(S3Error::code),
+            Some(&S3ErrorCode::InvalidRequest)
+        );
         let conditions = object_write_conditions(
             Some(ETagCondition::ETag(ETag::Strong("md5".to_string()))),
-            Some(ETagCondition::ETag(ETag::Weak("none".to_string()))),
-        );
+            None,
+            false,
+        )?;
         assert!(matches!(
             conditions.if_match,
             Some(ObjectTagCondition::Md5(value)) if value == "md5"
         ));
-        assert!(matches!(
-            conditions.if_none_match,
-            Some(ObjectTagCondition::Md5(value)) if value == "none"
-        ));
+        assert!(conditions.if_none_match.is_none());
 
         let conditions = object_write_conditions(
             Some(ETagCondition::ETag(ETag::Weak("md5".to_string()))),
             Some(ETagCondition::Any),
-        );
+            false,
+        )?;
         assert!(matches!(
             conditions.if_match,
             Some(ObjectTagCondition::Never)
@@ -1279,9 +1272,17 @@ mod tests {
             Some(ObjectTagCondition::Any)
         ));
 
-        let conditions = object_write_conditions(Some(ETagCondition::Any), None);
+        let conditions = object_write_conditions(Some(ETagCondition::Any), None, false)?;
         assert!(matches!(conditions.if_match, Some(ObjectTagCondition::Any)));
-        assert!(conditions.if_none_match.is_none());
+        let browser_form = object_write_conditions(
+            None,
+            Some(ETagCondition::ETag(ETag::Weak("form".to_string()))),
+            true,
+        )?;
+        assert!(
+            matches!(browser_form.if_none_match, Some(ObjectTagCondition::Md5(value)) if value=="form")
+        );
+        Ok(())
     }
 
     #[test]

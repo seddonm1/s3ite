@@ -147,6 +147,7 @@ async fn multipart_completion_is_logged() -> Result<()> {
     Ok(())
 }
 
+/// Checks that trace-close records include each operation and its request fields.
 #[tokio::test]
 #[serial(conformance)]
 async fn all_s3_endpoint_trace_closes_are_logged() -> Result<()> {
@@ -158,6 +159,7 @@ async fn all_s3_endpoint_trace_closes_are_logged() -> Result<()> {
     let target_bucket = bucket_name("s3ite-log-target");
     let empty_bucket = bucket_name("s3ite-log-empty");
     let key = "logged-object";
+    let source_size = 5 * 1024 * 1024 + 1;
     let copy_key = "logged-copy";
     let delete_key = "logged-delete-one";
     let delete_many_a = "logged-delete-many-a";
@@ -191,7 +193,7 @@ async fn all_s3_endpoint_trace_closes_are_logged() -> Result<()> {
         .put_object()
         .bucket(&bucket)
         .key(key)
-        .body(ByteStream::from_static(b"body"))
+        .body(ByteStream::from(vec![b'b'; source_size]))
         .send()
         .await?;
     for key in [delete_key, delete_many_a, delete_many_b] {
@@ -388,7 +390,7 @@ async fn all_s3_endpoint_trace_closes_are_logged() -> Result<()> {
             "list_multipart_uploads{{user_id={user_id} client_ip={client_ip} bucket={bucket} prefix=logged delimiter=/ key_marker= upload_id_marker= max_uploads=10}}"
         ),
         format!(
-            "put_object{{user_id={user_id} client_ip={client_ip} bucket={bucket} key={key} content_length=4}}"
+            "put_object{{user_id={user_id} client_ip={client_ip} bucket={bucket} key={key} content_length={source_size}}}"
         ),
         format!(
             "put_object_acl{{user_id={user_id} client_ip={client_ip} bucket={bucket} key={key} version_id=}}"

@@ -33,7 +33,7 @@ use tokio::{
     signal,
     time::sleep,
 };
-use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer};
+use tower::{ServiceBuilder, limit::GlobalConcurrencyLimitLayer};
 use tracing::{info, warn};
 
 mod compat;
@@ -182,6 +182,10 @@ async fn shutdown_signal() -> std::io::Result<()> {
 }
 
 /// Serves S3 connections until shutdown and gives active requests time to finish.
+///
+/// `concurrency_limit` caps in-flight S3 requests across every connection: one
+/// semaphore is shared by all accepted connections, so HTTP/1 keep-alive
+/// clients cannot bypass the limit by opening more connections.
 async fn serve(
     listener: TcpListener,
     svc: S3Service,
@@ -194,6 +198,7 @@ async fn serve(
     let http_server = auto::Builder::new(TokioExecutor::new());
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
     let mut shutdown = std::pin::pin!(shutdown_signal());
+    let request_limit = GlobalConcurrencyLimitLayer::new(concurrency_limit.into());
 
     readiness.set(true);
     info!("server is running at http://{local_addr}");
@@ -214,7 +219,7 @@ async fn serve(
                 request.extensions_mut().insert(ClientAddress(remote_addr));
                 request
             })
-            .layer(ConcurrencyLimitLayer::new(concurrency_limit.into()))
+            .layer(request_limit.clone())
             .layer(cors_layer.clone())
             .layer(S3CompatLayer)
             .service(svc.clone());

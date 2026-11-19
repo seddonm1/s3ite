@@ -10,7 +10,8 @@ use rusqlite::Transaction;
 use tokio::fs;
 
 use super::{
-    BucketConnection, BucketVersioningState, EncryptionMode, Sqlite, SqliteError, SqliteResult,
+    BucketConnection, BucketOpen, BucketVersioningState, EncryptionMode, Sqlite, SqliteError,
+    SqliteResult,
 };
 
 impl Sqlite {
@@ -43,7 +44,7 @@ impl Sqlite {
                 continue;
             };
 
-            Self::prepare_bucket_file(path.clone(), config, &bucket).await?;
+            Self::prepare_bucket_file(path.clone(), config, &bucket, BucketOpen::Startup).await?;
             let connection = BucketConnection::open(path, config, &bucket).await?;
             buckets.insert(bucket, Arc::new(connection));
         }
@@ -83,7 +84,7 @@ impl Sqlite {
 
         let file_path = self.get_bucket_path(bucket)?;
         let config = self.config.clone();
-        Self::prepare_bucket_file(file_path.clone(), &config, bucket).await?;
+        Self::prepare_bucket_file(file_path.clone(), &config, bucket, BucketOpen::Create).await?;
 
         let connection = BucketConnection::open(file_path, &config, bucket).await?;
         let bucket = bucket.to_string();

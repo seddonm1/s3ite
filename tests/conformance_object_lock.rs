@@ -11,10 +11,10 @@ use aws_sdk_s3::{
     Client,
     primitives::{ByteStream, DateTime},
     types::{
-        BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, DefaultRetention, Delete,
-        ObjectIdentifier, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold,
-        ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode,
-        ObjectLockRule,
+        BucketVersioningStatus, ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart,
+        DefaultRetention, Delete, ObjectIdentifier, ObjectLockConfiguration, ObjectLockEnabled,
+        ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention,
+        ObjectLockRetentionMode, ObjectLockRule,
     },
 };
 use reqwest::{Method, StatusCode};
@@ -107,9 +107,11 @@ fn legal_hold(status: ObjectLockLegalHoldStatus) -> ObjectLockLegalHold {
     ObjectLockLegalHold::builder().status(status).build()
 }
 
+/// Uploads a version with a client checksum, including in buckets with default retention.
 async fn put_object(client: &Client, bucket: &str, key: &str) -> Result<String> {
     let output = client
         .put_object()
+        .checksum_algorithm(ChecksumAlgorithm::Crc32)
         .bucket(bucket)
         .key(key)
         .body(ByteStream::from_static(b"abc"))
@@ -132,6 +134,7 @@ async fn put_unversioned_object(client: &Client, bucket: &str, key: &str) -> Res
     Ok(())
 }
 
+/// Uploads a governance-retained version with a client checksum.
 async fn put_object_with_governance_retention(
     client: &Client,
     bucket: &str,
@@ -142,6 +145,7 @@ async fn put_object_with_governance_retention(
         .put_object()
         .bucket(bucket)
         .key(key)
+        .checksum_algorithm(ChecksumAlgorithm::Crc32)
         .object_lock_mode(ObjectLockMode::Governance)
         .object_lock_retain_until_date(retain_until_date)
         .body(ByteStream::from_static(b"abc"))
@@ -153,6 +157,7 @@ async fn put_object_with_governance_retention(
         .ok_or_else(|| anyhow!("PutObject response missing version ID"))
 }
 
+/// Uploads a compliance-retained version with a client checksum.
 async fn put_object_with_compliance_retention(
     client: &Client,
     bucket: &str,
@@ -163,6 +168,7 @@ async fn put_object_with_compliance_retention(
         .put_object()
         .bucket(bucket)
         .key(key)
+        .checksum_algorithm(ChecksumAlgorithm::Crc32)
         .object_lock_mode(ObjectLockMode::Compliance)
         .object_lock_retain_until_date(retain_until_date)
         .body(ByteStream::from_static(b"abc"))
@@ -1485,6 +1491,7 @@ async fn test_object_lock_uploading_obj() -> Result<()> {
         .put_object()
         .bucket(&bucket)
         .key(key)
+        .checksum_algorithm(ChecksumAlgorithm::Crc32)
         .object_lock_mode(ObjectLockMode::Governance)
         .object_lock_retain_until_date(date_2030())
         .object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On)
@@ -1594,5 +1601,179 @@ async fn test_object_lock_changing_mode_from_compliance() -> Result<()> {
         .expect_err("changing compliance mode should fail");
     assert_error_contains(&error, "AccessDenied");
 
+    Ok(())
+}
+
+/// Verifies CopyObject never carries the source version's Object Lock settings.
+///
+/// AWS documents that "copied objects will not retain the Object Lock settings
+/// from the original objects"; a copy is locked only by request headers or the
+/// destination bucket's default retention.
+#[tokio::test]
+#[serial(conformance)]
+async fn s3ite_copy_object_does_not_inherit_source_object_lock() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let source_bucket = create_object_lock_bucket(&client, "object-lock-copy-src").await?;
+    put_object_with_compliance_retention(&client, &source_bucket, "src", date_2030()).await?;
+    client
+        .put_object_legal_hold()
+        .bucket(&source_bucket)
+        .key("src")
+        .legal_hold(legal_hold(ObjectLockLegalHoldStatus::On))
+        .send()
+        .await?;
+    let copy_source = format!("{source_bucket}/src");
+
+    let plain_bucket = create_bucket(&client, "object-lock-copy-plain").await?;
+    client
+        .copy_object()
+        .bucket(&plain_bucket)
+        .key("copy")
+        .copy_source(&copy_source)
+        .send()
+        .await?;
+    let head = client
+        .head_object()
+        .bucket(&plain_bucket)
+        .key("copy")
+        .send()
+        .await?;
+    assert_eq!(head.object_lock_mode(), None);
+    assert_eq!(head.object_lock_legal_hold_status(), None);
+    client
+        .delete_object()
+        .bucket(&plain_bucket)
+        .key("copy")
+        .send()
+        .await?;
+
+    let default_bucket = create_object_lock_bucket(&client, "object-lock-copy-dflt").await?;
+    client
+        .put_object_lock_configuration()
+        .bucket(&default_bucket)
+        .object_lock_configuration(governance_days_config(1))
+        .send()
+        .await?;
+    let copied = client
+        .copy_object()
+        .bucket(&default_bucket)
+        .key("copy")
+        .copy_source(&copy_source)
+        .send()
+        .await?;
+    let head = client
+        .head_object()
+        .bucket(&default_bucket)
+        .key("copy")
+        .send()
+        .await?;
+    assert_eq!(head.object_lock_mode(), Some(&ObjectLockMode::Governance));
+    assert_ne!(
+        head.object_lock_legal_hold_status(),
+        Some(&ObjectLockLegalHoldStatus::On)
+    );
+    let retention = get_retention(&client, &default_bucket, "copy", copied.version_id()).await?;
+    assert!(
+        retention
+            .retain_until_date()
+            .is_some_and(|until| until.secs() < RETAIN_2030)
+    );
+    Ok(())
+}
+
+/// Requires either integrity header for retention, bucket defaults, and legal holds.
+#[tokio::test]
+#[serial(conformance)]
+async fn s3ite_put_object_lock_integrity_headers() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = create_object_lock_bucket(&client, "object-lock-integrity").await?;
+    let path = format!("/{bucket}/key");
+    let unlocked = raw_http::signed_request(&server, Method::PUT, &path, b"abc".to_vec()).await?;
+    assert_eq!(unlocked.status(), StatusCode::OK);
+    let mut rejections = Vec::new();
+    for lock in [
+        &[
+            ("x-amz-object-lock-mode", "GOVERNANCE"),
+            (
+                "x-amz-object-lock-retain-until-date",
+                "2140-01-01T00:00:00Z",
+            ),
+        ][..],
+        &[("x-amz-object-lock-legal-hold", "ON")][..],
+    ] {
+        let rejected = raw_http::signed_request_with_headers(
+            &server,
+            Method::PUT,
+            &path,
+            b"abc".to_vec(),
+            lock,
+        )
+        .await?;
+        rejections.push((rejected.status(), rejected.text().await?));
+        for integrity in [
+            &[("Content-MD5", "kAFQmDzST7DWlj99KOF/cg==")][..],
+            &[
+                ("x-amz-sdk-checksum-algorithm", "CRC32"),
+                ("x-amz-checksum-crc32", "NSRBwg=="),
+            ][..],
+            &[("x-amz-checksum-crc32", "NSRBwg==")][..],
+        ] {
+            let mut headers = lock.to_vec();
+            headers.extend_from_slice(integrity);
+            let accepted = raw_http::signed_request_with_headers(
+                &server,
+                Method::PUT,
+                &path,
+                b"abc".to_vec(),
+                &headers,
+            )
+            .await?;
+            assert_eq!(accepted.status(), StatusCode::OK);
+        }
+    }
+
+    client
+        .put_object_lock_configuration()
+        .bucket(&bucket)
+        .object_lock_configuration(governance_days_config(1))
+        .send()
+        .await?;
+    // AWS's Object Lock compliance assessment also requires integrity on
+    // retention inherited from the bucket's default.
+    let default_path = format!("/{bucket}/default");
+    let rejected =
+        raw_http::signed_request(&server, Method::PUT, &default_path, b"abc".to_vec()).await?;
+    rejections.push((rejected.status(), rejected.text().await?));
+    // A header that only looks like a checksum supplies nothing to verify.
+    let rejected = raw_http::signed_request_with_headers(
+        &server,
+        Method::PUT,
+        &default_path,
+        b"abc".to_vec(),
+        &[("x-amz-checksum-bogus", "anything")],
+    )
+    .await?;
+    rejections.push((rejected.status(), rejected.text().await?));
+    assert_eq!(
+        rejections
+            .iter()
+            .map(|(status, xml)| (*status, xml.contains("<Code>InvalidRequest</Code>")))
+            .collect::<Vec<_>>(),
+        [(StatusCode::BAD_REQUEST, true); 4],
+        "{rejections:?}",
+    );
+    let accepted = raw_http::signed_request_with_headers(
+        &server,
+        Method::PUT,
+        &default_path,
+        b"abc".to_vec(),
+        &[("Content-MD5", "kAFQmDzST7DWlj99KOF/cg==")],
+    )
+    .await?;
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let retention = get_retention(&client, &bucket, "default", None).await?;
+    assert_eq!(retention.mode(), Some(&ObjectLockRetentionMode::Governance));
     Ok(())
 }

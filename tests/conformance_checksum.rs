@@ -24,7 +24,9 @@ use serial_test::serial;
 use support::{
     assertions::assert_error_contains,
     fixtures::{bucket_name, create_bucket, get_object_bytes, put_object},
-    raw_http::signed_request_with_headers,
+    raw_http::{
+        TrailerBody, signed_request_with_headers, trailer_request, unsigned_trailer_request,
+    },
     sdk,
     server::TestServer,
 };
@@ -114,6 +116,163 @@ async fn check_object_checksum(algorithm: &str, expected: &str) -> Result<()> {
         assert_eq!(read.status(), StatusCode::OK);
         assert_eq!(read.headers()[&name], expected);
     }
+    Ok(())
+}
+
+/// Verifies PutObject compares an `aws-chunked` trailer checksum with the body.
+///
+/// Ceph's suite sends checksums as headers only, so trailer coverage is s3ite-specific.
+#[tokio::test]
+#[serial(conformance)]
+async fn s3ite_put_object_verifies_trailer_checksum() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-trl");
+    create_bucket(&client, &bucket).await?;
+    let path = format!("/{bucket}/myobj");
+    let trailer = "x-amz-checksum-sha256";
+    let body = vec![b'A'; 1024];
+
+    let stored = unsigned_trailer_request(
+        &server,
+        Method::PUT,
+        &path,
+        &body,
+        trailer,
+        Some(SHA256_1024_A),
+    )
+    .await?;
+    assert_eq!(stored.status(), StatusCode::OK);
+    assert_eq!(stored.headers()[trailer], SHA256_1024_A);
+
+    let mismatch = unsigned_trailer_request(
+        &server,
+        Method::PUT,
+        &path,
+        b"corrupt",
+        trailer,
+        Some(SHA256_1024_A),
+    )
+    .await?;
+    assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
+    assert!(mismatch.text().await?.contains("<Code>BadDigest</Code>"));
+
+    let missing =
+        unsigned_trailer_request(&server, Method::PUT, &path, b"x", trailer, None).await?;
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+
+    assert_eq!(get_object_bytes(&client, &bucket, "myobj").await?, body);
+    let head = client
+        .head_object()
+        .bucket(&bucket)
+        .key("myobj")
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(head.checksum_sha256(), Some(SHA256_1024_A));
+    Ok(())
+}
+
+/// Verifies trailers that s3s would leave unchecked are rejected and keep the old object.
+///
+/// s3s prefers `x-amz-checksum-algorithm` over `x-amz-trailer`, so a CRC32
+/// header with a SHA256 trailer would otherwise compute only CRC32. A trailer
+/// field repeated in the body is ambiguous and must not pick the first value.
+#[tokio::test]
+#[serial(conformance)]
+async fn s3ite_put_object_rejects_unverifiable_trailers() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-trl");
+    create_bucket(&client, &bucket).await?;
+    put_object(&client, &bucket, "myobj", b"original").await?;
+    let path = format!("/{bucket}/myobj");
+    let trailer = "x-amz-checksum-sha256";
+    let body = vec![b'A'; 1024];
+
+    let mismatched_algorithm = trailer_request(
+        &server,
+        Method::PUT,
+        &path,
+        TrailerBody {
+            payload: b"corrupt",
+            declared_trailer: trailer,
+            trailers: &[(trailer, SHA256_1024_A)],
+            extra_headers: &[("x-amz-checksum-algorithm", "CRC32")],
+        },
+    )
+    .await?;
+    assert_eq!(mismatched_algorithm.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        mismatched_algorithm
+            .text()
+            .await?
+            .contains("<Code>InvalidRequest</Code>")
+    );
+
+    let repeated = trailer_request(
+        &server,
+        Method::PUT,
+        &path,
+        TrailerBody {
+            payload: &body,
+            declared_trailer: trailer,
+            trailers: &[(trailer, SHA256_1024_A), (trailer, "bogus")],
+            extra_headers: &[],
+        },
+    )
+    .await?;
+    assert_eq!(repeated.status(), StatusCode::BAD_REQUEST);
+
+    assert_eq!(
+        get_object_bytes(&client, &bucket, "myobj").await?,
+        b"original"
+    );
+    Ok(())
+}
+
+/// Verifies UploadPart compares an `aws-chunked` trailer checksum with the part body.
+#[tokio::test]
+#[serial(conformance)]
+async fn s3ite_upload_part_verifies_trailer_checksum() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-trl");
+    create_bucket(&client, &bucket).await?;
+    let upload = client
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key("myobj")
+        .checksum_algorithm(ChecksumAlgorithm::Sha256)
+        .send()
+        .await?;
+    let upload_id = upload.upload_id().context("missing upload id")?;
+    let path = format!("/{bucket}/myobj?partNumber=1&uploadId={upload_id}");
+    let trailer = "x-amz-checksum-sha256";
+
+    let mismatch = unsigned_trailer_request(
+        &server,
+        Method::PUT,
+        &path,
+        b"corrupt",
+        trailer,
+        Some(SHA256_1024_A),
+    )
+    .await?;
+    assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
+    assert!(mismatch.text().await?.contains("<Code>BadDigest</Code>"));
+
+    let stored = unsigned_trailer_request(
+        &server,
+        Method::PUT,
+        &path,
+        &vec![b'A'; 1024],
+        trailer,
+        Some(SHA256_1024_A),
+    )
+    .await?;
+    assert_eq!(stored.status(), StatusCode::OK);
+    assert_eq!(stored.headers()[trailer], SHA256_1024_A);
     Ok(())
 }
 
@@ -1460,4 +1619,154 @@ async fn upload_plain_part(
         )
         .part_number(part_number)
         .build())
+}
+
+/// Verifies aws-chunked over HTTP chunked transfer and declared-length mismatches.
+#[tokio::test]
+#[serial(conformance)]
+async fn s3ite_put_aws_chunked_framing() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-frames");
+    create_bucket(&client, &bucket).await?;
+    let path = format!("/{bucket}/frames");
+    let mut expected = vec![b'A'; 8192];
+    expected.extend_from_slice(b"end");
+    let crc32 = "7/9n2A==";
+    let trailer = "x-amz-checksum-crc32";
+    let mut outcomes = Vec::new();
+    for (chunks, decoded_length, http_chunked, code) in [
+        (
+            &[&expected[..8192], &expected[8192..]][..],
+            expected.len(),
+            true,
+            None,
+        ),
+        (
+            &[expected.as_slice()][..],
+            expected.len() - 1,
+            false,
+            Some("IncompleteBody"),
+        ),
+        (
+            &[expected.as_slice()][..],
+            expected.len() + 1,
+            false,
+            Some("IncompleteBody"),
+        ),
+    ] {
+        let response = support::raw_http::aws_chunked_request(
+            &server,
+            Method::PUT,
+            &path,
+            support::raw_http::AwsChunkedRequest {
+                chunks,
+                decoded_length,
+                declared_trailer: trailer,
+                trailers: &[(trailer, crc32)],
+                extra_headers: &[],
+                http_chunked,
+            },
+        )
+        .await?;
+        let status = response.status();
+        let xml = response.text().await?;
+        let code_matches = code.is_none_or(|code| xml.contains(&format!("<Code>{code}</Code>")));
+        let preserved = get_object_bytes(&client, &bucket, "frames").await? == expected;
+        outcomes.push((status, code_matches, preserved, xml));
+    }
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|(status, code, bytes, _)| (*status, *code, *bytes))
+            .collect::<Vec<_>>(),
+        [
+            (StatusCode::OK, true, true),
+            (StatusCode::BAD_REQUEST, true, true),
+            (StatusCode::BAD_REQUEST, true, true)
+        ],
+        "{outcomes:?}",
+    );
+    Ok(())
+}
+
+/// Rejects undeclared checksum trailers on overwrite and preserves both committed bodies.
+#[tokio::test]
+#[serial(conformance)]
+async fn s3ite_rejects_undeclared_checksum_trailers() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-undeclared");
+    create_bucket(&client, &bucket).await?;
+    let key = "frames";
+    let object_path = format!("/{bucket}/{key}");
+    let original = b"old body";
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from_static(original))
+        .send()
+        .await?;
+    let upload = client
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+    let upload = upload.upload_id().context("missing upload ID")?;
+    let part = client
+        .upload_part()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(upload)
+        .part_number(1)
+        .body(ByteStream::from_static(original))
+        .send()
+        .await?;
+    let part = CompletedPart::builder()
+        .part_number(1)
+        .set_e_tag(part.e_tag)
+        .build();
+    let part_path = format!("{object_path}?partNumber=1&uploadId={upload}");
+    let checksum = "VNX0Sg==";
+
+    let mut outcomes = Vec::new();
+    for path in [&object_path, &part_path] {
+        let response = trailer_request(
+            &server,
+            Method::PUT,
+            path,
+            TrailerBody {
+                payload: b"replacement",
+                declared_trailer: "x-amz-meta-note",
+                trailers: &[
+                    ("x-amz-meta-note", "example"),
+                    ("x-amz-checksum-crc32", checksum),
+                ],
+                extra_headers: &[],
+            },
+        )
+        .await?;
+        outcomes.push((response.status(), response.text().await?));
+    }
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|(status, xml)| (*status, xml.contains("<Code>InvalidRequest</Code>")))
+            .collect::<Vec<_>>(),
+        [(StatusCode::BAD_REQUEST, true); 2],
+        "{outcomes:?}",
+    );
+    assert_eq!(get_object_bytes(&client, &bucket, key).await?, original);
+    client
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(upload)
+        .multipart_upload(CompletedMultipartUpload::builder().parts(part).build())
+        .send()
+        .await?;
+    assert_eq!(get_object_bytes(&client, &bucket, key).await?, original);
+    Ok(())
 }

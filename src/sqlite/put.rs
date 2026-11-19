@@ -6,10 +6,11 @@ use rusqlite::{Error::ToSqlConversionFailure, Transaction};
 use time::OffsetDateTime;
 
 use super::{
-    BucketVersioningState, EncodedBlobChunk, KeyMetadata, KeyValue, NULL_VERSION_ID,
-    ObjectTagCondition, ObjectWriteConditions, ObjectWriteOutcome, Sqlite, SqliteError,
-    SqliteResult, sql_size,
+    BucketVersioningState, KeyMetadata, NULL_VERSION_ID, ObjectTagCondition, ObjectWriteConditions,
+    ObjectWriteOutcome, Sqlite, SqliteError, SqliteResult, sql_size, staging::StagedChunkOwner,
 };
+#[cfg(test)]
+use super::{EncodedBlobChunk, KeyValue};
 
 const VERSION_ID_LEN: usize = 31;
 const VERSION_ID_ALPHABET: &[u8; 64] =
@@ -244,6 +245,7 @@ impl Sqlite {
         Ok(())
     }
 
+    #[cfg(test)]
     /// Inserts body bytes as bounded chunks for an object or multipart owner.
     pub(super) fn put_object_blob_chunks(
         transaction: &Transaction,
@@ -307,6 +309,7 @@ impl Sqlite {
         Ok(())
     }
 
+    #[cfg(test)]
     /// Inserts pre-encoded body chunks for an object or multipart owner.
     pub(crate) fn put_encoded_object_blob_chunks<I>(
         transaction: &Transaction,
@@ -375,6 +378,7 @@ impl Sqlite {
             .ok_or(SqliteError::ObjectBodyInconsistent)
     }
 
+    #[cfg(test)]
     /// Inserts an object version using the requested body chunk size.
     pub(crate) fn put_object_with_chunk_size(
         transaction: &Transaction,
@@ -413,6 +417,7 @@ impl Sqlite {
         Ok(write_outcome)
     }
 
+    #[cfg(test)]
     /// Inserts an object version whose body chunks were encoded before the transaction.
     pub(crate) fn put_object_with_encoded_chunks<I>(
         transaction: &Transaction,
@@ -442,6 +447,36 @@ impl Sqlite {
         if written_size != expected_size {
             return Err(SqliteError::ObjectBodyInconsistent);
         }
+        Ok(write_outcome)
+    }
+
+    /// Inserts an object version whose body was streamed into a staged body beforehand.
+    ///
+    /// The version, its storage part, and the claimed chunks commit together, so
+    /// a failed write leaves the staged body to be deleted rather than a partial
+    /// object.
+    pub(crate) fn put_object_with_staged_chunks(
+        transaction: &Transaction,
+        key: &str,
+        key_metadata: KeyMetadata,
+        staging_id: uuid::Uuid,
+    ) -> SqliteResult<ObjectWriteOutcome> {
+        let expected_size = key_metadata.size;
+        let write_outcome = Self::put_object_version(transaction, key, key_metadata)?;
+        Self::put_object_storage_part(
+            transaction,
+            write_outcome.sequence,
+            write_outcome.last_modified,
+            expected_size,
+        )?;
+        Self::claim_staged_chunks(
+            transaction,
+            staging_id,
+            StagedChunkOwner::Object {
+                object_sequence: write_outcome.sequence,
+            },
+            expected_size,
+        )?;
         Ok(write_outcome)
     }
 }

@@ -37,18 +37,18 @@ pub(super) fn encode_continuation_token(key: &str) -> String {
     format!("{CONTINUATION_TOKEN_PREFIX}{}", hex(key.as_bytes()))
 }
 
+/// Converts one ASCII hexadecimal digit into its numeric nibble.
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// Decodes a hexadecimal string into bytes.
 pub(super) fn decode_hex(value: &str) -> Option<Vec<u8>> {
-    /// Converts one ASCII hexadecimal digit into its numeric nibble.
-    fn nibble(byte: u8) -> Option<u8> {
-        match byte {
-            b'0'..=b'9' => Some(byte - b'0'),
-            b'a'..=b'f' => Some(byte - b'a' + 10),
-            b'A'..=b'F' => Some(byte - b'A' + 10),
-            _ => None,
-        }
-    }
-
     let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
     if !remainder.is_empty() {
         return None;
@@ -56,7 +56,7 @@ pub(super) fn decode_hex(value: &str) -> Option<Vec<u8>> {
 
     let mut decoded = Vec::with_capacity(pairs.len());
     for pair in pairs {
-        decoded.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
+        decoded.push((hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?);
     }
     Some(decoded)
 }
@@ -91,18 +91,21 @@ pub(super) fn encode_list_value(value: String, encode: bool) -> String {
 }
 
 /// Decodes S3 list input values that clients encode for XML-safe control bytes.
+///
+/// Only `%0A`, `%0D`, and `%09` are decoded; every other byte is copied
+/// unchanged. The scan works on raw bytes so a `%` followed by multi-byte
+/// UTF-8 text never slices a `str` inside a character.
 pub(super) fn decode_list_input_value(value: String) -> String {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(value.len());
     let mut index = 0;
 
     while index < bytes.len() {
-        if bytes[index] == b'%'
-            && index + 2 < bytes.len()
-            && let Some(hex) = decode_hex(&value[index + 1..index + 3])
-            && matches!(hex.as_slice(), [b'\n' | b'\r' | b'\t'])
+        if let [b'%', high, low, ..] = bytes[index..]
+            && let (Some(high), Some(low)) = (hex_nibble(high), hex_nibble(low))
+            && let byte @ (b'\n' | b'\r' | b'\t') = (high << 4) | low
         {
-            decoded.push(hex[0]);
+            decoded.push(byte);
             index += 3;
             continue;
         }
@@ -721,6 +724,17 @@ mod tests {
             decode_list_input_value("literal%41value".to_string()),
             "literal%41value"
         );
+        assert_eq!(decode_list_input_value("%0A".to_string()), "\n");
+        assert_eq!(decode_list_input_value("%0".to_string()), "%0");
+    }
+
+    /// Checks that a `%` followed by multibyte UTF-8 is kept as text instead of panicking.
+    #[test]
+    fn list_input_decoding_preserves_multibyte_text_after_percent() {
+        for value in ["%aé", "%é", "a%ée%0A", "%\u{1F600}x", "%a\u{1F600}"] {
+            let expected = value.replace("%0A", "\n");
+            assert_eq!(decode_list_input_value(value.to_string()), expected);
+        }
     }
 
     #[test]

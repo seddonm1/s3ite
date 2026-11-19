@@ -307,8 +307,16 @@ fn assert_expiration_header(
 ) -> Result<()> {
     let (expires_at, actual_rule_id) = parse_expiration_header(value)?;
     assert_eq!(actual_rule_id, rule_id);
-    let earliest = request_started_at + Duration::days(days) - Duration::seconds(1);
-    let latest = OffsetDateTime::now_utc() + Duration::days(days) + Duration::seconds(2);
+    // AWS Lifecycle configuration elements rounds day-based expiration to
+    // the next midnight UTC. The window only accounts for crossing midnight
+    // between starting the request and receiving the response.
+    let earliest = (request_started_at.date() + Duration::days(days + 1))
+        .midnight()
+        .assume_utc();
+    let latest = (OffsetDateTime::now_utc().date() + Duration::days(days + 1))
+        .midnight()
+        .assume_utc();
+    assert_eq!(expires_at.time(), time::Time::MIDNIGHT);
     assert!(
         expires_at >= earliest && expires_at <= latest,
         "expiration {expires_at} outside expected window {earliest}..={latest}"

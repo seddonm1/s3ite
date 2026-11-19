@@ -1,15 +1,17 @@
 //! S3 object read and attribute request handling.
 
-use std::ops::Range as ByteRange;
+use std::{ops::Range as ByteRange, sync::Arc};
 
 use crate::sqlite::{
-    CompletedObjectPart, KeyMetadata, ObjectBodyReference, StoredBlobChunk, StoredChecksum,
+    CompletedObjectPart, EncryptedChunkRead, KeyMetadata, ObjectBodyReference, StoredChecksum,
     StoredSse,
 };
 
+use super::source::decrypting_snapshot_stream;
+
 use super::metadata::format_expires;
 use super::{
-    Bytes, ChecksumMode, ETag, GetObjectAttributesInput, GetObjectAttributesOutput,
+    ChecksumMode, ETag, GetObjectAttributesInput, GetObjectAttributesOutput,
     GetObjectAttributesParts, GetObjectInput, GetObjectOutput, GetObjectTorrentInput,
     GetObjectTorrentOutput, HeadObjectInput, HeadObjectOutput, HeaderValue,
     LifecycleExpirationHeader, Not, ObjectAttributes, ObjectPart, ObjectReadConditionFailure,
@@ -17,12 +19,12 @@ use super::{
     SqliteError, SqliteResult, StorageClass, StreamExt, StreamingBlob, X_AMZ_TAGGING_COUNT,
     checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_md5, checksum_mode_enabled,
     checksum_sha1, checksum_sha256, checksum_sha512, checksum_struct, checksum_type_output,
-    checksum_xxhash3, checksum_xxhash64, checksum_xxhash128, decrypt_stored_chunks,
-    encryption_headers, list_limit, not_found_delete_marker_error, not_modified_error,
-    object_checksum_for_part, object_lock_legal_hold_status, object_lock_mode,
-    object_lock_retain_until_date, open_encryption, requested_part_range, s3_error,
-    s3_error_from_sqlite, s3_error_with_message, stream, validate_expected_bucket_owner,
-    validate_no_sse_headers, validate_part_number, validate_read_conditions,
+    checksum_xxhash3, checksum_xxhash64, checksum_xxhash128, encryption_headers, list_limit,
+    not_found_delete_marker_error, not_modified_error, object_checksum_for_part,
+    object_lock_legal_hold_status, object_lock_mode, object_lock_retain_until_date,
+    open_encryption, requested_part_range, s3_error, s3_error_from_sqlite, s3_error_with_message,
+    stream, validate_expected_bucket_owner, validate_no_sse_headers, validate_part_number,
+    validate_read_conditions,
 };
 
 use crate::database::{BlobReadReceiver, BlobReadRequest};
@@ -68,7 +70,8 @@ struct ObjectBodyRead {
 /// Backing body for a `GetObject` response.
 enum ObjectBodyReadBody {
     Blob(BlobReadReceiver),
-    Bytes(Bytes),
+    /// Already-decoded plaintext stream, such as decrypted SSE chunks.
+    Stream(StreamingBlob),
 }
 
 /// Metadata selected inside the blob-reader transaction before streaming starts.
@@ -94,7 +97,8 @@ enum ObjectBodyReadStart {
     /// The object exists and has an associated blob read request.
     Found {
         read: Box<ObjectBodyReadFound>,
-        chunks: Option<Vec<StoredBlobChunk>>,
+        /// Encrypted chunks whose ciphertext the BLOB stream delivers, for SSE objects.
+        chunks: Option<Vec<EncryptedChunkRead>>,
     },
 }
 
@@ -321,14 +325,12 @@ fn resolve_get_object_read(
 
     let read = load_object_body_read_found(transaction, key, object, part_number, range)?;
     let (chunks, requests) = if read.object.key_metadata.stored_sse.is_some() {
-        (
-            Some(Sqlite::get_object_blob_chunks(
-                transaction,
-                read.object.sequence,
-                read.object.key_metadata.size,
-            )?),
-            Vec::new(),
-        )
+        let (chunks, requests) = Sqlite::encrypted_object_read_plan(
+            transaction,
+            read.object.sequence,
+            read.object_range.clone(),
+        )?;
+        (Some(chunks), requests)
     } else {
         (
             None,
@@ -373,16 +375,12 @@ async fn finish_get_object_read(
                     .clone()
                     .ok_or_else(|| s3_error(S3ErrorCode::InternalError))?;
                 let active = open_encryption(sqlite, stored).await?;
-                let bytes = decrypt_stored_chunks(&active, chunks).map_err(s3_error_from_sqlite)?;
-                let start =
-                    usize::try_from(read.object_range.start).map_err(S3Error::internal_error)?;
-                let end =
-                    usize::try_from(read.object_range.end).map_err(S3Error::internal_error)?;
-                let bytes = Bytes::from(bytes);
-                let slice = bytes
-                    .get(start..end)
-                    .ok_or_else(|| s3_error(S3ErrorCode::InvalidRange))?;
-                ObjectBodyReadBody::Bytes(bytes.slice_ref(slice))
+                ObjectBodyReadBody::Stream(decrypting_snapshot_stream(
+                    body,
+                    chunks,
+                    read.object_range.clone(),
+                    Arc::new(active),
+                ))
             } else {
                 ObjectBodyReadBody::Blob(body)
             };
@@ -509,9 +507,7 @@ fn get_object_response_body(body: ObjectBodyReadBody, content_length: u64) -> St
             )
             .fuse(),
         ),
-        ObjectBodyReadBody::Bytes(bytes) => StreamingBlob::wrap::<_, S3Error>(
-            stream::once(async move { Ok::<Bytes, S3Error>(bytes) }).fuse(),
-        ),
+        ObjectBodyReadBody::Stream(stream) => stream,
     }
 }
 

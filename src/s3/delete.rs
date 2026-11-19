@@ -6,80 +6,70 @@ use crate::telemetry::audit_deletion;
 use super::{
     DeleteError, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput,
     DeletedObject, ETagCondition, Not, OffsetDateTime, S3ErrorCode, S3Request, S3Response,
-    S3Result, Sqlite, SqliteError, delete_requires_object_lock_check, http_date_time,
-    s3_error_from_sqlite, s3_error_with_message, strong_etag_condition_matches,
-    validate_expected_bucket_owner, validate_object_lock_delete,
+    S3Result, Sqlite, SqliteError, delete_requires_object_lock_check, s3_error_from_sqlite,
+    s3_error_with_message, strong_etag_condition_matches, validate_expected_bucket_owner,
+    validate_object_lock_delete,
 };
 use s3s::dto::Delete;
 
-type RequestedDeletion = (String, Option<String>, ObjectDeleteConditions);
+type RequestedDeletion = (String, Option<String>, Option<ETagCondition>);
 
-#[derive(Clone, Debug)]
-struct ObjectDeleteConditions {
-    etag_matches: Option<ETagCondition>,
-    last_modified_time: Option<OffsetDateTime>,
-    size: Option<i64>,
-}
-
-impl ObjectDeleteConditions {
-    /// Returns whether the delete request supplied at least one precondition.
-    #[must_use]
-    fn has_any(&self) -> bool {
-        self.etag_matches.is_some() || self.last_modified_time.is_some() || self.size.is_some()
+/// Rejects conditions that AWS restricts to directory buckets.
+fn validate_delete_condition_fields(has_time: bool, has_size: bool) -> S3Result<()> {
+    if has_time || has_size {
+        // AWS DeleteObject and ObjectIdentifier limit these fields to directory
+        // buckets. They document no specific code for a general-purpose bucket.
+        return Err(s3_error_with_message(
+            S3ErrorCode::InvalidRequest,
+            "Last-modified-time and size delete conditions require a directory bucket",
+        ));
     }
+    Ok(())
 }
 
-/// Applies delete conditional request semantics inside a write transaction.
+/// Applies an `ETag` precondition to metadata selected in the write transaction.
 fn validate_delete_conditions(
     metadata: Option<&KeyMetadata>,
-    conditions: &ObjectDeleteConditions,
+    condition: Option<&ETagCondition>,
+    current: bool,
 ) -> Result<(), SqliteError> {
-    let Some(metadata) = metadata else {
-        return Ok(());
-    };
-
-    if let Some(condition) = conditions.etag_matches.as_ref()
+    // AWS documents a current delete marker separately from a missing row.
+    // The caller applies its missing-key rules. Preserve explicit-version
+    // conditional behavior because AWS does not define the combined request.
+    if let (Some(metadata), Some(condition)) = (metadata, condition)
         && match condition {
-            ETagCondition::Any => false,
+            ETagCondition::Any => current && metadata.is_delete_marker,
             ETagCondition::ETag(_) => {
-                strong_etag_condition_matches(condition, metadata.md5.as_deref()).not()
+                !strong_etag_condition_matches(condition, metadata.md5.as_deref())
             }
         }
     {
         return Err(SqliteError::PreconditionFailed);
     }
-
-    if let Some(last_modified_time) = conditions.last_modified_time
-        && http_date_time(metadata.last_modified) != http_date_time(last_modified_time)
-    {
-        return Err(SqliteError::PreconditionFailed);
-    }
-
-    if let Some(size) = conditions.size
-        && metadata.size != size
-    {
-        return Err(SqliteError::PreconditionFailed);
-    }
-
     Ok(())
 }
 
+/// Extracts per-key `ETag` conditions and rejects directory-only XML fields.
 fn requested_deletions(delete: Delete) -> S3Result<Vec<RequestedDeletion>> {
     let deletions = delete
         .objects
         .into_iter()
         .map(|object| {
-            (
-                object.key,
-                object.version_id,
-                ObjectDeleteConditions {
-                    etag_matches: object.e_tag.map(ETagCondition::ETag),
-                    last_modified_time: object.last_modified_time.map(Into::into),
-                    size: object.size,
-                },
-            )
+            validate_delete_condition_fields(
+                object.last_modified_time.is_some(),
+                object.size.is_some(),
+            )?;
+            let condition = object.e_tag.map(|value| {
+                // AWS conditional-deletes uses a bare * as the bulk wildcard.
+                if value.as_strong() == Some("*") {
+                    ETagCondition::Any
+                } else {
+                    ETagCondition::ETag(value)
+                }
+            });
+            Ok((object.key, object.version_id, condition))
         })
-        .collect::<Vec<_>>();
+        .collect::<S3Result<Vec<_>>>()?;
     if deletions.len() > 1000 {
         return Err(s3_error_with_message(
             S3ErrorCode::MalformedXML,
@@ -89,6 +79,7 @@ fn requested_deletions(delete: Delete) -> S3Result<Vec<RequestedDeletion>> {
     Ok(deletions)
 }
 
+/// Returns a per-key error for an Object Lock denial.
 fn access_denied_delete_error(key: String, version_id: Option<String>) -> DeleteError {
     DeleteError {
         key: Some(key),
@@ -126,11 +117,10 @@ pub(super) async fn delete_object(
     } = req.input;
     validate_expected_bucket_owner(expected_bucket_owner.as_deref())?;
 
-    let conditions = ObjectDeleteConditions {
-        etag_matches: if_match,
-        last_modified_time: if_match_last_modified_time.map(Into::into),
-        size: if_match_size,
-    };
+    validate_delete_condition_fields(
+        if_match_last_modified_time.is_some(),
+        if_match_size.is_some(),
+    )?;
     let bypass_governance = bypass_governance_retention.unwrap_or(false);
 
     sqlite
@@ -149,7 +139,13 @@ pub(super) async fn delete_object(
                 Some(version_id) => Sqlite::get_version_metadata(transaction, &key, version_id)?,
                 None => Sqlite::get_current_metadata(transaction, &key)?,
             };
-            validate_delete_conditions(metadata.as_ref(), &conditions)?;
+            // AWS conditional deletes: "If the object doesn't exist when
+            // evaluating either of the preconditions, S3 rejects the request
+            // and returns a Not Found error response."
+            if version_id.is_none() && metadata.is_none() && if_match.is_some() {
+                return Err(SqliteError::ObjectNotFound);
+            }
+            validate_delete_conditions(metadata.as_ref(), if_match.as_ref(), version_id.is_none())?;
             if let Some(metadata) = metadata.as_ref()
                 && delete_requires_object_lock_check(versioning_state, version_id.as_deref())
                 && let Err(err) = validate_object_lock_delete(
@@ -160,16 +156,11 @@ pub(super) async fn delete_object(
             {
                 return Ok(Err(err));
             }
-            let outcome = if version_id.is_none() && metadata.is_none() && conditions.has_any() {
-                ObjectDeleteOutcome {
-                    version_id: None,
-                    is_delete_marker: false,
-                    delete_marker_version_id: None,
-                }
-            } else {
-                Sqlite::delete_object(transaction, &key, version_id.as_deref())?
-            };
-            Ok(Ok(outcome))
+            Ok(Ok(Sqlite::delete_object(
+                transaction,
+                &key,
+                version_id.as_deref(),
+            )?))
         })
         .await
         .map_err(s3_error_from_sqlite)??;
@@ -243,7 +234,22 @@ pub(super) async fn delete_objects(
                     }
                     None => Sqlite::get_current_metadata(transaction, &key)?,
                 };
-                match validate_delete_conditions(metadata.as_ref(), &conditions) {
+                // Conditional deletes places missing conditional keys in the
+                // per-object error results. Preserve explicit VersionId handling.
+                if version_id.is_none() && metadata.is_none() && conditions.is_some() {
+                    errors.push(DeleteError {
+                        key: Some(key),
+                        version_id,
+                        code: Some("NoSuchKey".to_string()),
+                        message: Some("The specified key does not exist".to_string()),
+                    });
+                    continue;
+                }
+                match validate_delete_conditions(
+                    metadata.as_ref(),
+                    conditions.as_ref(),
+                    version_id.is_none(),
+                ) {
                     Ok(()) => {
                         if let Some(metadata) = metadata.as_ref()
                             && delete_requires_object_lock_check(
@@ -261,15 +267,7 @@ pub(super) async fn delete_objects(
                             continue;
                         }
                         let outcome =
-                            if version_id.is_none() && metadata.is_none() && conditions.has_any() {
-                                ObjectDeleteOutcome {
-                                    version_id: None,
-                                    is_delete_marker: false,
-                                    delete_marker_version_id: None,
-                                }
-                            } else {
-                                Sqlite::delete_object(transaction, &key, version_id.as_deref())?
-                            };
+                            Sqlite::delete_object(transaction, &key, version_id.as_deref())?;
                         deleted_entries.push((key, outcome));
                     }
                     Err(SqliteError::PreconditionFailed) => {
@@ -335,71 +333,28 @@ mod tests {
         }
     }
 
-    fn delete_conditions(
-        etag_matches: Option<ETagCondition>,
-        last_modified_time: Option<OffsetDateTime>,
-        size: Option<i64>,
-    ) -> ObjectDeleteConditions {
-        ObjectDeleteConditions {
-            etag_matches,
-            last_modified_time,
-            size,
-        }
-    }
-
-    fn assert_precondition_failed(result: &Result<(), SqliteError>) {
-        assert!(matches!(result, Err(SqliteError::PreconditionFailed)));
-    }
-
+    /// Covers existing, missing, and delete-marker metadata for `ETag` conditions.
     #[test]
     fn applies_delete_conditions() {
         let last_modified = OffsetDateTime::UNIX_EPOCH + Duration::seconds(10);
-        let object = metadata(Some("md5"), last_modified, 5);
+        let mut object = metadata(Some("md5"), last_modified, 5);
+        let matched = ETagCondition::ETag(ETag::Strong("md5".to_string()));
+        let mismatch = ETagCondition::ETag(ETag::Strong("other".to_string()));
+        let wildcard = ETagCondition::Any;
 
-        assert!(
-            validate_delete_conditions(
-                None,
-                &delete_conditions(
-                    Some(ETagCondition::ETag(ETag::Strong("other".to_string()))),
-                    Some(last_modified + Duration::seconds(1)),
-                    Some(9),
-                ),
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_delete_conditions(
-                Some(&object),
-                &delete_conditions(
-                    Some(ETagCondition::ETag(ETag::Strong("md5".to_string()))),
-                    Some(last_modified),
-                    Some(5),
-                ),
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_delete_conditions(
-                Some(&object),
-                &delete_conditions(Some(ETagCondition::Any), None, None),
-            )
-            .is_ok()
-        );
-        assert_precondition_failed(&validate_delete_conditions(
-            Some(&object),
-            &delete_conditions(
-                Some(ETagCondition::ETag(ETag::Strong("other".to_string()))),
-                None,
-                None,
-            ),
+        assert!(validate_delete_conditions(None, Some(&mismatch), true).is_ok());
+        assert!(validate_delete_conditions(Some(&object), Some(&matched), true).is_ok());
+        assert!(validate_delete_conditions(Some(&object), Some(&wildcard), true).is_ok());
+        assert!(matches!(
+            validate_delete_conditions(Some(&object), Some(&mismatch), true),
+            Err(SqliteError::PreconditionFailed)
         ));
-        assert_precondition_failed(&validate_delete_conditions(
-            Some(&object),
-            &delete_conditions(None, Some(last_modified + Duration::seconds(1)), None),
+
+        object.is_delete_marker = true;
+        assert!(matches!(
+            validate_delete_conditions(Some(&object), Some(&wildcard), true),
+            Err(SqliteError::PreconditionFailed)
         ));
-        assert_precondition_failed(&validate_delete_conditions(
-            Some(&object),
-            &delete_conditions(None, None, Some(9)),
-        ));
+        assert!(validate_delete_conditions(Some(&object), Some(&wildcard), false).is_ok());
     }
 }

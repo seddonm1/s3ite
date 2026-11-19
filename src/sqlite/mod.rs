@@ -28,6 +28,7 @@ mod model;
 mod multipart;
 mod object_lock;
 mod put;
+mod staging;
 mod tagging;
 
 use self::checksum::{
@@ -39,15 +40,15 @@ pub use self::error::{SqliteError, SqliteResult};
 pub(crate) use self::model::{
     BucketVersioningState, ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKind,
     CompletedMultipartUploadOutcome, CompletedMultipartUploadRecord, CompletedMultipartUploadState,
-    CompletedObjectPart, EncodedBlobChunk, EncryptionMode, KeyMetadata, KeyValue, Multipart,
+    CompletedObjectPart, EncodedBlobChunk, EncryptedChunkRead, EncryptionMode, KeyMetadata,
     MultipartChecksumConfig, MultipartCompletion, MultipartCompletionChecksum,
     MultipartCompletionPart, MultipartCompletionRequest, MultipartMetadata, MultipartPartWrite,
     MultipartUploadListEntry, MultipartUploadListPage, MultipartUploadState,
-    MultipartUploadSummary, ObjectBodyReference, ObjectDeleteOutcome, ObjectLifecycleExpiration,
-    ObjectSummary, ObjectTagCondition, ObjectTaggingTarget, ObjectVersionListEntry,
-    ObjectVersionListPage, ObjectVersionTarget, ObjectWriteConditions, ObjectWriteOutcome,
-    PartChecksum, PreparedMultipartUpload, StoredBlobChunk, StoredChecksum, StoredCorsRule,
-    StoredLifecycleAndFilter, StoredLifecycleExpiration, StoredLifecycleFilter,
+    MultipartUploadSummary, ObjectBodyReference, ObjectChunkLocation, ObjectDeleteOutcome,
+    ObjectLifecycleExpiration, ObjectSummary, ObjectTagCondition, ObjectTaggingTarget,
+    ObjectVersionListEntry, ObjectVersionListPage, ObjectVersionTarget, ObjectWriteConditions,
+    ObjectWriteOutcome, PartChecksum, PreparedMultipartUpload, StoredBlobChunk, StoredChecksum,
+    StoredCorsRule, StoredLifecycleAndFilter, StoredLifecycleExpiration, StoredLifecycleFilter,
     StoredLifecycleRule, StoredNoncurrentVersionExpiration, StoredObjectLock,
     StoredObjectLockConfig, StoredObjectLockDefaultRetention, StoredObjectLockMode,
     StoredObjectRetention, StoredSse, StoredTag, current_expiration_time, decode_base64,
@@ -57,14 +58,52 @@ pub(crate) use self::model::{
 
 #[cfg(test)]
 pub(crate) use self::model::{
-    CompositeChecksum, FullObjectChecksum, encode_base64, test_support as checksum_test_support,
+    CompositeChecksum, FullObjectChecksum, KeyValue, Multipart, encode_base64,
+    test_support as checksum_test_support,
 };
 
 pub(crate) const NULL_VERSION_ID: &str = "null";
 
+/// Age after which periodic maintenance treats a staged upload body as abandoned.
+///
+/// Failed and cancelled requests delete their own staged bodies; this sweep is
+/// a backstop for requests whose cleanup never ran. Age is measured from the
+/// last appended chunk. A live request can never own a row this old, because
+/// staging gives up after [`STAGED_BODY_MAX_LIFETIME`].
+const ABANDONED_STAGED_BODY_AGE: Duration = Duration::days(1);
+
+/// Longest a request may spend staging one body before it is rejected.
+///
+/// It is shorter than [`ABANDONED_STAGED_BODY_AGE`], with an hour of margin for
+/// wall-clock adjustments, so the sweep only ever deletes rows whose request
+/// has already finished.
+pub(crate) const STAGED_BODY_MAX_LIFETIME: std::time::Duration =
+    std::time::Duration::from_hours(23);
+
+const _: () = assert!(
+    STAGED_BODY_MAX_LIFETIME.as_secs() + 60 * 60
+        <= ABANDONED_STAGED_BODY_AGE.whole_seconds().unsigned_abs()
+);
+
+/// Why a bucket database is being opened, which decides what startup cleanup is safe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BucketOpen {
+    /// Process startup, before any request can reach the bucket.
+    ///
+    /// Every staged body belongs to a previous process and is deleted.
+    Startup,
+    /// `CreateBucket` at runtime.
+    ///
+    /// A concurrent `CreateBucket` may already have published this database
+    /// and started staging uploads, so staged bodies are left to maintenance.
+    Create,
+}
+
 /// On-disk schema for the 0.7.0 release. Bump when the storage layout changes.
 const BUCKET_SCHEMA_VERSION: i32 = 70;
-pub(crate) const DEFAULT_OBJECT_BLOB_CHUNK_SIZE: usize = 128 * 1024 * 1024;
+/// Chunk size for unit-test fixtures that build a [`Sqlite`] directly.
+#[cfg(test)]
+pub(crate) const DEFAULT_OBJECT_BLOB_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 const BUCKET_SCHEMA_SQL: &str = "
 -- Singleton bucket metadata, currently the object versioning state.
 CREATE TABLE bucket_state (
@@ -405,11 +444,22 @@ CREATE INDEX object_part_object_start
 CREATE INDEX object_part_completed_list
     ON object_part(object_sequence, is_multipart_part, part_number);
 
+-- Upload bodies streamed into chunks before their object version or part row exists.
+-- Rows are claimed by the final write transaction; anything left behind is an
+-- abandoned upload and is deleted at startup and by periodic maintenance.
+CREATE TABLE blob_staging (
+    staging_id BLOB NOT NULL PRIMARY KEY,
+    last_appended TEXT NOT NULL
+) STRICT;
+
 -- Physical object bytes split into bounded SQLite BLOB chunks.
+-- Each chunk has exactly one owner: an object version, a multipart upload part,
+-- or a staged upload body that has not been committed yet.
 CREATE TABLE object_blob_chunk (
     chunk_id INTEGER PRIMARY KEY,
     object_sequence INTEGER,
     upload_id BLOB,
+    staging_id BLOB,
     part_number INTEGER NOT NULL CHECK(part_number BETWEEN 1 AND 10000),
     chunk_number INTEGER NOT NULL CHECK(chunk_number >= 1),
     offset INTEGER NOT NULL CHECK(offset >= 0),
@@ -419,6 +469,7 @@ CREATE TABLE object_blob_chunk (
     sse_tag BLOB,
     FOREIGN KEY (object_sequence) REFERENCES object_version (sequence) ON DELETE CASCADE,
     FOREIGN KEY (upload_id) REFERENCES multipart_upload (upload_id) ON DELETE CASCADE,
+    FOREIGN KEY (staging_id) REFERENCES blob_staging (staging_id) ON DELETE CASCADE,
     FOREIGN KEY (object_sequence, part_number)
         REFERENCES object_part (object_sequence, part_number)
         ON DELETE CASCADE
@@ -428,15 +479,9 @@ CREATE TABLE object_blob_chunk (
         ON DELETE CASCADE
         DEFERRABLE INITIALLY DEFERRED,
     CHECK (
-        (
-            object_sequence IS NOT NULL
-            AND upload_id IS NULL
-        )
-        OR
-        (
-            object_sequence IS NULL
-            AND upload_id IS NOT NULL
-        )
+        (object_sequence IS NOT NULL)
+        + (upload_id IS NOT NULL)
+        + (staging_id IS NOT NULL) = 1
     ),
     CHECK (
         (
@@ -458,6 +503,9 @@ CREATE UNIQUE INDEX object_blob_chunk_object_order
 CREATE UNIQUE INDEX object_blob_chunk_upload_order
     ON object_blob_chunk(upload_id, part_number, chunk_number)
     WHERE upload_id IS NOT NULL;
+CREATE UNIQUE INDEX object_blob_chunk_staging_order
+    ON object_blob_chunk(staging_id, chunk_number)
+    WHERE staging_id IS NOT NULL;
 CREATE INDEX object_blob_chunk_object_offset
     ON object_blob_chunk(object_sequence, offset)
     WHERE object_sequence IS NOT NULL;
@@ -636,16 +684,21 @@ impl Sqlite {
         self.blob_chunk_size
     }
 
-    /// Chooses a safe storage chunk size for the current `SQLite` build.
-    fn default_blob_chunk_size() -> SqliteResult<usize> {
+    /// Converts the configured chunk size to bytes, checked against this `SQLite` build.
+    ///
+    /// A chunk must fit well inside `SQLite`'s maximum BLOB length, so a larger
+    /// setting is rejected at startup rather than failing on the first upload.
+    fn configured_blob_chunk_size(chunk_size_mib: usize) -> SqliteResult<usize> {
         let sqlite_limit = Self::sqlite_length_limit()?;
-        let chunk_size = DEFAULT_OBJECT_BLOB_CHUNK_SIZE.min(sqlite_limit / 2);
-        if chunk_size == 0 {
-            return Err(SqliteError::Configuration(
-                "SQLite length limit is too small for object storage".to_string(),
-            ));
-        }
-        Ok(chunk_size)
+        chunk_size_mib
+            .checked_mul(1024 * 1024)
+            .filter(|size| (1..=sqlite_limit / 2).contains(size))
+            .ok_or_else(|| {
+                SqliteError::Configuration(format!(
+                    "blob_chunk_size_mib must be between 1 and {} MiB for this SQLite build",
+                    sqlite_limit / 2 / (1024 * 1024)
+                ))
+            })
     }
 
     /// Reads the bucket schema version from `PRAGMA user_version`.
@@ -689,10 +742,14 @@ impl Sqlite {
     }
 
     /// Validates the schema before starting bucket workers. Writable buckets also run startup maintenance.
+    ///
+    /// `open` decides whether staged upload bodies may be swept unconditionally;
+    /// see [`BucketOpen`].
     pub(super) async fn prepare_bucket_file(
         path: PathBuf,
         config: &crate::Config,
         bucket: &str,
+        open: BucketOpen,
     ) -> SqliteResult<()> {
         let config = config.clone();
         let bucket = bucket.to_string();
@@ -705,7 +762,7 @@ impl Sqlite {
             }
             let mut connection = Connection::open(path)?;
             connection.set_transaction_behavior(TransactionBehavior::Immediate);
-            Self::prepare_writable_bucket_connection(&mut connection, &config, &bucket)
+            Self::prepare_writable_bucket_connection(&mut connection, &config, &bucket, open)
         })
         .await
         .map_err(|_| SqliteError::ThreadJoin)?
@@ -730,7 +787,7 @@ impl Sqlite {
         }
 
         let root = env::current_dir()?.join(&config.root).canonicalize()?;
-        let blob_chunk_size = Self::default_blob_chunk_size()?;
+        let blob_chunk_size = Self::configured_blob_chunk_size(config.blob_chunk_size_mib)?;
         let buckets = Self::open_configured_buckets(&root, config).await?;
 
         // validate that any specified bucket configurations have existing bucket
@@ -759,10 +816,15 @@ impl Sqlite {
     }
 
     /// Prepares an already opened writable bucket connection.
+    ///
+    /// Creates the schema, then runs startup cleanup in one transaction:
+    /// staged bodies (only for [`BucketOpen::Startup`]), expired multipart
+    /// uploads, and due lifecycle rules.
     fn prepare_writable_bucket_connection(
         connection: &mut rusqlite::Connection,
         config: &crate::Config,
         bucket: &str,
+        open: BucketOpen,
     ) -> SqliteResult<()> {
         let multipart_expire_before = expiration_threshold(config.multipart_upload_ttl_seconds);
         let completed_multipart_expire_before =
@@ -772,6 +834,10 @@ impl Sqlite {
 
         let transaction = connection.transaction()?;
         Self::create_tables(&transaction)?;
+        if open == BucketOpen::Startup {
+            // No request from a previous process can still claim its staged body.
+            Self::delete_all_staged_bodies(&transaction)?;
+        }
         Self::delete_expired_multipart_uploads(
             &transaction,
             multipart_expire_before,
@@ -834,12 +900,17 @@ impl Sqlite {
         connection
             .write_raw_connection(move |connection| {
                 let transaction = connection.transaction()?;
+                let now = OffsetDateTime::now_utc();
+                Self::delete_abandoned_staged_bodies(
+                    &transaction,
+                    now - ABANDONED_STAGED_BODY_AGE,
+                )?;
                 Self::delete_expired_multipart_uploads(
                     &transaction,
                     multipart_expire_before,
                     completed_multipart_expire_before,
                 )?;
-                Self::apply_lifecycle_rules(&transaction, OffsetDateTime::now_utc())?;
+                Self::apply_lifecycle_rules(&transaction, now)?;
                 transaction.commit()?;
 
                 connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
@@ -917,9 +988,9 @@ mod tests {
     };
 
     use super::{
-        BucketVersioningState, Duration, MultipartUploadState, OffsetDateTime, Sqlite, SqliteError,
-        SqliteResult, StoredObjectLock, expiration_threshold, reader_connection_pragmas, row_size,
-        sql_limit, sql_size, writer_connection_pragmas,
+        BucketOpen, BucketVersioningState, Duration, MultipartUploadState, OffsetDateTime, Sqlite,
+        SqliteError, SqliteResult, StoredObjectLock, expiration_threshold,
+        reader_connection_pragmas, row_size, sql_limit, sql_size, writer_connection_pragmas,
     };
 
     fn open_schema() -> SqliteResult<Connection> {
@@ -997,6 +1068,20 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         columns.sort();
         Ok(columns)
+    }
+
+    /// The configured chunk size is converted to bytes and bounded by `SQLite`'s length limit.
+    #[test]
+    fn configured_blob_chunk_size_fits_sqlite() -> SqliteResult<()> {
+        assert_eq!(Sqlite::configured_blob_chunk_size(4)?, 4 * 1024 * 1024);
+        let too_large = Sqlite::sqlite_length_limit()? / (1024 * 1024);
+        for chunk_size_mib in [0, too_large, usize::MAX] {
+            assert!(matches!(
+                Sqlite::configured_blob_chunk_size(chunk_size_mib),
+                Err(SqliteError::Configuration(message)) if message.starts_with("blob_chunk_size_mib")
+            ));
+        }
+        Ok(())
     }
 
     #[test]
@@ -1172,6 +1257,7 @@ mod tests {
             "multipart_upload",
             "multipart_upload_tag",
             "object_part",
+            "blob_staging",
             "object_blob_chunk",
             "completed_multipart_upload",
         ] {
@@ -1426,8 +1512,62 @@ mod tests {
         let version: i32 = connection.query_row("PRAGMA user_version;", (), |row| row.get(0))?;
         assert_eq!(version, 0);
         drop(connection);
-        Sqlite::prepare_bucket_file(path.clone(), &Config::default(), "bucket").await?;
-        Sqlite::prepare_bucket_file(path, &config, "bucket").await?;
+        Sqlite::prepare_bucket_file(
+            path.clone(),
+            &Config::default(),
+            "bucket",
+            BucketOpen::Startup,
+        )
+        .await?;
+        Sqlite::prepare_bucket_file(path, &config, "bucket", BucketOpen::Startup).await?;
+
+        remove_root(&root);
+        Ok(())
+    }
+
+    /// Startup deletes every staged body, but `CreateBucket` must not.
+    ///
+    /// A concurrent `CreateBucket` can publish the database and start staging
+    /// before a slower create reaches its own startup cleanup.
+    #[tokio::test]
+    async fn only_process_startup_discards_live_staged_bodies() -> SqliteResult<()> {
+        let root = temp_root("prepare-staged")?;
+        let path = root.join("bucket.sqlite3");
+        let staged_count = |path: &std::path::Path| -> SqliteResult<i64> {
+            let connection = Connection::open(path)?;
+            Ok(connection.query_row("SELECT COUNT(*) FROM blob_staging;", (), |row| row.get(0))?)
+        };
+
+        Sqlite::prepare_bucket_file(
+            path.clone(),
+            &Config::default(),
+            "bucket",
+            BucketOpen::Create,
+        )
+        .await?;
+        let connection = Connection::open(&path)?;
+        connection.execute(
+            "INSERT INTO blob_staging (staging_id, last_appended) VALUES (?1, ?2);",
+            (uuid::Uuid::new_v4(), OffsetDateTime::now_utc()),
+        )?;
+        drop(connection);
+
+        Sqlite::prepare_bucket_file(
+            path.clone(),
+            &Config::default(),
+            "bucket",
+            BucketOpen::Create,
+        )
+        .await?;
+        assert_eq!(staged_count(&path)?, 1);
+        Sqlite::prepare_bucket_file(
+            path.clone(),
+            &Config::default(),
+            "bucket",
+            BucketOpen::Startup,
+        )
+        .await?;
+        assert_eq!(staged_count(&path)?, 0);
 
         remove_root(&root);
         Ok(())
@@ -1438,7 +1578,13 @@ mod tests {
         let root = temp_root("prepare-writable")?;
         let path = root.join("bucket.sqlite3");
 
-        Sqlite::prepare_bucket_file(path.clone(), &Config::default(), "bucket").await?;
+        Sqlite::prepare_bucket_file(
+            path.clone(),
+            &Config::default(),
+            "bucket",
+            BucketOpen::Startup,
+        )
+        .await?;
         let connection = BucketConnection::open(&path, &Config::default(), "bucket").await?;
         let version: i32 = connection
             .read(|connection| {

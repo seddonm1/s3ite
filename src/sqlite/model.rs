@@ -732,7 +732,7 @@ pub(crate) fn current_expiration_time(
     expiration.date.or_else(|| {
         expiration
             .days
-            .map(|days| last_modified + time::Duration::days(i64::from(days)))
+            .map(|days| lifecycle_day_boundary(last_modified, days))
     })
 }
 
@@ -740,9 +740,18 @@ pub(crate) fn current_expiration_time(
 #[must_use]
 pub(crate) fn noncurrent_expiration_time(
     expiration: &StoredNoncurrentVersionExpiration,
-    last_modified: OffsetDateTime,
+    noncurrent_since: OffsetDateTime,
 ) -> OffsetDateTime {
-    last_modified + time::Duration::days(i64::from(expiration.noncurrent_days))
+    lifecycle_day_boundary(noncurrent_since, expiration.noncurrent_days)
+}
+
+/// Adds the rule's days and uses the next midnight UTC, per AWS Lifecycle configuration elements.
+fn lifecycle_day_boundary(since: OffsetDateTime, days: i32) -> OffsetDateTime {
+    let utc = since.to_offset(time::UtcOffset::UTC);
+    utc.date()
+        .saturating_add(time::Duration::days(i64::from(days) + 1))
+        .midnight()
+        .assume_utc()
 }
 
 /// Selects an object's storage-level lifecycle expiration when one applies.
@@ -882,6 +891,7 @@ impl FromSql for BucketVersioningState {
     }
 }
 
+#[cfg(test)]
 /// Object body and metadata loaded from the bucket database.
 #[derive(Debug)]
 pub(crate) struct KeyValue {
@@ -899,6 +909,30 @@ pub(crate) struct EncodedBlobChunk {
     pub(crate) body: Vec<u8>,
     pub(crate) sse_nonce: Option<Vec<u8>>,
     pub(crate) sse_tag: Option<Vec<u8>>,
+}
+
+/// Identity and plaintext position of one stored chunk of an object version.
+///
+/// `chunk_id` alone is not a stable identity because chunk rowids may be
+/// reused after deletes; it is always matched together with the owning
+/// `object_sequence`, which `AUTOINCREMENT` never reuses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ObjectChunkLocation {
+    pub(crate) chunk_id: i64,
+    pub(crate) offset: i64,
+    pub(crate) size: i64,
+}
+
+/// Position and AES-GCM parameters of one encrypted chunk read from a snapshot.
+///
+/// The ciphertext itself arrives separately through the BLOB stream, in the
+/// same order as these entries.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EncryptedChunkRead {
+    pub(crate) offset: i64,
+    pub(crate) size: i64,
+    pub(crate) sse_nonce: Vec<u8>,
+    pub(crate) sse_tag: Vec<u8>,
 }
 
 /// Stored object blob chunk loaded directly from storage.
@@ -1123,6 +1157,7 @@ pub(crate) struct ObjectDeleteOutcome {
     pub(crate) delete_marker_version_id: Option<String>,
 }
 
+#[cfg(test)]
 /// Stored multipart upload part with its body and checksum metadata.
 #[derive(Debug)]
 pub(crate) struct Multipart {

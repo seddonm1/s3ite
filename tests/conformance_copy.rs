@@ -6,7 +6,7 @@
 
 mod support;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 use aws_sdk_s3::{
     primitives::ByteStream,
     types::{BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, MetadataDirective},
@@ -20,6 +20,17 @@ use support::{
 };
 
 const MIB: usize = 1024 * 1024;
+
+/// Returns the quoted hex MD5 that AWS uses as a single-part object's ETag.
+fn md5_etag(body: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    let digest = Md5::digest(body);
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("\"{hex}\"")
+}
 
 /// Verifies copying within the same bucket preserves object bytes.
 #[tokio::test]
@@ -375,6 +386,24 @@ async fn test_object_copy_versioning_multipart_upload() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("copy in versioned bucket missing version ID"))?
         .to_string();
     assert_copied_object(&client, &bucket, "bar321foo", &source_body, content_type).await?;
+    // CopyObject creates a single-part object, so AWS gives it the MD5 of its
+    // data as the ETag rather than the multipart source's "-N" ETag.
+    let copied_etag = copied
+        .copy_object_result()
+        .and_then(|result| result.e_tag())
+        .ok_or_else(|| anyhow::anyhow!("copy response missing ETag"))?;
+    ensure!(
+        completed.e_tag().is_some_and(|etag| etag.contains('-')),
+        "the multipart source should have a multipart ETag"
+    );
+    assert_eq!(copied_etag, md5_etag(&source_body));
+    let head = client
+        .head_object()
+        .bucket(&bucket)
+        .key("bar321foo")
+        .send()
+        .await?;
+    assert_eq!(head.e_tag(), Some(md5_etag(&source_body).as_str()));
 
     client
         .copy_object()
@@ -718,5 +747,55 @@ async fn assert_copied_object(
         response.body.collect().await?.into_bytes().as_ref(),
         expected_body
     );
+    Ok(())
+}
+
+/// Rejects a whole copy whose persisted chunks extend beyond the source metadata.
+#[tokio::test]
+#[serial(conformance)]
+async fn s3ite_copy_requires_exact_source_coverage() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-copy");
+    create_bucket(&client, &bucket).await?;
+    put_object(&client, &bucket, "source", b"abcdef").await?;
+    put_object(&client, &bucket, "target", b"preserved").await?;
+    let db = rusqlite::Connection::open(server.data_root().join(format!("{bucket}.sqlite3")))?;
+    let mut errors = Vec::new();
+    for size in [4, 0] {
+        assert_eq!(
+            db.execute(
+                "UPDATE object_version SET size = ?1 WHERE key = 'source';",
+                (size,)
+            )?,
+            1
+        );
+        let rejected = client
+            .copy_object()
+            .bucket(&bucket)
+            .key("target")
+            .copy_source(format!("{bucket}/source"))
+            .send()
+            .await;
+        errors.push(rejected);
+    }
+    for rejected in errors {
+        assert_error_contains(
+            &rejected.expect_err("copy must reject excess chunks"),
+            "InternalError",
+        );
+    }
+    assert_eq!(
+        get_object_bytes(&client, &bucket, "target").await?,
+        b"preserved"
+    );
+
+    let ranged = client.get_object().bucket(&bucket).key("source");
+    db.execute(
+        "UPDATE object_version SET size = 4 WHERE key = 'source';",
+        (),
+    )?;
+    let response = ranged.range("bytes=1-3").send().await?;
+    assert_eq!(response.body.collect().await?.into_bytes().as_ref(), b"bcd");
     Ok(())
 }

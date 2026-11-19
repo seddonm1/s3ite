@@ -131,31 +131,177 @@ pub async fn signed_chunked_request(
     Ok(request.send().await?)
 }
 
+/// Sends a SigV4 `STREAMING-UNSIGNED-PAYLOAD-TRAILER` request with one trailer field.
+///
+/// The payload is framed as a single `aws-chunked` data chunk followed by the
+/// terminating chunk and the trailer. When `trailer_value` is `None`, the
+/// trailer is declared in `x-amz-trailer` but omitted from the body.
+pub async fn unsigned_trailer_request(
+    server: &TestServer,
+    method: Method,
+    path_and_query: &str,
+    payload: &[u8],
+    trailer_name: &str,
+    trailer_value: Option<&str>,
+) -> Result<Response> {
+    let trailers = trailer_value
+        .map(|value| vec![(trailer_name, value)])
+        .unwrap_or_default();
+    trailer_request(
+        server,
+        method,
+        path_and_query,
+        TrailerBody {
+            payload,
+            declared_trailer: trailer_name,
+            trailers: &trailers,
+            extra_headers: &[],
+        },
+    )
+    .await
+}
+
+/// One `aws-chunked` body with its declared and actual trailer lines.
+pub struct TrailerBody<'a> {
+    /// Decoded object bytes, framed as a single chunk.
+    pub payload: &'a [u8],
+    /// Value of the `x-amz-trailer` request header.
+    pub declared_trailer: &'a str,
+    /// Trailer lines sent after the final chunk, in order.
+    pub trailers: &'a [(&'a str, &'a str)],
+    /// Additional signed request headers.
+    pub extra_headers: &'a [(&'a str, &'a str)],
+}
+
+/// Sends a `STREAMING-UNSIGNED-PAYLOAD-TRAILER` request with arbitrary trailer lines.
+pub async fn trailer_request(
+    server: &TestServer,
+    method: Method,
+    path_and_query: &str,
+    body: TrailerBody<'_>,
+) -> Result<Response> {
+    aws_chunked_request(
+        server,
+        method,
+        path_and_query,
+        AwsChunkedRequest {
+            chunks: &[body.payload],
+            decoded_length: body.payload.len(),
+            declared_trailer: body.declared_trailer,
+            trailers: body.trailers,
+            extra_headers: body.extra_headers,
+            http_chunked: false,
+        },
+    )
+    .await
+}
+
+/// The AWS-framed body and the independent HTTP and decoded lengths.
+pub struct AwsChunkedRequest<'a> {
+    pub chunks: &'a [&'a [u8]],
+    pub decoded_length: usize,
+    pub declared_trailer: &'a str,
+    pub trailers: &'a [(&'a str, &'a str)],
+    pub extra_headers: &'a [(&'a str, &'a str)],
+    pub http_chunked: bool,
+}
+
+/// Sends actual aws-chunked frames, optionally inside HTTP chunked transfer.
+pub async fn aws_chunked_request(
+    server: &TestServer,
+    method: Method,
+    path_and_query: &str,
+    body: AwsChunkedRequest<'_>,
+) -> Result<Response> {
+    let url = format!("{}{}", server.endpoint(), path_and_query);
+    let mut framed = Vec::new();
+    for chunk in body.chunks {
+        framed.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+        framed.extend_from_slice(chunk);
+        framed.extend_from_slice(b"\r\n");
+    }
+    framed.extend_from_slice(b"0\r\n");
+    for (name, value) in body.trailers {
+        framed.extend_from_slice(format!("{name}:{value}\r\n").as_bytes());
+    }
+    framed.extend_from_slice(b"\r\n");
+
+    let content_length = framed.len().to_string();
+    let decoded_length = body.decoded_length.to_string();
+    let mut headers = vec![
+        ("Content-Encoding", "aws-chunked"),
+        ("x-amz-decoded-content-length", decoded_length.as_str()),
+        ("x-amz-trailer", body.declared_trailer),
+    ];
+    if body.http_chunked {
+        headers.push(("Transfer-Encoding", "chunked"));
+    } else {
+        headers.push(("Content-Length", content_length.as_str()));
+    }
+    headers.extend_from_slice(body.extra_headers);
+    let mut signing_settings = SigningSettings::default();
+    signing_settings.percent_encoding_mode = PercentEncodingMode::Single;
+    signing_settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+    signing_settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
+    let signing = sign_request(
+        server,
+        &method,
+        &url,
+        SignableBody::Precomputed("STREAMING-UNSIGNED-PAYLOAD-TRAILER".to_string()),
+        &headers,
+        signing_settings,
+    )?;
+
+    let client = client()?;
+    let transport_body = if body.http_chunked {
+        reqwest::Body::wrap_stream(stream::once(async move {
+            Ok::<_, std::io::Error>(Bytes::from(framed))
+        }))
+    } else {
+        reqwest::Body::from(framed)
+    };
+    let mut request = client.request(method, &url).body(transport_body);
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    for (name, value) in signing.headers() {
+        request = request.header(name, value);
+    }
+    Ok(request.send().await?)
+}
+
+/// Sends signed request headers and half-closes the client write side.
 pub async fn signed_header_only_request(
     server: &TestServer,
     method: Method,
     path_and_query: &str,
     headers: &[(&str, &str)],
 ) -> Result<RawHttpResponse> {
-    signed_header_only_request_with_body(
-        server,
-        method,
-        path_and_query,
-        headers,
-        SignableBody::Bytes(&[]),
-    )
-    .await
+    signed_header_only_exchange(server, method, path_and_query, headers, true).await
 }
 
-async fn signed_header_only_request_with_body(
+/// Sends Expect: 100-continue without sending a body or closing the write side.
+pub async fn signed_expect_continue_request(
     server: &TestServer,
     method: Method,
     path_and_query: &str,
     headers: &[(&str, &str)],
-    body: SignableBody<'_>,
+) -> Result<RawHttpResponse> {
+    let mut headers = headers.to_vec();
+    headers.push(("Expect", "100-continue"));
+    signed_header_only_exchange(server, method, path_and_query, &headers, false).await
+}
+
+/// Reads a raw response after sending only the signed HTTP/1.1 request headers.
+async fn signed_header_only_exchange(
+    server: &TestServer,
+    method: Method,
+    path_and_query: &str,
+    headers: &[(&str, &str)],
+    half_close: bool,
 ) -> Result<RawHttpResponse> {
     let url = format!("{}{}", server.endpoint(), path_and_query);
-    let signing_headers = signing_headers_with_body(server, &method, &url, body, headers)?;
+    let signing_headers = signing_headers(server, &method, &url, &[], headers)?;
     let authority = server
         .endpoint()
         .strip_prefix("http://")
@@ -187,7 +333,9 @@ async fn signed_header_only_request_with_body(
 
     let mut stream = tokio::net::TcpStream::connect(authority).await?;
     stream.write_all(request.as_bytes()).await?;
-    stream.shutdown().await?;
+    if half_close {
+        stream.shutdown().await?;
+    }
 
     let mut response = Vec::new();
     timeout(Duration::from_secs(5), stream.read_to_end(&mut response))

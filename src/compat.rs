@@ -47,13 +47,16 @@ where
     type Error = HttpError;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
+    /// Delegates readiness to the wrapped S3 service.
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
     /// Applies compatibility checks before dispatch and adjusts selected responses.
     fn call(&mut self, req: Request<B>) -> Self::Future {
-        if let Some(response) = presigned_expiry_compat(&req) {
+        if let Some(response) =
+            request_framing_error(&req).or_else(|| presigned_expiry_compat(&req))
+        {
             return Box::pin(async move { Ok(response) });
         }
 
@@ -79,10 +82,70 @@ fn is_post_object_form<B>(req: &Request<B>) -> bool {
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| {
-            value
-                .split(';')
-                .next()
-                .is_some_and(|media_type| media_type.eq_ignore_ascii_case("multipart/form-data"))
+            value.split(';').next().is_some_and(|media_type| {
+                media_type
+                    .trim()
+                    .eq_ignore_ascii_case("multipart/form-data")
+            })
+        })
+}
+
+/// Rejects unsupported upload framing before the service can poll the body.
+fn request_framing_error<B>(req: &Request<B>) -> Option<HttpResponse> {
+    let headers = req.headers();
+    // AWS documents Content-Length in POST Object syntax but does not specify
+    // this rejection. The real S3 accelerate response is recorded at
+    // https://github.com/gitroomhq/postiz-app/issues/1659.
+    if is_post_object_form(req) && !headers.contains_key(header::CONTENT_LENGTH) {
+        return Some(s3_error_response(
+            StatusCode::LENGTH_REQUIRED,
+            "MissingContentLength",
+            Some("You must provide the Content-Length HTTP header."),
+            None,
+        ));
+    }
+
+    // AWS documentation does not specify the rejection of plain chunked PUTs.
+    // See https://github.com/co-cddo/gds-idea-app-drop/pull/9 and
+    // https://dev.to/sahays/axios-got-faceoff-uploading-a-file-to-amazon-workdocs-using-amazon-s3-pre-signed-url-1hfo.
+    // The SigV4 streaming guide permits Transfer-Encoding with a decoded length
+    // and no Content-Length for an AWS-framed body.
+    if req.method() == Method::PUT
+        && headers
+            .get_all(header::TRANSFER_ENCODING)
+            .iter()
+            .any(|value| {
+                value
+                    .as_bytes()
+                    .split(|byte| *byte == b',')
+                    .any(|coding| !coding.trim_ascii().eq_ignore_ascii_case(b"identity"))
+            })
+        && !(is_aws_chunked(headers)
+            && headers.contains_key("x-amz-decoded-content-length")
+            && !headers.contains_key(header::CONTENT_LENGTH))
+    {
+        return Some(s3_error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            Some("A header you provided implies functionality that is not implemented"),
+            Some("Transfer-Encoding"),
+        ));
+    }
+    None
+}
+
+/// Identifies `SigV4` streaming payload modes, which carry their own aws-chunked framing.
+fn is_aws_chunked(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get("x-amz-content-sha256")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            matches!(
+                value,
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+                    | "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
+                    | "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
+            )
         })
 }
 
@@ -152,15 +215,27 @@ fn presigned_expiry_compat<B>(req: &Request<B>) -> Option<HttpResponse> {
         return Some(s3_error_response(
             StatusCode::BAD_REQUEST,
             "InvalidArgument",
+            None,
+            None,
         ));
     }
 
     let Ok(expires) = expires.parse::<i64>() else {
-        return Some(s3_error_response(StatusCode::FORBIDDEN, "AccessDenied"));
+        return Some(s3_error_response(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            None,
+            None,
+        ));
     };
 
     if !(1..=604_800).contains(&expires) {
-        return Some(s3_error_response(StatusCode::FORBIDDEN, "AccessDenied"));
+        return Some(s3_error_response(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            None,
+            None,
+        ));
     }
 
     None
@@ -182,9 +257,21 @@ fn query_value<'a>(query: &'a str, name: &str) -> Option<&'a str> {
 ///
 /// These responses are intentionally small because they only cover cases that
 /// are rejected before the request reaches the normal `s3s` error machinery.
-fn s3_error_response(status: StatusCode, code: &str) -> HttpResponse {
-    let body =
-        format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code></Error>");
+fn s3_error_response(
+    status: StatusCode,
+    code: &str,
+    message: Option<&str>,
+    header: Option<&str>,
+) -> HttpResponse {
+    use std::fmt::Write as _;
+    let mut body = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code>");
+    if let Some(message) = message {
+        let _ = write!(body, "<Message>{message}</Message>");
+    }
+    if let Some(header) = header {
+        let _ = write!(body, "<Header>{header}</Header>");
+    }
+    body.push_str("</Error>");
     let mut response = HttpResponse::new(Body::from(body));
     *response.status_mut() = status;
     response.headers_mut().insert(
@@ -202,6 +289,70 @@ mod tests {
 
     fn request(method: Method, uri: &str) -> Result<Request<()>, hyper::http::Error> {
         Request::builder().method(method).uri(uri).body(())
+    }
+
+    /// Classifies POST forms and PUT transfer codings using headers alone.
+    #[test]
+    fn classifies_upload_framing() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut req = request(Method::POST, "/bucket")?;
+        req.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("Multipart/Form-Data ; boundary=test"),
+        );
+        assert_eq!(
+            request_framing_error(&req).map(|r| r.status()),
+            Some(StatusCode::LENGTH_REQUIRED)
+        );
+        req.headers_mut().insert(
+            header::TRANSFER_ENCODING,
+            HeaderValue::from_static("chunked"),
+        );
+        assert_eq!(
+            request_framing_error(&req).map(|r| r.status()),
+            Some(StatusCode::LENGTH_REQUIRED)
+        );
+        req.headers_mut()
+            .insert(header::CONTENT_LENGTH, HeaderValue::from_static("1"));
+        assert!(request_framing_error(&req).is_none());
+
+        *req.method_mut() = Method::PUT;
+        req.headers_mut().remove(header::CONTENT_LENGTH);
+        req.headers_mut().insert(
+            header::TRANSFER_ENCODING,
+            HeaderValue::from_static("IdEnTiTy"),
+        );
+        assert!(request_framing_error(&req).is_none());
+        req.headers_mut().append(
+            header::TRANSFER_ENCODING,
+            HeaderValue::from_static("identity, chunked"),
+        );
+        assert_eq!(
+            request_framing_error(&req).map(|r| r.status()),
+            Some(StatusCode::NOT_IMPLEMENTED)
+        );
+
+        req.headers_mut().insert(
+            "x-amz-content-sha256",
+            HeaderValue::from_static("STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+        );
+        assert_eq!(
+            request_framing_error(&req).map(|r| r.status()),
+            Some(StatusCode::NOT_IMPLEMENTED)
+        );
+        req.headers_mut().insert(
+            "x-amz-decoded-content-length",
+            HeaderValue::from_static("1"),
+        );
+        assert!(request_framing_error(&req).is_none());
+        req.headers_mut()
+            .insert(header::CONTENT_LENGTH, HeaderValue::from_static("1"));
+        assert_eq!(
+            request_framing_error(&req).map(|r| r.status()),
+            Some(StatusCode::NOT_IMPLEMENTED)
+        );
+        *req.method_mut() = Method::GET;
+        assert!(request_framing_error(&req).is_none());
+        Ok(())
     }
 
     /// Collects a test response body as UTF-8.
@@ -363,9 +514,10 @@ mod tests {
         assert_eq!(query_value("Other-X-Amz-Expires=60", "X-Amz-Expires"), None);
     }
 
+    /// Checks the XML shape of a compatibility error.
     #[tokio::test]
     async fn builds_xml_error_responses() -> Result<(), HttpError> {
-        let response = s3_error_response(StatusCode::FORBIDDEN, "AccessDenied");
+        let response = s3_error_response(StatusCode::FORBIDDEN, "AccessDenied", None, None);
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(
             response.headers().get(header::CONTENT_TYPE),

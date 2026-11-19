@@ -1,26 +1,33 @@
 //! S3 `CopyObject` request handling.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, ops::Range as ByteRange, sync::Arc};
 
+use crate::database::BucketConnection;
 use crate::sqlite::{
-    ChecksumAlgorithmKind, EncryptionMode, KeyMetadata, KeyValue, ObjectBodyReference,
-    ObjectWriteConditions, StoredChecksum, StoredObjectLock, StoredSse, StoredTag,
+    ChecksumAccumulator, ChecksumAlgorithmKind, ChecksumTypeKind, EncryptionMode, KeyMetadata,
+    ObjectBodyReference, ObjectChunkLocation, ObjectWriteConditions, StoredChecksum,
+    StoredObjectLock, StoredSse, StoredTag,
 };
 
+use super::source::object_range_stream;
+use super::sse::ActiveSse;
+use super::stage::{StagedBody, stage_streaming_body};
+
 use super::metadata::parse_expires;
+use super::multipart::checked_copy_source_range;
 use super::{
-    CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource, CopyTaggingDirective, ETag,
-    InternalError, MetadataDirective, Not, ObjectAclRequest, ObjectLockWriteHeaders,
-    ObjectReadConditions, OffsetDateTime, S3_SINGLE_REQUEST_BODY_MAX, S3ErrorCode, S3Request,
-    S3Response, S3Result, Sqlite, SqliteError, SqliteResult, WriteEncryption,
-    checksum_algorithm_from_request, checksum_crc32, checksum_crc32c, checksum_crc64nvme,
-    checksum_md5, checksum_sha1, checksum_sha256, checksum_sha512, checksum_type_output,
-    checksum_xxhash3, checksum_xxhash64, checksum_xxhash128, copy_tagging_directive,
-    decrypt_stored_chunks, encrypt_value_chunks, encryption_headers, http_date_time,
+    CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource, CopyTaggingDirective, Digest,
+    ETag, Md5, MetadataDirective, Not, ObjectAclRequest, ObjectLockWriteHeaders,
+    ObjectReadConditions, OffsetDateTime, S3_SINGLE_REQUEST_BODY_MAX, S3ErrorCode, S3Range,
+    S3Request, S3Response, S3Result, Sqlite, SqliteError, SqliteResult, StreamingBlob,
+    WriteEncryption, checksum_algorithm_from_request, checksum_crc32, checksum_crc32c,
+    checksum_crc64nvme, checksum_md5, checksum_sha1, checksum_sha256, checksum_sha512,
+    checksum_type_output, checksum_xxhash3, checksum_xxhash64, checksum_xxhash128,
+    copy_tagging_directive, encryption_headers, hex, http_date_time,
     load_bucket_object_lock_config, normalize_content_encoding, normalize_metadata,
-    object_lock_for_copied_version, object_lock_write_headers, object_write_checksum_from_value,
-    object_write_conditions, open_encryption, requested_encryption, resolve_write_encryption,
-    s3_error, s3_error_from_sqlite, s3_error_with_message, strong_etag_condition_matches,
+    object_lock_for_new_version, object_lock_write_headers, object_write_conditions,
+    open_encryption, requested_encryption, resolve_write_encryption, s3_error,
+    s3_error_from_sqlite, s3_error_with_message, strong_etag_condition_matches,
     validate_expected_bucket_owner, validate_no_unsupported_sse_headers, validate_object_acl,
     weak_etag_condition_matches,
 };
@@ -48,10 +55,33 @@ struct CopyObjectRequest {
     object_lock_headers: ObjectLockWriteHeaders,
 }
 
-/// Source object body plus tags used by `CopyObject`.
+/// Source version selected for a copy: its metadata, tags, and a plan for streaming its body.
+///
+/// The body is never loaded whole; [`CopySourceObject::body`] streams the
+/// requested plaintext range one storage chunk at a time.
 pub(super) struct CopySourceObject {
-    pub(super) object: KeyValue,
+    pub(super) key_metadata: KeyMetadata,
     tags: Vec<StoredTag>,
+    connection: Arc<BucketConnection>,
+    sequence: i64,
+    locations: Vec<ObjectChunkLocation>,
+    pub(super) range: ByteRange<u64>,
+    encryption: Option<Arc<ActiveSse>>,
+}
+
+impl CopySourceObject {
+    /// Streams the planned source bytes, decrypting each stored chunk when needed.
+    ///
+    /// A source version deleted while the copy streams ends the stream with `NoSuchKey`.
+    pub(super) fn body(&self) -> StreamingBlob {
+        object_range_stream(
+            self.connection.clone(),
+            self.sequence,
+            self.locations.clone(),
+            self.range.clone(),
+            self.encryption.clone(),
+        )
+    }
 }
 
 /// Applies copy-source conditional request semantics to loaded source metadata.
@@ -201,7 +231,7 @@ fn parse_copy_object_request(input: CopyObjectInput) -> S3Result<CopyObjectReque
         content_language: input.content_language,
         cache_control: input.cache_control,
         expires: parse_expires(expires.as_deref())?,
-        target_conditions: object_write_conditions(if_match, if_none_match),
+        target_conditions: object_write_conditions(if_match, if_none_match, false)?,
         source_conditions: ObjectReadConditions {
             etag_matches: copy_source_if_match,
             modified_since: copy_source_if_modified_since.map(Into::into),
@@ -231,69 +261,67 @@ fn validate_copy_target(request: &CopyObjectRequest) -> S3Result<()> {
 }
 
 /// Rewrites loaded source metadata for the destination object.
+///
+/// The checksum is left for the caller to compute while streaming the body;
+/// see [`copy_checksum_kind`] for the algorithm the copy must use.
 fn prepare_copied_object(
-    mut object: KeyValue,
+    mut metadata: KeyMetadata,
     request: &CopyObjectRequest,
     target_stored_sse: Option<StoredSse>,
     target_object_lock: StoredObjectLock,
-) -> SqliteResult<(KeyValue, StoredChecksum)> {
-    object.key.clone_from(&request.target_key);
-    object.key_metadata.last_modified = OffsetDateTime::now_utc();
+) -> KeyMetadata {
+    metadata.last_modified = OffsetDateTime::now_utc();
     if request.replace_metadata {
-        object.key_metadata.metadata.clone_from(&request.metadata);
-        object
-            .key_metadata
-            .content_type
-            .clone_from(&request.content_type);
-        object
-            .key_metadata
+        metadata.metadata.clone_from(&request.metadata);
+        metadata.content_type.clone_from(&request.content_type);
+        metadata
             .content_encoding
             .clone_from(&request.content_encoding);
-        object
-            .key_metadata
+        metadata
             .content_disposition
             .clone_from(&request.content_disposition);
-        object
-            .key_metadata
+        metadata
             .content_language
             .clone_from(&request.content_language);
-        object
-            .key_metadata
-            .cache_control
-            .clone_from(&request.cache_control);
-        object.key_metadata.expires = request.expires;
+        metadata.cache_control.clone_from(&request.cache_control);
+        metadata.expires = request.expires;
     }
-    let checksum_kind = request
-        .target_checksum_kind
-        .or_else(|| {
-            object
-                .key_metadata
-                .checksum
-                .as_ref()
-                .map(StoredChecksum::algorithm)
-        })
-        .unwrap_or(ChecksumAlgorithmKind::Crc64Nvme);
-    let checksum = object_write_checksum_from_value(checksum_kind, &object)?;
-    object.key_metadata.checksum = Some(checksum.clone());
-    object.key_metadata.stored_sse = target_stored_sse;
-    object.key_metadata.object_lock = target_object_lock;
-    Ok((object, checksum))
+    metadata.checksum = None;
+    metadata.stored_sse = target_stored_sse;
+    metadata.object_lock = target_object_lock;
+    metadata
 }
 
-/// Reads a consistent source snapshot and unwraps its data key after releasing the reader.
+/// Chooses the copy's full-object checksum algorithm.
+///
+/// An explicit request algorithm wins, then the source's algorithm, then the
+/// `CRC64NVME` default.
+fn copy_checksum_kind(request: &CopyObjectRequest, source: &KeyMetadata) -> ChecksumAlgorithmKind {
+    request
+        .target_checksum_kind
+        .or_else(|| source.checksum.as_ref().map(StoredChecksum::algorithm))
+        .unwrap_or(ChecksumAlgorithmKind::Crc64Nvme)
+}
+
+/// Reads the source version's metadata, tags, and chunk plan, then unwraps its data key.
+///
+/// Conditions are checked in the same read transaction that selects the
+/// version, so the streamed body belongs to the version they were checked
+/// against.
 pub(super) async fn load_copy_source_object(
     sqlite: &Sqlite,
     bucket: &str,
     key: &str,
     version_id: Option<String>,
     conditions: ObjectReadConditions,
+    requested_range: Option<S3Range>,
 ) -> S3Result<CopySourceObject> {
     let source_key = key.to_owned();
     let connection = sqlite
         .get_connection(bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
-    let (metadata, value, chunks, tags) = connection
+    let (key_metadata, sequence, locations, tags, range) = connection
         .read(move |transaction| {
             let source = match version_id {
                 Some(id) => {
@@ -312,39 +340,31 @@ pub(super) async fn load_copy_source_object(
                 return Err(SqliteError::ObjectNotFound);
             }
             validate_copy_source_conditions(&key_metadata, &conditions)?;
-            let (value, chunks) = if key_metadata.stored_sse.is_some() {
-                (
-                    Vec::new(),
-                    Sqlite::get_object_blob_chunks(transaction, sequence, key_metadata.size)?,
-                )
+            let size = u64::try_from(key_metadata.size)
+                .map_err(|_| SqliteError::ObjectBodyInconsistent)?;
+            let range = checked_copy_source_range(requested_range, size)?;
+            let locations = if requested_range.is_some() {
+                Sqlite::object_chunk_locations(transaction, sequence, range.clone())?
             } else {
-                (
-                    Sqlite::get_object_bytes(transaction, sequence, key_metadata.size)?,
-                    Vec::new(),
-                )
+                Sqlite::whole_object_chunk_locations(transaction, sequence, size)?
             };
-            Ok((
-                key_metadata,
-                value,
-                chunks,
-                Sqlite::get_object_tags(transaction, sequence)?,
-            ))
+            let tags = Sqlite::get_object_tags(transaction, sequence)?;
+            Ok((key_metadata, sequence, locations, tags, range))
         })
         .await
         .map_err(s3_error_from_sqlite)?;
-    let value = if let Some(stored) = metadata.stored_sse.clone() {
-        let active = open_encryption(sqlite, stored).await?;
-        decrypt_stored_chunks(&active, chunks).map_err(s3_error_from_sqlite)?
-    } else {
-        value
+    let encryption = match key_metadata.stored_sse.clone() {
+        Some(stored) => Some(Arc::new(open_encryption(sqlite, stored).await?)),
+        None => None,
     };
     Ok(CopySourceObject {
-        object: KeyValue {
-            key: key.to_owned(),
-            value: Some(value),
-            key_metadata: metadata,
-        },
+        key_metadata,
         tags,
+        connection,
+        sequence,
+        locations,
+        range,
+        encryption,
     })
 }
 
@@ -372,23 +392,65 @@ fn copy_object_result(
     }
 }
 
-/// Reads a source snapshot and checks the destination conditions in the transaction
-/// that installs the copied version, its body, and its tags.
+/// Streams a copy's body into staged target chunks while computing its checksum.
+///
+/// The source is decrypted and the target encrypted one chunk at a time. A
+/// stream failure, such as the source being deleted mid-copy, or a size
+/// mismatch discards the staged chunks; the source's own error, such as
+/// `NoSuchKey`, is returned.
+///
+/// Also returns the hex MD5 of the copied bytes. `CopyObject` always creates a
+/// single-part object, and AWS gives copies an `ETag` that is the MD5 of their
+/// data, so a copy of a multipart object must not keep the source's `-N` `ETag`.
+async fn stage_copy_body(
+    source: &CopySourceObject,
+    target_connection: Arc<BucketConnection>,
+    chunk_size: usize,
+    target_encryption: Option<&ActiveSse>,
+    checksum_kind: ChecksumAlgorithmKind,
+) -> S3Result<(StagedBody, StoredChecksum, String)> {
+    let mut accumulator = ChecksumAccumulator::new(checksum_kind);
+    let mut md5 = Md5::new();
+    let staged = stage_streaming_body(
+        target_connection,
+        source.body(),
+        chunk_size,
+        source.key_metadata.size,
+        target_encryption,
+        |bytes| {
+            accumulator.update(bytes);
+            md5.update(bytes);
+        },
+    )
+    .await?;
+    if let Some(checksum) = accumulator.finish_stored(ChecksumTypeKind::FullObject) {
+        return Ok((staged, checksum, hex(md5.finalize())));
+    }
+    staged.discard();
+    Err(s3_error_from_sqlite(SqliteError::ChecksumMismatch))
+}
+
+/// Streams a source version into a new target version.
+///
+/// The source size limit is enforced before any body bytes are read. The
+/// destination conditions are checked in the transaction that claims the
+/// staged body and installs the copied version and its tags.
 async fn copy_object_data(
     sqlite: &Sqlite,
     request: CopyObjectRequest,
 ) -> S3Result<(CopyObjectResult, Option<String>, Option<EncryptionMode>)> {
-    let object = load_copy_source_object(
+    let source = load_copy_source_object(
         sqlite,
         &request.source_bucket,
         &request.source_key,
         request.source_version_id.clone(),
         request.source_conditions.clone(),
+        None,
     )
     .await?;
-    validate_copy_source_size(&object.object.key_metadata).map_err(s3_error_from_sqlite)?;
+    validate_copy_source_size(&source.key_metadata).map_err(s3_error_from_sqlite)?;
     let target_tags = match &request.tagging_directive {
-        CopyTaggingDirective::Copy => object.tags.clone(),
+        CopyTaggingDirective::Copy => source.tags.clone(),
         CopyTaggingDirective::Replace(tags) => tags.clone(),
     };
     let target_encryption = resolve_write_encryption(
@@ -403,51 +465,49 @@ async fn copy_object_data(
     let encrypted = target_encryption
         .as_ref()
         .map(|active| active.stored.mode());
-    let chunk_size = sqlite.blob_chunk_size();
-    let target_stored_sse = target_encryption
-        .as_ref()
-        .map(|encryption| encryption.stored.clone());
-    let target_object_lock = object_lock_for_copied_version(
-        &object.object.key_metadata.object_lock,
+    // S3 never copies the source version's Object Lock settings: the copy is a
+    // new version locked only by request headers or the destination default.
+    let target_object_lock = object_lock_for_new_version(
         &target_object_lock_config,
         request.object_lock_headers.clone(),
         OffsetDateTime::now_utc(),
     )?;
-    let (object, checksum) = prepare_copied_object(
-        object.object,
-        &request,
-        target_stored_sse,
-        target_object_lock,
-    )
-    .map_err(s3_error_from_sqlite)?;
-    let encrypted_chunks = target_encryption
-        .as_ref()
-        .map(|encryption| {
-            let value = object.value.as_deref().ok_or_else(|| {
-                s3_error_with_message(InternalError, "copy source body is missing")
-            })?;
-            encrypt_value_chunks(value, chunk_size, encryption)
-        })
-        .transpose()?;
     let target_connection = sqlite
         .get_connection(&request.target_bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
-    target_connection
+    let (staged, checksum, md5) = stage_copy_body(
+        &source,
+        target_connection.clone(),
+        sqlite.blob_chunk_size(),
+        target_encryption.as_ref(),
+        copy_checksum_kind(&request, &source.key_metadata),
+    )
+    .await?;
+    let mut metadata = prepare_copied_object(
+        source.key_metadata,
+        &request,
+        target_encryption
+            .as_ref()
+            .map(|encryption| encryption.stored.clone()),
+        target_object_lock,
+    );
+    metadata.checksum = Some(checksum.clone());
+    metadata.md5 = Some(md5);
+    let staging_id = staged.staging_id();
+    let written = target_connection
         .write(move |transaction| {
             Sqlite::check_object_write_conditions(
                 transaction,
-                &object.key,
+                &request.target_key,
                 &request.target_conditions,
             )?;
-            let write_outcome = if let Some(chunks) = encrypted_chunks {
-                let KeyValue {
-                    key, key_metadata, ..
-                } = object;
-                Sqlite::put_object_with_encoded_chunks(transaction, &key, key_metadata, chunks)?
-            } else {
-                Sqlite::put_object_with_chunk_size(transaction, object, chunk_size)?
-            };
+            let write_outcome = Sqlite::put_object_with_staged_chunks(
+                transaction,
+                &request.target_key,
+                metadata,
+                staging_id,
+            )?;
             Sqlite::replace_object_tags(transaction, write_outcome.sequence, &target_tags)?;
             let result = copy_object_result(
                 &checksum,
@@ -457,7 +517,17 @@ async fn copy_object_data(
             Ok((result, write_outcome.returned_version_id, encrypted))
         })
         .await
-        .map_err(s3_error_from_sqlite)
+        .map_err(s3_error_from_sqlite);
+    match written {
+        Ok(written) => {
+            staged.claimed();
+            Ok(written)
+        }
+        Err(err) => {
+            staged.discard();
+            Err(err)
+        }
+    }
 }
 
 /// Copies an object between buckets while applying S3 metadata-directive rules.
@@ -548,34 +618,31 @@ mod tests {
         }
     }
 
-    /// Builds a copy source with a body, user metadata, and the requested checksum.
-    fn object(value: Vec<u8>, checksum: Option<StoredChecksum>) -> KeyValue {
-        KeyValue {
-            key: "source-key".to_string(),
-            value: Some(value),
-            key_metadata: KeyMetadata {
-                version_id: "source-version".to_string(),
-                size: 7,
-                metadata: Some(HashMap::from([("old".to_string(), "value".to_string())])),
-                content_type: Some("text/plain".to_string()),
-                content_encoding: Some("gzip".to_string()),
-                content_disposition: None,
-                content_language: None,
-                cache_control: Some("old-cache".to_string()),
-                expires: Some(OffsetDateTime::UNIX_EPOCH),
-                last_modified: OffsetDateTime::UNIX_EPOCH,
-                md5: Some("md5".to_string()),
-                checksum,
-                stored_sse: None,
-                object_lock: StoredObjectLock::default(),
-                is_latest: true,
-                is_delete_marker: false,
-            },
+    /// Builds copy source metadata with user metadata and the requested checksum.
+    fn object(checksum: Option<StoredChecksum>) -> KeyMetadata {
+        KeyMetadata {
+            version_id: "source-version".to_string(),
+            size: 7,
+            metadata: Some(HashMap::from([("old".to_string(), "value".to_string())])),
+            content_type: Some("text/plain".to_string()),
+            content_encoding: Some("gzip".to_string()),
+            content_disposition: None,
+            content_language: None,
+            cache_control: Some("old-cache".to_string()),
+            expires: Some(OffsetDateTime::UNIX_EPOCH),
+            last_modified: OffsetDateTime::UNIX_EPOCH,
+            md5: Some("md5".to_string()),
+            checksum,
+            stored_sse: None,
+            object_lock: StoredObjectLock::default(),
+            is_latest: true,
+            is_delete_marker: false,
         }
     }
 
+    /// Builds a five-byte source fixture with the given MD5 and modification time.
     fn metadata(md5: Option<&str>, last_modified: OffsetDateTime) -> KeyMetadata {
-        let mut metadata = object(Vec::new(), None).key_metadata;
+        let mut metadata = object(None);
         metadata.md5 = md5.map(str::to_string);
         metadata.last_modified = last_modified;
         metadata.size = 5;
@@ -872,31 +939,20 @@ mod tests {
         request.target_key = "target-key".to_string();
         let source_checksum = StoredChecksum::Full(FullObjectChecksum::Sha256("old".to_string()));
 
-        let (copied, checksum) = match prepare_copied_object(
-            object(b"payload".to_vec(), Some(source_checksum)),
-            &request,
-            None,
-            StoredObjectLock::default(),
-        ) {
-            Ok(result) => result,
-            Err(err) => panic!("unexpected error: {err:?}"),
-        };
+        let source = object(Some(source_checksum));
+        let kind = copy_checksum_kind(&request, &source);
+        let copied = prepare_copied_object(source, &request, None, StoredObjectLock::default());
 
-        assert_eq!(copied.key, "target-key");
         assert_eq!(
             copied
-                .key_metadata
                 .metadata
                 .as_ref()
                 .and_then(|metadata| metadata.get("old")),
             Some(&"value".to_string())
         );
-        assert_eq!(
-            copied.key_metadata.content_type.as_deref(),
-            Some("text/plain")
-        );
-        assert_eq!(checksum.algorithm(), ChecksumAlgorithmKind::Sha256);
-        assert_eq!(copied.key_metadata.checksum.as_ref(), Some(&checksum));
+        assert_eq!(copied.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(kind, ChecksumAlgorithmKind::Sha256);
+        assert_eq!(copied.checksum, None);
     }
 
     #[test]
@@ -925,39 +981,21 @@ mod tests {
             Err(err) => panic!("unexpected error: {err:?}"),
         };
 
-        let (copied, checksum) = match prepare_copied_object(
-            object(b"payload".to_vec(), None),
-            &request,
-            None,
-            StoredObjectLock::default(),
-        ) {
-            Ok(result) => result,
-            Err(err) => panic!("unexpected error: {err:?}"),
-        };
+        let source = object(None);
+        let kind = copy_checksum_kind(&request, &source);
+        let copied = prepare_copied_object(source, &request, None, StoredObjectLock::default());
 
-        assert_eq!(copied.key, "target-key");
         assert_eq!(
             copied
-                .key_metadata
                 .metadata
                 .as_ref()
                 .and_then(|metadata| metadata.get("new")),
             Some(&"value".to_string())
         );
-        assert_eq!(
-            copied.key_metadata.content_type.as_deref(),
-            Some("application/json")
-        );
-        assert_eq!(
-            copied.key_metadata.content_encoding.as_deref(),
-            Some("gzip")
-        );
-        assert_eq!(
-            copied.key_metadata.cache_control.as_deref(),
-            Some("max-age=60")
-        );
-        assert_eq!(checksum.algorithm(), ChecksumAlgorithmKind::Crc64Nvme);
-        assert_eq!(copied.key_metadata.checksum.as_ref(), Some(&checksum));
+        assert_eq!(copied.content_type.as_deref(), Some("application/json"));
+        assert_eq!(copied.content_encoding.as_deref(), Some("gzip"));
+        assert_eq!(copied.cache_control.as_deref(), Some("max-age=60"));
+        assert_eq!(kind, ChecksumAlgorithmKind::Crc64Nvme);
     }
 
     #[test]

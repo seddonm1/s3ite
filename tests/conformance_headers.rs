@@ -657,3 +657,37 @@ async fn raw_http_status(
     let status = status.parse::<u16>()?;
     StatusCode::from_u16(status).map_err(Into::into)
 }
+
+/// Verifies a decoded length that disagrees with a plain signed body is rejected.
+///
+/// `x-amz-decoded-content-length` marks the request as a declared-length
+/// upload even without `aws-chunked` framing, so the staged body must match
+/// it. A longer or shorter body must not be committed at its actual size.
+#[tokio::test]
+#[serial(conformance)]
+async fn s3ite_put_object_rejects_mismatched_decoded_content_length() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-len");
+    create_bucket(&client, &bucket).await?;
+    put_object(&client, &bucket, "foo", b"original").await?;
+    let path = format!("/{bucket}/foo");
+
+    for (declared, code) in [("2", "InvalidRequest"), ("10", "IncompleteBody")] {
+        let response = raw_http::signed_request_with_headers(
+            &server,
+            Method::PUT,
+            &path,
+            BODY.to_vec(),
+            &[("x-amz-decoded-content-length", declared)],
+        )
+        .await?;
+        assert_error(response, StatusCode::BAD_REQUEST, code).await?;
+    }
+
+    assert_eq!(
+        get_object_bytes(&client, &bucket, "foo").await?,
+        b"original"
+    );
+    Ok(())
+}
