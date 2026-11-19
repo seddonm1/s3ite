@@ -538,6 +538,13 @@ Readiness turns on after bucket initialization and S3 socket binding. It turns
 off when graceful shutdown begins. Probes report the server lifecycle without
 issuing SQLite queries or calling KMS.
 
+On `SIGTERM`, readiness turns off at once but the S3 listener keeps accepting
+requests for 5 seconds, so traffic that arrives before Kubernetes removes the
+pod from its endpoints is still served. The listener then closes, open
+connections get up to 10 seconds to finish, and telemetry gets up to 5 seconds
+to flush. That is at most 20 seconds, within Kubernetes' default 30 second
+termination grace period. `Ctrl+C` skips the 5 second window.
+
 ### OpenTelemetry
 
 Export is off by default. To send traces, metrics, and audit logs to one

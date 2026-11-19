@@ -137,6 +137,12 @@ async fn probes_follow_storage_startup_and_graceful_drain() -> Result<()> {
     );
     await_status(&client, &ready, StatusCode::SERVICE_UNAVAILABLE).await?;
     assert_eq!(client.get(&live).send().await?.status(), StatusCode::OK);
+    // During the SIGTERM grace window the listener still accepts new requests,
+    // so traffic routed before Kubernetes sees the 503 is served.
+    let listing_url =
+        presigned_url_with_credentials(&endpoint, CREDENTIALS, Method::GET, "/readyz")?;
+    let during_grace = client.get(listing_url).send().await?;
+    assert_eq!(during_grace.status(), StatusCode::OK);
     upload.get_mut().write_all(b"x").await?;
     let mut result = String::new();
     timeout(Duration::from_secs(5), upload.read_to_string(&mut result)).await??;

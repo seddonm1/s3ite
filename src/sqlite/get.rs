@@ -388,13 +388,16 @@ impl Sqlite {
         Self::get_object_body_reference_internal(transaction, key, None, true)
     }
 
-    /// Fetches exact visible object metadata and body rowid by key and version ID.
+    /// Fetches object metadata and body rowid by key and version ID, including delete markers.
+    ///
+    /// Callers decide what a named delete marker means: GET answers 405, copy
+    /// treats it as a missing version.
     pub(crate) fn get_object_version_body_reference(
         transaction: &Transaction,
         key: &str,
         version_id: &str,
     ) -> SqliteResult<Option<ObjectBodyReference>> {
-        Self::get_object_body_reference_internal(transaction, key, Some(version_id), false)
+        Self::get_object_body_reference_internal(transaction, key, Some(version_id), true)
     }
 
     /// Fetches metadata and rowid for opening an object body BLOB.

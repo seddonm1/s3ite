@@ -1179,7 +1179,7 @@ async fn test_multipart_get_part() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_multipart_single_get_part() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_multipart_single_get_part
+    // Adapted from s3tests/functional/test_s3.py::test_multipart_single_get_part: AWS answers 416 InvalidPartNumber where Ceph answers 400 InvalidPart.
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-mpu");
@@ -1240,7 +1240,7 @@ async fn test_multipart_single_get_part() -> Result<()> {
         Ok(_) => bail!("partNumber beyond multipart object should fail"),
         Err(error) => error,
     };
-    assert_error_contains(&invalid, "InvalidPart");
+    assert_error_contains(&invalid, "InvalidPartNumber");
 
     Ok(())
 }
@@ -1282,7 +1282,7 @@ async fn s3ite_multipart_part_boundaries_are_cleared_by_put_and_copy() -> Result
         Ok(_) => bail!("PutObject should clear completed part boundaries"),
         Err(error) => error,
     };
-    assert_error_contains(&error, "InvalidPart");
+    assert_error_contains(&error, "InvalidPartNumber");
 
     put_object(&client, &bucket, "copy-source", b"copied").await?;
     client

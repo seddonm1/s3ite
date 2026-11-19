@@ -53,7 +53,7 @@ async fn test_object_head_zero_bytes() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_non_multipart_get_part() -> Result<()> {
-    // Mirrors s3tests/functional/test_s3.py::test_non_multipart_get_part
+    // Adapted from s3tests/functional/test_s3.py::test_non_multipart_get_part: AWS answers 416 InvalidPartNumber where Ceph answers 400 InvalidPart.
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-obj");
@@ -81,7 +81,7 @@ async fn test_non_multipart_get_part() -> Result<()> {
         Ok(_) => bail!("partNumber beyond normal object should fail"),
         Err(error) => error,
     };
-    assert_error_contains(&error, "InvalidPart");
+    assert_error_contains(&error, "InvalidPartNumber");
 
     let response = client
         .get_object()

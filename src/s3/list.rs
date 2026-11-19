@@ -335,7 +335,7 @@ pub(super) async fn list_objects(
     marker = marker.map(decode_list_input_value);
     delimiter = delimiter.map(decode_list_input_value);
 
-    let max_keys = max_keys.unwrap_or(1000).clamp(0, 1000);
+    let max_keys = list_max_keys(max_keys)?;
     let max_keys_usize = usize::try_from(max_keys).map_err(S3Error::internal_error)?;
     let marker_output = Some(marker.clone().unwrap_or_default());
     let prefix_filter = prefix.clone().unwrap_or_default();
@@ -420,7 +420,7 @@ pub(super) async fn list_object_versions(
     key_marker = key_marker.map(decode_list_input_value);
     delimiter = delimiter.map(decode_list_input_value);
 
-    let max_keys = max_keys.unwrap_or(1000).clamp(0, 1000);
+    let max_keys = list_max_keys(max_keys)?;
     let key_marker_clone = key_marker.clone();
     let version_id_marker_clone = version_id_marker.clone();
     let prefix_filter = prefix.clone().unwrap_or_default();
@@ -529,7 +529,7 @@ pub(super) async fn list_objects_v2(
     start_after = start_after.map(decode_list_input_value);
     delimiter = delimiter.map(decode_list_input_value);
 
-    let max_keys = max_keys.unwrap_or(1000).clamp(0, 1000);
+    let max_keys = list_max_keys(max_keys)?;
     let max_keys_usize = usize::try_from(max_keys).map_err(S3Error::internal_error)?;
     let continuation_token_clone = continuation_token.clone();
     let prefix_filter = prefix.clone().unwrap_or_default();
@@ -605,9 +605,37 @@ pub(super) async fn list_objects_v2(
     Ok(S3Response::new(output))
 }
 
+/// Resolves a listing `max-keys`, defaulting to and capping at 1000.
+///
+/// AWS S3 rejects a negative value with `InvalidArgument` instead of
+/// treating it as zero.
+fn list_max_keys(max_keys: Option<i32>) -> S3Result<i32> {
+    match max_keys {
+        Some(value) if value < 0 => Err(s3_error_with_message(
+            S3ErrorCode::InvalidArgument,
+            "Argument maxKeys must be an integer between 0 and 2147483647",
+        )),
+        value => Ok(value.unwrap_or(1000).min(1000)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rejects negative `max-keys` and caps large values at 1000.
+    #[test]
+    fn resolves_listing_max_keys() {
+        assert_eq!(list_max_keys(None).ok(), Some(1000));
+        assert_eq!(list_max_keys(Some(0)).ok(), Some(0));
+        assert_eq!(list_max_keys(Some(5000)).ok(), Some(1000));
+        assert_eq!(
+            list_max_keys(Some(-1))
+                .err()
+                .map(|error| error.code().clone()),
+            Some(S3ErrorCode::InvalidArgument)
+        );
+    }
 
     use s3s::dto::ObjectVersionStorageClass;
     use time::OffsetDateTime;

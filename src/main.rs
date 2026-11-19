@@ -128,9 +128,13 @@ fn build_s3_service(config: &Config, sqlite: Sqlite) -> MainResult<S3Service> {
     )));
 
     // Validation requires both credentials, so every request is authenticated.
-    let (Some(access_key), Some(secret_key)) =
-        (config.access_key.clone(), config.secret_key.clone())
-    else {
+    let (Some(access_key), Some(secret_key)) = (
+        config.access_key.clone(),
+        config
+            .secret_key
+            .as_ref()
+            .map(|key| key.expose().to_owned()),
+    ) else {
         return Err(MainError::Configuration(
             "access_key and secret_key are required".into(),
         ));
@@ -165,18 +169,75 @@ async fn accept_connection(listener: &TcpListener) -> (TcpStream, SocketAddr) {
     }
 }
 
+/// The signal that started a shutdown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShutdownSignal {
+    /// Console Ctrl+C: stop accepting connections at once.
+    Interrupt,
+    /// SIGTERM from an orchestrator: keep serving through [`TERMINATE_GRACE`].
+    Terminate,
+}
+
 /// Waits for a console interrupt or a Unix termination signal before draining connections.
-async fn shutdown_signal() -> std::io::Result<()> {
+async fn shutdown_signal() -> std::io::Result<ShutdownSignal> {
     #[cfg(unix)]
     {
         let mut terminate = unix_signal(SignalKind::terminate())?;
         tokio::select! {
-            result = signal::ctrl_c() => result,
-            _ = terminate.recv() => Ok(()),
+            result = signal::ctrl_c() => result.map(|()| ShutdownSignal::Interrupt),
+            _ = terminate.recv() => Ok(ShutdownSignal::Terminate),
         }
     }
     #[cfg(not(unix))]
-    signal::ctrl_c().await
+    signal::ctrl_c().await.map(|()| ShutdownSignal::Interrupt)
+}
+
+/// Time between SIGTERM and closing the listener, while readiness reports 503.
+///
+/// Kubernetes removes a pod from its Service endpoints only after readiness
+/// fails, so connections keep arriving for a few seconds after SIGTERM.
+/// Serving them during this window avoids refused connections.
+const TERMINATE_GRACE: Duration = Duration::from_secs(5);
+
+/// Longest open connections may take to finish once the listener closes.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What the accept loop does once a shutdown signal arrives.
+#[derive(Debug)]
+enum ShutdownStep {
+    /// Keep accepting through [`TERMINATE_GRACE`], then drain.
+    Grace,
+    /// Close the listener and drain now, returning any signal-handler error after.
+    Drain(Option<std::io::Error>),
+}
+
+/// Maps a shutdown signal, or a failure to wait for one, to the next step.
+///
+/// A signal-handler failure still drains open connections before the error is
+/// returned, so a broken handler never drops in-flight requests.
+fn shutdown_step(result: std::io::Result<ShutdownSignal>) -> ShutdownStep {
+    match result {
+        Ok(ShutdownSignal::Terminate) => {
+            info!(
+                grace_seconds = TERMINATE_GRACE.as_secs(),
+                "SIGTERM received; draining after grace window"
+            );
+            ShutdownStep::Grace
+        }
+        Ok(ShutdownSignal::Interrupt) => ShutdownStep::Drain(None),
+        Err(error) => {
+            tracing::error!(%error, "shutdown signal handler failed; draining");
+            ShutdownStep::Drain(Some(error))
+        }
+    }
+}
+
+/// Resolves when the SIGTERM grace window ends, or never before a SIGTERM.
+async fn grace_elapsed(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Time an HTTP/1 client has to send a complete request head.
@@ -215,14 +276,28 @@ async fn serve(
     readiness.set(true);
     info!("server is running at http://{local_addr}");
 
+    // Readiness drops as soon as a signal arrives. After SIGTERM the listener
+    // stays open through the grace window; a signal-handler failure still
+    // drains before its error is returned.
+    let mut grace_deadline = None;
+    let mut signal_error = None;
     loop {
         let (stream, remote_addr) = tokio::select! {
             conn = accept_connection(&listener) => conn,
-            result = shutdown.as_mut() => {
+            result = shutdown.as_mut(), if grace_deadline.is_none() => {
                 readiness.set(false);
-                result?;
-                break;
+                match shutdown_step(result) {
+                    ShutdownStep::Grace => {
+                        grace_deadline = Some(tokio::time::Instant::now() + TERMINATE_GRACE);
+                        continue;
+                    }
+                    ShutdownStep::Drain(error) => {
+                        signal_error = error;
+                        break;
+                    }
+                }
             }
+            () = grace_elapsed(grace_deadline) => break,
         };
 
         let io = TokioIo::new(stream);
@@ -250,13 +325,13 @@ async fn serve(
         () = graceful.shutdown() => {
              info!("graceful shutdown completed");
         },
-        () = sleep(Duration::from_secs(10)) => {
+        () = sleep(DRAIN_TIMEOUT) => {
              tracing::warn!("graceful shutdown timed out; aborting open connections");
         }
     }
 
     info!("server is stopped");
-    Ok(())
+    signal_error.map_or(Ok(()), |error| Err(error.into()))
 }
 
 #[cfg(test)]
@@ -264,6 +339,46 @@ mod tests {
     use std::error::Error as _;
 
     use super::*;
+
+    /// Refuses to build an S3 service without both owner credentials.
+    #[tokio::test]
+    async fn s3_service_requires_both_credentials() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let config = Config {
+            root: root.path().to_owned(),
+            maintenance_interval_seconds: 0,
+            access_key: Some("access".to_owned()),
+            ..Default::default()
+        };
+        let sqlite = Sqlite::new(&config).await?;
+        assert!(matches!(
+            build_s3_service(&config, sqlite.clone()),
+            Err(MainError::Configuration(_))
+        ));
+        let config = Config {
+            secret_key: "secret".parse().ok(),
+            ..config
+        };
+        assert!(build_s3_service(&config, sqlite).is_ok());
+        Ok(())
+    }
+
+    /// SIGTERM opens the grace window; Ctrl+C and handler failures drain at once.
+    #[test]
+    fn shutdown_signals_choose_grace_or_drain() {
+        assert!(matches!(
+            shutdown_step(Ok(ShutdownSignal::Terminate)),
+            ShutdownStep::Grace
+        ));
+        assert!(matches!(
+            shutdown_step(Ok(ShutdownSignal::Interrupt)),
+            ShutdownStep::Drain(None)
+        ));
+        assert!(matches!(
+            shutdown_step(Err(std::io::Error::other("handler"))),
+            ShutdownStep::Drain(Some(_))
+        ));
+    }
 
     #[test]
     fn main_error_formats_configuration_messages() {

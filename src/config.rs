@@ -84,11 +84,11 @@ struct ConfigArgs {
 
     /// The secret access key that is used to authenticate for this service.
     #[arg(long, requires = "access_key")]
-    secret_key: Option<String>,
+    secret_key: Option<Secret>,
 
     /// Base64-encoded 32-byte master key used for SSE-S3 object encryption.
     #[arg(long)]
-    sse_s3_key: Option<String>,
+    sse_s3_key: Option<Secret>,
 
     /// Enable SSE-KMS in this AWS region using the AWS SDK credential chain.
     #[arg(long)]
@@ -246,6 +246,37 @@ impl ConfigAction {
 ///
 /// Values can be loaded from YAML and selectively overridden by command-line
 /// arguments.
+/// A configured secret whose `Debug` output never shows the value.
+///
+/// `Config` and the CLI arguments derive `Debug`, so wrapping the secret key
+/// and SSE-S3 master key keeps them out of any debug log or panic message.
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    /// Returns the secret value for the code that actually uses it.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    /// Prints a placeholder instead of the secret.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+impl std::str::FromStr for Secret {
+    type Err = std::convert::Infallible;
+
+    /// Wraps a secret given as a CLI flag.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(value.to_owned()))
+    }
+}
+
 #[derive(Clone, Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -269,10 +300,10 @@ pub struct Config {
     pub access_key: Option<String>,
 
     /// The secret access key that is used to authenticate for this service.
-    pub secret_key: Option<String>,
+    pub secret_key: Option<Secret>,
 
     /// Base64-encoded 32-byte master key used for SSE-S3 object encryption.
-    pub sse_s3_key: Option<String>,
+    pub sse_s3_key: Option<Secret>,
 
     /// AWS region for the optional KMS client.
     pub kms_region: Option<String>,
@@ -624,7 +655,7 @@ impl Config {
         self.cors_mode()
             .validate()
             .map_err(ConfigError::Configuration)?;
-        if let Some(key) = self.sse_s3_key.as_deref() {
+        if let Some(key) = self.sse_s3_key.as_ref().map(Secret::expose) {
             crate::s3::parse_master_key(key).map_err(ConfigError::Configuration)?;
         }
         self.cors_layer().map(|_| ())
@@ -633,7 +664,8 @@ impl Config {
     /// Returns the decoded SSE-S3 master key when configured.
     pub(crate) fn sse_s3_master_key(&self) -> Option<[u8; 32]> {
         self.sse_s3_key
-            .as_deref()
+            .as_ref()
+            .map(Secret::expose)
             .and_then(|key| crate::s3::parse_master_key(key).ok())
     }
 
@@ -1471,6 +1503,38 @@ mod tests {
         assert_eq!(config.journal_size_limit(Some("bucket")), 4096);
     }
 
+    /// Keeps the secret key and SSE-S3 master key out of `Debug` output.
+    #[test]
+    fn debug_output_redacts_secrets() -> TestResult {
+        let master_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let matches = ConfigArgs::command().try_get_matches_from([
+            "s3ite",
+            "--access-key",
+            "visible-access-key",
+            "--secret-key",
+            "hidden-secret-key",
+            "--sse-s3-key",
+            master_key,
+        ])?;
+        let args = ConfigArgs::from_arg_matches(&matches)?;
+        let config = Config::from_arg_matches(&matches)?;
+        for debug in [format!("{args:?}"), format!("{config:?}")] {
+            assert!(debug.contains("visible-access-key"));
+            assert!(debug.contains("[REDACTED]"));
+            assert!(!debug.contains("hidden-secret-key"));
+            assert!(!debug.contains(master_key));
+        }
+        assert_eq!(
+            config.secret_key.as_ref().map(Secret::expose),
+            Some("hidden-secret-key")
+        );
+        assert_eq!(
+            config.sse_s3_key.as_ref().map(Secret::expose),
+            Some(master_key)
+        );
+        Ok(())
+    }
+
     /// Reports an unknown setting while loading bucket overrides for startup.
     #[test]
     fn yaml_rejects_unknown_bucket_keys() -> TestResult {
@@ -1918,7 +1982,7 @@ mod tests {
         let default = Config::default();
 
         let access_key = config.access_key.clone().unwrap_or_default();
-        let secret_key = config.secret_key.clone().unwrap_or_default();
+        let secret_key = config.secret_key.as_ref().map_or("", Secret::expose);
         assert_eq!(access_key.len(), ACCESS_KEY_LENGTH);
         assert!(
             access_key
@@ -2464,7 +2528,10 @@ mod tests {
         assert_eq!(config.port, 9001);
         assert_eq!(config.health_bind, Some("127.0.0.1:9101".parse()?));
         assert_eq!(config.access_key.as_deref(), Some("access"));
-        assert_eq!(config.secret_key.as_deref(), Some("secret"));
+        assert_eq!(
+            config.secret_key.as_ref().map(Secret::expose),
+            Some("secret")
+        );
         assert_eq!(config.cors_mode(), CorsMode::Disabled);
         assert_eq!(config.domain_name.as_deref(), Some("s3.example.test"));
         assert_eq!(config.concurrency_limit, 32);

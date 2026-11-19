@@ -2,6 +2,8 @@
 
 use std::{ops::Range as ByteRange, sync::Arc};
 
+use time::OffsetDateTime;
+
 use crate::sqlite::{
     CompletedObjectPart, EncryptedChunkRead, KeyMetadata, ObjectBodyReference, StoredChecksum,
     StoredSse,
@@ -19,12 +21,12 @@ use super::{
     SqliteError, SqliteResult, StorageClass, StreamExt, StreamingBlob, X_AMZ_TAGGING_COUNT,
     checksum_crc32, checksum_crc32c, checksum_crc64nvme, checksum_md5, checksum_mode_enabled,
     checksum_sha1, checksum_sha256, checksum_sha512, checksum_struct, checksum_type_output,
-    checksum_xxhash3, checksum_xxhash64, checksum_xxhash128, encryption_headers, list_limit,
-    not_found_delete_marker_error, not_modified_error, object_checksum_for_part,
-    object_lock_legal_hold_status, object_lock_mode, object_lock_retain_until_date,
-    open_encryption, requested_part_range, s3_error, s3_error_from_sqlite, s3_error_with_message,
-    stream, validate_expected_bucket_owner, validate_no_sse_headers, validate_part_number,
-    validate_read_conditions,
+    checksum_xxhash3, checksum_xxhash64, checksum_xxhash128, delete_marker_version_error,
+    encryption_headers, list_limit, not_found_delete_marker_error, not_modified_error,
+    object_checksum_for_part, object_lock_legal_hold_status, object_lock_mode,
+    object_lock_retain_until_date, open_encryption, requested_part_range, s3_error,
+    s3_error_from_sqlite, s3_error_with_message, stream, validate_expected_bucket_owner,
+    validate_no_sse_headers, validate_part_number, validate_read_conditions,
 };
 
 use crate::database::{BlobReadReceiver, BlobReadRequest};
@@ -88,7 +90,9 @@ enum ObjectBodyReadStart {
     /// No current or requested object version exists.
     Missing,
     /// The resolved current version is a delete marker.
-    DeleteMarker,
+    /// The resolved version is a delete marker; carries its version id and
+    /// last-modified time when the request named that version.
+    DeleteMarker(Option<(String, OffsetDateTime)>),
     /// Preconditions failed while evaluating metadata in the reader transaction.
     ConditionFailed {
         failure: ObjectReadConditionFailure,
@@ -189,7 +193,7 @@ fn requested_object_range_sqlite(
         (Some(part_number), _) => match completed_part {
             Some(part) => completed_part_range_sqlite(part),
             None if completed_part_count == 0 && part_number == 1 => Ok(0..object_size),
-            None => Err(SqliteError::InvalidMultipartPart),
+            None => Err(SqliteError::PartNumberNotSatisfiable),
         },
         (None, None) => Ok(0..object_size),
         (None, Some(range)) => {
@@ -311,7 +315,13 @@ fn resolve_get_object_read(
         return Ok((ObjectBodyReadStart::Missing, Vec::new()));
     };
     if object.key_metadata.is_delete_marker {
-        return Ok((ObjectBodyReadStart::DeleteMarker, Vec::new()));
+        let named = version_id.map(|_| {
+            (
+                object.key_metadata.version_id.clone(),
+                object.key_metadata.last_modified,
+            )
+        });
+        return Ok((ObjectBodyReadStart::DeleteMarker(named), Vec::new()));
     }
     if let Err(failure) = validate_read_conditions(&object.key_metadata, conditions) {
         return Ok((
@@ -361,7 +371,10 @@ async fn finish_get_object_read(
 ) -> S3Result<ObjectBodyRead> {
     match start {
         ObjectBodyReadStart::Missing => Err(not_found_delete_marker_error(false)),
-        ObjectBodyReadStart::DeleteMarker => Err(not_found_delete_marker_error(true)),
+        ObjectBodyReadStart::DeleteMarker(None) => Err(not_found_delete_marker_error(true)),
+        ObjectBodyReadStart::DeleteMarker(Some((version_id, last_modified))) => {
+            Err(delete_marker_version_error(&version_id, last_modified))
+        }
         ObjectBodyReadStart::ConditionFailed { failure, md5 } => Err(match failure {
             ObjectReadConditionFailure::PreconditionFailed => {
                 s3_error(S3ErrorCode::PreconditionFailed)
@@ -407,8 +420,8 @@ fn load_head_object(
 ) -> SqliteResult<Option<ObjectMetadataRead>> {
     let metadata = match version_id {
         Some(version_id) => Some(
+            // A named delete marker is returned so HEAD can answer 405.
             Sqlite::get_version_metadata(transaction, key, version_id)?
-                .filter(|metadata| metadata.is_delete_marker.not())
                 .ok_or(SqliteError::ObjectVersionNotFound)?,
         ),
         None => Sqlite::get_current_metadata(transaction, key)?,
@@ -744,6 +757,7 @@ pub(super) async fn head_object(
         .get_connection(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
+    let version_requested = version_id.is_some();
     let read = connection
         .read(move |transaction| {
             load_head_object(transaction, &key, version_id.as_deref(), part_number)
@@ -754,7 +768,11 @@ pub(super) async fn head_object(
         return Err(not_found_delete_marker_error(false));
     };
     if read.metadata.is_delete_marker {
-        return Err(not_found_delete_marker_error(true));
+        return Err(if version_requested {
+            delete_marker_version_error(&read.metadata.version_id, read.metadata.last_modified)
+        } else {
+            not_found_delete_marker_error(true)
+        });
     }
     validate_loaded_read_conditions(
         &read.metadata,
@@ -1145,7 +1163,7 @@ mod tests {
         assert_s3_ok(requested_object_range(Some(1), None, None, 0, 10), &(0..10));
         assert_error_code(
             requested_object_range(Some(2), None, None, 2, 10),
-            &S3ErrorCode::InvalidPart,
+            &S3ErrorCode::Custom("InvalidPartNumber".into()),
         );
     }
 
@@ -1195,7 +1213,7 @@ mod tests {
         );
         assert!(matches!(
             requested_object_range_sqlite(Some(2), None, None, 2, 10),
-            Err(SqliteError::InvalidMultipartPart)
+            Err(SqliteError::PartNumberNotSatisfiable)
         ));
 
         let invalid_part = completed_part(1, -1, 1);

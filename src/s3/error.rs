@@ -34,6 +34,7 @@ pub(super) fn s3_error_from_sqlite(error: SqliteError) -> S3Error {
         SqliteError::MultipartUploadNotFound => S3Error::new(S3ErrorCode::NoSuchUpload),
         SqliteError::MultipartAccessDenied => S3Error::new(S3ErrorCode::AccessDenied),
         SqliteError::InvalidMultipartPart => S3Error::new(S3ErrorCode::InvalidPart),
+        SqliteError::PartNumberNotSatisfiable => invalid_part_number_error(),
         SqliteError::MultipartPartTooSmall => S3Error::new(S3ErrorCode::EntityTooSmall),
         SqliteError::SingleRequestObjectTooLarge => S3Error::new(S3ErrorCode::EntityTooLarge),
         SqliteError::MultipartObjectTooLarge => {
@@ -80,6 +81,47 @@ pub(super) fn not_found_delete_marker_error(is_delete_marker: bool) -> S3Error {
     let delete_marker = if is_delete_marker { "true" } else { "false" };
     if let Ok(value) = delete_marker.parse() {
         headers.insert(X_AMZ_DELETE_MARKER, value);
+    }
+    error.set_headers(headers);
+    error
+}
+
+/// Builds AWS's 416 `InvalidPartNumber` for a `partNumber` the object does not have.
+pub(super) fn invalid_part_number_error() -> S3Error {
+    let mut error = S3Error::with_message(
+        S3ErrorCode::Custom("InvalidPartNumber".into()),
+        "The requested partnumber is not satisfiable",
+    );
+    error.set_status_code(hyper::StatusCode::RANGE_NOT_SATISFIABLE);
+    error
+}
+
+/// Builds AWS's 405 for a GET or HEAD that names a delete marker's version.
+///
+/// AWS S3 answers `MethodNotAllowed` with `x-amz-delete-marker: true`, the
+/// marker's `x-amz-version-id`, and its `Last-Modified`. A request for the
+/// current version that finds a delete marker is a 404 instead; see
+/// [`not_found_delete_marker_error`].
+pub(super) fn delete_marker_version_error(
+    version_id: &str,
+    last_modified: time::OffsetDateTime,
+) -> S3Error {
+    let mut error = s3_error(S3ErrorCode::MethodNotAllowed);
+    let mut headers = error
+        .headers()
+        .cloned()
+        .unwrap_or_else(|| S3Response::new(()).headers);
+    headers.insert(X_AMZ_DELETE_MARKER, HeaderValue::from_static("true"));
+    if let Ok(value) = HeaderValue::from_str(version_id) {
+        headers.insert("x-amz-version-id", value);
+    }
+    let mut date = Vec::new();
+    if s3s::dto::Timestamp::from(last_modified)
+        .format(s3s::dto::TimestampFormat::HttpDate, &mut date)
+        .is_ok()
+        && let Ok(value) = HeaderValue::from_bytes(&date)
+    {
+        headers.insert(hyper::header::LAST_MODIFIED, value);
     }
     error.set_headers(headers);
     error
@@ -168,6 +210,12 @@ mod tests {
             &S3ErrorCode::AccessDenied,
         );
         assert_maps(SqliteError::InvalidMultipartPart, &S3ErrorCode::InvalidPart);
+        let error = s3_error_from_sqlite(SqliteError::PartNumberNotSatisfiable);
+        assert_eq!(error.code().as_str(), "InvalidPartNumber");
+        assert_eq!(
+            error.status_code(),
+            Some(hyper::StatusCode::RANGE_NOT_SATISFIABLE)
+        );
         assert_maps(
             SqliteError::MultipartPartTooSmall,
             &S3ErrorCode::EntityTooSmall,

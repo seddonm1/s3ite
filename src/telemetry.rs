@@ -42,20 +42,42 @@ pub(crate) struct Telemetry {
     audit_reads: bool,
 }
 
+/// Longest the exporters may take to flush at shutdown.
+///
+/// With the 5 s SIGTERM grace and the 10 s connection drain this keeps a
+/// shutdown within Kubernetes' default 30 s termination grace period.
+const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl Drop for Telemetry {
     /// Flushes all active signals, including the final metrics collection.
+    ///
+    /// The flush runs on its own thread and is abandoned after
+    /// [`FLUSH_TIMEOUT`]: the metrics provider ignores shutdown timeouts, so an
+    /// unreachable collector could otherwise hold the process past its grace
+    /// period.
     fn drop(&mut self) {
-        for result in [
-            self.logs.as_ref().map(SdkLoggerProvider::shutdown),
-            self.metrics.as_ref().map(SdkMeterProvider::shutdown),
-            self.traces.as_ref().map(SdkTracerProvider::shutdown),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if let Err(error) = result {
-                warn!(%error, "OTLP shutdown failed");
+        let (logs, metrics, traces) = (self.logs.take(), self.metrics.take(), self.traces.take());
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for result in [
+                logs.as_ref().map(SdkLoggerProvider::shutdown),
+                metrics.as_ref().map(SdkMeterProvider::shutdown),
+                traces.as_ref().map(SdkTracerProvider::shutdown),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let Err(error) = result {
+                    warn!(%error, "OTLP shutdown failed");
+                }
             }
+            _ = done.send(());
+        });
+        if finished.recv_timeout(FLUSH_TIMEOUT).is_err() {
+            warn!(
+                timeout_seconds = FLUSH_TIMEOUT.as_secs(),
+                "OTLP shutdown timed out; exiting without a complete flush"
+            );
         }
     }
 }

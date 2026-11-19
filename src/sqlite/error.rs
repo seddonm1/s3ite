@@ -75,6 +75,9 @@ pub enum SqliteError {
     /// A requested multipart part is missing or does not match stored data.
     #[error("invalid multipart part")]
     InvalidMultipartPart,
+    /// A read named a part number the object does not have.
+    #[error("requested part number is not satisfiable")]
+    PartNumberNotSatisfiable,
     /// A non-final multipart part is smaller than the minimum part size.
     #[error("multipart part is too small")]
     MultipartPartTooSmall,

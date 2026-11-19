@@ -143,8 +143,8 @@ use self::{
         payload_checksum_accumulator, validate_content_md5,
     },
     error::{
-        not_found_delete_marker_error, not_modified_error, s3_error, s3_error_from_sqlite,
-        s3_error_with_message,
+        delete_marker_version_error, not_found_delete_marker_error, not_modified_error, s3_error,
+        s3_error_from_sqlite, s3_error_with_message,
     },
     list::{
         decode_continuation_token, decode_list_input_value, encode_continuation_token,
@@ -299,6 +299,11 @@ fn weak_etag_condition_matches(condition: &ETagCondition, md5: Option<&str>) -> 
 }
 
 /// Applies GET/HEAD conditional request semantics to loaded object metadata.
+///
+/// Follows the RFC 9110 order: If-Match, then If-Unmodified-Since (ignored
+/// when If-Match is present), then If-None-Match, then If-Modified-Since
+/// (ignored when If-None-Match is present). Precondition failures therefore
+/// win over not-modified results.
 fn validate_read_conditions(
     metadata: &KeyMetadata,
     conditions: &ObjectReadConditions,
@@ -306,6 +311,13 @@ fn validate_read_conditions(
     let md5 = metadata.md5.as_deref();
     if let Some(condition) = conditions.etag_matches.as_ref()
         && strong_etag_condition_matches(condition, md5).not()
+    {
+        return Err(ObjectReadConditionFailure::PreconditionFailed);
+    }
+
+    if conditions.etag_matches.is_none()
+        && let Some(since) = conditions.unmodified_since
+        && http_date_time(metadata.last_modified) > http_date_time(since)
     {
         return Err(ObjectReadConditionFailure::PreconditionFailed);
     }
@@ -318,13 +330,6 @@ fn validate_read_conditions(
         && http_date_time(metadata.last_modified) <= http_date_time(since)
     {
         return Err(ObjectReadConditionFailure::NotModified);
-    }
-
-    if conditions.etag_matches.is_none()
-        && let Some(since) = conditions.unmodified_since
-        && http_date_time(metadata.last_modified) > http_date_time(since)
-    {
-        return Err(ObjectReadConditionFailure::PreconditionFailed);
     }
 
     Ok(())
@@ -1318,6 +1323,21 @@ mod tests {
         assert!(matches!(
             result,
             Err(ObjectReadConditionFailure::NotModified)
+        ));
+
+        // RFC 9110: a failed If-Unmodified-Since wins over a matching If-None-Match.
+        let result = validate_read_conditions(
+            &object,
+            &read_conditions(
+                None,
+                None,
+                Some(ETagCondition::ETag(ETag::Strong("md5".to_string()))),
+                Some(before),
+            ),
+        );
+        assert!(matches!(
+            result,
+            Err(ObjectReadConditionFailure::PreconditionFailed)
         ));
 
         assert!(

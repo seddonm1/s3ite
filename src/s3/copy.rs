@@ -328,7 +328,9 @@ pub(super) async fn load_copy_source_object(
         .read(move |transaction| {
             let source = match version_id {
                 Some(id) => {
+                    // A named delete marker is not a copyable version.
                     Sqlite::get_object_version_body_reference(transaction, &source_key, &id)?
+                        .filter(|source| !source.key_metadata.is_delete_marker)
                         .ok_or(SqliteError::ObjectVersionNotFound)?
                 }
                 None => Sqlite::get_current_object_body_reference(transaction, &source_key)?

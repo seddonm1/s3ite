@@ -1740,3 +1740,51 @@ fn assert_ceph_shaped_version_id(version_id: &str) {
         "unexpected version ID shape: {version_id}"
     );
 }
+
+/// Verifies GET and HEAD of a named delete-marker version return 405, as on AWS S3.
+///
+/// AWS answers `MethodNotAllowed` with `x-amz-delete-marker`, the marker's
+/// version id, and `Last-Modified`; the current-version request stays a 404.
+#[tokio::test]
+#[serial(conformance)]
+async fn s3ite_named_delete_marker_version_is_method_not_allowed() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let client = sdk::client(&server);
+    let bucket = bucket_name("s3ite-marker-405");
+    let key = "marked";
+    create_bucket(&client, &bucket).await?;
+    put_bucket_versioning(&client, &bucket, BucketVersioningStatus::Enabled).await?;
+    put_object(&client, &bucket, key, b"body").await?;
+    let marker = client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+    let marker_version = marker
+        .version_id()
+        .context("delete marker response missing version ID")?;
+
+    let path = format!("/{bucket}/{key}?versionId={marker_version}");
+    for method in [Method::GET, Method::HEAD] {
+        let response =
+            raw_http::signed_request_with_headers(&server, method.clone(), &path, Vec::new(), &[])
+                .await?;
+        assert_status(&response, StatusCode::METHOD_NOT_ALLOWED);
+        let headers = response.headers();
+        assert_eq!(headers["x-amz-delete-marker"], "true", "{method}");
+        assert_eq!(headers["x-amz-version-id"], marker_version, "{method}");
+        assert!(headers.contains_key("last-modified"), "{method}");
+    }
+
+    let current = raw_http::signed_request_with_headers(
+        &server,
+        Method::GET,
+        &format!("/{bucket}/{key}"),
+        Vec::new(),
+        &[],
+    )
+    .await?;
+    assert_status(&current, StatusCode::NOT_FOUND);
+    Ok(())
+}

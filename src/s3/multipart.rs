@@ -107,11 +107,18 @@ fn list_limit(limit: Option<i32>, default: i32, max: i32) -> S3Result<i32> {
 }
 
 /// Parses an upload-copy source byte range.
+///
+/// AWS S3 accepts only the `bytes=first-last` form here, so suffix
+/// (`bytes=-N`) and open-ended (`bytes=N-`) ranges are `InvalidArgument`.
 pub(super) fn parse_copy_source_range(range: Option<String>) -> S3Result<Option<S3Range>> {
     range
-        .map(|range| {
-            S3Range::parse(&range)
-                .map_err(|_| s3_error_with_message(S3ErrorCode::InvalidArgument, "invalid range"))
+        .map(|range| match S3Range::parse(&range) {
+            Ok(range @ S3Range::Int { last: Some(_), .. }) => Ok(range),
+            _ => Err(s3_error_with_message(
+                S3ErrorCode::InvalidArgument,
+                "The x-amz-copy-source-range value must be of the form bytes=first-last \
+                 where first and last are the zero-based offsets of the first and last bytes to copy",
+            )),
         })
         .transpose()
 }
@@ -239,7 +246,7 @@ pub(super) fn requested_part_range(
     match completed_part {
         Some(part) => completed_part_range(part),
         None if completed_part_count == 0 && part_number == 1 => Ok(0..object_size),
-        None => Err(s3_error(S3ErrorCode::InvalidPart)),
+        None => Err(super::error::invalid_part_number_error()),
     }
 }
 
@@ -1638,14 +1645,6 @@ mod tests {
         };
         assert_sqlite_ok(checked_copy_source_range(Some(range), 10), &(2..6));
 
-        let range = parse_copy_source_range(Some("bytes=-4".to_string()))
-            .ok()
-            .flatten();
-        let Some(range) = range else {
-            unreachable!("valid suffix copy-source range should parse");
-        };
-        assert_sqlite_ok(checked_copy_source_range(Some(range), 10), &(6..10));
-
         let range = parse_copy_source_range(Some("bytes=8-20".to_string()))
             .ok()
             .flatten();
@@ -1657,21 +1656,13 @@ mod tests {
             Err(SqliteError::InvalidObjectRange)
         ));
 
-        let range = parse_copy_source_range(Some("bytes=-0".to_string()))
-            .ok()
-            .flatten();
-        let Some(range) = range else {
-            unreachable!("syntactically valid empty suffix range should parse");
-        };
-        assert!(matches!(
-            checked_copy_source_range(Some(range), 10),
-            Err(SqliteError::InvalidObjectRange)
-        ));
-
-        assert_error_code(
-            parse_copy_source_range(Some("not-a-range".to_string())),
-            &S3ErrorCode::InvalidArgument,
-        );
+        // AWS accepts only bytes=first-last for a copy source.
+        for range in ["not-a-range", "bytes=-4", "bytes=-0", "bytes=4-"] {
+            assert_error_code(
+                parse_copy_source_range(Some(range.to_string())),
+                &S3ErrorCode::InvalidArgument,
+            );
+        }
     }
 
     #[test]
@@ -1715,7 +1706,7 @@ mod tests {
         assert_eq!(requested_part_range(1, None, 0, 9).ok(), Some(0..9));
         assert_error_code(
             requested_part_range(2, None, 2, 9),
-            &S3ErrorCode::InvalidPart,
+            &S3ErrorCode::Custom("InvalidPartNumber".into()),
         );
     }
 
