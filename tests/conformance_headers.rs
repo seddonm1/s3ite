@@ -201,155 +201,33 @@ async fn s3ite_bucket_create_bad_contentlength_negative() -> Result<()> {
     Ok(())
 }
 
+/// Verifies SigV2 header and presigned requests are refused.
+///
+/// AWS S3 rejects SigV2 on every bucket created since June 2020, so s3ite
+/// accepts only SigV4.
 #[tokio::test]
 #[serial(conformance)]
-async fn s3ite_object_create_bad_md5_invalid_garbage_aws2() -> Result<()> {
-    // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_md5_invalid_garbage_aws2
-    let (server, _client, bucket) = bucket("s3ite-header-object").await?;
-    let response = sig_v2_request(
-        &server,
-        Method::PUT,
-        &format!("/{bucket}/foo"),
-        BODY,
-        &[("Content-MD5", "AWS HAHAHA")],
-    )
-    .await?;
-    assert_error(response, StatusCode::BAD_REQUEST, "InvalidDigest").await
-}
+async fn s3ite_sig_v2_requests_are_rejected() -> Result<()> {
+    let (server, client, bucket) = bucket("s3ite-header-sigv2").await?;
+    let response =
+        sig_v2_request(&server, Method::PUT, &format!("/{bucket}/foo"), BODY, &[]).await?;
+    assert_error(response, StatusCode::FORBIDDEN, "AccessDenied").await?;
 
-#[tokio::test]
-#[serial(conformance)]
-async fn s3ite_object_create_bad_ua_empty_aws2() -> Result<()> {
-    // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_ua_empty_aws2
-    assert_successful_sig_v2_put_with_headers(&[("User-Agent", "")]).await
-}
-
-#[tokio::test]
-#[serial(conformance)]
-async fn s3ite_object_create_bad_ua_none_aws2() -> Result<()> {
-    // Mirrors s3tests/functional/test_headers.py::test_object_create_bad_ua_none_aws2
-    assert_successful_sig_v2_put_with_headers(&[]).await
-}
-
-/// Checks how the upstream SigV2 verifier handles the two date headers.
-#[tokio::test]
-#[serial(conformance)]
-async fn s3ite_sig_v2_http_date_header() -> Result<()> {
-    let date = OffsetDateTime::now_utc().format(format_description!(
-        "[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT"
-    ))?;
-    assert_successful_sig_v2_put_with_headers(&[("Date", &date)]).await?;
-    assert_sig_v2_object_date_error(&date, StatusCode::BAD_REQUEST, "InvalidRequest").await
-}
-
-/// Checks object creation with invalid SigV2 dates.
-#[tokio::test]
-#[serial(conformance)]
-async fn s3ite_object_create_bad_date_invalid_aws2() -> Result<()> {
-    // Adapted from s3tests/functional/test_headers.py::test_object_create_bad_date_invalid_aws2: use upstream SigV2 timestamp validation.
-    assert_sig_v2_object_date_error("Bad Date", StatusCode::BAD_REQUEST, "InvalidRequest").await
-}
-
-/// Checks object creation with empty SigV2 dates.
-#[tokio::test]
-#[serial(conformance)]
-async fn s3ite_object_create_bad_date_empty_aws2() -> Result<()> {
-    // Adapted from s3tests/functional/test_headers.py::test_object_create_bad_date_empty_aws2: use upstream SigV2 timestamp validation.
-    assert_sig_v2_object_date_error("", StatusCode::BAD_REQUEST, "InvalidRequest").await
-}
-
-/// Checks object creation with stale SigV2 dates.
-#[tokio::test]
-#[serial(conformance)]
-async fn s3ite_object_create_bad_date_before_today_aws2() -> Result<()> {
-    // Adapted from s3tests/functional/test_headers.py::test_object_create_bad_date_before_today_aws2: use upstream SigV2 timestamp validation.
-    assert_sig_v2_object_date_error(
-        "20100707T215304Z",
-        StatusCode::FORBIDDEN,
-        "RequestTimeTooSkewed",
-    )
-    .await
-}
-
-/// Checks object creation with pre-epoch SigV2 dates.
-#[tokio::test]
-#[serial(conformance)]
-async fn s3ite_object_create_bad_date_before_epoch_aws2() -> Result<()> {
-    // Adapted from s3tests/functional/test_headers.py::test_object_create_bad_date_before_epoch_aws2: use upstream SigV2 timestamp validation.
-    assert_sig_v2_object_date_error(
-        "19500707T215304Z",
-        StatusCode::FORBIDDEN,
-        "RequestTimeTooSkewed",
-    )
-    .await
-}
-
-/// Checks object creation with far-future SigV2 dates.
-#[tokio::test]
-#[serial(conformance)]
-async fn s3ite_object_create_bad_date_after_end_aws2() -> Result<()> {
-    // Adapted from s3tests/functional/test_headers.py::test_object_create_bad_date_after_end_aws2: use upstream SigV2 timestamp validation.
-    assert_sig_v2_object_date_error(
-        "99990707T215304Z",
-        StatusCode::FORBIDDEN,
-        "RequestTimeTooSkewed",
-    )
-    .await
-}
-
-/// Checks bucket creation with invalid SigV2 dates.
-#[tokio::test]
-#[serial(conformance)]
-async fn s3ite_bucket_create_bad_date_invalid_aws2() -> Result<()> {
-    // Adapted from s3tests/functional/test_headers.py::test_bucket_create_bad_date_invalid_aws2: use upstream SigV2 timestamp validation.
-    assert_sig_v2_bucket_date_error("Bad Date", StatusCode::BAD_REQUEST, "InvalidRequest").await
-}
-
-/// Checks bucket creation with empty SigV2 dates.
-#[tokio::test]
-#[serial(conformance)]
-async fn s3ite_bucket_create_bad_date_empty_aws2() -> Result<()> {
-    // Adapted from s3tests/functional/test_headers.py::test_bucket_create_bad_date_empty_aws2: use upstream SigV2 timestamp validation.
-    assert_sig_v2_bucket_date_error("", StatusCode::BAD_REQUEST, "InvalidRequest").await
-}
-
-/// Checks bucket creation with stale SigV2 dates.
-#[tokio::test]
-#[serial(conformance)]
-async fn s3ite_bucket_create_bad_date_before_today_aws2() -> Result<()> {
-    // Adapted from s3tests/functional/test_headers.py::test_bucket_create_bad_date_before_today_aws2: use upstream SigV2 timestamp validation.
-    assert_sig_v2_bucket_date_error(
-        "20100707T215304Z",
-        StatusCode::FORBIDDEN,
-        "RequestTimeTooSkewed",
-    )
-    .await
-}
-
-/// Checks bucket creation with future SigV2 dates.
-#[tokio::test]
-#[serial(conformance)]
-async fn s3ite_bucket_create_bad_date_after_today_aws2() -> Result<()> {
-    // Adapted from s3tests/functional/test_headers.py::test_bucket_create_bad_date_after_today_aws2: use upstream SigV2 timestamp validation.
-    assert_sig_v2_bucket_date_error(
-        "20300707T215304Z",
-        StatusCode::FORBIDDEN,
-        "RequestTimeTooSkewed",
-    )
-    .await
-}
-
-/// Checks bucket creation with pre-epoch SigV2 dates.
-#[tokio::test]
-#[serial(conformance)]
-async fn s3ite_bucket_create_bad_date_before_epoch_aws2() -> Result<()> {
-    // Adapted from s3tests/functional/test_headers.py::test_bucket_create_bad_date_before_epoch_aws2: use upstream SigV2 timestamp validation.
-    assert_sig_v2_bucket_date_error(
-        "19500707T215304Z",
-        StatusCode::FORBIDDEN,
-        "RequestTimeTooSkewed",
-    )
-    .await
+    put_object(&client, &bucket, "foo", BODY).await?;
+    let expires = (OffsetDateTime::now_utc().unix_timestamp() + 300).to_string();
+    let resource = format!("/{bucket}/foo");
+    let signature = sig_v2_signature(
+        server.secret_key(),
+        &format!("GET\n\n\n{expires}\n{resource}"),
+    );
+    let url = format!(
+        "{}{resource}?AWSAccessKeyId={}&Expires={expires}&Signature={}",
+        server.endpoint(),
+        server.access_key(),
+        raw_http::path_segment(&signature),
+    );
+    let response = raw_http::get_url(&url).await?;
+    assert_error(response, StatusCode::FORBIDDEN, "AccessDenied").await
 }
 
 async fn bucket(prefix: &str) -> Result<(TestServer, Client, String)> {
@@ -403,59 +281,6 @@ async fn assert_successful_create_bucket_with_header(name: &str, value: &str) ->
     .await?;
     assert_status(&response, StatusCode::OK);
     Ok(())
-}
-
-async fn assert_successful_sig_v2_put_with_headers(headers: &[(&str, &str)]) -> Result<()> {
-    let (server, client, bucket) = bucket("s3ite-header-object").await?;
-    let key = "foo";
-    let response = sig_v2_request(
-        &server,
-        Method::PUT,
-        &format!("/{bucket}/{key}"),
-        &[],
-        headers,
-    )
-    .await?;
-    assert_status(&response, StatusCode::OK);
-
-    put_object(&client, &bucket, key, BODY).await?;
-    assert_eq!(get_object_bytes(&client, &bucket, key).await?, BODY);
-    Ok(())
-}
-
-async fn assert_sig_v2_object_date_error(
-    value: &str,
-    status: StatusCode,
-    code: &str,
-) -> Result<()> {
-    let (server, _client, bucket) = bucket("s3ite-header-object").await?;
-    let response = sig_v2_request(
-        &server,
-        Method::PUT,
-        &format!("/{bucket}/foo"),
-        BODY,
-        &[("x-amz-date", value)],
-    )
-    .await?;
-    assert_error(response, status, code).await
-}
-
-async fn assert_sig_v2_bucket_date_error(
-    value: &str,
-    status: StatusCode,
-    code: &str,
-) -> Result<()> {
-    let server = TestServer::spawn().await?;
-    let bucket = bucket_name("s3ite-header-bucket");
-    let response = sig_v2_request(
-        &server,
-        Method::PUT,
-        &format!("/{bucket}"),
-        &[],
-        &[("x-amz-date", value)],
-    )
-    .await?;
-    assert_error(response, status, code).await
 }
 
 async fn assert_error(response: Response, expected: StatusCode, code: &str) -> Result<()> {

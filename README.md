@@ -44,8 +44,8 @@ The supported S3 surface is intentionally focused:
   and bucket defaults.
 - POST form uploads: browser-form `POST Object`, SigV4 POST policy validation,
   success status responses, and success redirects.
-- Auth compatibility: signed owner requests, presigned URLs, SigV2/SigV4 edge
-  cases, and owner-only ACL reads or owner-equivalent ACL writes.
+- Auth compatibility: signed owner requests, presigned URLs, SigV4 edge cases,
+  and owner-only ACL reads or owner-equivalent ACL writes.
 
 Out of scope surfaces include IAM, STS, SNS, S3 Select, S3 Control, torrent,
 public or anonymous access, public ACL grants, bucket policies, lifecycle
@@ -132,7 +132,7 @@ s3ite. The matrix was last reconciled on 2026-06-12.
 | Auth | SigV4 signed owner requests | ✅ | ✅ | ✅ | s3ite supports a single configured owner identity. |
 | Auth | Presigned GET URLs | ✅ | ✅ | ✅ | Includes expiry and tamper rejection. |
 | Auth | Presigned PUT URLs | ✅ | ✅ | ✅ | Includes owner-equivalent ACL compatibility. |
-| Auth | SigV2 legacy compatibility edges | ❌ | ✅ | ✅ | Uses the upstream SigV2 verifier and its date and canonical path rules. |
+| Auth | SigV2 legacy compatibility edges | ❌ | ✅ | ❌ | Rejected with `AccessDenied`, as AWS does for buckets created since June 2020. Sign with SigV4. |
 | Auth | Unsigned public/anonymous access | ✅ | ✅ | ❌ | s3ite denies unsigned requests when auth is configured. |
 | Auth | Bucket policy API and enforcement | ✅ | ✅ | ❌ | Out of scope for s3ite. |
 | Auth | IAM user/group/role/account APIs | ✅ | ❌ | ❌ | MinIO has IAM concepts, but not the AWS IAM API surface. |
@@ -366,10 +366,8 @@ URLs from that identity act as the single owner, and unsigned requests are
 denied. `s3ite --print-config-template` prints a starter configuration with a
 freshly generated credential pair.
 
-SigV2 header authentication follows `s3s`. Send an RFC 1123 HTTP date in
-`Date` or a UTC timestamp such as `20261117T120000Z` in `x-amz-date`.
-Sign the request path exactly as sent, including any trailing slash.
-The server rejects malformed dates and checks clock skew.
+Only SigV4 is accepted. SigV2 header, presigned and POST form requests are
+rejected with `AccessDenied`, as AWS does for buckets created since June 2020.
 
 ACLs are compatibility-only. `GetBucketAcl` and `GetObjectAcl` return a
 synthetic owner `FULL_CONTROL` ACL, and owner-equivalent ACL writes such as

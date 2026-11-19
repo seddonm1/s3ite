@@ -27,7 +27,7 @@ verifies their contents and metadata. [Migration instructions](README.md#migrate
 - s3ite is now a binary-only crate. The library target and binary feature gate were removed.
 - The CLI and YAML configuration set database access for the whole service, including read-only mode, SQLite pragmas, reader pools, and maintenance settings. YAML bucket overrides can change read-only mode and SQLite pragmas per bucket.
 - SQLite connections apply reader and writer pragmas, disable trusted schemas, use a busy timeout, limit retained journal size, and run periodic `PRAGMA optimize` maintenance.
-- Updated Rust dependencies and delegated SigV2 authentication to `s3s` 0.17. Clients sending RFC 2822 dates in `x-amz-date` should use the compact UTC format or send an RFC 1123 `Date` header. Bucket creation signatures must match the path on the wire.
+- Updated Rust dependencies to `s3s` 0.17. SigV2 requests are rejected with `AccessDenied`, as AWS does for buckets created since June 2020; clients must sign with SigV4.
 - Docker images use a fully static musl binary in a `scratch` runtime image, built with `tikv-jemallocator`, fat LTO, and `cargo-multivers`. AArch64 builds disable outline atomics for bundled C code.
 - CI checks formatting, Clippy warnings, and 95% line coverage both overall and per source file.
 

@@ -122,9 +122,10 @@ async fn run_s3(mut config: Config, observer: Observer, readiness: Readiness) ->
 /// Builds the S3 service with the configured owner and addressing mode.
 fn build_s3_service(config: &Config, sqlite: Sqlite) -> MainResult<S3Service> {
     let mut s3 = S3ServiceBuilder::new(sqlite);
-    let mut protocol = S3Config::default();
-    protocol.enable_sig_v2 = true;
-    s3.set_config(Arc::new(StaticConfigProvider::new(protocol.into())));
+    // The s3s default leaves SigV2 disabled, which AWS S3 also rejects.
+    s3.set_config(Arc::new(StaticConfigProvider::new(
+        S3Config::default().into(),
+    )));
 
     // Validation requires both credentials, so every request is authenticated.
     let (Some(access_key), Some(secret_key)) =
