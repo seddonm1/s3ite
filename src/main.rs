@@ -17,7 +17,7 @@ use aws_config::{BehaviorVersion, Region};
 use aws_sdk_kms::Client as KmsClient;
 use hyper::service::service_fn;
 use hyper_util::{
-    rt::{TokioExecutor, TokioIo},
+    rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto,
 };
 use s3s::{
@@ -174,6 +174,12 @@ async fn shutdown_signal() -> std::io::Result<()> {
     signal::ctrl_c().await
 }
 
+/// Time an HTTP/1 client has to send a complete request head.
+///
+/// Matches the idle timeout on upload bodies, so a stalled client is cut off
+/// at the same point whether it stalls in the headers or the body.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Serves S3 connections until shutdown and gives active requests time to finish.
 ///
 /// `requests` caps in-flight S3 requests across every connection: one
@@ -190,7 +196,13 @@ async fn serve(
     readiness: Readiness,
 ) -> MainResult<()> {
     let local_addr = listener.local_addr()?;
-    let http_server = auto::Builder::new(TokioExecutor::new());
+    let mut http_server = auto::Builder::new(TokioExecutor::new());
+    // hyper only enforces its header-read timeout when a timer is set. Without
+    // one, a client can hold a connection open by sending headers slowly.
+    http_server
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT);
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
     let mut shutdown = std::pin::pin!(shutdown_signal());
     let request_limit = GlobalConcurrencyLimitLayer::with_semaphore(requests);

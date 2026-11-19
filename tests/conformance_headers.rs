@@ -691,3 +691,33 @@ async fn s3ite_put_object_rejects_mismatched_decoded_content_length() -> Result<
     );
     Ok(())
 }
+
+/// Verifies a client that never finishes its request head is disconnected.
+///
+/// Without a header-read timeout a slow client could hold connections open
+/// indefinitely (slowloris). The server allows 20 seconds.
+#[tokio::test]
+#[serial(conformance)]
+async fn s3ite_drops_connections_with_incomplete_request_heads() -> Result<()> {
+    let server = TestServer::spawn().await?;
+    let address = server
+        .endpoint()
+        .strip_prefix("http://")
+        .context("endpoint should be plain HTTP")?;
+    let mut stream = TcpStream::connect(address).await?;
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+        .await?;
+
+    let started = tokio::time::Instant::now();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut response))
+        .await
+        .context("server kept an incomplete request head open")??;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(19),
+        "closed too early: {elapsed:?}"
+    );
+    Ok(())
+}
