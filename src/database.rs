@@ -145,8 +145,10 @@ impl Drop for BucketConnection {
 impl BucketConnection {
     /// Opens a bucket database with one writer and configured reader pools.
     ///
-    /// The writer uses the bucket's configured pragmas. Metadata readers and
-    /// BLOB readers open read-only connections with deferred transactions.
+    /// The writer uses the bucket's configured pragmas, except for a read-only
+    /// bucket, whose writer opens read-only with the reader pragmas so opening
+    /// never modifies the file. Metadata readers and BLOB readers open
+    /// read-only connections with deferred transactions.
     ///
     /// # Errors
     ///
@@ -181,6 +183,19 @@ impl BucketConnection {
 
         let inner = BucketConnectionInner::connect(
             move || {
+                // A read-only bucket must not change its file: the writer
+                // pragmas persist `journal_mode` into the database header,
+                // which fails on a read-only filesystem. Its writer opens
+                // read-only like the readers, so any stray write fails.
+                if config.read_only(Some(&bucket)) {
+                    let mut writer = rusqlite::Connection::open_with_flags(
+                        path,
+                        OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )?;
+                    writer.set_transaction_behavior(TransactionBehavior::Deferred);
+                    writer.execute_batch(&reader_connection_pragmas(&config, Some(&bucket)))?;
+                    return Ok(writer);
+                }
                 let mut writer = rusqlite::Connection::open(path)?;
                 writer.set_transaction_behavior(TransactionBehavior::Immediate);
                 writer.execute_batch(&writer_connection_pragmas(&config, Some(&bucket)))?;
@@ -1382,6 +1397,47 @@ mod tests {
 
         let err = connection.read(|_| Ok(())).await.err();
         assert!(matches!(err, Some(SqliteError::DatabaseQueueClosed)));
+
+        remove_sqlite_files(&path);
+        Ok(())
+    }
+
+    /// Opening a read-only bucket leaves its journal mode untouched and refuses writes.
+    #[tokio::test]
+    async fn read_only_open_does_not_modify_the_database() -> SqliteResult<()> {
+        let path = temp_path();
+        {
+            let setup = Connection::open(&path)?;
+            setup.execute_batch("CREATE TABLE marker (id INTEGER PRIMARY KEY) STRICT;")?;
+        }
+        let config = Config {
+            read_only: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            config.journal_mode(Some("bucket")),
+            crate::config::JournalMode::Wal
+        );
+
+        let connection = BucketConnection::open(&path, &config, "bucket").await?;
+        let rows: i64 = connection
+            .read(|transaction| {
+                Ok(transaction.query_row("SELECT COUNT(*) FROM marker;", (), |row| row.get(0))?)
+            })
+            .await?;
+        assert_eq!(rows, 0);
+        let write = connection
+            .write(|transaction| {
+                transaction.execute("INSERT INTO marker (id) VALUES (1);", ())?;
+                Ok(())
+            })
+            .await;
+        assert!(write.is_err());
+        connection.close().await?;
+
+        let journal_mode: String =
+            Connection::open(&path)?.query_row("PRAGMA journal_mode;", (), |row| row.get(0))?;
+        assert_eq!(journal_mode, "delete");
 
         remove_sqlite_files(&path);
         Ok(())
