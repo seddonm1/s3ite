@@ -470,11 +470,13 @@ mod tests {
     use super::*;
     use crate::{Config, sqlite::DEFAULT_OBJECT_BLOB_CHUNK_SIZE};
 
+    /// Builds storage with custom configuration for encryption tests.
     fn sqlite_with_config(config: Config) -> Sqlite {
         Sqlite {
             root: PathBuf::new(),
             config,
             buckets: Arc::new(RwLock::new(HashMap::new())),
+            bucket_lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             blob_chunk_size: DEFAULT_OBJECT_BLOB_CHUNK_SIZE,
         }
     }

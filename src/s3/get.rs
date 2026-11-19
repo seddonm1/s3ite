@@ -1023,11 +1023,13 @@ mod tests {
         }
     }
 
+    /// Builds storage with an empty bucket registry for request validation tests.
     fn sqlite_without_buckets() -> Sqlite {
         Sqlite {
             root: PathBuf::new(),
             config: Config::default(),
             buckets: Arc::new(RwLock::new(HashMap::new())),
+            bucket_lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             blob_chunk_size: crate::sqlite::DEFAULT_OBJECT_BLOB_CHUNK_SIZE,
         }
     }

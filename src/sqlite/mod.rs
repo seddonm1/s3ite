@@ -12,7 +12,7 @@ use rusqlite::{
     limits::Limit,
 };
 use time::{Duration, OffsetDateTime};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::database::BucketConnection;
 
@@ -669,6 +669,8 @@ pub struct Sqlite {
     pub(crate) root: PathBuf,
     pub(crate) config: crate::Config,
     pub(crate) buckets: Arc<RwLock<HashMap<String, Arc<BucketConnection>>>>,
+    /// Serializes bucket creation and deletion, including database file changes.
+    pub(crate) bucket_lifecycle: Arc<Mutex<()>>,
     pub(crate) blob_chunk_size: usize,
 }
 
@@ -815,6 +817,7 @@ impl Sqlite {
             root,
             config: config.clone(),
             buckets,
+            bucket_lifecycle: Arc::new(Mutex::new(())),
             blob_chunk_size,
         })
     }

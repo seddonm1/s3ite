@@ -77,13 +77,15 @@ impl Sqlite {
     /// Creates or opens a bucket database and registers its connection.
     ///
     /// A newly initialized database enables `object_lock` in its schema
-    /// transaction, before any worker can serve the bucket.
+    /// transaction, before any worker can serve the bucket. The lifecycle lock
+    /// keeps deletion from unlinking the database while it is being opened.
     pub(crate) async fn create_bucket(
         &self,
         bucket: &str,
         object_lock: bool,
     ) -> SqliteResult<bool> {
         self.validate_mutable_bucket(bucket)?;
+        let _lifecycle = self.bucket_lifecycle.lock().await;
 
         if self.buckets.read().await.contains_key(bucket) {
             return Ok(false);
@@ -100,20 +102,20 @@ impl Sqlite {
         .await?;
 
         let connection = BucketConnection::open(file_path, &config, bucket).await?;
-        let bucket = bucket.to_string();
+        self.buckets
+            .write()
+            .await
+            .insert(bucket.to_string(), Arc::new(connection));
 
-        let mut buckets = self.buckets.write().await;
-        if buckets.contains_key(&bucket).not() {
-            buckets.insert(bucket, Arc::new(connection));
-            return Ok(true);
-        }
-
-        Ok(false)
+        Ok(true)
     }
 
     /// Deletes an empty bucket database and its `SQLite` sidecar files.
+    ///
+    /// Holds the lifecycle lock through connection shutdown and file removal.
     pub(crate) async fn delete_bucket(&self, bucket: &str) -> SqliteResult<()> {
         self.validate_mutable_bucket(bucket)?;
+        let _lifecycle = self.bucket_lifecycle.lock().await;
 
         let connection = self.get_connection(bucket).await?;
         let close_connection = connection.clone();
@@ -219,20 +221,24 @@ mod tests {
 
     use super::*;
 
+    /// Builds storage with custom configuration and an empty bucket registry.
     fn sqlite_with_config(config: Config) -> Sqlite {
         Sqlite {
             root: PathBuf::new(),
             config,
             buckets: Arc::new(RwLock::new(HashMap::new())),
+            bucket_lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             blob_chunk_size: DEFAULT_OBJECT_BLOB_CHUNK_SIZE,
         }
     }
 
+    /// Builds storage rooted at a test directory with an empty bucket registry.
     fn sqlite_with_root(root: PathBuf) -> Sqlite {
         Sqlite {
             root,
             config: Config::default(),
             buckets: Arc::new(RwLock::new(HashMap::new())),
+            bucket_lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             blob_chunk_size: DEFAULT_OBJECT_BLOB_CHUNK_SIZE,
         }
     }
@@ -322,15 +328,8 @@ mod tests {
         Ok(())
     }
 
-    /// Ensures deleting a nonempty bucket preserves its file and registry entry.
-    #[tokio::test]
-    async fn delete_bucket_refuses_nonempty_bucket() -> SqliteResult<()> {
-        let root = temp_root("delete-nonempty-bucket")?;
-        let sqlite = sqlite_with_root(root.clone());
-
-        assert!(sqlite.create_bucket("bucket", false).await?);
-        let path = sqlite.get_bucket_path("bucket")?;
-        let connection = sqlite.get_connection("bucket").await?;
+    /// Commits a delete marker in the bucket.
+    async fn write_delete_marker(connection: &BucketConnection) -> SqliteResult<()> {
         connection
             .write(|transaction| {
                 transaction.execute(
@@ -349,12 +348,92 @@ mod tests {
                 )?;
                 Ok(())
             })
-            .await?;
+            .await
+    }
+
+    /// Ensures deleting a nonempty bucket preserves its file and registry entry.
+    #[tokio::test]
+    async fn delete_bucket_refuses_nonempty_bucket() -> SqliteResult<()> {
+        let root = temp_root("delete-nonempty-bucket")?;
+        let sqlite = sqlite_with_root(root.clone());
+
+        assert!(sqlite.create_bucket("bucket", false).await?);
+        let path = sqlite.get_bucket_path("bucket")?;
+        let connection = sqlite.get_connection("bucket").await?;
+        write_delete_marker(&connection).await?;
 
         let err = sqlite.delete_bucket("bucket").await.err();
         assert!(matches!(err, Some(SqliteError::BucketNotEmpty)));
         assert!(path.exists());
         assert!(sqlite.buckets.read().await.contains_key("bucket"));
+
+        connection.close().await?;
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    /// Queues a create behind a delete that has started but cannot read the registry.
+    #[tokio::test]
+    async fn create_bucket_waits_for_in_progress_delete() -> SqliteResult<()> {
+        let root = temp_root("create-during-delete")?;
+        let sqlite = sqlite_with_root(root.clone());
+        assert!(sqlite.create_bucket("bucket", false).await?);
+
+        // Stop the delete at its first registry lookup after it takes the lifecycle lock.
+        let buckets = sqlite.buckets.write().await;
+        let delete = sqlite.delete_bucket("bucket");
+        tokio::pin!(delete);
+        tokio::select! {
+            biased;
+            result = &mut delete => panic!("delete finished with the registry locked: {result:?}"),
+            () = std::future::ready(()) => {}
+        }
+        assert!(sqlite.bucket_lifecycle.try_lock().is_err());
+        drop(buckets);
+
+        let create = sqlite.create_bucket("bucket", false);
+        tokio::pin!(create);
+        tokio::select! {
+            biased;
+            result = &mut create => panic!("create finished while delete held the lock: {result:?}"),
+            () = std::future::ready(()) => {}
+        }
+
+        let (deleted, created) = tokio::join!(delete, create);
+        deleted?;
+        assert!(created?);
+        sqlite.delete_bucket("bucket").await?;
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    /// Verifies that reopening a recreated bucket loads its committed delete marker.
+    #[tokio::test]
+    async fn recreated_bucket_keeps_committed_write_after_reopen() -> SqliteResult<()> {
+        let root = temp_root("recreate-bucket")?;
+        let sqlite = sqlite_with_root(root.clone());
+        assert!(sqlite.create_bucket("bucket", false).await?);
+        sqlite.delete_bucket("bucket").await?;
+        assert!(sqlite.create_bucket("bucket", false).await?);
+
+        let connection = sqlite.get_connection("bucket").await?;
+        write_delete_marker(&connection).await?;
+        connection.close().await?;
+        drop(connection);
+        drop(sqlite);
+
+        let buckets = Sqlite::open_configured_buckets(&root, &Config::default()).await?;
+        let connection = buckets.get("bucket").ok_or(SqliteError::BucketNotFound)?;
+        let is_delete_marker: bool = connection
+            .read(|transaction| {
+                Ok(transaction.query_row(
+                    "SELECT is_delete_marker FROM object_version WHERE key = 'key';",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await?;
+        assert!(is_delete_marker);
 
         connection.close().await?;
         fs::remove_dir_all(root).ok();
