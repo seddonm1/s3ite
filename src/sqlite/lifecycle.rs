@@ -6,8 +6,6 @@ use rusqlite::{Error::ToSqlConversionFailure, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::database::BucketConnection;
-
 use super::{
     NULL_VERSION_ID, ObjectLifecycleExpiration, Sqlite, SqliteResult, StoredLifecycleAndFilter,
     StoredLifecycleExpiration, StoredLifecycleFilter, StoredLifecycleRule,
@@ -194,67 +192,62 @@ impl Sqlite {
         Ok(())
     }
 
-    /// Runs lifecycle in writer transactions that yield between upload or whole-key pages.
+    /// Aborts due multipart uploads in the next batch after `after`, in one transaction.
     ///
-    /// Each batch reads the current rules and uses the pass's fixed expiration time.
-    pub(super) async fn maintain_lifecycle(
-        connection: &BucketConnection,
+    /// Returns the cursor for the following batch, or `None` once every upload
+    /// has been visited or the bucket has no lifecycle rules. Start with
+    /// `("", Uuid::nil())`: S3 keys are never empty, so it sorts before every row.
+    pub(super) fn lifecycle_upload_batch(
+        transaction: &Transaction,
         now: OffsetDateTime,
-    ) -> SqliteResult<()> {
-        // S3 keys are never empty, so an empty key sorts before every row.
-        let mut after = Some((String::new(), Uuid::nil()));
-        while let Some(cursor) = after {
-            after = connection
-                .write(move |transaction| {
-                    let rules = Self::get_bucket_lifecycle_rules(transaction)?;
-                    if rules.is_empty() {
-                        return Ok(None);
-                    }
-                    let uploads = Self::lifecycle_multipart_candidates(
-                        transaction,
-                        (&cursor.0, cursor.1),
-                        LIFECYCLE_BATCH_SIZE,
-                    )?;
-                    Self::abort_lifecycle_multipart_uploads(transaction, &rules, now, &uploads)?;
-                    Ok(uploads
-                        .last()
-                        .map(|upload| (upload.key.clone(), upload.upload_id)))
-                })
-                .await?;
+        after: (&str, Uuid),
+    ) -> SqliteResult<Option<(String, Uuid)>> {
+        let rules = Self::get_bucket_lifecycle_rules(transaction)?;
+        if rules.is_empty() {
+            return Ok(None);
         }
+        let uploads =
+            Self::lifecycle_multipart_candidates(transaction, after, LIFECYCLE_BATCH_SIZE)?;
+        Self::abort_lifecycle_multipart_uploads(transaction, &rules, now, &uploads)?;
+        Ok(uploads
+            .last()
+            .map(|upload| (upload.key.clone(), upload.upload_id)))
+    }
 
-        let mut after = Some(String::new());
-        while let Some(cursor) = after {
-            after = connection
-                .write(move |transaction| {
-                    let rules = Self::get_bucket_lifecycle_rules(transaction)?;
-                    if rules.is_empty() {
-                        return Ok(None);
-                    }
-                    // Returns the first and last key of the next page of up to
-                    // LIFECYCLE_BATCH_SIZE distinct keys after the cursor, or NULLs
-                    // when no keys remain. Pages cover whole keys, so every version
-                    // of a key is evaluated in the same transaction.
-                    let (first, last): (Option<String>, Option<String>) = transaction.query_row(
-                        "SELECT MIN(key), MAX(key)
-                         FROM (
-                             SELECT DISTINCT key
-                             FROM object_version
-                             WHERE key > ?1
-                             ORDER BY key
-                             LIMIT ?2
-                         );",
-                        (cursor, LIFECYCLE_BATCH_SIZE),
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )?;
-                    if let Some(bounds) = first.as_deref().zip(last.as_deref()) {
-                        Self::expire_lifecycle_object_keys(transaction, &rules, now, bounds)?;
-                    }
-                    Ok(last)
-                })
-                .await?;
+    /// Expires due versions for the next batch of whole keys after `after`, in one transaction.
+    ///
+    /// Returns the last key processed as the next cursor, or `None` once every
+    /// key has been visited or the bucket has no lifecycle rules. Start with an
+    /// empty key, which sorts before every S3 key.
+    pub(super) fn lifecycle_key_batch(
+        transaction: &Transaction,
+        now: OffsetDateTime,
+        after: &str,
+    ) -> SqliteResult<Option<String>> {
+        let rules = Self::get_bucket_lifecycle_rules(transaction)?;
+        if rules.is_empty() {
+            return Ok(None);
         }
-        Ok(())
+        // Returns the first and last key of the next page of up to
+        // LIFECYCLE_BATCH_SIZE distinct keys after the cursor, or NULLs when no
+        // keys remain. Pages cover whole keys, so every version of a key is
+        // evaluated in the same transaction.
+        let (first, last): (Option<String>, Option<String>) = transaction.query_row(
+            "SELECT MIN(key), MAX(key)
+             FROM (
+                 SELECT DISTINCT key
+                 FROM object_version
+                 WHERE key > ?1
+                 ORDER BY key
+                 LIMIT ?2
+             );",
+            (after, LIFECYCLE_BATCH_SIZE),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if let Some(bounds) = first.as_deref().zip(last.as_deref()) {
+            Self::expire_lifecycle_object_keys(transaction, &rules, now, bounds)?;
+        }
+        Ok(last)
     }
 
     /// Expires current versions, noncurrent versions, then lone markers in an inclusive key range.

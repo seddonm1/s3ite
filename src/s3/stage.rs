@@ -12,12 +12,11 @@ use std::{sync::Arc, time::Duration};
 
 use futures::StreamExt;
 use s3s::stream::aws_chunked_stream::AwsChunkedStreamError;
-use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
     database::BucketConnection,
-    sqlite::{STAGED_BODY_MAX_LIFETIME, Sqlite, SqliteError},
+    sqlite::{STAGED_BODY_MAX_LIFETIME, Sqlite},
 };
 
 use super::{
@@ -66,44 +65,7 @@ impl Drop for StagedBody {
         };
         let connection = self.connection.clone();
         let staging_id = self.staging_id;
-        runtime.spawn(async move { delete_staged_body(&connection, staging_id).await });
-    }
-}
-
-/// Write attempts made to delete an unclaimed staged body.
-const CLEANUP_ATTEMPTS: u32 = 10;
-/// Delay before the first cleanup retry; it doubles up to [`CLEANUP_MAX_RETRY_DELAY`].
-const CLEANUP_RETRY_DELAY: Duration = Duration::from_millis(10);
-/// Longest delay between cleanup retries.
-const CLEANUP_MAX_RETRY_DELAY: Duration = Duration::from_secs(1);
-
-/// Deletes one unclaimed staged body, retrying while the writer queue is full.
-///
-/// Cleanup runs when the writer is likely busy (a cancelled or failed upload
-/// under load), so a full queue is retried with capped exponential backoff for
-/// a few seconds. Any other failure, or a queue that stays full, is logged and
-/// left to the maintenance idle sweep and the next process startup.
-async fn delete_staged_body(connection: &BucketConnection, staging_id: Uuid) {
-    let mut delay = CLEANUP_RETRY_DELAY;
-    for attempt in 1..=CLEANUP_ATTEMPTS {
-        let result = connection
-            .write(move |transaction| Sqlite::delete_staged_body(transaction, staging_id))
-            .await;
-        match result {
-            Ok(()) => return,
-            Err(SqliteError::DatabaseQueueFull) if attempt < CLEANUP_ATTEMPTS => {
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(CLEANUP_MAX_RETRY_DELAY);
-            }
-            Err(err) => {
-                warn!(
-                    %staging_id,
-                    error = %err,
-                    "staged upload body cleanup failed; maintenance will delete it"
-                );
-                return;
-            }
-        }
+        runtime.spawn(async move { Sqlite::discard_staged_body(&connection, staging_id).await });
     }
 }
 
@@ -686,7 +648,7 @@ mod tests {
         connection.close().await.map_err(S3Error::internal_error)?;
         tokio::time::timeout(
             Duration::from_secs(1),
-            super::delete_staged_body(&connection, Uuid::new_v4()),
+            Sqlite::discard_staged_body(&connection, Uuid::new_v4()),
         )
         .await
         .map_err(S3Error::internal_error)?;

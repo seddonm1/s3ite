@@ -46,6 +46,10 @@ CI in `.github/workflows/rust.yml` runs:
 - `cargo llvm-cov --all-targets --workspace --fail-under-lines 95 --fail-under-file-lines 95`
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --workspace -- -D warnings`
+- `python3 scripts/audit_transaction_boundaries.py` (production functions take
+  `&BucketConnection` only in `src/database.rs` and `src/sqlite/mod.rs`)
+- `python3 scripts/audit_conformance_mirrors.py` (each conformance test is
+  `s3ite_`-prefixed or names its Ceph source with `Mirrors` or `Adapted from`)
 
 When behavior changes, add or adjust focused tests so the per-file coverage gate
 stays healthy. Prefer focused tests first, then broader tests when behavior,

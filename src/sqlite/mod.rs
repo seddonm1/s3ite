@@ -71,6 +71,13 @@ pub(crate) const NULL_VERSION_ID: &str = "null";
 /// last appended chunk. A live request can never own a row this old, because
 /// staging gives up after [`STAGED_BODY_MAX_LIFETIME`].
 const ABANDONED_STAGED_BODY_AGE: Duration = Duration::days(1);
+/// Write attempts made to delete an unclaimed staged body.
+const CLEANUP_ATTEMPTS: u32 = 10;
+/// Delay before the first cleanup retry; it doubles up to [`CLEANUP_MAX_RETRY_DELAY`].
+const CLEANUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+/// Longest delay between cleanup retries.
+const CLEANUP_MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Maintenance passes that may defer WAL checkpoint and vacuum on a busy server.
 const MAX_DEFERRED_COMPACTIONS: u32 = 10;
 
@@ -877,6 +884,60 @@ impl Sqlite {
         Self::apply_lifecycle_rules(&transaction, OffsetDateTime::now_utc())?;
         transaction.commit()?;
         connection.execute_batch("PRAGMA optimize=0x10002;")?;
+        Ok(())
+    }
+
+    /// Deletes one unclaimed staged body, retrying while the writer queue is full.
+    ///
+    /// Cleanup runs when the writer is likely busy (a cancelled or failed upload
+    /// under load), so a full queue is retried with capped exponential backoff for
+    /// a few seconds. Any other failure, or a queue that stays full, is logged and
+    /// left to the maintenance idle sweep and the next process startup.
+    pub(crate) async fn discard_staged_body(connection: &BucketConnection, staging_id: uuid::Uuid) {
+        let mut delay = CLEANUP_RETRY_DELAY;
+        for attempt in 1..=CLEANUP_ATTEMPTS {
+            let result = connection
+                .write(move |transaction| Self::delete_staged_body(transaction, staging_id))
+                .await;
+            match result {
+                Ok(()) => return,
+                Err(SqliteError::DatabaseQueueFull) if attempt < CLEANUP_ATTEMPTS => {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(CLEANUP_MAX_RETRY_DELAY);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        %staging_id,
+                        error = %err,
+                        "staged upload body cleanup failed; maintenance will delete it"
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Runs lifecycle in batched writer transactions so client writes run between them.
+    ///
+    /// Each batch re-reads the rules and uses the pass's fixed time `now`.
+    async fn maintain_lifecycle(
+        connection: &BucketConnection,
+        now: OffsetDateTime,
+    ) -> SqliteResult<()> {
+        let mut after = Some((String::new(), uuid::Uuid::nil()));
+        while let Some((key, upload_id)) = after {
+            after = connection
+                .write(move |transaction| {
+                    Self::lifecycle_upload_batch(transaction, now, (&key, upload_id))
+                })
+                .await?;
+        }
+        let mut after = Some(String::new());
+        while let Some(key) = after {
+            after = connection
+                .write(move |transaction| Self::lifecycle_key_batch(transaction, now, &key))
+                .await?;
+        }
         Ok(())
     }
 

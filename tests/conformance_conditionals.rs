@@ -384,7 +384,7 @@ async fn test_put_object_ifmatch_failed() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_put_object_ifnonmatch_good() -> Result<()> {
-    // Ceph compares this ETag. AWS PutObject and Conditional writes require "*".
+    // Adapted from s3tests/functional/test_s3.py::test_put_object_ifnonmatch_good: Ceph compares this ETag. AWS PutObject and Conditional writes require "*".
     let (_server, client, bucket, _state) = seeded_object().await?;
     let error = client
         .put_object()
@@ -412,7 +412,7 @@ async fn test_put_object_ifnonmatch_good() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_put_object_ifnonmatch_failed() -> Result<()> {
-    // Ceph compares this ETag. AWS PutObject and Conditional writes require "*".
+    // Adapted from s3tests/functional/test_s3.py::test_put_object_ifnonmatch_failed: Ceph compares this ETag. AWS PutObject and Conditional writes require "*".
     let (_server, client, bucket, state) = seeded_object().await?;
     let error = client
         .put_object()
@@ -535,7 +535,7 @@ async fn test_put_object_ifnonmatch_overwrite_existed_failed() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_put_object_if_match() -> Result<()> {
-    // Adapted from Ceph. AWS Conditional writes accepts only "*" for If-None-Match.
+    // Adapted from s3tests/functional/test_s3.py::test_put_object_if_match: AWS Conditional writes accepts only "*" for If-None-Match.
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cond");
@@ -680,7 +680,7 @@ async fn test_put_object_if_match() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_put_current_object_if_none_match() -> Result<()> {
-    // Adapted from Ceph. AWS Conditional writes accepts only "*" for If-None-Match.
+    // Adapted from s3tests/functional/test_s3.py::test_put_current_object_if_none_match: AWS Conditional writes accepts only "*" for If-None-Match.
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cond");
@@ -743,7 +743,7 @@ async fn test_put_current_object_if_none_match() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_put_current_object_if_match() -> Result<()> {
-    // Adapted from Ceph. AWS Conditional writes requires "*" for the initial create.
+    // Adapted from s3tests/functional/test_s3.py::test_put_current_object_if_match: AWS Conditional writes requires "*" for the initial create.
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cond");
@@ -841,7 +841,7 @@ async fn test_put_current_object_if_match() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_put_object_current_if_match() -> Result<()> {
-    // Adapted from Ceph. AWS Conditional writes accepts only "*" for If-None-Match.
+    // Adapted from s3tests/functional/test_s3.py::test_put_object_current_if_match: AWS Conditional writes accepts only "*" for If-None-Match.
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cond");
@@ -1112,7 +1112,7 @@ async fn s3ite_concurrent_copy_if_none_match() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_copy_object_dest_if_none_match() -> Result<()> {
-    // Adapted from Ceph. AWS Conditional writes accepts only "*" for destination If-None-Match.
+    // Adapted from s3tests/functional/test_s3.py::test_copy_object_dest_if_none_match: AWS Conditional writes accepts only "*" for destination If-None-Match.
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     for versioned in [false, true] {
@@ -1403,7 +1403,7 @@ async fn test_multipart_put_object_suspended_if_none_match() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_multipart_put_object_if_match() -> Result<()> {
-    // Adapted from Ceph. AWS Conditional writes accepts only "*" for If-None-Match.
+    // Adapted from s3tests/functional/test_s3.py::test_multipart_put_object_if_match: AWS Conditional writes accepts only "*" for If-None-Match.
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cond");
@@ -1510,7 +1510,7 @@ async fn test_multipart_put_object_if_match() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_multipart_put_current_object_if_none_match() -> Result<()> {
-    // Adapted from Ceph. AWS Conditional writes accepts only "*" for If-None-Match.
+    // Adapted from s3tests/functional/test_s3.py::test_multipart_put_current_object_if_none_match: AWS Conditional writes accepts only "*" for If-None-Match.
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cond");
@@ -1571,7 +1571,7 @@ async fn test_multipart_put_current_object_if_none_match() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_multipart_put_current_object_if_match() -> Result<()> {
-    // Adapted from Ceph. AWS Conditional writes accepts only "*" for If-None-Match.
+    // Adapted from s3tests/functional/test_s3.py::test_multipart_put_current_object_if_match: AWS Conditional writes accepts only "*" for If-None-Match.
     let server = TestServer::spawn().await?;
     let client = sdk::client(&server);
     let bucket = bucket_name("s3ite-cond");
@@ -1685,7 +1685,7 @@ async fn test_delete_object_if_match() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_object_if_match_size() -> Result<()> {
-    // Ceph evaluates this condition. AWS DeleteObject supports it for directory buckets only.
+    // Adapted from s3tests/functional/test_s3.py::test_delete_object_if_match_size: Ceph evaluates this condition. AWS DeleteObject supports it for directory buckets only.
     let (_server, client, bucket, _state) = seeded_object_with_body(b"delete-me").await?;
     let error = client
         .delete_object()
@@ -1712,7 +1712,7 @@ async fn test_delete_object_if_match_size() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_object_if_match_last_modified_time() -> Result<()> {
-    // Ceph evaluates this condition. AWS DeleteObject supports it for directory buckets only.
+    // Adapted from s3tests/functional/test_s3.py::test_delete_object_if_match_last_modified_time: Ceph evaluates this condition. AWS DeleteObject supports it for directory buckets only.
     let (_server, client, bucket, state) = seeded_object_with_body(b"delete-me").await?;
     let error = client
         .delete_object()
@@ -1763,7 +1763,7 @@ async fn s3ite_delete_object_conditions_on_missing_key() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_object_current_if_match() -> Result<()> {
-    // Ceph treats a conditional delete of a missing key as a no-op and allows
+    // Adapted from s3tests/functional/test_s3.py::test_delete_object_current_if_match: Ceph treats a conditional delete of a missing key as a no-op and allows
     // a wildcard over a delete marker. AWS conditional deletes returns Not Found
     // for the missing key and 412 for the delete marker.
     let server = TestServer::spawn().await?;
@@ -1861,7 +1861,7 @@ async fn test_delete_object_current_if_match() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_object_current_if_match_last_modified_time() -> Result<()> {
-    // Ceph evaluates this condition. AWS DeleteObject supports it for directory buckets only.
+    // Adapted from s3tests/functional/test_s3.py::test_delete_object_current_if_match_last_modified_time: Ceph evaluates this condition. AWS DeleteObject supports it for directory buckets only.
     let (_server, client, bucket, _version, state) =
         seeded_versioned_object_with_body(b"delete-me").await?;
     let error = client
@@ -1889,7 +1889,7 @@ async fn test_delete_object_current_if_match_last_modified_time() -> Result<()> 
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_object_current_if_match_size() -> Result<()> {
-    // Ceph evaluates this condition. AWS DeleteObject supports it for directory buckets only.
+    // Adapted from s3tests/functional/test_s3.py::test_delete_object_current_if_match_size: Ceph evaluates this condition. AWS DeleteObject supports it for directory buckets only.
     let (_server, client, bucket, _version, _state) =
         seeded_versioned_object_with_body(b"delete-me").await?;
     let error = client
@@ -1978,7 +1978,7 @@ async fn test_delete_object_version_if_match() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_object_version_if_match_last_modified_time() -> Result<()> {
-    // Ceph evaluates this condition. AWS DeleteObject supports it for directory buckets only.
+    // Adapted from s3tests/functional/test_s3.py::test_delete_object_version_if_match_last_modified_time: Ceph evaluates this condition. AWS DeleteObject supports it for directory buckets only.
     let (_server, client, bucket, version, state) =
         seeded_versioned_object_with_body(b"delete-me").await?;
     let error = client
@@ -2007,7 +2007,7 @@ async fn test_delete_object_version_if_match_last_modified_time() -> Result<()> 
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_object_version_if_match_size() -> Result<()> {
-    // Ceph evaluates this condition. AWS DeleteObject supports it for directory buckets only.
+    // Adapted from s3tests/functional/test_s3.py::test_delete_object_version_if_match_size: Ceph evaluates this condition. AWS DeleteObject supports it for directory buckets only.
     let (_server, client, bucket, version, _state) =
         seeded_versioned_object_with_body(b"delete-me").await?;
     let error = client
@@ -2086,7 +2086,7 @@ async fn test_delete_objects_if_match() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_objects_if_match_last_modified_time() -> Result<()> {
-    // Ceph evaluates this condition. AWS ObjectIdentifier supports it for directory buckets only.
+    // Adapted from s3tests/functional/test_s3.py::test_delete_objects_if_match_last_modified_time: Ceph evaluates this condition. AWS ObjectIdentifier supports it for directory buckets only.
     let (_server, client, bucket, state) = seeded_object_with_body(b"delete-me").await?;
     let error = client
         .delete_objects()
@@ -2121,7 +2121,7 @@ async fn test_delete_objects_if_match_last_modified_time() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_objects_if_match_size() -> Result<()> {
-    // Ceph evaluates this condition. AWS ObjectIdentifier supports it for directory buckets only.
+    // Adapted from s3tests/functional/test_s3.py::test_delete_objects_if_match_size: Ceph evaluates this condition. AWS ObjectIdentifier supports it for directory buckets only.
     let (_server, client, bucket, _state) = seeded_object_with_body(b"delete-me").await?;
     let error = client
         .delete_objects()
@@ -2206,7 +2206,7 @@ async fn test_delete_objects_current_if_match() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_objects_current_if_match_last_modified_time() -> Result<()> {
-    // Ceph evaluates this condition. AWS ObjectIdentifier supports it for directory buckets only.
+    // Adapted from s3tests/functional/test_s3.py::test_delete_objects_current_if_match_last_modified_time: Ceph evaluates this condition. AWS ObjectIdentifier supports it for directory buckets only.
     let (_server, client, bucket, _version, state) =
         seeded_versioned_object_with_body(b"delete-me").await?;
     let error = client
@@ -2242,7 +2242,7 @@ async fn test_delete_objects_current_if_match_last_modified_time() -> Result<()>
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_objects_current_if_match_size() -> Result<()> {
-    // Ceph evaluates this condition. AWS ObjectIdentifier supports it for directory buckets only.
+    // Adapted from s3tests/functional/test_s3.py::test_delete_objects_current_if_match_size: Ceph evaluates this condition. AWS ObjectIdentifier supports it for directory buckets only.
     let (_server, client, bucket, _version, _state) =
         seeded_versioned_object_with_body(b"delete-me").await?;
     let error = client
@@ -2317,7 +2317,7 @@ async fn test_delete_objects_version_if_match() -> Result<()> {
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_objects_version_if_match_last_modified_time() -> Result<()> {
-    // Ceph evaluates this condition. AWS ObjectIdentifier supports it for directory buckets only.
+    // Adapted from s3tests/functional/test_s3.py::test_delete_objects_version_if_match_last_modified_time: Ceph evaluates this condition. AWS ObjectIdentifier supports it for directory buckets only.
     let (_server, client, bucket, version, state) =
         seeded_versioned_object_with_body(b"delete-me").await?;
     let error = client
@@ -2354,7 +2354,7 @@ async fn test_delete_objects_version_if_match_last_modified_time() -> Result<()>
 #[tokio::test]
 #[serial(conformance)]
 async fn test_delete_objects_version_if_match_size() -> Result<()> {
-    // Ceph evaluates this condition. AWS ObjectIdentifier supports it for directory buckets only.
+    // Adapted from s3tests/functional/test_s3.py::test_delete_objects_version_if_match_size: Ceph evaluates this condition. AWS ObjectIdentifier supports it for directory buckets only.
     let (_server, client, bucket, version, _state) =
         seeded_versioned_object_with_body(b"delete-me").await?;
     let error = client
