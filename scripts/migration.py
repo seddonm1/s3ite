@@ -12,7 +12,10 @@ your configured AWS profiles.
 Run the old server read-only for a consistent copy. Allow temporary disk space
 for the largest source object. The script checks the legacy MD5 when available
 and reads back each destination object to compare SHA-256 and metadata. A rerun
-accepts identical objects and stops on conflicts. The destination assigns new
+accepts identical objects. A key that conflicts or fails is reported and
+skipped, never overwritten, and the run continues. After each bucket the script
+compares the destination's keys with the source's. It exits non-zero and lists
+every problem if anything did not match. The destination assigns new
 timestamps. Only current objects and their metadata are copied.
 
 A v0.6.0 bucket containing a directory marker (an empty object whose key ends
@@ -96,6 +99,12 @@ def fingerprint(response, output=None, expected_md5=None):
 def copy_object(source, destination, bucket, key):
     address = {"Bucket": bucket, "Key": key}
     response = source.get_object(**address)
+    if "ExpiresString" in response and "Expires" not in response:
+        # botocore drops an Expires value it cannot parse as a date. The new
+        # server only stores HTTP dates, so copying would silently lose it.
+        raise ValueError(
+            f"Expires {response['ExpiresString']!r} is not an HTTP date and cannot be copied"
+        )
     metadata = {"Metadata": response.get("Metadata", {})}
     metadata.update({name: response[name] for name in CONTENT_HEADERS if name in response})
     with TemporaryFile() as staged:
@@ -140,23 +149,54 @@ def migrate(source, destination):
     source.meta.events.unregister(
         "before-parameter-build.s3.ListObjectsV2", set_list_objects_encoding_type_url
     )
+    # Also disable it for the destination, whose keys are compared with the source's.
+    destination.meta.events.unregister(
+        "before-parameter-build.s3.ListObjectsV2", set_list_objects_encoding_type_url
+    )
+    problems = []
     known_buckets = set(bucket_names(destination))
     for bucket in bucket_names(source):
-        if bucket not in known_buckets:
-            destination.create_bucket(Bucket=bucket)
-        copied = matched = 0
         try:
-            for key in object_keys(source, bucket):
-                try:
-                    if copy_object(source, destination, bucket, key):
-                        copied += 1
-                    else:
-                        matched += 1
-                except (BotoCoreError, ClientError, OSError, ValueError) as error:
-                    raise RuntimeError(f"key {key!r}: {error}") from error
-        except (BotoCoreError, ClientError, RuntimeError, ValueError) as error:
-            raise RuntimeError(f"bucket {bucket!r}: {error}") from error
-        print(f"{bucket}: copied {copied}, already identical {matched}", flush=True)
+            if bucket not in known_buckets:
+                destination.create_bucket(Bucket=bucket)
+            migrate_bucket(source, destination, bucket, problems)
+        except (BotoCoreError, ClientError, ValueError) as error:
+            problems.append(f"bucket {bucket!r}: {error}")
+            print(f"{bucket}: stopped: {error}", flush=True)
+    return problems
+
+
+def migrate_bucket(source, destination, bucket, problems):
+    """Copies one bucket's keys, then checks the destination holds exactly those keys.
+
+    A failed key is recorded in `problems` and the copy continues with the next
+    key. Listing errors propagate, because the bucket cannot then be verified.
+    """
+    copied = matched = failed = 0
+    source_keys = set()
+    for key in object_keys(source, bucket):
+        source_keys.add(key)
+        try:
+            if copy_object(source, destination, bucket, key):
+                copied += 1
+            else:
+                matched += 1
+        except (BotoCoreError, ClientError, OSError, ValueError) as error:
+            failed += 1
+            problems.append(f"bucket {bucket!r} key {key!r}: {error}")
+
+    destination_keys = set(object_keys(destination, bucket))
+    missing = sorted(source_keys - destination_keys)
+    extra = sorted(destination_keys - source_keys)
+    for key in missing:
+        problems.append(f"bucket {bucket!r} key {key!r}: missing from the destination")
+    for key in extra:
+        problems.append(f"bucket {bucket!r} key {key!r}: exists only on the destination")
+    print(
+        f"{bucket}: copied {copied}, already identical {matched}, failed {failed}, "
+        f"source keys {len(source_keys)}, destination keys {len(destination_keys)}",
+        flush=True,
+    )
 
 
 def main():
@@ -173,9 +213,15 @@ def main():
     try:
         source = client(args.source, args.source_profile)
         destination = client(args.destination, args.destination_profile)
-        migrate(source, destination)
-    except (BotoCoreError, ClientError, OSError, RuntimeError, ValueError) as error:
+        problems = migrate(source, destination)
+    except (BotoCoreError, ClientError, OSError, ValueError) as error:
         sys.exit(f"Migration stopped: {error}")
+    if problems:
+        print(f"Migration finished with {len(problems)} problem(s):", file=sys.stderr)
+        for problem in problems:
+            print(f"  {problem}", file=sys.stderr)
+        sys.exit(1)
+    print("Migration finished: every source key matches the destination.")
 
 
 if __name__ == "__main__":

@@ -343,8 +343,14 @@ credentials, add `--source-profile old --destination-profile new`, replacing
 The script checks a source object's stored MD5 ETag when available and computes
 SHA-256 over its bytes. The destination checks that SHA-256 during upload. The
 script then reads the object back and compares its hash and metadata. On a
-rerun, it skips an existing key only after the same comparison. A conflict
-stops the run and preserves the destination object.
+rerun, it skips an existing key only after the same comparison. A key that
+conflicts or fails is reported and skipped, and the destination object is never
+overwritten. After each bucket the script checks that the destination holds
+exactly the source's keys. At the end it lists every problem and exits non-zero
+if there were any, so a rerun after fixing them finishes the migration.
+
+The new server stores `Expires` only as an HTTP date. An object whose `Expires`
+is some other string is reported instead of being copied without it.
 
 The destination assigns fresh modification timestamps. The transfer covers
 live objects and empty buckets. Bucket configuration, historical versions, and
