@@ -82,7 +82,8 @@ impl ChunkReader {
         }
         let plaintext = match (&self.encryption, chunk.sse_nonce, chunk.sse_tag) {
             (Some(encryption), Some(nonce), Some(tag)) => {
-                decrypt_chunk(encryption, &nonce, &tag, &chunk.body).map_err(|_| inconsistent())?
+                decrypt_chunk(encryption, location.position, &nonce, &tag, &chunk.body)
+                    .map_err(|_| inconsistent())?
             }
             (None, None, None) => chunk.body,
             _ => return Err(inconsistent()),
@@ -150,6 +151,7 @@ impl SnapshotDecrypter {
         }
         let plaintext = decrypt_chunk(
             &self.encryption,
+            chunk.position,
             &chunk.sse_nonce,
             &chunk.sse_tag,
             &ciphertext,
@@ -314,7 +316,7 @@ mod tests {
         assert_eq!(read_range(&connection, plain, 2..7, None).await?, b"cdefg");
 
         let encryption = Arc::new(
-            new_active_sse(&[3; 32])
+            new_active_sse(&[3; 32], "bucket", "key")
                 .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, err))?,
         );
         let sealed = store(&connection, "sealed", b"abcdefgh", Some(&encryption)).await?;
@@ -358,7 +360,7 @@ mod tests {
 
     /// Test key shared by the snapshot decrypter tests.
     fn snapshot_key() -> S3Result<Arc<ActiveSse>> {
-        new_active_sse(&[5; 32])
+        new_active_sse(&[5; 32], "bucket", "key")
             .map(Arc::new)
             .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, err))
     }

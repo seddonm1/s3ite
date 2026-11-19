@@ -2,13 +2,13 @@
 
 use aes_gcm::{
     Aes256Gcm, Nonce,
-    aead::{Aead, KeyInit, consts::U12},
+    aead::{Aead, KeyInit, Payload, consts::U12},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hyper::http::{HeaderMap, HeaderValue};
 use s3s::{S3Error, S3ErrorCode, S3Result, dto::ServerSideEncryption};
 
-use crate::sqlite::{EncodedBlobChunk, EncryptionMode, Sqlite, StoredSse};
+use crate::sqlite::{ChunkPosition, EncodedBlobChunk, EncryptionMode, Sqlite, StoredSse};
 #[cfg(test)]
 use crate::sqlite::{SqliteError, SqliteResult, StoredBlobChunk};
 
@@ -47,15 +47,40 @@ pub(crate) fn parse_master_key(value: &str) -> Result<[u8; MASTER_KEY_LEN], Stri
     })
 }
 
-/// Creates a new data key and wraps it with the configured master key.
-pub(crate) fn new_active_sse(master_key: &[u8; MASTER_KEY_LEN]) -> Result<ActiveSse, String> {
+/// Authenticated data that binds a wrapped data key to its object.
+///
+/// It is the object ARN, the same value SSE-KMS keys carry as their
+/// `aws:s3:arn` encryption context. Multipart uploads complete under their own
+/// key and copies wrap a fresh data key, so the ARN never changes for a key.
+fn object_aad(bucket: &str, key: &str) -> Vec<u8> {
+    format!("arn:aws:s3:::{bucket}/{key}").into_bytes()
+}
+
+/// Authenticated data that binds an encrypted chunk to its place in its part.
+///
+/// A chunk then fails to decrypt if it is reordered, moved to another part, or
+/// left behind when the part is truncated, because the part size is bound too.
+fn chunk_aad(position: ChunkPosition) -> [u8; 16] {
+    let mut aad = [0; 16];
+    aad[..4].copy_from_slice(&position.part_number.to_be_bytes());
+    aad[4..8].copy_from_slice(&position.chunk_number.to_be_bytes());
+    aad[8..].copy_from_slice(&position.part_size.to_be_bytes());
+    aad
+}
+
+/// Creates a new data key for `bucket`/`key` and wraps it with the master key.
+pub(crate) fn new_active_sse(
+    master_key: &[u8; MASTER_KEY_LEN],
+    bucket: &str,
+    key: &str,
+) -> Result<ActiveSse, String> {
     let mut data_key = [0; DATA_KEY_LEN];
     getrandom::fill(&mut data_key).map_err(|err| err.to_string())?;
 
     let mut nonce = [0; NONCE_LEN];
     getrandom::fill(&mut nonce).map_err(|err| err.to_string())?;
 
-    let encrypted = encrypt_bytes(master_key, &nonce, &data_key)?;
+    let encrypted = encrypt_bytes(master_key, &nonce, &data_key, &object_aad(bucket, key))?;
     let (ciphertext, tag) = split_ciphertext_tag(encrypted)?;
     Ok(ActiveSse {
         stored: StoredSse::Local {
@@ -67,10 +92,12 @@ pub(crate) fn new_active_sse(master_key: &[u8; MASTER_KEY_LEN]) -> Result<Active
     })
 }
 
-/// Unwraps a stored object/upload data key.
+/// Unwraps the stored data key of the object or upload at `bucket`/`key`.
 pub(crate) fn active_sse_from_stored(
     master_key: &[u8; MASTER_KEY_LEN],
     stored: StoredSse,
+    bucket: &str,
+    key: &str,
 ) -> Result<ActiveSse, String> {
     let StoredSse::Local {
         nonce,
@@ -82,21 +109,22 @@ pub(crate) fn active_sse_from_stored(
     };
     let nonce = nonce_array(nonce)?;
     let encrypted = join_ciphertext_tag(ciphertext, tag);
-    let data_key = decrypt_bytes(master_key, &nonce, &encrypted)?;
+    let data_key = decrypt_bytes(master_key, &nonce, &encrypted, &object_aad(bucket, key))?;
     let data_key = data_key
         .try_into()
         .map_err(|bytes: Vec<u8>| format!("invalid SSE data key length: {}", bytes.len()))?;
     Ok(ActiveSse { stored, data_key })
 }
 
-/// Encrypts one object storage chunk.
+/// Encrypts one object storage chunk, bound to its `position` in its part.
 pub(crate) fn encrypt_chunk(
     active: &ActiveSse,
+    position: ChunkPosition,
     plaintext: &[u8],
 ) -> Result<EncryptedChunk, String> {
     let mut nonce = [0; NONCE_LEN];
     getrandom::fill(&mut nonce).map_err(|err| err.to_string())?;
-    let encrypted = encrypt_bytes(&active.data_key, &nonce, plaintext)?;
+    let encrypted = encrypt_bytes(&active.data_key, &nonce, plaintext, &chunk_aad(position))?;
     let (ciphertext, tag) = split_ciphertext_tag(encrypted)?;
     Ok(EncryptedChunk {
         ciphertext,
@@ -105,41 +133,56 @@ pub(crate) fn encrypt_chunk(
     })
 }
 
-/// Decrypts one object storage chunk.
+/// Decrypts one object storage chunk, which must be at the `position` it was encrypted for.
 pub(crate) fn decrypt_chunk(
     active: &ActiveSse,
+    position: ChunkPosition,
     nonce: &[u8],
     tag: &[u8],
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, String> {
     let nonce = nonce_array(nonce)?;
     let encrypted = join_ciphertext_tag(ciphertext, tag);
-    decrypt_bytes(&active.data_key, &nonce, &encrypted)
+    decrypt_bytes(&active.data_key, &nonce, &encrypted, &chunk_aad(position))
 }
 
-/// Encrypts bytes with AES-256-GCM and returns ciphertext plus tag.
+/// Encrypts bytes with AES-256-GCM, authenticating `aad`, and returns ciphertext plus tag.
 fn encrypt_bytes(
     key: &[u8; MASTER_KEY_LEN],
     nonce: &[u8; NONCE_LEN],
     plaintext: &[u8],
+    aad: &[u8],
 ) -> Result<Vec<u8>, String> {
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|err| err.to_string())?;
     let nonce = <&Nonce<U12>>::try_from(nonce.as_slice()).map_err(|err| err.to_string())?;
     cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|err| err.to_string())
 }
 
-/// Decrypts bytes produced by `encrypt_bytes`.
+/// Decrypts bytes produced by `encrypt_bytes`; fails unless `aad` matches.
 fn decrypt_bytes(
     key: &[u8; MASTER_KEY_LEN],
     nonce: &[u8; NONCE_LEN],
     ciphertext: &[u8],
+    aad: &[u8],
 ) -> Result<Vec<u8>, String> {
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|err| err.to_string())?;
     let nonce = <&Nonce<U12>>::try_from(nonce.as_slice()).map_err(|err| err.to_string())?;
     cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map_err(|err| err.to_string())
 }
 
@@ -295,9 +338,11 @@ pub(super) async fn resolve_write_encryption(
             .map_err(s3_error_from_sqlite)?
     };
     match mode {
-        Some(EncryptionMode::Aes256) => new_active_sse(&require_sse_s3_master_key(sqlite)?)
-            .map(Some)
-            .map_err(|_| s3_error_with_message(InternalError, "SSE-S3 encryption failed")),
+        Some(EncryptionMode::Aes256) => {
+            new_active_sse(&require_sse_s3_master_key(sqlite)?, bucket, key)
+                .map(Some)
+                .map_err(|_| s3_error_with_message(InternalError, "SSE-S3 encryption failed"))
+        }
         Some(EncryptionMode::Kms(id)) => kms::generate(
             &sqlite.config,
             bucket,
@@ -311,11 +356,16 @@ pub(super) async fn resolve_write_encryption(
     }
 }
 
-/// Reopens a persisted encryption envelope outside the storage transaction.
-pub(super) async fn open_encryption(sqlite: &Sqlite, stored: StoredSse) -> S3Result<ActiveSse> {
+/// Reopens the persisted encryption envelope of `bucket`/`key` outside the storage transaction.
+pub(super) async fn open_encryption(
+    sqlite: &Sqlite,
+    bucket: &str,
+    key: &str,
+    stored: StoredSse,
+) -> S3Result<ActiveSse> {
     match &stored {
         StoredSse::Local { .. } => {
-            active_sse_from_stored(&require_sse_s3_master_key(sqlite)?, stored)
+            active_sse_from_stored(&require_sse_s3_master_key(sqlite)?, stored, bucket, key)
                 .map_err(|_| s3_error_with_message(InternalError, "SSE-S3 decryption failed"))
         }
         StoredSse::Kms {
@@ -367,8 +417,14 @@ pub(super) fn encrypt_value_chunks(
     }
     let mut chunks = Vec::new();
     let mut next_offset = 0_i64;
+    let part_size = i64::try_from(value.len()).map_err(S3Error::internal_error)?;
     for plaintext in value.chunks(chunk_size) {
-        push_encrypted_chunk(&mut chunks, &mut next_offset, plaintext, encryption)?;
+        push_encrypted_chunk(
+            &mut chunks,
+            &mut next_offset,
+            plaintext,
+            (encryption, part_size),
+        )?;
     }
     Ok(chunks)
 }
@@ -379,9 +435,17 @@ pub(super) fn decrypt_stored_chunks(
     encryption: &ActiveSse,
     chunks: Vec<StoredBlobChunk>,
 ) -> SqliteResult<Vec<u8>> {
+    // Test values are stored as a single part covering every chunk.
+    let part_size = chunks.iter().map(|chunk| chunk.size).sum();
     let mut value = Vec::new();
     let mut expected_offset = 0_i64;
-    for chunk in chunks {
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        let position = ChunkPosition {
+            part_number: 1,
+            chunk_number: i32::try_from(index + 1)
+                .map_err(|_| SqliteError::ObjectBodyInconsistent)?,
+            part_size,
+        };
         if chunk.offset != expected_offset {
             return Err(SqliteError::ObjectBodyInconsistent);
         }
@@ -389,7 +453,7 @@ pub(super) fn decrypt_stored_chunks(
         else {
             return Err(SqliteError::ObjectBodyInconsistent);
         };
-        let plaintext = decrypt_chunk(encryption, nonce, tag, &chunk.body)
+        let plaintext = decrypt_chunk(encryption, position, nonce, tag, &chunk.body)
             .map_err(SqliteError::Configuration)?;
         if i64::try_from(plaintext.len()).map_err(|_| SqliteError::ObjectBodyInconsistent)?
             != chunk.size
@@ -405,20 +469,19 @@ pub(super) fn decrypt_stored_chunks(
 }
 
 #[cfg(test)]
-/// Encrypts one plaintext chunk and appends it with the next chunk number and offset.
+/// Encrypts one plaintext chunk of a single-part value of `part_size` bytes and appends it.
 fn push_encrypted_chunk(
     chunks: &mut Vec<EncodedBlobChunk>,
     next_offset: &mut i64,
     plaintext: &[u8],
-    encryption: &ActiveSse,
+    (encryption, part_size): (&ActiveSse, i64),
 ) -> S3Result<()> {
-    let chunk_number = i32::try_from(chunks.len() + 1).map_err(S3Error::internal_error)?;
-    let chunk = encode_chunk(
-        Some(encryption),
-        chunk_number,
-        *next_offset,
-        plaintext.to_vec(),
-    )?;
+    let position = ChunkPosition {
+        part_number: 1,
+        chunk_number: i32::try_from(chunks.len() + 1).map_err(S3Error::internal_error)?,
+        part_size,
+    };
+    let chunk = encode_chunk(Some(encryption), position, *next_offset, plaintext.to_vec())?;
     *next_offset = next_offset
         .checked_add(chunk.size)
         .ok_or_else(|| S3Error::with_message(InternalError, "upload chunk offset overflow"))?;
@@ -433,10 +496,11 @@ fn push_encrypted_chunk(
 /// same length, with the nonce and tag kept in their own columns.
 pub(super) fn encode_chunk(
     encryption: Option<&ActiveSse>,
-    chunk_number: i32,
+    position: ChunkPosition,
     offset: i64,
     plaintext: Vec<u8>,
 ) -> S3Result<EncodedBlobChunk> {
+    let chunk_number = position.chunk_number;
     let size = i64::try_from(plaintext.len()).map_err(S3Error::internal_error)?;
     let Some(encryption) = encryption else {
         return Ok(EncodedBlobChunk {
@@ -448,7 +512,7 @@ pub(super) fn encode_chunk(
             sse_tag: None,
         });
     };
-    let encrypted = encrypt_chunk(encryption, &plaintext)
+    let encrypted = encrypt_chunk(encryption, position, &plaintext)
         .map_err(|_| S3Error::with_message(InternalError, "object chunk encryption failed"))?;
     Ok(EncodedBlobChunk {
         chunk_number,
@@ -519,7 +583,7 @@ mod tests {
     fn rejects_malformed_wrapped_data_key() -> Result<(), String> {
         let master_key = [0; MASTER_KEY_LEN];
         let nonce = [0; NONCE_LEN];
-        let encrypted = encrypt_bytes(&master_key, &nonce, b"short")?;
+        let encrypted = encrypt_bytes(&master_key, &nonce, b"short", &object_aad("bucket", "key"))?;
         let (ciphertext, tag) = split_ciphertext_tag(encrypted)?;
         let mut stored = StoredSse::Local {
             nonce: nonce.to_vec(),
@@ -527,7 +591,7 @@ mod tests {
             tag,
         };
         assert_eq!(
-            active_sse_from_stored(&master_key, stored.clone())
+            active_sse_from_stored(&master_key, stored.clone(), "bucket", "key")
                 .err()
                 .as_deref(),
             Some("invalid SSE data key length: 5")
@@ -535,7 +599,7 @@ mod tests {
         if let StoredSse::Local { tag, .. } = &mut stored {
             tag[0] ^= 1;
         }
-        assert!(active_sse_from_stored(&master_key, stored).is_err());
+        assert!(active_sse_from_stored(&master_key, stored, "bucket", "key").is_err());
         Ok(())
     }
 
@@ -632,8 +696,8 @@ mod tests {
     /// Rejects malformed local envelopes and incomplete encrypted chunks.
     #[test]
     fn encrypt_and_decrypt_chunk_helpers_reject_inconsistent_input() -> S3Result<()> {
-        let encryption =
-            new_active_sse(&[6; 32]).map_err(|err| S3Error::with_message(InternalError, err))?;
+        let encryption = new_active_sse(&[6; 32], "bucket", "key")
+            .map_err(|err| S3Error::with_message(InternalError, err))?;
 
         assert!(split_ciphertext_tag(vec![1, 2, 3]).is_err());
         assert!(encrypt_value_chunks(b"value", 0, &encryption).is_err());
@@ -645,12 +709,16 @@ mod tests {
                     ciphertext: vec![0; 32],
                     tag: vec![0; 16],
                 },
+                "bucket",
+                "key",
             )
             .is_err()
         );
         let mut chunks = Vec::new();
         let mut next_offset = i64::MAX;
-        assert!(push_encrypted_chunk(&mut chunks, &mut next_offset, b"x", &encryption).is_err());
+        assert!(
+            push_encrypted_chunk(&mut chunks, &mut next_offset, b"x", (&encryption, 1)).is_err()
+        );
 
         let chunks = encrypt_value_chunks(b"abcdef", 3, &encryption)?;
         let mut stored = chunks
@@ -678,11 +746,66 @@ mod tests {
             .map(StoredBlobChunk::from)
             .collect::<Vec<_>>();
         stored[0].size += 1;
-        assert!(matches!(
-            decrypt_stored_chunks(&encryption, stored),
-            Err(SqliteError::ObjectBodyInconsistent)
-        ));
+        // The part size is authenticated, so this now fails to decrypt
+        // before the plaintext length check runs.
+        assert!(decrypt_stored_chunks(&encryption, stored).is_err());
 
+        Ok(())
+    }
+
+    /// Rejects chunks moved within or between parts, or read against another part size.
+    #[test]
+    fn chunks_only_decrypt_at_their_position() -> Result<(), String> {
+        let encryption = new_active_sse(&[8; 32], "bucket", "key")?;
+        let position = ChunkPosition {
+            part_number: 2,
+            chunk_number: 3,
+            part_size: 100,
+        };
+        let chunk = encrypt_chunk(&encryption, position, b"chunk")?;
+        let open = |position| {
+            decrypt_chunk(
+                &encryption,
+                position,
+                &chunk.nonce,
+                &chunk.tag,
+                &chunk.ciphertext,
+            )
+        };
+        assert_eq!(open(position)?, b"chunk");
+        for moved in [
+            ChunkPosition {
+                part_number: 1,
+                ..position
+            },
+            ChunkPosition {
+                chunk_number: 2,
+                ..position
+            },
+            ChunkPosition {
+                part_size: 99,
+                ..position
+            },
+        ] {
+            assert!(open(moved).is_err(), "{moved:?}");
+        }
+        Ok(())
+    }
+
+    /// Rejects a wrapped data key moved to another object's row.
+    #[test]
+    fn wrapped_data_keys_only_open_for_their_object() -> Result<(), String> {
+        let master_key = [9; MASTER_KEY_LEN];
+        let encryption = new_active_sse(&master_key, "bucket", "key")?;
+        let opened =
+            active_sse_from_stored(&master_key, encryption.stored.clone(), "bucket", "key")?;
+        assert_eq!(opened.data_key, encryption.data_key);
+        for (bucket, key) in [("bucket", "other"), ("other", "key")] {
+            assert!(
+                active_sse_from_stored(&master_key, encryption.stored.clone(), bucket, key)
+                    .is_err()
+            );
+        }
         Ok(())
     }
 }

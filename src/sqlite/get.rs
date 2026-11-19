@@ -7,9 +7,9 @@ use rusqlite::{OptionalExtension, Transaction};
 use crate::database::BlobReadRequest;
 
 use super::{
-    EncryptedChunkRead, KeyMetadata, ObjectBodyReference, ObjectChunkLocation, Sqlite, SqliteError,
-    SqliteResult, StoredBlobChunk, optional_stored_checksum, optional_stored_object_lock, row_bool,
-    row_size,
+    ChunkPosition, EncryptedChunkRead, KeyMetadata, ObjectBodyReference, ObjectChunkLocation,
+    Sqlite, SqliteError, SqliteResult, StoredBlobChunk, optional_stored_checksum,
+    optional_stored_object_lock, row_bool, row_size,
 };
 
 impl Sqlite {
@@ -222,18 +222,24 @@ impl Sqlite {
         }
         let start = i64::try_from(range.start).map_err(|_| SqliteError::ObjectBodyInconsistent)?;
         let end = i64::try_from(range.end).map_err(|_| SqliteError::ObjectBodyInconsistent)?;
-        // Both plans return chunk metadata ordered by offset. The range plan
-        // uses the offset bound for overlap and may clip the first and last chunk.
+        // Both plans return each chunk's id, offset, size, part number, chunk
+        // number, and its part's size (NULL if the part row is missing), ordered
+        // by offset. The range plan uses the offset bound for overlap and may
+        // clip the first and last chunk.
         let mut stmt = transaction.prepare_cached(if whole {
-            "SELECT chunk_id, offset, size
-            FROM object_blob_chunk
-            WHERE object_sequence = ?1
-            ORDER BY offset;"
+            "SELECT c.chunk_id, c.offset, c.size, c.part_number, c.chunk_number, p.size
+            FROM object_blob_chunk AS c
+            LEFT JOIN object_part AS p
+                ON p.object_sequence = c.object_sequence AND p.part_number = c.part_number
+            WHERE c.object_sequence = ?1
+            ORDER BY c.offset;"
         } else {
-            "SELECT chunk_id, offset, size
-            FROM object_blob_chunk
-            WHERE object_sequence = ?1 AND offset < ?3 AND offset + size > ?2
-            ORDER BY offset;"
+            "SELECT c.chunk_id, c.offset, c.size, c.part_number, c.chunk_number, p.size
+            FROM object_blob_chunk AS c
+            LEFT JOIN object_part AS p
+                ON p.object_sequence = c.object_sequence AND p.part_number = c.part_number
+            WHERE c.object_sequence = ?1 AND c.offset < ?3 AND c.offset + c.size > ?2
+            ORDER BY c.offset;"
         })?;
         let mut rows = if whole {
             stmt.query((object_sequence,))?
@@ -260,10 +266,18 @@ impl Sqlite {
             if misplaced || chunk_end <= next {
                 return Err(SqliteError::ObjectBodyInconsistent);
             }
+            let position = ChunkPosition {
+                part_number: row.get(3)?,
+                chunk_number: row.get(4)?,
+                part_size: row
+                    .get::<_, Option<i64>>(5)?
+                    .ok_or(SqliteError::ObjectBodyInconsistent)?,
+            };
             locations.push(ObjectChunkLocation {
                 chunk_id,
                 offset,
                 size,
+                position,
             });
             next = chunk_end;
         }
@@ -316,6 +330,7 @@ impl Sqlite {
             chunks.push(EncryptedChunkRead {
                 offset: location.offset,
                 size: location.size,
+                position: location.position,
                 sse_nonce,
                 sse_tag,
             });

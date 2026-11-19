@@ -166,6 +166,7 @@ async fn stage_put_object_body(
         with_client_idle_timeout(body),
         chunk_size,
         declared_size,
+        1,
         encryption,
         |bytes| {
             md5_hash.update(bytes);

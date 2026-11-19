@@ -357,7 +357,9 @@ pub(super) async fn load_copy_source_object(
         .await
         .map_err(s3_error_from_sqlite)?;
     let encryption = match key_metadata.stored_sse.clone() {
-        Some(stored) => Some(Arc::new(open_encryption(sqlite, stored).await?)),
+        Some(stored) => Some(Arc::new(
+            open_encryption(sqlite, bucket, key, stored).await?,
+        )),
         None => None,
     };
     Ok(CopySourceObject {
@@ -419,6 +421,7 @@ async fn stage_copy_body(
         source.body(),
         chunk_size,
         source.key_metadata.size,
+        1,
         target_encryption,
         |bytes| {
             accumulator.update(bytes);

@@ -911,6 +911,18 @@ pub(crate) struct EncodedBlobChunk {
     pub(crate) sse_tag: Option<Vec<u8>>,
 }
 
+/// Where a chunk sits within its part, which encrypted chunks are bound to.
+///
+/// Unlike the chunk's owner and object offset, none of these change when a
+/// staged body is claimed or a multipart upload completes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ChunkPosition {
+    pub(crate) part_number: i32,
+    pub(crate) chunk_number: i32,
+    /// Plaintext size of the whole part, so a truncated part fails to decrypt.
+    pub(crate) part_size: i64,
+}
+
 /// Identity and plaintext position of one stored chunk of an object version.
 ///
 /// `chunk_id` alone is not a stable identity because chunk rowids may be
@@ -921,6 +933,7 @@ pub(crate) struct ObjectChunkLocation {
     pub(crate) chunk_id: i64,
     pub(crate) offset: i64,
     pub(crate) size: i64,
+    pub(crate) position: ChunkPosition,
 }
 
 /// Position and AES-GCM parameters of one encrypted chunk read from a snapshot.
@@ -931,6 +944,7 @@ pub(crate) struct ObjectChunkLocation {
 pub(crate) struct EncryptedChunkRead {
     pub(crate) offset: i64,
     pub(crate) size: i64,
+    pub(crate) position: ChunkPosition,
     pub(crate) sse_nonce: Vec<u8>,
     pub(crate) sse_tag: Vec<u8>,
 }

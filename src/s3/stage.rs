@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::{
     database::BucketConnection,
-    sqlite::{STAGED_BODY_MAX_LIFETIME, Sqlite},
+    sqlite::{ChunkPosition, STAGED_BODY_MAX_LIFETIME, Sqlite},
 };
 
 use super::{
@@ -87,6 +87,7 @@ pub(super) async fn stage_streaming_body(
     mut body: StreamingBlob,
     chunk_size: usize,
     expected_size: i64,
+    part_number: i32,
     encryption: Option<&ActiveSse>,
     mut observe_plaintext: impl FnMut(&[u8]),
 ) -> S3Result<StagedBody> {
@@ -105,6 +106,8 @@ pub(super) async fn stage_streaming_body(
             settled: false,
         },
         encryption,
+        part_number,
+        part_size: expected_size,
         next_chunk_number: 1,
     };
     let mut buffer = Vec::new();
@@ -225,6 +228,10 @@ fn aws_chunked_stream_error(err: AwsChunkedStreamError) -> S3Error {
 struct ChunkWriter<'a> {
     staged: StagedBody,
     encryption: Option<&'a ActiveSse>,
+    /// Part the body will be claimed as; staged chunks are encrypted for it.
+    part_number: i32,
+    /// Declared body size, which every chunk is bound to.
+    part_size: i64,
     next_chunk_number: i32,
 }
 
@@ -232,12 +239,12 @@ impl ChunkWriter<'_> {
     /// Encodes one plaintext chunk and appends it in its own writer transaction.
     async fn flush(&mut self, plaintext: Vec<u8>) -> S3Result<()> {
         let size = i64::try_from(plaintext.len()).map_err(S3Error::internal_error)?;
-        let chunk = encode_chunk(
-            self.encryption,
-            self.next_chunk_number,
-            self.staged.size,
-            plaintext,
-        )?;
+        let position = ChunkPosition {
+            part_number: self.part_number,
+            chunk_number: self.next_chunk_number,
+            part_size: self.part_size,
+        };
+        let chunk = encode_chunk(self.encryption, position, self.staged.size, plaintext)?;
         let staging_id = self.staged.staging_id;
         self.staged
             .connection
@@ -342,6 +349,7 @@ mod tests {
             body(&[b"ab", b"cdef", b"ghi"], false),
             4,
             9,
+            1,
             None,
             |bytes| observed.extend_from_slice(bytes),
         )
@@ -363,13 +371,14 @@ mod tests {
     #[tokio::test]
     async fn stages_encrypted_chunks_that_decrypt() -> S3Result<()> {
         let (_directory, connection) = open_bucket().await.map_err(S3Error::internal_error)?;
-        let encryption = new_active_sse(&[7; 32])
+        let encryption = new_active_sse(&[7; 32], "bucket", "key")
             .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, err))?;
         let staged = stage_streaming_body(
             connection.clone(),
             body(&[b"ab", b"cdef", b"ghi"], false),
             3,
             9,
+            1,
             Some(&encryption),
             |_| {},
         )
@@ -397,6 +406,7 @@ mod tests {
             body(&[b"abcd"], true),
             2,
             4,
+            1,
             None,
             |_| {},
         )
@@ -412,6 +422,7 @@ mod tests {
             body(&[b"abcd"], false),
             2,
             4,
+            1,
             None,
             |_| {},
         )
@@ -460,6 +471,7 @@ mod tests {
             body(&[b"abcd", b"ef"], false),
             2,
             5,
+            1,
             None,
             |_| {},
         )
@@ -471,6 +483,7 @@ mod tests {
             body(&[b"abc"], false),
             2,
             4,
+            1,
             None,
             |_| {},
         )
@@ -486,13 +499,13 @@ mod tests {
             Ok(Bytes::from_static(b"ab")),
             Err(S3Error::new(S3ErrorCode::NoSuchKey)),
         ]));
-        let result = stage_streaming_body(connection.clone(), missing, 1, 4, None, |_| {}).await;
+        let result = stage_streaming_body(connection.clone(), missing, 1, 4, 1, None, |_| {}).await;
         assert_rejected_without_chunks(&connection, result, &S3ErrorCode::NoSuchKey).await?;
 
         let io = StreamingBlob::wrap::<_, std::io::Error>(stream::iter([Err(
             std::io::Error::other("reset"),
         )]));
-        let result = stage_streaming_body(connection.clone(), io, 1, 4, None, |_| {}).await;
+        let result = stage_streaming_body(connection.clone(), io, 1, 4, 1, None, |_| {}).await;
         assert_rejected_without_chunks(&connection, result, &S3ErrorCode::InternalError).await
     }
 
@@ -562,7 +575,8 @@ mod tests {
         let request_connection = connection.clone();
         let (answered, response) = tokio::sync::oneshot::channel();
         let request = tokio::spawn(async move {
-            let result = stage_streaming_body(request_connection, body, 4, 7, None, |_| {}).await;
+            let result =
+                stage_streaming_body(request_connection, body, 4, 7, 1, None, |_| {}).await;
             let _ = answered.send(result.err().map(|err| err.code().clone()));
             std::future::pending::<()>().await;
         });
@@ -602,7 +616,7 @@ mod tests {
         let stalled = StreamingBlob::wrap::<_, S3Error>(
             stream::iter([Ok(Bytes::from_static(b"ab"))]).chain(stream::pending()),
         );
-        let result = stage_streaming_body(connection.clone(), stalled, 2, 4, None, |_| {}).await;
+        let result = stage_streaming_body(connection.clone(), stalled, 2, 4, 1, None, |_| {}).await;
         let lifetime = crate::sqlite::STAGED_BODY_MAX_LIFETIME;
         assert!((lifetime..lifetime + Duration::from_secs(1)).contains(&started.elapsed()));
         tokio::time::resume();
@@ -683,7 +697,7 @@ mod tests {
     async fn rejects_zero_chunk_size() -> S3Result<()> {
         let (_directory, connection) = open_bucket().await.map_err(S3Error::internal_error)?;
         assert!(
-            stage_streaming_body(connection, body(&[b"a"], false), 0, 1, None, |_| {})
+            stage_streaming_body(connection, body(&[b"a"], false), 0, 1, 1, None, |_| {})
                 .await
                 .is_err()
         );

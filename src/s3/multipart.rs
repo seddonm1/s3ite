@@ -6,6 +6,8 @@ use crate::sqlite::{
     MultipartCompletionRequest, MultipartPartWrite, MultipartUploadListEntry, MultipartUploadState,
     PartChecksum, StoredChecksum, StoredSse,
 };
+use crate::{database::BucketConnection, sqlite::ChunkPosition};
+use std::sync::Arc;
 
 use super::copy::load_copy_source_object;
 use super::metadata::parse_expires;
@@ -191,15 +193,17 @@ fn validate_upload_part_write_state(
     Ok(())
 }
 
-/// Reopens the multipart upload data key for encrypted part storage.
+/// Reopens the data key of the upload for `bucket`/`key` for encrypted part storage.
 async fn active_upload_encryption(
     sqlite: &Sqlite,
+    bucket: &str,
+    key: &str,
     stored: Option<StoredSse>,
 ) -> S3Result<Option<ActiveSse>> {
     let Some(stored) = stored else {
         return Ok(None);
     };
-    open_encryption(sqlite, stored).await.map(Some)
+    open_encryption(sqlite, bucket, key, stored).await.map(Some)
 }
 
 struct UploadPartWriteContext {
@@ -446,6 +450,48 @@ fn upload_part_output(
 /// The range is validated against the source size before any body bytes are
 /// read. MD5 and the upload's configured checksum are computed while the range
 /// streams, and the upload's state is revalidated in the claiming transaction.
+/// Opens the target bucket of an `UploadPartCopy`, loads its upload, and reopens the data key.
+///
+/// The returned state still holds the stored envelope, which the part write
+/// must find unchanged.
+async fn open_copy_part_upload(
+    sqlite: &Sqlite,
+    request: &UploadPartCopyRequest,
+) -> S3Result<(
+    Arc<BucketConnection>,
+    MultipartUploadState,
+    Option<ActiveSse>,
+)> {
+    let connection = sqlite
+        .get_connection(&request.bucket)
+        .await
+        .map_err(s3_error_from_sqlite)?;
+    let upload_id = request.upload_id;
+    let bucket = request.bucket.clone();
+    let key = request.key.clone();
+    let access_key = request.access_key.clone();
+    let upload_state = connection
+        .read(move |transaction| {
+            load_multipart_upload_state(
+                transaction,
+                upload_id,
+                &bucket,
+                &key,
+                access_key.as_deref(),
+            )
+        })
+        .await
+        .map_err(s3_error_from_sqlite)?;
+    let encryption = active_upload_encryption(
+        sqlite,
+        &request.bucket,
+        &request.key,
+        upload_state.stored_sse.clone(),
+    )
+    .await?;
+    Ok((connection, upload_state, encryption))
+}
+
 async fn copy_part_data(
     sqlite: &Sqlite,
     request: UploadPartCopyRequest,
@@ -472,31 +518,9 @@ async fn copy_part_data(
     }
     let size =
         validate_upload_part_copy_size(source.range.clone()).map_err(s3_error_from_sqlite)?;
-    let connection = sqlite
-        .get_connection(&request.bucket)
-        .await
-        .map_err(s3_error_from_sqlite)?;
-    let upload_state = {
-        let upload_id = request.upload_id;
-        let bucket = request.bucket.clone();
-        let key = request.key.clone();
-        let access_key = request.access_key.clone();
-        connection
-            .read(move |transaction| {
-                load_multipart_upload_state(
-                    transaction,
-                    upload_id,
-                    &bucket,
-                    &key,
-                    access_key.as_deref(),
-                )
-            })
-            .await
-            .map_err(s3_error_from_sqlite)?
-    };
+    let (connection, upload_state, encryption) = open_copy_part_upload(sqlite, &request).await?;
     let checksum_config = upload_state.checksum;
-    let expected_encryption = upload_state.stored_sse.clone();
-    let encryption = active_upload_encryption(sqlite, upload_state.stored_sse).await?;
+    let expected_encryption = upload_state.stored_sse;
     let encrypted = encryption.as_ref().map(|active| active.stored.mode());
 
     let mut md5_hash = Md5::new();
@@ -506,6 +530,7 @@ async fn copy_part_data(
         source.body(),
         chunk_size,
         size,
+        request.part_number,
         encryption.as_ref(),
         |bytes| {
             md5_hash.update(bytes);
@@ -850,6 +875,7 @@ async fn upload_streamed_part(
         with_client_idle_timeout(body),
         context.chunk_size,
         context.declared_size,
+        context.part_number,
         encryption.as_ref(),
         |bytes| {
             md5_hash.update(bytes);
@@ -1020,7 +1046,8 @@ pub(super) async fn upload_part(
     let checksum_config = upload_state.checksum;
     checksum_input.validate_upload_part(checksum_config)?;
     let expected_encryption = upload_state.stored_sse.clone();
-    let encryption = active_upload_encryption(sqlite, upload_state.stored_sse).await?;
+    let encryption =
+        active_upload_encryption(sqlite, &bucket, &key, upload_state.stored_sse).await?;
     let context = UploadPartWriteContext {
         bucket,
         key,
@@ -1265,7 +1292,7 @@ async fn precompute_multipart_completion_checksum(
     let Some(stored) = state.stored_sse else {
         return Ok(None);
     };
-    let active = open_encryption(sqlite, stored).await?;
+    let active = open_encryption(sqlite, &request.bucket, &request.key, stored).await?;
     let checksum_config = MultipartChecksumConfig::for_completion(
         state.checksum,
         &request.requested_checksum,
@@ -1288,6 +1315,8 @@ async fn precompute_multipart_completion_checksum(
                 if *number != part.part_number || part.md5.as_ref() != Some(etag) {
                     return Err(SqliteError::InvalidMultipartPart);
                 }
+                // The visitor sees chunks numbered 1, 2, ... in order.
+                let mut chunk_number = 0;
                 Sqlite::for_each_upload_part_chunk(
                     transaction,
                     upload_id,
@@ -1297,7 +1326,13 @@ async fn precompute_multipart_completion_checksum(
                         let (Some(nonce), Some(tag)) = (chunk.sse_nonce, chunk.sse_tag) else {
                             return Err(SqliteError::ObjectBodyInconsistent);
                         };
-                        let plaintext = decrypt_chunk(&active, &nonce, &tag, &chunk.body)
+                        chunk_number += 1;
+                        let position = ChunkPosition {
+                            part_number: part.part_number,
+                            chunk_number,
+                            part_size: part.size,
+                        };
+                        let plaintext = decrypt_chunk(&active, position, &nonce, &tag, &chunk.body)
                             .map_err(SqliteError::Configuration)?;
                         if i64::try_from(plaintext.len()).ok() != Some(chunk.size) {
                             return Err(SqliteError::ObjectBodyInconsistent);

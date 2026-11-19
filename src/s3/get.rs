@@ -354,6 +354,8 @@ fn resolve_get_object_read(
 /// Builds the `GetObject` read state after storage metadata has been resolved.
 async fn finish_get_object_read(
     sqlite: &Sqlite,
+    bucket: &str,
+    key: &str,
     start: ObjectBodyReadStart,
     body: BlobReadReceiver,
 ) -> S3Result<ObjectBodyRead> {
@@ -374,7 +376,7 @@ async fn finish_get_object_read(
                     .stored_sse
                     .clone()
                     .ok_or_else(|| s3_error(S3ErrorCode::InternalError))?;
-                let active = open_encryption(sqlite, stored).await?;
+                let active = open_encryption(sqlite, bucket, key, stored).await?;
                 ObjectBodyReadBody::Stream(decrypting_snapshot_stream(
                     body,
                     chunks,
@@ -696,6 +698,7 @@ pub(super) async fn get_object(
         .get_connection(&bucket)
         .await
         .map_err(s3_error_from_sqlite)?;
+    let object_key = key.clone();
     let (start, body) = connection
         .read_blob(move |transaction| {
             resolve_get_object_read(
@@ -709,7 +712,7 @@ pub(super) async fn get_object(
         })
         .await
         .map_err(s3_error_from_sqlite)?;
-    let read = finish_get_object_read(sqlite, start, body).await?;
+    let read = finish_get_object_read(sqlite, &bucket, &object_key, start, body).await?;
     let output = get_object_output(read, range.as_ref(), part_number, checksum_mode.as_ref())?;
     Ok(S3Response::new(output))
 }
@@ -778,9 +781,16 @@ pub(super) async fn head_object(
 }
 
 /// Checks KMS access before returning protected checksum metadata.
+///
+/// SSE-S3 checksums need no key check, so only KMS envelopes are opened.
 async fn authorize_checksum(sqlite: &Sqlite, envelope: Option<&StoredSse>) -> S3Result<()> {
-    if let Some(stored @ StoredSse::Kms { .. }) = envelope {
-        open_encryption(sqlite, stored.clone()).await?;
+    if let Some(StoredSse::Kms {
+        key_id,
+        ciphertext,
+        context,
+    }) = envelope
+    {
+        super::kms::decrypt(&sqlite.config, key_id, ciphertext, context).await?;
     }
     Ok(())
 }
